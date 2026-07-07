@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - "20"
+          - "22"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install package dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Syntax checks
+        run: npm run check
+
+      - name: Packed artifact smoke
+        run: npm run pack:check
+
+      - name: Package dry run
+        run: npm pack --dry-run --json --ignore-scripts

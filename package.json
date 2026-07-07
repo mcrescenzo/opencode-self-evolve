@@ -1,0 +1,50 @@
+{
+  "name": "@mcrescenzo/opencode-self-evolve",
+  "version": "0.1.0",
+  "description": "Conservative manual opencode plugin that proposes local tooling and convention improvements without mutating external systems.",
+  "type": "module",
+  "main": "./self-evolve.js",
+  "homepage": "https://github.com/mcrescenzo/opencode-self-evolve#readme",
+  "bugs": {
+    "url": "https://github.com/mcrescenzo/opencode-self-evolve/issues"
+  },
+  "author": "Michael Crescenzo",
+  "exports": {
+    ".": "./self-evolve.js"
+  },
+  "files": [
+    "self-evolve.js",
+    "self-evolve-core.js",
+    "analyzer-prompt.js",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mcrescenzo/opencode-self-evolve"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "self-evolve",
+    "agent"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check self-evolve.js && node --check self-evolve-core.js && node --check analyzer-prompt.js && node --check scripts/live-command-hook-smoke.mjs && node --check scripts/pack-artifact-check.mjs",
+    "pack:check": "node scripts/pack-artifact-check.mjs",
+    "smoke:live": "node scripts/live-command-hook-smoke.mjs"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.7"
+  }
+}

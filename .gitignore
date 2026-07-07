@@ -1,0 +1,21 @@
+
+# Beads / Dolt files (added by bd init)
+.beads/
+.dolt/
+*.db
+.beads-credential-key
+.repo-review/
+
+# Node / runtime artifacts
+node_modules/
+.opencode/
+.remember/
+.claude/
+logs/
+*.log
+
+# Local secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
