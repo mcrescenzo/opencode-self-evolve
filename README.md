@@ -1,10 +1,14 @@
 # opencode Self-Evolve Plugin
 
-`self-evolve` is a conservative first-party opencode plugin that runs only when the user manually invokes `/self-evolve` or `/self-evolve scan`. It looks at the recent session transcript for evidence-backed opportunities to improve local opencode tooling, skills, commands, workflows, plugins, or project conventions. It never edits files, calls internal tooling, writes to external issue trackers or memory systems, pushes, publishes, or mutates external systems.
+Long opencode sessions build up small friction that nobody stops to notice: a skill that's missing a case you keep hitting, a command you keep retyping by hand, a convention that only lives in your head. Most of it just accumulates, session after session, because reviewing your own transcript for "what would have made this smoother?" isn't something you have time to do.
 
-## Installation
+`self-evolve` does that review for you. Run `/self-evolve scan` and it reads the recent conversation and, when it finds one concrete, evidence-backed opportunity to improve your local opencode tooling — a skill, command, agent, workflow, plugin, or project convention — it hands you a single advisory proposal: what it noticed, why, and what you could do about it. No proposal at all is a common and expected result; it only speaks up when it has real evidence.
 
-Install the package in the opencode config environment:
+It's deliberately conservative: it's a first-party opencode plugin that only ever runs when you explicitly type `/self-evolve` or `/self-evolve scan`, and it never edits files, calls internal tooling, writes to external issue trackers or memory systems, publishes, pushes, or mutates any external system. It proposes; you decide.
+
+## Quick Start
+
+Install the package in your opencode config environment:
 
 ```sh
 npm install @mcrescenzo/opencode-self-evolve
@@ -18,9 +22,9 @@ Then register it in `opencode.json`:
 }
 ```
 
-Restart opencode after changing plugin registration. Running sessions keep the plugin list and instructions they loaded at startup.
+Restart opencode after changing plugin registration — a running session keeps whatever plugin list and instructions it loaded at startup.
 
-For local development from a source checkout, register the checkout entrypoint path instead of the package name:
+Working from a source checkout instead? Register the checkout's entrypoint path rather than the package name:
 
 ```json
 {
@@ -28,35 +32,73 @@ For local development from a source checkout, register the checkout entrypoint p
 }
 ```
 
-Verify loading in a new opencode session:
+To confirm it loaded, start a new opencode session and run:
 
 ```text
 /self-evolve status
 ```
 
-Expected output starts with `Self-evolve status: active`. If the command is treated as a normal model prompt, the plugin did not load or opencode was not restarted after registration changed.
+You should see output starting with `Self-evolve status: active`. If the command instead turns into a normal model prompt, the plugin didn't load, or opencode wasn't restarted after you changed the registration.
+
+## Example
+
+Say you spend a session re-running the same debugging command by hand a few times. Running a scan afterward might surface something like this:
+
+```text
+$ /self-evolve scan
+```
+
+```text
+Self-evolve found a possible improvement: Add a skill for the payments log-tailing routine
+
+You ran `docker logs payments-api | grep ERROR | tail -n 50` by hand four times this
+session while tracking down the checkout bug. A small skill would save the retyping
+next time this comes up.
+
+Advisory only: no changes will be made unless you explicitly ask.
+Options:
+- Implement now: ask an agent to make this change.
+- Save follow-up: ask to record it as backlog work for later.
+- Ignore it: run /self-evolve dismiss se-1.
+- Disable self-evolve for this session: run /self-evolve disable.
+
+Proposal ID: se-1
+Placement: repo-local
+Target: .claude/skills/tail-payment-logs.md
+Risk: low. Mitigation: the skill only wraps a read-only log command; review before adding.
+Confidence: 0.81
+Evidence:
+- You ran the same docker logs/grep/tail sequence in 4 separate turns.
+- You said "let's not do this by hand again" after the third repeat.
+
+Suggested action: draft a skill that wraps the docker logs/grep/tail sequence with a
+parameterized service name.
+```
+
+This is an illustrative example, not a canned response — the real analyzer reads your actual transcript, so the title, evidence, and suggested action will reflect your own session (or it may find nothing worth proposing at all, which is fine and expected).
+
+## Commands
+
+- `/self-evolve` or `/self-evolve scan` — run a manual analysis (these are equivalent).
+- `/self-evolve status` — show session state: pause/disable state, run and proposal counts, pending proposal.
+- `/self-evolve pause` / `/self-evolve resume` — temporarily stop or restart manual scans for this session.
+- `/self-evolve disable` — turn self-evolve off for this session.
+- `/self-evolve dismiss <proposal-id>` — clear a pending proposal.
+- `/self-evolve help` — list the commands.
+
+`status`, `pause`, `resume`, `disable`, and `dismiss` are deterministic — they never invoke a model. Only `/self-evolve` and `/self-evolve scan` call the analyzer.
 
 ## Supported Environment
 
 - Node.js `>=20.11.0` is required and declared in `package.json`.
-- opencode CLI `>1.17.7` is the supported host range for plugin loading and live smoke validation.
-- `npm run smoke:live` uses `OPENCODE_BIN` when set, otherwise it uses `$HOME/.opencode/bin/opencode` or `opencode` on `PATH`.
-- The package uses npm scripts and does not pin a `packageManager`; there is no install-time build step.
-- `@opencode-ai/plugin` remains a runtime dependency for the opencode plugin API convention used by portable plugin installs. Runtime source imports are local modules or Node built-ins; the dependency also documents the supported plugin surface for consumers and future type-aware tooling.
-
-## Hooks
-
-The plugin registers exactly three opencode hooks:
-
-- `config` — registers the hidden, deny-all-tools `self-evolve-analyzer` primary agent and captures the configured default model.
-- `command.execute.before` — intercepts `/self-evolve` and its subcommands; this is the only entry point that can trigger an analyzer run.
-- `dispose` — clears the in-memory session registry when opencode unloads the plugin.
-
-It does not register `event` or `chat.message` hooks; analysis only ever runs from an explicit `/self-evolve` command.
+- opencode CLI `>=1.17.7` is the supported host range for plugin loading and live smoke validation.
+- `npm run smoke:live` uses `OPENCODE_BIN` when set, otherwise `$HOME/.opencode/bin/opencode` or `opencode` on `PATH`.
+- The package uses npm scripts and doesn't pin a `packageManager`; there's no install-time build step.
+- `@opencode-ai/plugin` is a runtime dependency, documenting the plugin API convention that portable plugin installs rely on.
 
 ## Configuration
 
-opencode plugins can be registered as a tuple with options:
+Most people never need to touch these, but the two you're most likely to tune are:
 
 ```json
 {
@@ -64,74 +106,34 @@ opencode plugins can be registered as a tuple with options:
     [
       "@mcrescenzo/opencode-self-evolve",
       {
-        "maxAnalyzerRuns": 4,
-        "maxProposals": 2,
-        "minConfidence": 0.8
+        "minConfidence": 0.8,
+        "maxProposals": 2
       }
     ]
   ]
 }
 ```
 
-Options:
+- `minConfidence` (default `0.72`) — how confident the analyzer must be before a proposal reaches you. Raise it if you're seeing proposals that feel like a stretch.
+- `maxProposals` (default `3`) — how many accepted proposals a session can produce before scans stop offering new ones.
+- `minIntervalMs` (default `600000`, i.e. 10 minutes) — the cooldown after a scan result before another scan is allowed.
 
-- `minIntervalMs` default `600000`: cooldown recorded after a scan result.
-- `maxAnalyzerRuns` default `8`: maximum analyzer runs per session.
-- `maxProposals` default `3`: maximum accepted proposals per session.
-- `maxAnalyzerFailures` default `3`: disables the session after repeated counted analyzer failures.
-- `messageLimit` default `120`: recent messages considered for transcript construction.
-- `transcriptMaxChars` default `30000`: maximum transcript characters sent to the analyzer.
-- `messageMaxChars` default `2000`: maximum characters retained from each message.
-- `minConfidence` default `0.72`: minimum proposal confidence accepted by validation.
-- `analyzerTimeoutMs` default `120000`: timeout for the analyzer prompt call.
-- `sdkTimeoutMs` default `15000`: timeout for SDK reads and analyzer-session creation.
-- `cleanupTimeoutMs` default `5000`: timeout for best-effort analyzer-session cleanup.
-- `deliveryTimeoutMs` default `5000`: timeout for optional TUI toast delivery.
-- `maxRegistrySessions` default `200`: lazy cap for inactive per-session states kept in memory.
-
-## Behavior
-
-- Maintains plugin-owned in-memory state per active `sessionID` only; opencode may still have transient runtime records/logs for temporary analyzer sessions.
-- Registers no passive event or chat hooks for analysis; the analyzer is called only from the `/self-evolve` command hook.
-- Uses deterministic gates before hidden analyzer calls: analyzer run cap, proposal cap, failure cap, pause/disable state, and one pending proposal at a time.
-- Reads recent active-session messages with opencode SDK compatibility fallbacks, bounds and redacts the transcript, then sends the analyzer prompt, JSON schema, redacted transcript excerpt, and analyzer JSON response through a temporary isolated analyzer session with a timeout.
-- Never falls back to active-session analyzer prompting; if temporary session creation or prompting fails, the scan fails closed with human-readable command output.
-- Cleans up the temporary analyzer session best-effort through the verified abort/interrupt lifecycle path; cleanup failure does not mask a valid analyzer result.
-- Validates strict JSON proposals plugin-side before returning a full human-facing advisory in deterministic command output and showing an optional TUI toast. It does not post advisory text back into the active session with `promptAsync` or rely on `noReply` behavior.
+There are eight more tunables covering transcript bounds, timeouts, and analyzer run caps — see [docs/configuration.md](docs/configuration.md) for the full table.
 
 ## Privacy And Token Use
 
-- Deterministic control commands such as `/self-evolve status`, `/self-evolve pause`, `/self-evolve resume`, `/self-evolve disable`, and `/self-evolve dismiss <proposal-id>` do not invoke a model.
-- `/self-evolve` and `/self-evolve scan` are manual analyzer runs. They read recent active-session messages through the opencode SDK, bound the transcript by message and character limits, redact common secret-like values, and send the analyzer prompt plus the bounded redacted transcript excerpt to the configured model/provider through a temporary analyzer session.
-- Manual scans may consume provider tokens according to the configured model/provider.
-- The analyzer is hidden, temperature `0`, one step, and tool-denied. The plugin validates the analyzer result locally and returns deterministic command output.
-- The plugin does not write files, persist proposals, publish packages, push git data, write to external issue trackers or memory systems, or mutate external services.
+- The deterministic control commands (`status`, `pause`, `resume`, `disable`, `dismiss`) never touch a model — they're free and instant.
+- A manual scan (`/self-evolve` or `/self-evolve scan`) reads your recent session messages through the opencode SDK, bounds the transcript by message and character limits, redacts common secret-like values, and sends the analyzer prompt plus that bounded, redacted excerpt to your configured model/provider through a temporary, isolated session.
+- That means a scan can consume provider tokens according to your configured model/provider — it's a deliberate action, not a background one.
+- The analyzer itself is hidden, runs at temperature `0`, takes one step, and has every tool denied; the plugin validates its output locally before showing you anything.
+- The plugin never writes files, persists proposals, publishes packages, pushes git data, writes to external issue trackers or memory systems, or mutates external services.
 
 ## Limitations
 
-- Redaction is defensive but not a substitute for keeping secrets out of chat transcripts. Do not run a manual scan over transcript content that should never be sent to the configured provider.
-- Proposals are advisory only. A human or coding agent must review and apply any suggested change separately.
-- Session state is in memory. Restarting opencode clears pause state, counters, and pending proposals.
-- Temporary analyzer-session cleanup is best-effort; cleanup failures are reported only when they affect the command result.
-
-## Public Repository Surface
-
-`AGENTS.md` and `CLAUDE.md` are public contributor/agent guides. `.claude/` settings are local automation and are not part of the public source or npm package.
-
-## Commands
-
-The plugin intercepts `/self-evolve` through `command.execute.before`; command output is deterministic and does not require a normal model turn.
-
-- `/self-evolve`
-- `/self-evolve help`
-- `/self-evolve status`
-- `/self-evolve pause`
-- `/self-evolve resume`
-- `/self-evolve disable`
-- `/self-evolve scan`
-- `/self-evolve dismiss <proposal-id>`
-
-Bare `/self-evolve` and `/self-evolve scan` are equivalent manual scans. Status, pause, resume, disable, and dismiss are deterministic control commands.
+- Redaction is defensive, not a guarantee — don't run a scan over transcript content that should never reach your configured provider.
+- Proposals are advisory only. You (or an agent acting on your behalf) still have to review and apply any suggested change yourself.
+- Session state lives in memory only. Restarting opencode clears pause state, counters, and any pending proposal.
+- Cleaning up the temporary analyzer session is best-effort; a cleanup failure is only reported when it affects the command result.
 
 ## Troubleshooting
 
@@ -141,13 +143,11 @@ Bare `/self-evolve` and `/self-evolve scan` are equivalent manual scans. Status,
 - **`npm run smoke:live` cannot find opencode:** install opencode locally or set `OPENCODE_BIN` to the opencode binary path.
 - **`npm run smoke:live` fails to bind `127.0.0.1`:** run it in an environment that permits local loopback server binding. Some sandboxes deny this even though normal local development and CI allow it.
 
-## Analyzer Contract
+## For AI Agents
 
-The config hook registers hidden primary agent `self-evolve-analyzer` with the configured default model, temperature `0`, one step, and all tools denied. The analyzer must return strict JSON matching `analyzer-prompt.js`. The plugin instructs strict JSON but still parses text-mode output with a defensive brace-extraction fallback after the analyzer returns, so do not describe accepted output as raw strict JSON only.
+If you're an agent operating in a session where this plugin is installed: it only runs when someone explicitly types `/self-evolve` or `/self-evolve scan` — there's no passive `event` or `chat.message` hook watching the conversation, so it never triggers on its own. Everything it returns is advisory only: it never edits files, calls other tools, or writes to external systems. Treat a proposal as something to relay to the user or act on with their separate approval, not as a standing instruction to execute.
 
-A valid proposal needs concrete evidence, target, placement, risk, mitigation, confidence, and suggested action. Invalid JSON and malformed analyzer output are counted analyzer failures and can disable the session after `maxAnalyzerFailures`. Low-confidence, duplicate, vague, unsafe, or otherwise non-actionable proposals are suppressed without counting as analyzer failures.
-
-## Validation
+## Development
 
 Run from this directory:
 
@@ -155,13 +155,8 @@ Run from this directory:
 npm test
 npm run check
 npm run pack:check
-npm run smoke:live
 ```
 
-`npm run pack:check` builds the npm tarball in a temporary directory, verifies the intended public file set, excludes repo-only agent/backlog files, extracts the tarball, and imports the packed plugin entrypoint.
+Run `npm run smoke:live` when you have a local opencode binary available.
 
-`npm run smoke:live` starts a disposable real `opencode serve` process with an isolated temporary config and a fixture plugin. It verifies live plugin loading, absence of passive event/chat hooks, and the `command.execute.before` hook for deterministic control commands without invoking the provider/model-backed `/session/{id}/command` endpoint or spending tokens.
-
-GitHub Actions runs the no-token release gates on push and pull request: `npm test`, `npm run check`, `npm run pack:check`, and `npm pack --dry-run --json --ignore-scripts`. `npm run pack:check` is the CI-safe packed-artifact smoke; `npm run smoke:live` remains a local release check because it needs an installed opencode binary and localhost binding.
-
-After changing this plugin or parent registration/docs, restart opencode. Running sessions keep already-loaded plugin/config state.
+See [docs/internals.md](docs/internals.md) for how the plugin's hooks, analyzer contract, and CI checks work under the hood, and [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and repository layout notes.

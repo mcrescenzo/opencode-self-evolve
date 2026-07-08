@@ -16,4 +16,11 @@ npm run pack:check
 npm run smoke:live
 ```
 
+See [docs/internals.md](docs/internals.md) for what each of these checks verifies and how the
+plugin's hooks and analyzer contract work.
+
 Avoid adding runtime dependencies unless there is a strong reason and the safety tradeoff is documented.
+
+## Repository Surface
+
+`AGENTS.md` and `CLAUDE.md` are public contributor/agent guides. `.claude/` settings are local automation and are not part of the public source or npm package.

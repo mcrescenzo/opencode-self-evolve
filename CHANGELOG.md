@@ -5,6 +5,16 @@ recorded here.
 
 This project follows semantic versioning after the first public release.
 
+## 0.1.2 - 2026-07-08
+
+- Fixed the documented supported opencode CLI range to `>=1.17.7` (was
+  `>1.17.7`, which wrongly excluded the verified 1.17.7 floor itself).
+- Documentation-only release otherwise: README rewritten to lead with the use
+  case, adds a worked `/self-evolve scan` proposal example and a "For AI
+  agents" note; configuration trimmed to the common tunables with the full
+  table in `docs/configuration.md`; internals moved to `docs/internals.md`.
+  No runtime changes.
+
 ## 0.1.1 - 2026-07-07
 
 - Added automated npm releases: pushing a version bump to `main` now publishes
