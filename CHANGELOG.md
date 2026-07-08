@@ -5,7 +5,13 @@ recorded here.
 
 This project follows semantic versioning after the first public release.
 
-## 0.1.0 - Unreleased
+## 0.1.1 - 2026-07-07
+
+- Added automated npm releases: pushing a version bump to `main` now publishes
+  to npm via GitHub Actions using npm trusted publishing (OIDC) with provenance,
+  then tags the commit and creates a GitHub Release.
+
+## 0.1.0 - 2026-07-07
 
 - Initial public package metadata for the manual self-evolve opencode plugin.
 - Manual scan command with hidden analyzer session, transcript redaction, proposal validation, deterministic advisory output, and optional TUI toast.

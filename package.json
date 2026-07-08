@@ -1,6 +1,6 @@
 {
   "name": "@mcrescenzo/opencode-self-evolve",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Conservative manual opencode plugin that proposes local tooling and convention improvements without mutating external systems.",
   "type": "module",
   "main": "./self-evolve.js",
