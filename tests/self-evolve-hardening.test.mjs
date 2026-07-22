@@ -15,6 +15,7 @@ import { createScheduler } from "../self-evolve-scheduler.js";
 import * as schemas from "../self-evolve-schemas.js";
 import { openStore } from "../self-evolve-store.js";
 import * as synthesis from "../self-evolve-synthesis.js";
+import SelfEvolvePlugin from "../self-evolve.js";
 import { SelfEvolveTuiPlugin } from "../self-evolve-tui.js";
 
 const H = (value) => inventory.hashSkillContent(value);
@@ -456,9 +457,10 @@ test("15 provider and TUI hangs are bounded and fail closed without disabling ma
     event: { on: () => () => {} },
     lifecycle: { signal: controller.signal, onDispose(fn) { disposers.push(fn); } },
     state: { session: { status: () => ({ type: "idle", since: 0 }) } },
-    client: { selfEvolve: { getInbox: async () => await new Promise(() => {}) } },
+    client: {},
+    __testMailboxClient: { getInbox: async () => await new Promise(() => {}) },
   };
-  await SelfEvolveTuiPlugin(api, { selfEvolve: { serverTimeoutMs: 5, idleDebounceMs: 0 } });
+  await SelfEvolveTuiPlugin(api, { selfEvolve: { projectFingerprint: PROJECT_A, serverTimeoutMs: 5, idleDebounceMs: 0 } });
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(alerts.length, 1);
   assert.equal(createCommandPolicy({ store: f.store, privacy: f.privacy, now: () => NOW }).getMode(), "manual");
@@ -481,8 +483,39 @@ test("16 newer schema state falls back to manual, reports health, and blocks aut
   assert.match(policy.execute({ verb: "mode", mode: "auto" }, { projectFingerprint: PROJECT_A }).responseText, /Manual\/no-write/u);
 });
 
-test("17 orphan hidden sessions after a hard process crash require runtime enumeration unavailable to these modules", { todo: "OpenCode SDK session enumeration and entrypoint boot wiring are required; self-evolve.js is prohibited for this bead." }, (t) => {
-  tempRoot(t, "orphan-session");
+test("17 durable entrypoint asynchronously aborts only active self-evolve orphan sessions without prompting", async (t) => {
+  const root = tempRoot(t, "orphan-session");
+  const aborted = [];
+  let prompts = 0;
+  const sessions = [
+    { id: "analyzer-active", agent: "self-evolve-analyzer", state: "running" },
+    { id: "synth-active", agent: "self-evolve-synthesizer", status: { type: "busy" } },
+    { id: "critic-active", info: { agent: "self-evolve-critic" }, state: "pending" },
+    { id: "critic-terminal", agent: "self-evolve-critic", state: "completed" },
+    { id: "ordinary-active", agent: "build", state: "running" },
+  ];
+  const ctx = {
+    directory: root,
+    worktree: root,
+    client: {
+      global: { health: async () => ({ data: { healthy: true, version: "1.18.3" } }) },
+      session: {
+        list: async () => ({ data: sessions }),
+        abort: async (args) => { aborted.push(args?.path?.id ?? args?.path?.sessionID ?? args?.sessionID ?? args?.id ?? args); return { data: {} }; },
+        prompt: async () => { prompts += 1; throw new Error("token prompt prohibited"); },
+      },
+    },
+  };
+  const hooks = await SelfEvolvePlugin(ctx, {
+    stateRoot: path.join(root, "state"),
+    hostRecoveryTimeoutMs: 50,
+    hostRecoveryRetries: 0,
+    now: () => NOW,
+  });
+  await waitFor(() => aborted.length === 3, "entrypoint orphan recovery");
+  assert.deepEqual(aborted.sort(), ["analyzer-active", "critic-active", "synth-active"]);
+  assert.equal(prompts, 0);
+  await hooks.dispose();
 });
 
 test("18 quota refuses writes above 8 MiB and retention removes old observations", (t) => {
@@ -507,14 +540,15 @@ test("18 quota refuses writes above 8 MiB and retention removes old observations
 function integrationThresholdHarness(t, successRate) {
   const root = tempRoot(t, `threshold-${String(successRate).replace(".", "-")}`);
   const store = openStore(root, { projectFingerprint: PROJECT_A, now: () => NOW });
+  seedRolloutHistory(store, 20, Math.round(20 * successRate));
   const privacy = { exportScope: () => ({ records: [] }), purgeScope: () => ({ ok: true, counts: {} }), scanForForbiddenContent: () => ({ ok: true }) };
   let applies = 0;
   const rawApplier = { applyProposal: async () => { applies += 1; return { ok: true, appliedHash: H(PROPOSED), auditId: H("audit") }; }, recoverPending: () => [], circuitBreakerOpen: () => false, close() {} };
   const item = persistedProposal({ skillRoot: root, records: [{ currentHash: H(CURRENT) }] }, { canonicalRoot: root, state: "pending", decisionVersion: 0 });
   const pipeline = { createPipeline(deps) { return { async runEvolutionCycle(args) { const applied = await deps.applier.applyProposal({ proposal: item, mode: args.mode, headless: true }); return { result: applied.ok ? "applied" : "proposal-ready", proposal: item, responseText: "threshold" }; }, runApprovalFlow: async () => ({ result: "failed-closed" }), runRollbackFlow: async () => ({ result: "failed-closed" }) }; } };
   const scheduler = { createScheduler: () => ({ setMode() {}, getCircuitBreaker: () => ({ open: false }), handleEvent() {}, recordWorkResult() {}, dispose() {} }) };
-  const runtime = createIntegration({ store, inventory: {}, privacy, schemas, observation: {}, synthesisModule: {}, applier: rawApplier, commands: { ...awaitableCommands }, pipeline, scheduler, options: { rolloutMetrics: { synthesesObserved: 20, successRate } }, now: () => NOW });
-  runtime.tuiBridge.setMode("yolo", { confirmed: true, allowlist: [root] });
+  const runtime = createIntegration({ store, inventory: {}, privacy, schemas, observation: {}, synthesisModule: {}, applier: rawApplier, commands: { ...awaitableCommands }, pipeline, scheduler, now: () => NOW });
+  runtime.__testBridge.setMode("yolo", { confirmed: true, allowlist: [root] });
   t.after(() => store.close());
   return { runtime, get applies() { return applies; } };
 }
@@ -522,6 +556,22 @@ function integrationThresholdHarness(t, successRate) {
 const awaitableCommands = {
   ...await import("../self-evolve-commands.js"),
 };
+
+function seedRolloutHistory(store, observed, successes) {
+  for (let index = 0; index < observed; index += 1) {
+    const status = index < successes ? "accepted" : "failed";
+    const event = schemas.makeSynthesisOutcomeAuditEvent({
+      outcomeId: H(`hardening-outcome-${index}`),
+      projectFingerprint: PROJECT_A,
+      clusterId: H(`hardening-outcome-cluster-${index}`),
+      status,
+      success: status === "accepted",
+      terminalAt: NOW - observed + index,
+      reasonCode: status === "accepted" ? "accepted" : "synthesis-failed",
+    });
+    store.appendRecord(schemas.wrapRecord("audit-event", event, event.timestamp));
+  }
+}
 
 test("19 yolo calibration gate rejects 15/20 and enables 18/20", async (t) => {
   const low = integrationThresholdHarness(t, 15 / 20);
@@ -535,6 +585,7 @@ test("19 yolo calibration gate rejects 15/20 and enables 18/20", async (t) => {
 test("20 a manual mode change during synthesis allows completion but prevents apply", async (t) => {
   const root = tempRoot(t, "mode-race");
   const store = openStore(root, { projectFingerprint: PROJECT_A, now: () => NOW });
+  seedRolloutHistory(store, 20, 20);
   const privacy = { exportScope: () => ({ records: [] }), purgeScope: () => ({ ok: true }), scanForForbiddenContent: () => ({ ok: true }) };
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -543,15 +594,15 @@ test("20 a manual mode change during synthesis allows completion but prevents ap
   const rawApplier = { applyProposal: async () => { applies += 1; return { ok: true }; }, recoverPending: () => [], circuitBreakerOpen: () => false, close() {} };
   const pipeline = { createPipeline(deps) { return { async runEvolutionCycle(args) { await gate; const applied = await deps.applier.applyProposal({ proposal: item, mode: args.mode, headless: true }); return { result: applied.ok ? "applied" : "proposal-ready", proposal: item }; }, runApprovalFlow: async () => ({}), runRollbackFlow: async () => ({}) }; } };
   const scheduler = { createScheduler: () => ({ setMode() {}, getCircuitBreaker: () => ({ open: false }), handleEvent() {}, recordWorkResult() {}, dispose() {} }) };
-  const runtime = createIntegration({ store, inventory: {}, privacy, schemas, observation: {}, synthesisModule: {}, applier: rawApplier, commands: awaitableCommands, pipeline, scheduler, options: { rolloutMetrics: { synthesesObserved: 20, successRate: 1 } }, now: () => NOW });
-  runtime.tuiBridge.setMode("yolo", { confirmed: true, allowlist: [root] });
+  const runtime = createIntegration({ store, inventory: {}, privacy, schemas, observation: {}, synthesisModule: {}, applier: rawApplier, commands: awaitableCommands, pipeline, scheduler, now: () => NOW });
+  runtime.__testBridge.setMode("yolo", { confirmed: true, allowlist: [root] });
   const running = runtime.runEvolutionCycle({ projectFingerprint: PROJECT_A });
   await new Promise((resolve) => setImmediate(resolve));
-  runtime.tuiBridge.setMode("manual");
+  runtime.__testBridge.setMode("manual");
   release();
   assert.equal((await running).result, "proposal-ready");
   assert.equal(applies, 0);
-  assert.equal(runtime.tuiBridge.getMode().effectiveMode, "manual");
+  assert.equal(runtime.__testBridge.getMode().effectiveMode, "manual");
   store.close();
 });
 

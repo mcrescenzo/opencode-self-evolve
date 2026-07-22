@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import {
+  SCHEMA_VERSION,
   ConsentState,
   Observation,
+  makeAggregateClaim,
   makeAuditEvent,
   makeConsentState,
   makeObservation,
@@ -30,6 +32,7 @@ const PRIVATE_KEY_MARKER = /-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----/u;
 const NEVER_STORED_KEY = /(?:^|_)(?:content|body|messageBody|rawMessage|rawText|transcript|completeTranscript)(?:$|_)/iu;
 const REPO_NAME_KEY = /(?:project|repo(?:sitory)?|customer)(?:Name|Id|Identifier)?$/iu;
 const UNIQUE_COMMAND_KEY = /(?:command|commandName|uniqueCommand|rawCommand)$/iu;
+const AGGREGATE_INPUT_FIELDS = Object.freeze(["claimType", "receiptType", "signatureHash", "incidentId", "occurrenceCount", "firstSeenAt", "lastSeenAt"]);
 
 function sha256(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -53,7 +56,19 @@ function requestedFingerprint(scope) {
 
 function timestampFor(record) {
   const payload = recordPayload(record) ?? {};
-  return payload.createdAt ?? payload.synthesizedAt ?? payload.timestamp ?? record?.createdAt;
+  return {
+    "episode-cursor": payload.lastIdleAt,
+    receipt: payload.lastSeenAt,
+    observation: payload.createdAt,
+    "evidence-cluster": payload.lastSeenAt,
+    "eligibility-explanation": record?.createdAt,
+    proposal: payload.synthesizedAt,
+    decision: payload.timestamp,
+    "audit-event": payload.timestamp,
+    "rollback-record": payload.rolledBackAt,
+    "intervention-epoch": payload.startedAt,
+    "circuit-breaker": payload.openedAt ?? record?.createdAt,
+  }[record?.kind] ?? payload.createdAt ?? payload.synthesizedAt ?? payload.timestamp ?? record?.createdAt;
 }
 
 function logicalId(record) {
@@ -100,8 +115,9 @@ function expirationFor(record, retentionDays) {
       : payload.createdAt !== undefined
         ? "observation"
         : null);
-  if (kind === "observation") return observationExpiresAt(createdAt, retentionDays);
-  if (["proposal", "decision", "audit-event"].includes(kind)) return proposalExpiresAt(createdAt, retentionDays);
+  if (["episode-cursor", "receipt", "observation", "evidence-cluster", "eligibility-explanation"].includes(kind)) return observationExpiresAt(createdAt, retentionDays);
+  if (["proposal", "proposal-content", "synthesis-attempt", "decision", "audit-event", "rollback-record", "intervention-epoch", "circuit-breaker"].includes(kind)) return proposalExpiresAt(createdAt, retentionDays);
+  if (kind === "apply-claim") return Number.isSafeInteger(payload.expiresAt) ? payload.expiresAt : null;
   return null;
 }
 
@@ -163,7 +179,7 @@ export function createPrivacyGuard({
   store,
   blockedNames = [],
 } = {}) {
-  const cleanConsent = makeConsentState(consent ?? ConsentState.defaults);
+  const initialConsent = makeConsentState(consent ?? ConsentState.defaults);
   if (!FINGERPRINT.test(String(projectFingerprint))) throw new TypeError("invalid-project-fingerprint");
   if (!Number.isSafeInteger(retentionDays) || retentionDays < 1) throw new TypeError("invalid-retention");
   if (!Number.isFinite(storageQuotaMiB) || storageQuotaMiB < 0) throw new TypeError("invalid-storage-quota");
@@ -171,6 +187,16 @@ export function createPrivacyGuard({
   if (!Array.isArray(blockedNames) || blockedNames.some((name) => typeof name !== "string")) throw new TypeError("invalid-blocklist");
   const invalidated = new Set();
   const quotaBytes = Math.floor(storageQuotaMiB * 1024 * 1024);
+
+  function durableSettings() {
+    if (!store?.getSettings) return { global: { consent: initialConsent, retentionDays, budgets: { storageQuotaMiB } } };
+    return store.getSettings();
+  }
+
+  function freshConsent() {
+    try { return makeConsentState(durableSettings().global.consent); }
+    catch { return makeConsentState(); }
+  }
 
   function successfulObservation(sanitized) {
     const result = { ...sanitized };
@@ -203,8 +229,11 @@ export function createPrivacyGuard({
     });
     if (rejected) return { ok: false, reason: rejected };
     if (observation.scope === "global" || observation.structuredFields?.scope === "global") {
+      const consentNow = freshConsent();
       const global = assertSafeGlobalClaim(observation, { blockedNames });
-      if (!global.ok || !cleanConsent.crossRepoAggregation) return { ok: false, reason: global.reason ?? "cross-repo-consent-required" };
+      if (!global.ok || !consentNow.sanitizedExcerpts || !consentNow.crossRepoAggregation) {
+        return { ok: false, reason: global.reason ?? (!consentNow.sanitizedExcerpts ? "sanitized-excerpts-consent-required" : "cross-repo-consent-required") };
+      }
     }
     try {
       const sanitized = makeObservation(Object.fromEntries(Observation.fields.map((key) => [key, observation[key]])));
@@ -216,7 +245,7 @@ export function createPrivacyGuard({
 
   /** Returns heuristic redaction only; "redacted" is not a secrecy guarantee. */
   function scrubExcerpt({ text, maxLength = DEFAULT_EXCERPT_LENGTH } = {}) {
-    if (!cleanConsent.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
+    if (!freshConsent().sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
     if (typeof text !== "string" || !Number.isSafeInteger(maxLength) || maxLength < 0) return { ok: false, reason: "invalid-excerpt" };
     let redacted = text.replace(/```[\s\S]*?```/g, "<code>").replace(PRIVATE_KEY, "<private-key>");
     for (const pattern of PROVIDER_TOKEN_PATTERNS) {
@@ -236,7 +265,9 @@ export function createPrivacyGuard({
   }
 
   function checkGlobalAggregation(records, requestedScope) {
-    if (!cleanConsent.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required", sanitized: [] };
+    const consentNow = freshConsent();
+    if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required", sanitized: [] };
+    if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required", sanitized: [] };
     if (requestedScope?.scope !== undefined && requestedScope.scope !== "global") return { ok: false, reason: "global-scope-required", sanitized: [] };
     const claims = new Map();
     for (const record of records) {
@@ -252,9 +283,71 @@ export function createPrivacyGuard({
     return { ok: true, sanitized: [...claims].sort(([a], [b]) => a.localeCompare(b)).map(([signature, occurrences]) => ({ signature, occurrences })) };
   }
 
+  function contributeAggregate(input) {
+    const consentNow = freshConsent();
+    if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
+    if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required" };
+    if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "invalid-aggregate-input" };
+    const keys = Object.keys(input);
+    if (keys.some((key) => !AGGREGATE_INPUT_FIELDS.includes(key)) || AGGREGATE_INPUT_FIELDS.some((key) => !(key in input))) {
+      return { ok: false, reason: "invalid-aggregate-input" };
+    }
+    if (typeof input.incidentId !== "string" || !input.incidentId || input.incidentId.length > 1024) return { ok: false, reason: "invalid-aggregate-input" };
+    try {
+      const firstSeenDay = new Date(input.firstSeenAt).toISOString().slice(0, 10);
+      const lastSeenDay = new Date(input.lastSeenAt).toISOString().slice(0, 10);
+      const incidentHash = sha256(`self-evolve-aggregate-incident-v1\n${projectFingerprint}\n${input.incidentId}`);
+      const aggregateId = sha256(`self-evolve-aggregate-contribution-v1\n${input.claimType}\n${input.receiptType}\n${input.signatureHash}\n${incidentHash}`);
+      const createdAt = now();
+      const record = makeAggregateClaim({
+        schemaVersion: SCHEMA_VERSION,
+        aggregateId,
+        claimType: input.claimType,
+        receiptType: input.receiptType,
+        signatureHash: input.signatureHash,
+        incidentHash,
+        occurrenceCount: input.occurrenceCount,
+        firstSeenDay,
+        lastSeenDay,
+        createdAt,
+        expiresAt: createdAt + retentionDays * DAY_MS,
+      });
+      const safe = assertSafeGlobalClaim(record, { blockedNames });
+      if (!safe.ok) return { ok: false, reason: safe.reason };
+      return requireStore(store).appendAggregate(record);
+    } catch (error) {
+      return { ok: false, reason: String(error.message).split(":", 1)[0] };
+    }
+  }
+
+  function readAggregateClaims({ scope = "global", includeExpired = false } = {}) {
+    const consentNow = freshConsent();
+    if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required", records: [] };
+    if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required", records: [] };
+    try {
+      return { ok: true, records: requireStore(store).readAggregates({ scope, includeExpired, nowMs: now() }) };
+    } catch (error) {
+      return { ok: false, reason: String(error.message).split(":", 1)[0], records: [] };
+    }
+  }
+
+  function retainAggregateClaims(nowMs = now()) {
+    const consentNow = freshConsent();
+    if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
+    if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required" };
+    try { return { ok: true, ...requireStore(store).retainAggregates(nowMs) }; }
+    catch (error) { return { ok: false, reason: String(error.message).split(":", 1)[0] }; }
+  }
+
   function checkRetention(nowMs = now()) {
-    const archive = requireStore(store).exportAll();
+    durableSettings();
+    const archive = requireStore(store).exportProject();
+    const latest = new Map();
+    for (const record of archive.records) if (record.kind === "proposal") latest.set(record.payload.id, record.payload);
+    const active = new Set([...latest].filter(([, proposal]) => ["pending", "approved", "applied"].includes(proposal.state)).map(([id]) => id));
     return archive.records.flatMap((record) => {
+      const proposalId = record.kind === "proposal" ? record.payload.id : record.payload?.proposalId;
+      if (proposalId && active.has(proposalId) && ["proposal", "decision", "audit-event"].includes(record.kind)) return [];
       const expiresAt = expirationFor(record, retentionDays);
       return expiresAt !== null && isExpired(expiresAt, nowMs) ? [{ kind: record.kind, id: logicalId(record), expiresAt }] : [];
     });
@@ -272,7 +365,8 @@ export function createPrivacyGuard({
   }
 
   function inspectScope(fingerprint) {
-    const archive = requireStore(store).exportAll();
+    durableSettings();
+    const archive = requireStore(store).exportProject();
     const records = scopedRecords(archive, fingerprint);
     const counts = { observations: 0, proposals: 0, decisions: 0, auditEvents: 0 };
     for (const record of records) {
@@ -281,12 +375,15 @@ export function createPrivacyGuard({
       else if (record.kind === "decision") counts.decisions += 1;
       else if (record.kind === "audit-event") counts.auditEvents += 1;
     }
-    const bytesUsed = Buffer.byteLength(JSON.stringify(records), "utf8");
-    return { ...counts, bytesUsed, quotaFraction: checkQuota(bytesUsed).usedFraction };
+    const usage = typeof store.getProjectUsage === "function"
+      ? store.getProjectUsage()
+      : { bytesUsed: Buffer.byteLength(JSON.stringify(records), "utf8"), quotaBytes };
+    return { ...counts, bytesUsed: usage.bytesUsed, quotaFraction: checkQuota(usage.bytesUsed, usage.quotaBytes).usedFraction };
   }
 
   function exportScope(fingerprint) {
-    const archive = requireStore(store).exportAll();
+    durableSettings();
+    const archive = requireStore(store).exportProject();
     if (archive.projectFingerprint !== fingerprint) return { ...archive, projectName: "", projectFingerprint: fingerprint, records: [] };
     const records = [];
     for (const record of scopedRecords(archive, fingerprint)) {
@@ -301,6 +398,11 @@ export function createPrivacyGuard({
     return { ...archive, records };
   }
 
+  function exportAll() {
+    durableSettings();
+    return requireStore(store).exportAll();
+  }
+
   function purgeScope({ scope, projectFingerprint: requestedProject } = {}) {
     if (scope !== "all" && requestedProject !== undefined && requestedProject !== projectFingerprint) return { ok: false, reason: "project-partition-mismatch", counts: {}, removedPaths: [] };
     const writableStore = requireStore(store);
@@ -311,7 +413,7 @@ export function createPrivacyGuard({
     // project subtree on scope="project", so we remove snapshot files before
     // returning; on scope="all" the entire self-evolve/ subtree is gone.
     const snapshotGlobs = [];
-    if (scope === "project" || scope === "all") {
+    if (scope === "project") {
       const snapshotRoot = typeof writableStore.snapshotRoot === "string" ? writableStore.snapshotRoot : null;
       if (snapshotRoot) {
         try {
@@ -367,10 +469,8 @@ export function createPrivacyGuard({
   function excludeRepo(fingerprint) {
     if (fingerprint !== projectFingerprint) return { ok: false, reason: "project-partition-mismatch" };
     const durableStore = requireStore(store);
-    const current = durableStore.getSettings().repo;
-    const settings = makeRepoSettings({ ...current, excluded: true });
-    const saved = durableStore.setRepoSettings(settings);
-    return saved?.ok === false ? saved : { ok: true, settings: saved };
+    const saved = durableStore.updateRepoSettings((current) => makeRepoSettings({ ...current, excluded: true }));
+    return saved?.ok === false ? saved : { ok: true, settings: saved.settings.repo };
   }
 
   return Object.freeze({
@@ -378,11 +478,15 @@ export function createPrivacyGuard({
     scrubExcerpt,
     checkPartition,
     checkGlobalAggregation,
+    contributeAggregate,
+    readAggregateClaims,
+    retainAggregateClaims,
     checkRetention,
     checkQuota,
     scanForForbiddenContent,
     inspectScope,
     exportScope,
+    exportAll,
     purgeScope,
     invalidateObservation,
     isObservationEligible,

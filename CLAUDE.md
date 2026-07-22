@@ -19,6 +19,7 @@ Run `npm test`, `npm run check`, and `npm run pack:check`. Run `npm run smoke:li
 - `self-evolve-pipeline.js`: shared autonomy stage orchestration.
 - `self-evolve-scheduler.js`: idle dedup, budgets, leases, epochs.
 - `self-evolve-integration.js`: effective mode, boot recovery, bridge, shutdown.
+- `self-evolve-lock.js`: shared synchronous cross-process store/mailbox lock.
 - `self-evolve-tui.js`: native safe-idle review and consent UI.
 
 ## Invariants
@@ -26,7 +27,7 @@ Run `npm test`, `npm run check`, and `npm run pack:check`. Run `npm run smoke:li
 - Dual target: server `.` must not import `./tui`, `@opencode-ai/plugin/tui`, or `@opentui/*`; TUI is available only from `./tui`; shared helpers import neither target.
 - Single export: `self-evolve.js` exports only `default SelfEvolvePlugin`. Test seams stay on `SelfEvolvePlugin.__test`.
 - Single registry: preserve the module-scoped `const registry`; factory calls update options in place and never replace session state.
-- Trigger gate: passive `event` exists only with `durableAutonomy: true` and non-manual startup mode. Never register passive `chat.message`. Manual analysis remains command-driven.
+- Trigger gate: durable v0.2 is the default; `durableAutonomy: false` is explicit legacy compatibility. Passive `event` exists only after successful durable boot with persisted effective auto/yolo mode. Never register passive `chat.message`. Manual analysis remains command-driven.
 - State split: the legacy registry is in-memory and cleared on dispose. Durable autonomy uses only the OpenCode state-root store.
 - Authority: the applier is the only skill writer and all model output remains advisory until deterministic policy authorizes it.
 - Public helper policy: `AGENTS.md` and this file ship as public guidance and must not contain private paths or internal tooling references.

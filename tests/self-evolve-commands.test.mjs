@@ -23,6 +23,11 @@ import { openStore } from "../self-evolve-store.js";
 const FINGERPRINT = "a".repeat(64);
 const HASH_A = "b".repeat(64);
 const HASH_B = "c".repeat(64);
+const NONCE = "d".repeat(48);
+
+function approvalInput(id = "se-1", overrides = {}) {
+  return `/self-evolve approve ${id} --target-hash ${overrides.targetHash ?? HASH_A} --proposed-content-hash ${overrides.proposedContentHash ?? HASH_B} --decision-version ${overrides.decisionVersion ?? 1} --nonce ${overrides.nonce ?? NONCE}`;
+}
 
 function hash(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -112,7 +117,7 @@ function seedApplyAudit(store, id, currentHash, appliedHash, timestamp = 950) {
 test("parser covers the complete command surface and rejects malformed input", () => {
   const cases = [
     ["/self-evolve help", "help"], ["?", "help"], ["scan", "scan"], ["status", "status"],
-    ["pause", "pause"], ["resume", "resume"], ["review se-1", "review"], ["approve se-1", "approve"],
+    ["pause", "pause"], ["resume", "resume"], ["review se-1", "review"], [approvalInput(), "approve"],
     ["reject se-1", "reject"], ["snooze se-1 7d", "snooze"], ["undo se-1", "undo"],
     ["exclude", "repo-override"], ["include", "repo-override"], ["repo inherit", "repo-mode"],
     ["consent passive on", "consent"], ["inspect observations 3", "inspect"],
@@ -123,6 +128,28 @@ test("parser covers the complete command surface and rejects malformed input", (
   assert.equal(parseSelfEvolveCommand("approve").ok, false);
   assert.equal(parseSelfEvolveCommand("purge").ok, false);
   assert.equal(parseSelfEvolveCommand("wat").ok, false);
+});
+
+test("approval parser requires one exact tuple and rejects every malformed shape", () => {
+  assert.deepEqual(command(approvalInput()), {
+    verb: "approve", proposalId: "se-1", targetHash: HASH_A, proposedContentHash: HASH_B, decisionVersion: 1, nonce: NONCE,
+  });
+  for (const input of [
+    "approve se-1",
+    approvalInput().replace(` --target-hash ${HASH_A}`, ""),
+    approvalInput().replace(` --proposed-content-hash ${HASH_B}`, ""),
+    approvalInput().replace(" --decision-version 1", ""),
+    approvalInput().replace(` --nonce ${NONCE}`, ""),
+    `${approvalInput()} bare-id`,
+    approvalInput().replace("--nonce", "--unknown"),
+    approvalInput().replace(`--nonce ${NONCE}`, `--target-hash ${HASH_A}`),
+    approvalInput("se-1", { targetHash: "A".repeat(64) }),
+    approvalInput("se-1", { proposedContentHash: "abc" }),
+    approvalInput("se-1", { decisionVersion: 0 }),
+    approvalInput("se-1", { decisionVersion: "1.5" }),
+    approvalInput("se-1", { decisionVersion: "9007199254740992" }),
+    approvalInput("se-1", { nonce: "not-a-server-nonce" }),
+  ]) assert.equal(parseSelfEvolveCommand(input).ok, false, input);
 });
 
 test("bare command migration and help preserve legacy mappings", () => {
@@ -230,30 +257,25 @@ test("newer settings fail closed to manual and refuse writes with a health messa
 test("inbox lists pending proposals and review shows one proposal headlessly", (t) => {
   const { policy, store } = fixture(t);
   for (const id of ["se-1", "se-2", "se-3"]) seedProposal(store, id);
+  seedProposal(store, "se-draft", "critic-pending", { criticPassed: false, criticScore: 0 });
   const inbox = policy.execute(command("inbox"), { projectFingerprint: FINGERPRINT });
   assert.match(inbox.responseText, /Pending proposals \(3\)/);
   for (const id of ["se-1", "se-2", "se-3"]) assert.match(inbox.responseText, new RegExp(id));
   const review = policy.execute(command("review se-2"), { projectFingerprint: FINGERPRINT });
   assert.match(review.responseText, /se-2/);
-  assert.match(review.responseText, /Acceptance is not file application/);
+  assert.match(review.responseText, /Approval tuple unavailable/);
+  assert.doesNotMatch(review.responseText, /proposedContent/);
+  assert.match(policy.execute(command("review se-draft"), { projectFingerprint: FINGERPRINT }).responseText, /not reviewable, approvable, or applicable/u);
+  assert.doesNotMatch(inbox.responseText, /se-draft/u);
 });
 
-test("approve creates a hash-bound Decision and duplicate approval fails CAS", (t) => {
+test("command policy cannot turn a direct or internal approval shortcut into authority", (t) => {
   const { policy, store } = fixture(t);
   seedProposal(store, "se-approve");
-  const first = policy.execute(command("approve se-approve"), { projectFingerprint: FINGERPRINT });
-  assert.match(first.responseText, /accepted for one-use review authorization/);
-  assert.match(first.responseText, /Acceptance is not file application/);
-  assert.equal(store.getRecord("proposal", "se-approve").payload.state, "approved");
-  const decisions = store.readRecords("decision");
-  assert.equal(decisions.length, 1);
-  assert.deepEqual(
-    Object.fromEntries(["proposalId", "targetHash", "proposedContentHash", "priorState", "newState"].map((key) => [key, decisions[0].payload[key]])),
-    { proposalId: "se-approve", targetHash: HASH_A, proposedContentHash: HASH_B, priorState: "pending", newState: "approved" },
-  );
-  const duplicate = policy.execute(command("approve se-approve"), { projectFingerprint: FINGERPRINT });
-  assert.match(duplicate.responseText, /stale-prior-state/);
-  assert.equal(store.readRecords("decision").length, 1);
+  const result = policy.execute(command(approvalInput("se-approve")), { projectFingerprint: FINGERPRINT });
+  assert.match(result.responseText, /durable server integration/);
+  assert.equal(store.getRecord("proposal", "se-approve").payload.state, "pending");
+  assert.equal(store.readRecords("decision").length, 0);
 });
 
 test("reject and legacy dismiss transition pending proposals to rejected", (t) => {

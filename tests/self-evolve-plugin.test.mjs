@@ -1,8 +1,18 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { beforeEach, test } from "node:test";
 import { ANALYZER_TOOLS } from "../analyzer-prompt.js";
 import { SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SOURCE } from "../self-evolve-core.js";
-import SelfEvolvePlugin from "../self-evolve.js";
+import DefaultSelfEvolvePlugin from "../self-evolve.js";
+import { makeGlobalSettings } from "../self-evolve-schemas.js";
+import { openStore, projectFingerprintFor } from "../self-evolve-store.js";
+
+const SelfEvolvePlugin = Object.assign(
+  (ctx, options = {}) => DefaultSelfEvolvePlugin(ctx, { ...options, durableAutonomy: false }),
+  { __test: DefaultSelfEvolvePlugin.__test },
+);
 
 function proposalPayload(overrides = {}) {
   return {
@@ -101,6 +111,16 @@ async function waitFor(condition, label) {
 
 async function tick() {
   await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function waitForDurableStartup(hooks, sessionID = "startup") {
+  const output = { parts: [] };
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    await hooks["command.execute.before"]({ command: "self-evolve", sessionID, arguments: "status" }, output);
+    if (!/startup-validation-pending/u.test(output.parts.at(-1).text)) return output.parts.at(-1).text;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail("Timed out waiting for deferred durable startup");
 }
 
 beforeEach(() => {
@@ -795,4 +815,495 @@ test("double-instantiation preserves existing registry state and still re-seeds 
   // instantiation, proving the fix does not just freeze options forever.
   const freshState = SelfEvolvePlugin.__test.registry.getOrCreate("fresh-after-second-instance", 17100);
   assert.equal(freshState.options.maxAnalyzerRuns, 5);
+});
+
+test("durable state root precedence prefers explicit, synchronous host, then SDK over environment", async () => {
+  const calls = [];
+  const ctx = {
+    directory: "/workspace/project",
+    client: {
+      path: {
+        get: async (input) => {
+          calls.push(input);
+          return { data: { state: "/runtime/state" } };
+        },
+      },
+    },
+  };
+
+  assert.equal(await SelfEvolvePlugin.__test.resolveStateRoot(ctx, { env: { XDG_STATE_HOME: "/environment" } }), "/runtime/state");
+  assert.deepEqual(calls, [{ query: { directory: "/workspace/project" } }]);
+
+  assert.equal(await SelfEvolvePlugin.__test.resolveStateRoot(ctx, { stateRoot: "/explicit/state" }), "/explicit/state");
+  assert.equal(calls.length, 1, "an explicit stateRoot must not call the SDK path endpoint");
+
+  ctx.path = { state: "/host/state" };
+  assert.equal(await SelfEvolvePlugin.__test.resolveStateRoot(ctx, { env: { XDG_STATE_HOME: "/environment" } }), "/host/state");
+  assert.equal(calls.length, 1, "a synchronous official host root must not call the SDK path endpoint");
+});
+
+test("durable state path SDK calls are bounded and unavailable APIs do not authorize environment fallback", async () => {
+  const ctx = { directory: "/workspace/project", client: { path: { get: async () => new Promise(() => {}) } } };
+  const started = Date.now();
+  assert.equal(await SelfEvolvePlugin.__test.resolveStateRoot(ctx, { env: { XDG_STATE_HOME: "/environment" }, stateRootTimeoutMs: 10 }), null);
+  assert.ok(Date.now() - started < 500);
+});
+
+test("provisional standard root validates after startup before durable initialization", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-root-match-"));
+  const stateRoot = path.join(root, "state", "opencode");
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(worktree, { recursive: true });
+  let sdkCalls = 0;
+  const ctx = {
+    directory: worktree,
+    worktree,
+    client: { global: { health: async () => ({ data: { healthy: true, version: "1.24.6" } }) }, path: { get: async () => { sdkCalls += 1; return { data: { state: stateRoot } }; } }, session: {} },
+  };
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const hooks = await DefaultSelfEvolvePlugin(ctx, { env: { XDG_STATE_HOME: path.join(root, "state") }, stateRootTimeoutMs: 50 });
+  assert.equal(fs.existsSync(path.join(stateRoot, "self-evolve")), false, "provisional startup must not initialize state");
+  const deadline = Date.now() + 1_000;
+  while (!fs.existsSync(path.join(stateRoot, "self-evolve", "global", "settings.json")) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "matched-root", arguments: "status" }, output);
+  assert.equal(sdkCalls, 1);
+  assert.match(output.parts.at(-1).text, /effective mode manual|stored mode manual/u);
+  assert.equal(fs.existsSync(path.join(stateRoot, "self-evolve", "global", "settings.json")), true);
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "matched-root", arguments: "health" }, output);
+  assert.match(output.parts.at(-1).text, /host 1\.24\.6/u, "deferred boot must retain the version resolved before provisional root selection");
+  await hooks.dispose();
+});
+
+test("a later factory instance cannot replace a pending instance state-root plan", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-root-instance-"));
+  const firstRoot = path.join(root, "first-state", "opencode");
+  const secondRoot = path.join(root, "second-state");
+  const firstWorktree = path.join(root, "first-worktree");
+  const secondWorktree = path.join(root, "second-worktree");
+  fs.mkdirSync(firstWorktree, { recursive: true });
+  fs.mkdirSync(secondWorktree, { recursive: true });
+  const firstCtx = {
+    directory: firstWorktree,
+    worktree: firstWorktree,
+    client: { global: { health: async () => ({ data: { healthy: true, version: "1.18.3" } }) }, path: { get: async () => ({ data: { state: firstRoot } }) }, session: {} },
+  };
+  const secondCtx = { directory: secondWorktree, worktree: secondWorktree, path: { state: secondRoot }, client: { global: { health: async () => ({ data: { healthy: true, version: "1.18.3" } }) }, session: {} } };
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const first = await DefaultSelfEvolvePlugin(firstCtx, { env: { XDG_STATE_HOME: path.join(root, "first-state") }, hostRecoveryDelayMs: 20 });
+  const second = await DefaultSelfEvolvePlugin(secondCtx, { stateRoot: secondRoot });
+  const deadline = Date.now() + 1_000;
+  while (!fs.existsSync(path.join(firstRoot, "self-evolve", "global", "settings.json")) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(fs.existsSync(path.join(firstRoot, "self-evolve", "global", "settings.json")), true);
+  assert.equal(fs.existsSync(path.join(secondRoot, "self-evolve", "global", "settings.json")), true);
+  await first.dispose();
+  await second.dispose();
+});
+
+test("post-start official root mismatch suspends a provisionally auto runtime without writes", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-root-mismatch-"));
+  const provisionalRoot = path.join(root, "environment", "opencode");
+  const officialRoot = path.join(root, "official");
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(worktree, { recursive: true });
+  const fingerprint = projectFingerprintFor("", worktree);
+  const seeded = openStore(provisionalRoot, { projectFingerprint: fingerprint });
+  const settings = seeded.getSettings();
+  seeded.setGlobalSettings(makeGlobalSettings({ ...settings.global, mode: "auto", updatedAt: settings.global.updatedAt + 1 }));
+  seeded.close();
+  const before = fs.readFileSync(path.join(provisionalRoot, "self-evolve", "global", "settings.json"), "utf8");
+  let sdkCalls = 0;
+  const ctx = {
+    directory: worktree,
+    worktree,
+    client: { global: { health: async () => ({ data: { healthy: true, version: "1.18.3" } }) }, path: { get: async () => { sdkCalls += 1; return { data: { state: officialRoot } }; } }, session: {} },
+  };
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const hooks = await DefaultSelfEvolvePlugin(ctx, { env: { XDG_STATE_HOME: path.join(root, "environment") }, stateRootTimeoutMs: 50 });
+  assert.equal(typeof hooks.event, "function", "read-only persisted mode selection must be preserved");
+  await hooks.event({ type: "session.idle", properties: { sessionID: "mismatch" } });
+  const statusText = await waitForDurableStartup(hooks, "mismatch");
+  assert.equal(sdkCalls, 1, "the prior environment-first probe must call the official SDK");
+  assert.match(statusText, /state-root-validation-mismatch/u);
+  assert.match(statusText, /explicit stateRoot and restart OpenCode/u);
+  assert.equal(fs.existsSync(officialRoot), false);
+  assert.equal(fs.readFileSync(path.join(provisionalRoot, "self-evolve", "global", "settings.json"), "utf8"), before);
+  await hooks.dispose();
+});
+
+test("post-start unavailable SDK fails closed and disposal resolves pending provisional startup", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-root-timeout-"));
+  const stateRoot = path.join(root, "state", "opencode");
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(worktree, { recursive: true });
+  const ctx = { directory: worktree, worktree, client: { global: { health: async () => ({ data: { healthy: true, version: "1.18.3" } }) }, path: { get: async () => new Promise(() => {}) }, session: {} } };
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const hooks = await DefaultSelfEvolvePlugin(ctx, { env: { XDG_STATE_HOME: path.join(root, "state") }, stateRootTimeoutMs: 10, stateRootValidationRetries: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "timeout", arguments: "health" }, output);
+  assert.match(output.parts.at(-1).text, /official-state-path-timeout/u);
+  assert.equal(fs.existsSync(stateRoot), false);
+  await hooks.dispose();
+
+  const cleanupHooks = await DefaultSelfEvolvePlugin(ctx, { env: { XDG_STATE_HOME: path.join(root, "state") }, hostRecoveryDelayMs: 100 });
+  await cleanupHooks.dispose();
+  assert.equal(fs.existsSync(stateRoot), false);
+});
+
+test("durable commands fail closed instead of falling through to the legacy parser", async () => {
+  const ctx = {
+    directory: "/workspace/project",
+    client: {
+      global: { health: async () => ({ data: { healthy: true, version: "1.18.3" } }) },
+      path: { get: async () => ({ data: {} }) },
+      session: {
+        messages: async () => {
+          assert.fail("legacy analyzer must not run when durable initialization is unavailable");
+        },
+      },
+    },
+  };
+  const hooks = await DefaultSelfEvolvePlugin(ctx, { mode: "auto", env: {} });
+  const output = { parts: [] };
+
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "durable-unavailable", arguments: "auto" }, output);
+
+  assert.match(output.parts.at(-1).text, /durable integration unavailable/i);
+  assert.doesNotMatch(output.parts.at(-1).text, /Unknown \/self-evolve command/i);
+  await hooks.dispose();
+});
+
+function durableFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-plugin-durable-"));
+  const stateRoot = path.join(root, "state");
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(worktree, { recursive: true });
+  const ctx = {
+    directory: worktree,
+    worktree,
+    path: { state: stateRoot },
+    client: {
+      global: { health: async () => ({ data: { healthy: true, version: "1.18.3" } }) },
+      path: { get: async () => ({ data: { state: stateRoot, worktree } }) },
+      session: {},
+    },
+  };
+  const projectFingerprint = projectFingerprintFor("", worktree);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return { root, stateRoot, worktree, ctx, projectFingerprint };
+}
+
+const hostCompatibilityCases = [
+  { name: "minimum supported 1.18.3", response: { data: { healthy: true, version: "1.18.3" } }, supported: true },
+  { name: "newer supported 1.x", response: { data: { healthy: true, version: "1.99.0" } }, supported: true },
+  { name: "older 1.18.2", response: { data: { healthy: true, version: "1.18.2" } }, version: "1.18.2", reason: "host-version-unsupported" },
+  { name: "legacy 1.17.7", response: { data: { healthy: true, version: "1.17.7" } }, version: "1.17.7", reason: "host-version-unsupported" },
+  { name: "malformed version", response: { data: { healthy: true, version: "not-semver" } }, version: "not-semver", reason: "host-version-malformed" },
+  { name: "unhealthy host", response: { data: { healthy: false, version: "1.18.3" } }, version: "1.18.3", reason: "host-health-unhealthy" },
+  { name: "prerelease host", response: { data: { healthy: true, version: "1.19.0-beta.1" } }, version: "1.19.0-beta.1", reason: "host-version-prerelease-unsupported" },
+  { name: "2.0 host", response: { data: { healthy: true, version: "2.0.0" } }, version: "2.0.0", reason: "host-version-unsupported" },
+];
+
+for (const hostCase of hostCompatibilityCases) {
+  test(`actual global health gates persisted-auto startup: ${hostCase.name}`, async (t) => {
+    const f = durableFixture(t);
+    const seeded = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+    const settings = seeded.getSettings();
+    seeded.setGlobalSettings(makeGlobalSettings({ ...settings.global, mode: "auto", updatedAt: settings.global.updatedAt + 1 }));
+    seeded.close();
+    f.ctx.client.global.health = async () => hostCase.response;
+
+    const hooks = await DefaultSelfEvolvePlugin(f.ctx, { hostVersion: "1.99.0", hostSupported: true });
+    assert.equal(typeof hooks.event, "function", "persisted auto may expose only an inert provisional hook while validation is pending");
+    await waitForDurableStartup(hooks, `startup-${hostCase.name}`);
+    const output = { parts: [] };
+    await hooks["command.execute.before"]({ command: "self-evolve", sessionID: `health-${hostCase.name}`, arguments: "health" }, output);
+    if (hostCase.supported) {
+      assert.match(output.parts.at(-1).text, new RegExp(`host ${hostCase.response.data.version.replaceAll(".", "\\.")}`));
+    } else {
+      assert.match(output.parts.at(-1).text, new RegExp(`host ${hostCase.version ?? "unknown"}`));
+      assert.match(output.parts.at(-1).text, new RegExp(hostCase.reason));
+    }
+    await hooks.dispose();
+  });
+}
+
+test("unavailable and timed-out global health fail persisted-auto startup closed", async (t) => {
+  for (const [name, health, reason] of [
+    ["unavailable", async () => { throw new Error("connection refused"); }, "host-health-unavailable"],
+    ["timeout", async () => new Promise(() => {}), "host-health-timeout"],
+  ]) {
+    const f = durableFixture(t);
+    const seeded = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+    const settings = seeded.getSettings();
+    seeded.setGlobalSettings(makeGlobalSettings({ ...settings.global, mode: "auto", updatedAt: settings.global.updatedAt + 1 }));
+    seeded.close();
+    f.ctx.client.global.health = health;
+    const hooks = await DefaultSelfEvolvePlugin(f.ctx, { __testHostHealthTimeoutMs: 10, hostVersion: "1.99.0", hostSupported: true });
+    assert.equal(typeof hooks.event, "function", `${name} may retain only the persisted-auto provisional hook`);
+    await waitForDurableStartup(hooks, `startup-${name}`);
+    const output = { parts: [] };
+    await hooks["command.execute.before"]({ command: "self-evolve", sessionID: `health-${name}`, arguments: "health" }, output);
+    assert.match(output.parts.at(-1).text, /host unknown/u);
+    assert.match(output.parts.at(-1).text, new RegExp(reason));
+    await hooks.dispose();
+  }
+});
+
+test("hostSupported false narrows actual supported health and spoof options never widen it", async (t) => {
+  const narrowed = durableFixture(t);
+  const narrowedStore = openStore(narrowed.stateRoot, { projectFingerprint: narrowed.projectFingerprint });
+  const narrowedSettings = narrowedStore.getSettings();
+  narrowedStore.setGlobalSettings(makeGlobalSettings({ ...narrowedSettings.global, mode: "auto", updatedAt: narrowedSettings.global.updatedAt + 1 }));
+  narrowedStore.close();
+  narrowed.ctx.client.global.health = async () => ({ data: { healthy: true, version: "1.19.0" } });
+  const narrowedHooks = await DefaultSelfEvolvePlugin(narrowed.ctx, { hostSupported: false });
+  await waitForDurableStartup(narrowedHooks, "startup-narrowed");
+  const narrowedOutput = { parts: [] };
+  await narrowedHooks["command.execute.before"]({ command: "self-evolve", sessionID: "health-narrowed", arguments: "health" }, narrowedOutput);
+  assert.match(narrowedOutput.parts.at(-1).text, /host 1\.19\.0/u);
+  assert.match(narrowedOutput.parts.at(-1).text, /host-support-disabled-by-option/u);
+  await narrowedHooks.dispose();
+
+  const spoofed = durableFixture(t);
+  spoofed.ctx.client.global.health = async () => ({ data: { healthy: true, version: "1.17.7" } });
+  const spoofedHooks = await DefaultSelfEvolvePlugin(spoofed.ctx, { hostVersion: "1.99.0", hostSupported: true });
+  await waitForDurableStartup(spoofedHooks, "startup-spoofed");
+  assert.equal(spoofedHooks.event, undefined);
+  const spoofedOutput = { parts: [] };
+  await spoofedHooks["command.execute.before"]({ command: "self-evolve", sessionID: "health-spoofed", arguments: "health" }, spoofedOutput);
+  assert.match(spoofedOutput.parts.at(-1).text, /host 1\.17\.7/u);
+  assert.match(spoofedOutput.parts.at(-1).text, /host-version-unsupported/u);
+  await spoofedHooks.dispose();
+});
+
+test("unsupported health is resolved before provisional persisted mode or official path validation", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-host-before-root-"));
+  const provisionalRoot = path.join(root, "state", "opencode");
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(worktree, { recursive: true });
+  const fingerprint = projectFingerprintFor("", worktree);
+  const seeded = openStore(provisionalRoot, { projectFingerprint: fingerprint });
+  const settings = seeded.getSettings();
+  seeded.setGlobalSettings(makeGlobalSettings({ ...settings.global, mode: "auto", updatedAt: settings.global.updatedAt + 1 }));
+  seeded.close();
+  const settingsPath = path.join(provisionalRoot, "self-evolve", "global", "settings.json");
+  const before = fs.readFileSync(settingsPath, "utf8");
+  let pathCalls = 0;
+  const ctx = {
+    directory: worktree,
+    worktree,
+    client: {
+      global: { health: async () => ({ data: { healthy: true, version: "1.18.2" } }) },
+      path: { get: async () => { pathCalls += 1; return { data: { state: provisionalRoot } }; } },
+      session: {},
+    },
+  };
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const hooks = await DefaultSelfEvolvePlugin(ctx, { env: { XDG_STATE_HOME: path.join(root, "state") } });
+  assert.equal(typeof hooks.event, "function");
+  await waitForDurableStartup(hooks, "startup-before-root");
+  assert.equal(pathCalls, 0, "unsupported health must stop before provisional or official root resolution");
+  assert.equal(fs.readFileSync(settingsPath, "utf8"), before);
+  await hooks.dispose();
+});
+
+test("serverUrl fallback fetches only the official origin global-health path", async (t) => {
+  const f = durableFixture(t);
+  delete f.ctx.client.global;
+  f.ctx.serverUrl = new URL("http://127.0.0.1:43210/");
+  const calls = [];
+  f.ctx.__testOnlySelfEvolveFetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, json: async () => ({ healthy: true, version: "1.20.4" }) };
+  };
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx);
+  const pending = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "fallback-pending", arguments: "health" }, pending);
+  assert.match(pending.parts.at(-1).text, /startup-validation-pending/u);
+  await waitForDurableStartup(hooks, "fallback-startup");
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "fallback-health", arguments: "health" }, output);
+  assert.match(output.parts.at(-1).text, /host 1\.20\.4/u);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://127.0.0.1:43210/global/health");
+  assert.equal(calls[0].options.method, "GET");
+  assert.equal(calls[0].options.redirect, "error");
+  await hooks.dispose();
+});
+
+for (const fallbackCase of [
+  { name: "unhealthy", body: { healthy: false, version: "1.18.3" }, reason: "host-health-unhealthy" },
+  { name: "malformed", body: { healthy: true, version: "bad" }, reason: "host-version-malformed" },
+]) {
+  test(`serverUrl fallback fails closed for ${fallbackCase.name} health`, async (t) => {
+    const f = durableFixture(t);
+    delete f.ctx.client.global;
+    f.ctx.serverUrl = "https://localhost:4443";
+    f.ctx.__testOnlySelfEvolveFetch = async () => ({ ok: true, status: 200, json: async () => fallbackCase.body });
+    const hooks = await DefaultSelfEvolvePlugin(f.ctx);
+    await waitForDurableStartup(hooks, `fallback-${fallbackCase.name}`);
+    const output = { parts: [] };
+    await hooks["command.execute.before"]({ command: "self-evolve", sessionID: `fallback-${fallbackCase.name}`, arguments: "health" }, output);
+    assert.match(output.parts.at(-1).text, new RegExp(fallbackCase.reason));
+    await hooks.dispose();
+  });
+}
+
+test("serverUrl fallback timeout and invalid or user-supplied URLs fail closed", async (t) => {
+  const timed = durableFixture(t);
+  delete timed.ctx.client.global;
+  timed.ctx.serverUrl = "http://localhost:4321/";
+  timed.ctx.__testOnlySelfEvolveFetch = async () => new Promise(() => {});
+  const timedHooks = await DefaultSelfEvolvePlugin(timed.ctx, { __testHostHealthTimeoutMs: 10 });
+  await waitForDurableStartup(timedHooks, "fallback-timeout");
+  const timedOutput = { parts: [] };
+  await timedHooks["command.execute.before"]({ command: "self-evolve", sessionID: "fallback-timeout", arguments: "health" }, timedOutput);
+  assert.match(timedOutput.parts.at(-1).text, /host-health-timeout/u);
+  await timedHooks.dispose();
+
+  for (const serverUrl of ["file:///tmp/opencode", "http://user:pass@localhost/", "http://localhost/base", "http://localhost/?target=elsewhere"]) {
+    const invalid = durableFixture(t);
+    delete invalid.ctx.client.global;
+    invalid.ctx.serverUrl = serverUrl;
+    let fetchCalls = 0;
+    invalid.ctx.__testOnlySelfEvolveFetch = async () => { fetchCalls += 1; throw new Error("must not fetch"); };
+    const hooks = await DefaultSelfEvolvePlugin(invalid.ctx, { serverUrl: "http://attacker.invalid", hostVersion: "1.99.0", hostSupported: true });
+    await waitForDurableStartup(hooks, `invalid-${serverUrl}`);
+    assert.equal(fetchCalls, 0);
+    const output = { parts: [] };
+    await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "invalid-server-url", arguments: "health" }, output);
+    assert.match(output.parts.at(-1).text, /host-health-unavailable/u);
+    await hooks.dispose();
+  }
+});
+
+test("deferred health grants no integration authority before resolution and dispose settles it", async (t) => {
+  const f = durableFixture(t);
+  const seeded = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+  const settings = seeded.getSettings();
+  seeded.setGlobalSettings(makeGlobalSettings({ ...settings.global, mode: "auto", updatedAt: settings.global.updatedAt + 1 }));
+  seeded.close();
+  let resolveHealth;
+  const healthPending = new Promise((resolve) => { resolveHealth = resolve; });
+  f.ctx.client.global.health = async () => await healthPending;
+  const calls = { events: 0, commands: 0 };
+  const integration = {
+    async handleEvent() { calls.events += 1; },
+    async handleCommand() { calls.commands += 1; return { responseText: "unexpected" }; },
+    close() {},
+  };
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, { pipeline: integration });
+  assert.equal(typeof hooks.event, "function");
+  const eventStarted = Date.now();
+  await hooks.event({ type: "session.idle", properties: { sessionID: "pending" } });
+  assert.ok(Date.now() - eventStarted < 50, "provisional event hook must return without awaiting startup");
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "pending", arguments: "auto" }, output);
+  assert.match(output.parts.at(-1).text, /startup-validation-pending/u);
+  assert.deepEqual(calls, { events: 0, commands: 0 });
+  resolveHealth({ data: { healthy: true, version: "1.18.3" } });
+  await waitForDurableStartup(hooks, "pending-authority");
+  await hooks.event({ type: "session.idle", properties: { sessionID: "ready" } });
+  assert.equal(calls.events, 1);
+  await hooks.dispose();
+
+  const blocked = durableFixture(t);
+  blocked.ctx.client.global.health = async () => new Promise(() => {});
+  const blockedHooks = await DefaultSelfEvolvePlugin(blocked.ctx, { __testHostHealthTimeoutMs: 10_000 });
+  const started = Date.now();
+  await blockedHooks.dispose();
+  assert.ok(Date.now() - started < 500, "dispose must abort and settle pending startup");
+});
+
+test("plain registration boots durable v0.2 in persisted manual mode", async (t) => {
+  const f = durableFixture(t);
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx);
+  assert.equal(hooks.event, undefined);
+  assert.equal(hooks["chat.message"], undefined);
+  await waitForDurableStartup(hooks, "plain-registration");
+  const store = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+  assert.equal(store.getSettings().global.mode, "manual");
+  assert.equal(fs.existsSync(path.join(f.stateRoot, "self-evolve", "global", "settings.json")), true);
+  store.close();
+  await hooks.dispose();
+});
+
+for (const mode of ["auto", "yolo"]) {
+  test(`persisted ${mode} registers the passive event hook after an options-free restart`, async (t) => {
+    const f = durableFixture(t);
+    const first = await DefaultSelfEvolvePlugin(f.ctx);
+    await waitForDurableStartup(first, `${mode}-startup-first`);
+    const output = { parts: [] };
+    if (mode === "auto") {
+      await first["command.execute.before"]({ command: "self-evolve", sessionID: `${mode}-first`, arguments: "auto" }, output);
+    } else {
+      const skillRoot = path.join(f.root, "skills");
+      fs.mkdirSync(skillRoot, { recursive: true });
+      await first["command.execute.before"]({ command: "self-evolve", sessionID: `${mode}-first`, arguments: `yolo confirm --allowlist ${skillRoot}` }, output);
+    }
+    assert.match(output.parts.at(-1).text, new RegExp(`changed to ${mode}`, "i"));
+    await first.dispose();
+
+    const restarted = await DefaultSelfEvolvePlugin(f.ctx);
+    assert.equal(typeof restarted.event, "function");
+    assert.equal(restarted["chat.message"], undefined);
+    await restarted.dispose();
+  });
+}
+
+test("persisted manual returns no passive hook after restart", async (t) => {
+  const f = durableFixture(t);
+  const store = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+  const settings = store.getSettings();
+  store.setGlobalSettings(makeGlobalSettings({ ...settings.global, mode: "auto", updatedAt: settings.global.createdAt + 1 }));
+  store.close();
+  const automatic = await DefaultSelfEvolvePlugin(f.ctx);
+  assert.equal(typeof automatic.event, "function");
+  const output = { parts: [] };
+  await waitForDurableStartup(automatic, "manual-reset-startup");
+  await automatic["command.execute.before"]({ command: "self-evolve", sessionID: "manual-reset", arguments: "manual" }, output);
+  await automatic.dispose();
+  const restarted = await DefaultSelfEvolvePlugin(f.ctx);
+  assert.equal(restarted.event, undefined);
+  await restarted.dispose();
+});
+
+test("startup mode is not authority and cannot override an existing durable preference", async (t) => {
+  const f = durableFixture(t);
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, { mode: "auto" });
+  assert.equal(hooks.event, undefined);
+  await waitForDurableStartup(hooks, "startup-mode-not-authority");
+  const store = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+  assert.equal(store.getSettings().global.mode, "manual");
+  store.close();
+  await hooks.dispose();
+});
+
+test("unavailable or corrupt durable state fails closed to no passive hook", async (t) => {
+  const unavailable = await DefaultSelfEvolvePlugin({ directory: "/workspace/unavailable", client: {} }, { env: {} });
+  assert.equal(unavailable.event, undefined);
+  await unavailable.dispose();
+
+  const f = durableFixture(t);
+  const initialized = await DefaultSelfEvolvePlugin(f.ctx);
+  await waitForDurableStartup(initialized, "corrupt-initialize");
+  await initialized.dispose();
+  fs.writeFileSync(path.join(f.stateRoot, "self-evolve", "global", "settings.json"), "{corrupt", "utf8");
+  const corrupt = await DefaultSelfEvolvePlugin(f.ctx);
+  assert.equal(corrupt.event, undefined);
+  await waitForDurableStartup(corrupt, "corrupt-startup");
+  const output = { parts: [] };
+  await corrupt["command.execute.before"]({ command: "self-evolve", sessionID: "corrupt", arguments: "auto" }, output);
+  assert.match(output.parts.at(-1).text, /durable integration unavailable/i);
+  await corrupt.dispose();
 });

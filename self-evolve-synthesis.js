@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { DEFAULT_BUDGETS, makeAuditEvent, makeProposal, transitionProposalState, wrapRecord } from "./self-evolve-schemas.js";
+import { createHash, randomBytes } from "node:crypto";
+import { DEFAULT_BUDGETS, makeAuditEvent, makeProposal, makeSynthesisAttempt, wrapRecord } from "./self-evolve-schemas.js";
 import { estimateGrowth, hashSkillContent, scanForSecretCanaries, scanForUnsafeContent, validateProposalTarget } from "./self-evolve-inventory.js";
 
 export const SYNTHESIS_ACTIONS = Object.freeze(["no-op", "delete", "consolidate", "rewrite", "relocate-detail", "add", "new-skill"]);
@@ -11,6 +11,7 @@ const DAY_MS = 86_400_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_CRITIC_THRESHOLD = 0.75;
+const SYNTHESIS_LEASE_TTL_MS = 5 * 60 * 1000;
 const MAX_FILE_BYTES = 64 * 1024;
 const activeTimers = new Set();
 const synthesisRuns = [];
@@ -414,6 +415,31 @@ function proposalRationale(result) {
   return JSON.stringify({ action: result.action, expectedBehavior: result.expectedBehavior, evidenceMapping: result.evidenceMapping, riskNotes: result.riskNotes, evaluationScenarios: result.evaluationScenarios }).slice(0, 2048);
 }
 
+function synthesisAttempt(cluster, targetSkill, timestamp) {
+  const outcomeId = sha256(`synthesis-attempt-v1\n${cluster.projectFingerprint}\n${cluster.id}\n${targetSkill.currentHash}\n${timestamp}\n${randomBytes(16).toString("hex")}`);
+  return makeSynthesisAttempt({
+    outcomeId,
+    proposalId: `se-${outcomeId.slice(0, 24)}`,
+    projectFingerprint: cluster.projectFingerprint,
+    clusterId: cluster.id,
+    targetHash: targetSkill.currentHash,
+    admittedAt: timestamp,
+    state: "admitted",
+  });
+}
+
+export function synthesisLeaseKey(attempt) {
+  for (const value of [attempt?.projectFingerprint, attempt?.clusterId, attempt?.targetHash]) {
+    if (!/^[a-f0-9]{64}$/.test(String(value))) throw new TypeError("invalid-synthesis-lease-binding");
+  }
+  return `synthesis_${sha256(`synthesis-lease-v1\n${attempt.projectFingerprint}\n${attempt.clusterId}\n${attempt.targetHash}`)}`;
+}
+
+export function releaseSynthesisLease(store, lease) {
+  if (!lease?.key || !lease?.nonce || typeof store?.releaseLease !== "function") return { ok: false, reason: "synthesis-lease-unavailable" };
+  return store.releaseLease(lease.key, lease.nonce);
+}
+
 export async function runSynthesis({ ctx, cluster, targetSkill, inventory, privacy, options = {}, now }) {
   const timestamp = nowMs(now);
   let gate;
@@ -425,6 +451,17 @@ export async function runSynthesis({ ctx, cluster, targetSkill, inventory, priva
     }
     return { ok: false, reason: gate.reason };
   }
+  const attempt = synthesisAttempt(cluster, targetSkill, timestamp);
+  const key = synthesisLeaseKey(attempt);
+  const acquired = gate.store.acquireLease?.(key, { ttlMs: SYNTHESIS_LEASE_TTL_MS, actor: SYNTHESIS_AGENT_NAME });
+  if (!acquired?.ok) return { ok: false, reason: acquired?.reason === "lease-busy" ? "synthesis-lease-busy" : acquired?.reason ?? "synthesis-lease-error" };
+  const lease = Object.freeze({ key, nonce: acquired.nonce });
+  const admitted = gate.store.appendRecord(wrapRecord("synthesis-attempt", attempt, timestamp));
+  if (!admitted?.ok || admitted.duplicate) {
+    releaseSynthesisLease(gate.store, lease);
+    return { ok: false, reason: admitted?.reason ?? "synthesis-attempt-admission-failed" };
+  }
+  options.faultInjection?.("synthesis-after-admission", { attempt });
   synthesisActive = true;
   synthesisRuns.push(timestamp);
   const currentContent = String(options.currentContent ?? targetSkill.currentContent ?? "");
@@ -432,20 +469,23 @@ export async function runSynthesis({ ctx, cluster, targetSkill, inventory, priva
     boundedCurrentContent(currentContent, targetSkill);
     const prompt = buildSynthesizerPrompt({ cluster, currentContent, targetSkill, inventory, budget: { tokensPerSynthesis: options.tokensPerSynthesis ?? SYNTHESIS_TOKEN_BUDGET } });
     const raw = await runHiddenSession(ctx, { agent: SYNTHESIS_AGENT_NAME, title: "Self-evolve synthesizer", prompt, schema: SYNTHESIS_OUTPUT_SCHEMA, options });
+    options.faultInjection?.("synthesis-after-provider-return", { attempt });
     const parsed = parseSynthesizerOutput(raw, { cluster, targetSkill: { ...targetSkill, currentContent }, inventory, expectedCurrentHash: targetSkill.currentHash });
     if (!parsed.ok) throw new Error(parsed.errors.join(","));
     const result = parsed.result;
     if (result.action === "no-op") {
       gate.store.appendRecord(auditEnvelope("synthesis-no-op", cluster.id, timestamp));
-      return { ok: true, proposal: null, noChange: true, errors: [] };
+      return { ok: true, proposal: null, noChange: true, attempt, lease, errors: [] };
     }
     const candidate = { skillTarget: { canonicalRoot: targetSkill.canonicalRoot, relativePath: targetSkill.relativePath, currentHash: targetSkill.currentHash }, proposedContent: result.proposedContent, proposedContentHash: result.proposedContentHash };
     const targetValidation = (options.validateTarget ?? validateProposalTarget)(candidate, inventory);
     if (!targetValidation?.ok) throw new Error((targetValidation?.errors ?? ["target-validation-failed"]).join(","));
-    const duplicate = gate.store.readRecords("proposal").some((record) => record.payload?.state === "pending" && record.payload?.proposedContentHash === result.proposedContentHash);
+    const latestProposals = new Map();
+    for (const record of gate.store.readRecords("proposal")) latestProposals.set(record.payload?.id, record.payload);
+    const duplicate = [...latestProposals.values()].some((item) => ["critic-pending", "pending", "approved", "applied"].includes(item?.state) && item?.clusterId === cluster.id);
     if (duplicate) throw new Error("duplicate-pending-proposal");
     const proposal = makeProposal({
-      id: `se-${cluster.id.slice(0, 12)}-${timestamp}`,
+      id: attempt.proposalId,
       projectFingerprint: cluster.projectFingerprint,
       clusterId: cluster.id,
       skillTarget: candidate.skillTarget,
@@ -456,23 +496,24 @@ export async function runSynthesis({ ctx, cluster, targetSkill, inventory, priva
       criticScore: 0,
       criticPassed: false,
       validDeterministic: true,
-      state: "pending",
+      state: "critic-pending",
       injectionFlagged: false,
     });
     const saved = gate.store.appendRecord(wrapRecord("proposal", proposal, timestamp));
     if (!saved?.ok || saved.duplicate) throw new Error(saved?.reason ?? "proposal-not-persisted-exactly-once");
-    return { ok: true, proposal, errors: [] };
+    options.faultInjection?.("synthesis-after-draft-proposal", { attempt, proposal });
+    return { ok: true, proposal, attempt, lease, errors: [] };
   } catch (error) {
     const reason = errorMessage(error);
     persistFailedSynthesis(gate.store, cluster, targetSkill, timestamp, reason, options);
-    return { ok: false, reason };
+    return { ok: false, reason, attempt, lease };
   } finally {
     synthesisActive = false;
   }
 }
 
-function criticTransition(proposal, state, timestamp) {
-  return transitionProposalState(proposal, {
+function criticDecision(proposal, state, timestamp) {
+  return {
     proposalId: proposal.id,
     targetHash: proposal.skillTarget.currentHash,
     proposedContentHash: proposal.proposedContentHash,
@@ -482,19 +523,14 @@ function criticTransition(proposal, state, timestamp) {
     nonce: sha256(`${proposal.id}:${state}:${timestamp}`),
     priorState: proposal.state,
     newState: state,
-  }, timestamp);
+  };
 }
 
 async function updateCriticProposal(store, proposal, result, passed, state, timestamp) {
-  return store.runCas("proposal", proposal.id, proposal.state, (current) => {
-    let next = current;
-    if (state !== current.state) {
-      const transitioned = criticTransition(current, state, timestamp);
-      if (!transitioned.ok) throw new Error(transitioned.error);
-      next = transitioned.state;
-    }
-    return makeProposal({ ...next, criticScore: result?.score ?? 0, criticPassed: passed });
-  });
+  const scored = store.runCas("proposal", proposal.id, proposal.state, (current) => makeProposal({ ...current, criticScore: result?.score ?? 0, criticPassed: passed }));
+  if (!scored?.ok || state === proposal.state) return scored;
+  const committed = store.commitDecision(criticDecision(scored.newRecord.payload, state, timestamp));
+  return committed?.ok ? { ok: true, newRecord: { payload: committed.proposal } } : committed;
 }
 
 export async function runCritic({ ctx, proposal, cluster, inventory, options = {}, now }) {
@@ -504,13 +540,17 @@ export async function runCritic({ ctx, proposal, cluster, inventory, options = {
   catch (error) { return { ok: false, reason: errorMessage(error), errors: [errorMessage(error)] }; }
   if (isBackedOff(store, "critic", proposal.id, timestamp)) return { ok: false, reason: "proposal-recently-failed", errors: ["proposal-recently-failed"] };
   try {
+    if (options.attemptLease) {
+      const status = store.getLeaseStatus?.(options.attemptLease.key);
+      if (!status?.held || status.lease?.nonce !== options.attemptLease.nonce || status.lease?.pid !== process.pid) throw new Error("synthesis-lease-lost");
+    }
     const prompt = buildCriticPrompt({ proposal, cluster, inventory });
     const raw = await runHiddenSession(ctx, { agent: CRITIC_AGENT_NAME, title: "Self-evolve critic", prompt, schema: CRITIC_OUTPUT_SCHEMA, options });
     const parsed = parseCriticOutput(raw);
     if (!parsed.ok) throw new Error(parsed.errors.join(","));
     const result = parsed.result;
     const passed = result.score >= (options.criticThreshold ?? DEFAULT_CRITIC_THRESHOLD) && result.evidenceLinked && result.nonDuplicative && result.recommendedAction === "accept";
-    const state = passed || result.recommendedAction === "request-revision" ? "pending" : "failed-closed";
+    const state = passed ? "pending" : "failed-closed";
     const changed = await updateCriticProposal(store, proposal, result, passed, state, timestamp);
     if (!changed?.ok) throw new Error(changed?.reason ?? "critic-cas-failed");
     return { ok: passed, criticResult: result, proposal: changed.newRecord.payload, errors: passed ? [] : result.reasons };

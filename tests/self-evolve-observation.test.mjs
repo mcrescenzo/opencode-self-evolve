@@ -5,6 +5,8 @@ import {
   correlateObservations,
   evaluateEligibility,
   extractReceipts,
+  hashMessageCursor,
+  hashSessionLineage,
   hashSignature,
   injectionHeuristic,
   isSelfReference,
@@ -17,6 +19,9 @@ const PROJECT_B = H("b");
 const SCOPE = H("c");
 const DAY = 86_400_000;
 const NOW = 40 * DAY;
+const LINEAGE_1 = hashSignature("lineage-1");
+const LINEAGE_2 = hashSignature("lineage-2");
+const LINEAGE_3 = hashSignature("lineage-3");
 
 function episode(messages, overrides = {}) {
   return {
@@ -45,6 +50,7 @@ function observation(overrides = {}) {
       ...(structuredFields ?? {}),
     },
     incidentId: "incident-1",
+    sessionLineageHash: LINEAGE_1,
     createdAt: NOW,
     injectionFlagged: false,
     redacted: true,
@@ -59,6 +65,14 @@ test("EXTRACT_RULES predeclares bounded deterministic receipt rules", () => {
   assert.equal(EXTRACT_RULES["repeated-command"].minimumOccurrences, 2);
   assert.equal(EXTRACT_RULES["repeated-manual-procedure"].minimumSteps, 3);
   assert.equal(EXTRACT_RULES["repeated-clarification"].windowMessages >= 2, true);
+});
+
+test("session lineage and message cursors are stable domain-separated hashes", () => {
+  const legacy = { role: "user", parts: [{ type: "text", text: "private mocked message" }] };
+  assert.match(hashSessionLineage("host-session"), /^[a-f0-9]{64}$/u);
+  assert.notEqual(hashSessionLineage("host-session"), hashMessageCursor({ id: "host-session" }));
+  assert.equal(hashMessageCursor(legacy), hashMessageCursor(structuredClone(legacy)));
+  assert.doesNotMatch(hashMessageCursor(legacy), /private|mocked|message/u);
 });
 
 test("extractor recognizes repeated commands, tool errors, procedures, and clarifications", () => {
@@ -105,15 +119,18 @@ test("secret-canary normalization removes provider tokens and raw text from rece
   assert.equal(JSON.stringify(receipts).includes(secret), false);
 });
 
-test("duplicate-collapse counts one incident across repeated observations in one session", () => {
+test("separate incidents in one session remain incidents but share one lineage", () => {
   const duplicate = observation();
   const clusters = correlateObservations([
     duplicate,
     { ...duplicate, id: H("e"), incidentId: "incident-2", createdAt: NOW + 1 },
   ]);
   assert.equal(clusters.length, 1);
-  assert.deepEqual(clusters[0].incidentIds, ["session-1"]);
-  assert.equal(clusters[0].occurrencesSum, 1);
+  assert.deepEqual(clusters[0].incidentIds, ["incident-1", "incident-2"]);
+  assert.equal(clusters[0].occurrencesSum, 2);
+  const [eligibility] = evaluateEligibility(clusters, { now: NOW, minIndependentIncidents: 2, minOccurrencesSum: 2, minDistinctSessions: 2 });
+  assert.equal(eligibility.eligible, false);
+  assert.match(eligibility.thresholdsMissed.minDistinctSessions, /actual 1/);
 });
 
 test("wrong-scope observations form separate project clusters", () => {
@@ -154,7 +171,7 @@ test("injection heuristic flags markers, controls, repetition, and quoted self-e
 test("self-reference observations cannot corroborate their own proposal", () => {
   const selfReference = observation({ isSelfEvolveOutput: true, incidentId: "self-reference" });
   assert.equal(isSelfReference(selfReference), true);
-  assert.deepEqual(correlateObservations([observation(), selfReference])[0].incidentIds, ["session-1"]);
+  assert.deepEqual(correlateObservations([observation(), selfReference])[0].incidentIds, ["incident-1"]);
 });
 
 test("model-only assistant assertions do not create deterministic receipts or candidates", () => {
@@ -169,9 +186,9 @@ test("model-only assistant assertions do not create deterministic receipts or ca
 
 test("three independent episodes across distinct sessions accumulate to eligibility", () => {
   const clusters = correlateObservations([
-    observation({ incidentId: "episode-1", sessionID: "session-1", createdAt: NOW - 2 }),
-    observation({ incidentId: "episode-2", sessionID: "session-2", createdAt: NOW - 1 }),
-    observation({ incidentId: "episode-3", sessionID: "session-3", createdAt: NOW }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, createdAt: NOW - 2 }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, createdAt: NOW - 1 }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, createdAt: NOW }),
   ]);
   const [result] = evaluateEligibility(clusters, { now: NOW });
   assert.equal(result.eligible, true);
@@ -180,11 +197,22 @@ test("three independent episodes across distinct sessions accumulate to eligibil
   assert.deepEqual(result.reasons, ["all-thresholds-met"]);
 });
 
+test("missing legacy lineage collapses to one unknown session", () => {
+  const values = [1, 2, 3].map((index) => {
+    const value = observation({ incidentId: `legacy-${index}`, createdAt: NOW - 3 + index });
+    delete value.sessionLineageHash;
+    return value;
+  });
+  const [result] = evaluateEligibility(correlateObservations(values), { now: NOW });
+  assert.equal(result.eligible, false);
+  assert.match(result.thresholdsMissed.minDistinctSessions, /actual 1/);
+});
+
 test("adjacent polarity contradiction blocks eligibility with an inspectable explanation", () => {
   const clusters = correlateObservations([
-    observation({ incidentId: "episode-1", sessionID: "session-1", createdAt: NOW - 2 }),
-    observation({ incidentId: "episode-2", sessionID: "session-2", createdAt: NOW - 1, structuredFields: { deterministicOutcome: false } }),
-    observation({ incidentId: "episode-3", sessionID: "session-3", createdAt: NOW }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, createdAt: NOW - 2 }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, createdAt: NOW - 1, structuredFields: { deterministicOutcome: false } }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, createdAt: NOW }),
   ]);
   const [result] = evaluateEligibility(clusters, { now: NOW });
   assert.equal(result.eligible, false);
@@ -194,9 +222,9 @@ test("adjacent polarity contradiction blocks eligibility with an inspectable exp
 
 test("stale evidence below the freshness ratio blocks eligibility", () => {
   const clusters = correlateObservations([
-    observation({ incidentId: "episode-1", sessionID: "session-1", createdAt: NOW - 40 * DAY }),
-    observation({ incidentId: "episode-2", sessionID: "session-2", createdAt: NOW - 39 * DAY }),
-    observation({ incidentId: "episode-3", sessionID: "session-3", createdAt: NOW }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, createdAt: NOW - 40 * DAY }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, createdAt: NOW - 39 * DAY }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, createdAt: NOW }),
   ]);
   const [result] = evaluateEligibility(clusters, { now: NOW, retentionMs: 30 * DAY });
   assert.equal(result.eligible, false);
@@ -206,9 +234,9 @@ test("stale evidence below the freshness ratio blocks eligibility", () => {
 
 test("repository scope is the default and global scope requires explicit designation", () => {
   const clusters = correlateObservations([
-    observation({ incidentId: "episode-1", sessionID: "session-1" }),
-    observation({ incidentId: "episode-2", sessionID: "session-2" }),
-    observation({ incidentId: "episode-3", sessionID: "session-3" }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1 }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2 }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3 }),
   ]);
   assert.equal(evaluateEligibility(clusters, { now: NOW })[0].eligible, true);
   const implicitGlobal = evaluateEligibility(clusters, { now: NOW, scope: "global" })[0];
@@ -220,9 +248,9 @@ test("repository scope is the default and global scope requires explicit designa
 
 test("eligibility fails closed when correlation metadata is unavailable", () => {
   const [cluster] = correlateObservations([
-    observation({ incidentId: "episode-1", sessionID: "session-1" }),
-    observation({ incidentId: "episode-2", sessionID: "session-2" }),
-    observation({ incidentId: "episode-3", sessionID: "session-3" }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1 }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2 }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3 }),
   ]);
   const detached = structuredClone(cluster);
   const [result] = evaluateEligibility([detached], { now: NOW });

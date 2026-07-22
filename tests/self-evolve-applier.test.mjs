@@ -3,9 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createApplier } from "../self-evolve-applier.js";
 import * as applierModule from "../self-evolve-applier.js";
-import { makeAuditEvent, wrapRecord } from "../self-evolve-schemas.js";
+import { makeAuditEvent, makeProposal, wrapRecord } from "../self-evolve-schemas.js";
 import { openStore } from "../self-evolve-store.js";
 import {
   discoverSkills,
@@ -17,6 +19,7 @@ import { createPrivacyGuard } from "../self-evolve-privacy.js";
 
 const PROJECT = "a".repeat(64);
 const CLUSTER = "b".repeat(64);
+const NEW_SKILL_CRASH_CHILD = fileURLToPath(new URL("./fixtures/new-skill-crash.mjs", import.meta.url));
 let clock = 10_000;
 
 function skill(name, body = "# Guidance\nKeep deterministic checks bounded.\n") {
@@ -143,7 +146,9 @@ test("stale target hash is rejected and audited", async (t) => {
 
 test("create-exclusive creates a new skill atomically", async (t) => {
   const f = fixture(t, { existing: false });
-  const p = proposal(f, { name: "new-skill" });
+  const candidate = proposal(f, { name: "new-skill", state: "pending" });
+  const { proposedContent, ...durable } = candidate;
+  const p = { ...makeProposal(durable), proposedContent, state: "approved", decisionVersion: 1 };
   const result = await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" });
   const target = path.join(f.root, "new-skill", "SKILL.md");
   assert.equal(result.ok, true);
@@ -168,6 +173,64 @@ test("concurrent create-exclusive calls have one winner", async (t) => {
   assert.deepEqual(results.map((item) => item.ok), [true, false]);
   assert.equal(results[1].reason, "lease-busy");
 });
+
+test("different proposals concurrently creating one target publish exactly one complete file", async (t) => {
+  const f = fixture(t, { existing: false });
+  const first = proposal(f, { name: "new-skill" });
+  const second = { ...first, id: "proposal-new-skill-second" };
+  const results = await Promise.all([
+    f.applier.applyProposal({ proposal: first, decision: decision(first), mode: "auto" }),
+    f.applier.applyProposal({ proposal: second, decision: decision(second), mode: "auto" }),
+  ]);
+  assert.equal(results.filter((item) => item.ok).length, 1);
+  assert.equal(results.find((item) => !item.ok).reason, "target-exists");
+  assert.equal(fs.readFileSync(path.join(f.root, "new-skill", "SKILL.md"), "utf8"), first.proposedContent);
+});
+
+for (const point of ["apply-after-pending-audit", "apply-after-publication", "apply-after-readback-audit"]) {
+  test(`new-skill process kill at ${point} leaves absent or complete content and recovers once`, async (t) => {
+    const f = fixture(t, { existing: false });
+    const content = skill("crash-skill", "# Complete\nNever publish partial content.\n");
+    const pending = proposal(f, { name: "crash-skill", content, state: "pending" });
+    const { proposedContent: _proposedContent, ...durablePending } = pending;
+    f.baseStore.appendRecord(wrapRecord("proposal", durablePending, 1));
+    const approvedDecision = decision(pending);
+    assert.equal(f.baseStore.commitDecision(approvedDecision).ok, true);
+    const target = path.join(f.root, "crash-skill", "SKILL.md");
+    const child = spawn(process.execPath, [NEW_SKILL_CRASH_CHILD, path.join(f.temp, "state"), f.root, PROJECT, point], { stdio: ["ignore", "ignore", "pipe"] });
+    const observed = [];
+    const monitor = setInterval(() => {
+      try { observed.push(fs.readFileSync(target, "utf8")); } catch (error) { if (error?.code !== "ENOENT") observed.push(`ERROR:${error.code}`); }
+    }, 1);
+    const exit = await new Promise((resolve, reject) => {
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+      child.on("error", reject);
+      child.on("close", (code, signal) => resolve({ code, signal, stderr }));
+    });
+    clearInterval(monitor);
+    assert.equal(exit.signal, "SIGKILL", exit.stderr);
+    assert.equal(observed.every((value) => value === content), true, JSON.stringify(observed));
+    if (fs.existsSync(target)) assert.equal(fs.readFileSync(target, "utf8"), content);
+
+    const recoveryApplier = createApplier({ store: f.store, inventory: f.inventory, privacy: f.privacy, now: () => Date.now() });
+    t.after(() => recoveryApplier.close());
+    const outcomes = recoveryApplier.recoverPending();
+    const outcome = outcomes.find((item) => item.proposalId === pending.id);
+    if (point === "apply-after-pending-audit") {
+      assert.equal(fs.existsSync(target), false);
+      assert.equal(outcome.reason, "apply-not-published");
+    } else if (point === "apply-after-publication") {
+      assert.equal(fs.readFileSync(target, "utf8"), content);
+      assert.equal(outcome.ok, true);
+    } else {
+      assert.equal(fs.readFileSync(target, "utf8"), content);
+      assert.equal(outcome, undefined);
+    }
+    assert.deepEqual(recoveryApplier.recoverPending(), []);
+    assert.equal(verifiedApplies(f, pending.id).length, point === "apply-after-pending-audit" ? 0 : 1);
+  });
+}
 
 test("targets outside the canonical allowlist are refused", async (t) => {
   const f = fixture(t);

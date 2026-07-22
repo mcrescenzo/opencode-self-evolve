@@ -1,5 +1,21 @@
-import { createHash } from "node:crypto";
-import { DEFAULT_BUDGETS, Mode, makeDecision } from "./self-evolve-schemas.js";
+import { DEFAULT_BUDGETS, makeDecision } from "./self-evolve-schemas.js";
+import path from "node:path";
+import {
+  BRIDGE_ACTOR,
+  createControlRequest,
+  createDecisionRequest,
+  pollDecisionResponse,
+  pollControlResponse,
+  readControlState,
+  readProjectInbox,
+  submitControlRequest,
+  submitDecisionRequest,
+} from "./self-evolve-bridge.js";
+import { resolveProjectIdentity } from "./self-evolve-store.js";
+import {
+  initialStateRootSelection,
+  validateProjectedStateRoot,
+} from "./self-evolve-state-root.js";
 
 /** @typedef {import("@opencode-ai/plugin/tui").TuiPlugin} TuiPlugin */
 /** @typedef {import("@opencode-ai/plugin/tui").TuiPluginApi} TuiPluginApi */
@@ -9,15 +25,18 @@ const NOTIFICATION_KEY = "self-evolve:notification-history";
 const FIRST_USE_KEY = "self-evolve:first-use-seen";
 const DISMISSED_KEY = "self-evolve:dismissed-ids";
 const LAST_SHOWN_KEY = "self-evolve:last-shown-at";
-const ACTOR = "self-evolve-tui";
+const PENDING_REQUESTS_KEY = "self-evolve:pending-request-ids";
+const ACTOR = BRIDGE_ACTOR;
 const MAX_SERVER_WAIT_MS = 5_000;
+const CONSENT_LABELS = Object.freeze({
+  passiveCalls: "Passive provider calls",
+  durableObservations: "Durable observations",
+  sanitizedExcerpts: "Sanitized excerpts",
+  crossRepoAggregation: "Cross-repository aggregation",
+});
 
 function nowFor(api) {
   return typeof api.now === "function" ? api.now() : Date.now();
-}
-
-function sha256(value) {
-  return createHash("sha256").update(String(value)).digest("hex");
 }
 
 function lines(value) {
@@ -45,7 +64,7 @@ export function formatProposalDigest(proposal, inventory = {}) {
     : Number.isFinite(currentTokens) && Number.isFinite(proposedTokens)
       ? proposedTokens - currentTokens
       : 0;
-  const actionLabel = proposal?.state === "applied" ? "Review applied change" : proposal?.state === "pending" ? "Review proposal" : "Review record";
+  const actionLabel = proposal?.state === "applied" ? "Review applied change" : proposal?.state === "pending" ? "Review proposal" : proposal?.state === "failed-closed" ? "Critical failed-closed record" : "Review record";
   return {
     title: `${actionLabel}: ${target}`,
     body: String(proposal?.rationaleText ?? proposal?.rationale ?? "No rationale supplied."),
@@ -135,7 +154,8 @@ export function buildDecisionFromDialog(proposal, choice, actor) {
   if (!newState) throw new TypeError(`unsupported-dialog-choice: ${choice}`);
   const timestamp = proposal.decisionTimestamp ?? proposal.synthesizedAt ?? 0;
   const decisionVersion = proposal.decisionVersion + 1;
-  const nonce = proposal.decisionNonce ?? sha256(`${proposal.id}:${decisionVersion}:${timestamp}:${normalized}:${actor}`);
+  if (!proposal.decisionNonce) throw new TypeError("server-issued-nonce-unavailable");
+  const nonce = proposal.decisionNonce;
   return makeDecision({
     proposalId: proposal.id,
     targetHash: proposal.skillTarget.currentHash,
@@ -150,7 +170,7 @@ export function buildDecisionFromDialog(proposal, choice, actor) {
 }
 
 export function shouldShowProposal(proposal, { lastShownAt = {}, dismissedIds = [], now = Date.now() } = {}) {
-  if (!proposal || !["pending", "applied"].includes(proposal.state)) return false;
+  if (!proposal || !["pending", "applied", "failed-closed"].includes(proposal.state)) return false;
   if (new Set(dismissedIds).has(proposal.id)) return false;
   if (Number.isFinite(proposal.snoozedUntil) && proposal.snoozedUntil > now) return false;
   const shown = typeof lastShownAt === "number" ? lastShownAt : lastShownAt?.[proposal.id];
@@ -158,25 +178,8 @@ export function shouldShowProposal(proposal, { lastShownAt = {}, dismissedIds = 
   return !Number.isFinite(shown) || shown < changedAt;
 }
 
-function unwrap(result) {
-  return result?.data ?? result;
-}
-
-function bridgeFor(api, options) {
-  return options?.selfEvolveBridge ?? api.client?.selfEvolve;
-}
-
-function commandForChoice(choice, proposalId) {
-  if (choice === "apply") return { verb: "approve", proposalId };
-  if (choice === "snooze") return { verb: "snooze", proposalId, duration: "1d" };
-  if (choice === "dismiss" || choice === "exclude") return { verb: "reject", proposalId };
-  if (choice === "undo") return { verb: "undo", proposalId };
-  throw new TypeError(`unsupported-dialog-choice: ${choice}`);
-}
-
 function resultFailure(result) {
-  const value = unwrap(result);
-  if (value?.ok === false) return value.reason ?? value.error ?? "decision-failed";
+  if (result?.ok === false) return result.reason ?? "decision-failed";
   return null;
 }
 
@@ -185,6 +188,13 @@ function dialogError(api, message) {
     title: "Self-evolve error",
     message: `${message}. See /self-evolve health for details.`,
   });
+}
+
+export function parseAllowlistInput(value) {
+  const roots = String(value ?? "").split(/\r?\n|,/u).map((item) => item.trim()).filter(Boolean);
+  if (roots.length > 32 || new Set(roots).size !== roots.length) throw new Error("invalid-allowlist");
+  for (const root of roots) if (!path.isAbsolute(root) || path.resolve(root) !== root) throw new Error("allowlist-roots-must-be-canonical-absolute-paths");
+  return roots;
 }
 
 /** @type {TuiPlugin} */
@@ -199,7 +209,48 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const budget = Number.isFinite(config.notificationsPerHour) ? config.notificationsPerHour : DEFAULT_BUDGETS.notificationsPerHour;
   const eventType = config.eventType ?? "self-evolve.proposal";
   const serverTimeoutMs = Math.min(MAX_SERVER_WAIT_MS, Math.max(1, Number.isFinite(config.serverTimeoutMs) ? config.serverTimeoutMs : MAX_SERVER_WAIT_MS));
-  const bridge = bridgeFor(api, options);
+  const pollMs = Math.min(5_000, Math.max(25, Number.isFinite(config.mailboxPollMs) ? config.mailboxPollMs : 250));
+  let stateRoot;
+  try {
+    stateRoot = initialStateRootSelection({
+      explicitStateRoot: config.stateRoot,
+      hostStateRoot: api.state?.path?.state,
+      environment: {},
+    }).stateRoot;
+  } catch (error) {
+    console.warn(`self-evolve TUI disabled: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  let identity;
+  try {
+    identity = resolveProjectIdentity({
+      projectFingerprint: config.projectFingerprint,
+      remoteUrl: config.remoteUrl,
+      worktreePath: config.worktree ?? api.state?.path?.worktree,
+      directory: api.state?.path?.directory,
+    });
+  } catch (error) {
+    console.warn(`self-evolve TUI disabled: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const projectFingerprint = identity.projectFingerprint;
+  const mailbox = options?.__testMailboxClient ?? api.__testMailboxClient ?? (stateRoot && projectFingerprint ? {
+    getInbox: () => {
+      const projection = readControlState(stateRoot, projectFingerprint, { now: nowFor(api) });
+      if (!projection) return [];
+      validateProjectedStateRoot(stateRoot, projection.stateRootIdentity);
+      return readProjectInbox(stateRoot, projectFingerprint, { now: nowFor(api) });
+    },
+    submit: (request) => submitDecisionRequest(stateRoot, request),
+    poll: (requestId) => pollDecisionResponse(stateRoot, projectFingerprint, requestId),
+    getControlState: () => {
+      const projection = readControlState(stateRoot, projectFingerprint, { now: nowFor(api) });
+      if (projection) validateProjectedStateRoot(stateRoot, projection.stateRootIdentity);
+      return projection;
+    },
+    submitControl: (request) => submitControlRequest(stateRoot, request),
+    pollControl: (requestId) => pollControlResponse(stateRoot, projectFingerprint, requestId),
+  } : null);
   const idle = safeIdlePredicate(api, debounceMs);
   const limiter = notificationRateLimiter(api, budget);
   const inFlight = new Set();
@@ -207,6 +258,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const timers = new Set();
   let disposed = false;
   let refreshQueued = false;
+  let pollTimer;
 
   const dismissedIds = () => {
     const value = api.kv.get(DISMISSED_KEY, []);
@@ -226,33 +278,63 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     timers.add(handle);
   }
 
-  async function boundedServerCall(task) {
-    let timer;
+  async function boundedMailboxCall(task) {
+    let timeout;
     try {
       return await Promise.race([
         task(),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("server-response-timeout")), serverTimeoutMs); }),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("mailbox-read-timeout")), serverTimeoutMs); }),
       ]);
     } finally {
-      clearTimeout(timer);
+      clearTimeout(timeout);
     }
   }
 
   async function getInbox() {
-    if (typeof bridge?.getInbox !== "function") return [];
-    const value = unwrap(await boundedServerCall(() => bridge.getInbox({ signal: api.lifecycle.signal })));
-    return Array.isArray(value) ? value : value?.proposals ?? [];
+    if (typeof mailbox?.getInbox !== "function") return [];
+    const value = await boundedMailboxCall(() => mailbox.getInbox());
+    return Array.isArray(value) ? value : [];
   }
 
   async function getFreshProposal(proposalId) {
-    if (typeof bridge?.getProposal !== "function") return null;
-    const value = unwrap(await boundedServerCall(() => bridge.getProposal({ proposalId, signal: api.lifecycle.signal })));
-    return value?.proposal ?? value ?? null;
+    return (await getInbox()).find((proposal) => proposal.id === proposalId) ?? null;
   }
 
-  async function executeCommand(command) {
-    if (typeof bridge?.execute !== "function") throw new Error("server-command-bridge-unavailable");
-    return boundedServerCall(() => bridge.execute({ command, signal: api.lifecycle.signal }));
+  function pendingRequests() {
+    const value = api.kv.get(PENDING_REQUESTS_KEY, []);
+    return Array.isArray(value) ? value.filter((item) => item && typeof item.requestId === "string") : [];
+  }
+
+  function savePendingRequests(value) {
+    api.kv.set(PENDING_REQUESTS_KEY, value.slice(-32));
+  }
+
+  async function pollResponse(requestId, timeoutMs = serverTimeoutMs, kind = "decision") {
+    const startedAt = Date.now();
+    while (!disposed && !api.lifecycle.signal.aborted && Date.now() - startedAt <= timeoutMs) {
+      const response = kind === "control" ? await mailbox.pollControl(requestId) : await mailbox.poll(requestId);
+      if (response) return response;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(100, pollMs)));
+    }
+    return null;
+  }
+
+  async function refreshResponses() {
+    if (typeof mailbox?.poll !== "function") return;
+    const remaining = [];
+    for (const pending of pendingRequests()) {
+      try {
+        const response = pending.kind === "control" ? await mailbox.pollControl?.(pending.requestId) : await mailbox.poll(pending.requestId);
+        if (!response) {
+          remaining.push(pending);
+        } else if (!response.ok) {
+          api.ui.DialogAlert({ title: "Self-evolve decision rejected", message: `${response.reason}. The durable inbox will be refreshed.` });
+        }
+      } catch {
+        remaining.push(pending);
+      }
+    }
+    savePendingRequests(remaining);
   }
 
   function busyDialog(proposal, body) {
@@ -272,21 +354,29 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       if (!fresh) throw new Error("proposal-not-found");
       if (choice === "undo" && fresh.state !== "applied") throw new Error("proposal-not-applied");
       const decision = buildDecisionFromDialog({ ...fresh, decisionTimestamp: nowFor(api) }, choice, ACTOR);
-      if (typeof bridge?.decide !== "function") throw new Error("server-decision-bridge-unavailable");
-      const result = await boundedServerCall(() => bridge.decide({ decision, command: commandForChoice(choice, fresh.id), signal: api.lifecycle.signal }));
+      if (typeof mailbox?.submit !== "function" || typeof mailbox?.poll !== "function") throw new Error("filesystem-mailbox-unavailable");
+      const request = createDecisionRequest({ projectFingerprint: projectFingerprint ?? fresh.projectFingerprint, proposal: { ...fresh, decisionNonce: decision.nonce }, newState: decision.newState, actor: ACTOR, timestamp: decision.timestamp });
+      await mailbox.submit(request);
+      savePendingRequests([...pendingRequests(), { requestId: request.requestId, proposalId: fresh.id, submittedAt: nowFor(api) }]);
+      const result = await pollResponse(request.requestId);
+      if (!result) {
+        api.ui.DialogAlert({ title: "Self-evolve decision queued", message: "The server has not responded yet. The request remains queued and will be checked at the next safe idle refresh." });
+        queueRefresh();
+        return { ok: false, reason: "decision-response-pending" };
+      }
+      savePendingRequests(pendingRequests().filter((item) => item.requestId !== request.requestId));
       const failure = resultFailure(result);
       if (failure) {
-        if (/stale-prior-state|nonce-already-burned|replayed-decision/.test(failure)) {
+        if (/stale|nonce|replay|hash|version/.test(failure)) {
           api.ui.DialogAlert({ title: "Proposal changed", message: `${failure}. The durable inbox will be refreshed.` });
           queueRefresh();
           return { ok: false, reason: failure };
         }
         throw new Error(failure);
       }
-      if (choice === "exclude") await executeCommand({ verb: "repo-override", excluded: true });
       const shown = lastShownAt();
       api.kv.set(LAST_SHOWN_KEY, { ...shown, [fresh.id]: nowFor(api) });
-      if (choice === "dismiss" || choice === "exclude") api.kv.set(DISMISSED_KEY, [...new Set([...dismissedIds(), fresh.id])]);
+      if (choice === "dismiss") api.kv.set(DISMISSED_KEY, [...new Set([...dismissedIds(), fresh.id])]);
       return { ok: true, decision };
     } catch (error) {
       dialogError(api, error instanceof Error ? error.message : String(error));
@@ -294,6 +384,142 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     } finally {
       inFlight.delete(proposal.id);
     }
+  }
+
+  async function getControlState() {
+    if (typeof mailbox?.getControlState !== "function") throw new Error("control-state-unavailable");
+    const state = await boundedMailboxCall(() => mailbox.getControlState());
+    if (!state) throw new Error("control-grant-unavailable");
+    return state;
+  }
+
+  async function submitControl(action, payload) {
+    try {
+      if (typeof mailbox?.submitControl !== "function" || typeof mailbox?.pollControl !== "function") throw new Error("control-mailbox-unavailable");
+      const controlState = await getControlState();
+      const request = createControlRequest({ controlState, action, payload, timestamp: nowFor(api) });
+      await mailbox.submitControl(request);
+      savePendingRequests([...pendingRequests(), { kind: "control", requestId: request.requestId, submittedAt: nowFor(api) }]);
+      const response = await pollResponse(request.requestId, serverTimeoutMs, "control");
+      if (!response) {
+        api.ui.DialogAlert({ title: "Self-evolve control queued", message: "The server has not responded yet. The bounded request remains queued." });
+        return { ok: false, reason: "control-response-pending" };
+      }
+      savePendingRequests(pendingRequests().filter((item) => item.requestId !== request.requestId));
+      if (!response.ok) {
+        api.ui.DialogAlert({ title: "Self-evolve control rejected", message: `${response.reason}. Reopen settings to refresh server state.` });
+        return { ok: false, reason: response.reason };
+      }
+      api.ui.toast({ variant: "success", message: "Self-evolve settings updated" });
+      return { ok: true };
+    } catch (error) {
+      dialogError(api, error instanceof Error ? error.message : String(error));
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  function confirmYolo(allowlist) {
+    const visible = allowlist.map((root) => `- ${root}`).join("\n");
+    api.ui.DialogConfirm({
+      title: "Yolo risk confirmation 1 of 2",
+      message: `Yolo may apply validated skill changes without per-change approval, only under this exact allowlist:\n${visible}`,
+      onConfirm: () => api.ui.DialogConfirm({
+        title: "Yolo risk confirmation 2 of 2",
+        message: `Confirm unattended skill writes to exactly:\n${visible}`,
+        onConfirm: () => { void submitControl("set-mode", { mode: "yolo", allowlist, confirmation: "ENABLE YOLO" }); },
+      }),
+    });
+  }
+
+  function promptYoloAllowlist(state) {
+    api.ui.DialogPrompt({
+      title: "Yolo allowlist",
+      placeholder: "/canonical/skill/root (one per line)",
+      value: state.allowedSkillRoots.join("\n"),
+      onConfirm: (value) => {
+        try {
+          const allowlist = parseAllowlistInput(value);
+          if (!allowlist.length) throw new Error("yolo-requires-a-non-empty-allowlist");
+          confirmYolo(allowlist);
+        } catch (error) { dialogError(api, error instanceof Error ? error.message : String(error)); }
+      },
+    });
+  }
+
+  function showModeFlow(state) {
+    const options = ["manual", "auto", "yolo"].map((mode) => ({
+      title: mode,
+      value: mode,
+      description: mode === "manual" ? "No passive work" : mode === "auto" ? "Draft automatically; approve each write" : "Allow unattended validated writes",
+    }));
+    const onSelect = (option) => {
+      if (option.value === "yolo") return promptYoloAllowlist(state);
+      api.ui.DialogConfirm({
+        title: `Set self-evolve mode to ${option.value}?`,
+        message: option.value === "auto" ? "Auto may make passive provider calls only when the separate consent controls permit it." : "Manual disables passive work.",
+        onConfirm: () => { void submitControl("set-mode", { mode: option.value }); },
+      });
+    };
+    api.ui.DialogSelect({ title: `Self-evolve mode (current: ${state.mode})`, options, onSelect, skipFilter: true });
+  }
+
+  function showAllowlistFlow(state) {
+    api.ui.DialogPrompt({
+      title: "Edit canonical skill-root allowlist",
+      description: () => "This changes the only roots eligible for yolo writes. Review every path before confirming.",
+      placeholder: "/canonical/skill/root (one per line)",
+      value: state.allowedSkillRoots.join("\n"),
+      onConfirm: (value) => {
+        try {
+          const allowlist = parseAllowlistInput(value);
+          const visible = allowlist.length ? allowlist.map((root) => `- ${root}`).join("\n") : "(empty)";
+          api.ui.DialogConfirm({
+            title: "Elevated allowlist confirmation",
+            message: `Replace the yolo allowlist with exactly:\n${visible}`,
+            onConfirm: () => { void submitControl("update-allowlist", { allowlist, confirmation: "UPDATE ALLOWLIST" }); },
+          });
+        } catch (error) { dialogError(api, error instanceof Error ? error.message : String(error)); }
+      },
+    });
+  }
+
+  function showConsentFlow(state, key) {
+    const enabled = !state.consent[key];
+    if (key === "crossRepoAggregation" && enabled && !state.consent.sanitizedExcerpts) {
+      api.ui.DialogAlert({ title: "Excerpt consent required", message: "Enable sanitized excerpts before cross-repository aggregation. Redaction reduces exposure; it does not guarantee secrecy." });
+      return;
+    }
+    const disclosure = key === "sanitizedExcerpts" || key === "crossRepoAggregation"
+      ? "Redaction reduces exposure but is not a secrecy guarantee. Review exports and retention policy accordingly."
+      : "This setting is independent and defaults to off.";
+    api.ui.DialogConfirm({
+      title: `${enabled ? "Enable" : "Disable"} ${CONSENT_LABELS[key]}?`,
+      message: disclosure,
+      onConfirm: () => { void submitControl("set-consent", { key, enabled }); },
+    });
+  }
+
+  async function openSettings() {
+    try {
+      const state = await getControlState();
+      const options = [
+        { title: "Mode", value: "mode", description: `${state.mode} (effective: ${state.effectiveMode})` },
+        { title: "Skill-root allowlist", value: "allowlist", description: `${state.allowedSkillRoots.length} root(s)` },
+        ...Object.entries(CONSENT_LABELS).map(([key, title]) => ({ title, value: `consent:${key}`, description: state.consent[key] ? "on" : "off" })),
+        { title: "Repository exclusion", value: "repo-excluded", description: state.repoExcluded ? "excluded" : "included" },
+      ];
+      const onSelect = (option) => {
+        if (option.value === "mode") showModeFlow(state);
+        else if (option.value === "allowlist") showAllowlistFlow(state);
+        else if (option.value === "repo-excluded") api.ui.DialogConfirm({
+          title: state.repoExcluded ? "Include this repository?" : "Exclude this repository?",
+          message: state.repoExcluded ? "Self-evolve may operate here subject to mode and consent." : "This repository will be excluded from self-evolve observation and application.",
+          onConfirm: () => { void submitControl("set-repo-excluded", { excluded: !state.repoExcluded }); },
+        });
+        else if (option.value.startsWith("consent:")) showConsentFlow(state, option.value.slice("consent:".length));
+      };
+      api.ui.DialogSelect({ title: "Self-evolve durable settings", options, onSelect, skipFilter: true });
+    } catch (error) { dialogError(api, error instanceof Error ? error.message : String(error)); }
   }
 
   function reviewBody(proposal) {
@@ -313,10 +539,13 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   function showProposal(proposal) {
     const digest = formatProposalDigest(proposal, proposal.inventory);
     const body = reviewBody(proposal);
+    const critical = proposal.state === "failed-closed";
     const audit = proposal.state === "applied" && proposal.mode === "yolo";
-    const choices = audit
+    const choices = critical
+      ? [["Dismiss critical record", "dismiss-audit"]]
+      : audit
       ? [["Undo", "undo"], ["Dismiss audit", "dismiss-audit"]]
-      : [["Apply", "apply"], ["Snooze", "snooze"], ["Dismiss", "dismiss"], ["Exclude repository", "exclude"]];
+      : [["Apply", "apply"], ["Snooze", "snooze"], ["Dismiss", "dismiss"]];
     const optionsForDialog = choices.map(([title, value]) => ({
       title,
       value,
@@ -345,6 +574,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       return { ok: false, reason: "session-not-idle" };
     }
     try {
+      await refreshResponses();
       const proposals = await getInbox();
       const proposal = proposals.find((item) => shouldShowProposal(item, {
         lastShownAt: lastShownAt(),
@@ -372,44 +602,6 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     queueMicrotask(() => void refreshInbox());
   }
 
-  function confirm(title, message, onConfirm) {
-    api.ui.DialogConfirm({ title, message, onConfirm: () => void onConfirm(), onCancel: () => {} });
-  }
-
-  async function applyMode(mode, allowlist) {
-    await executeCommand({ verb: "mode", mode, ...(mode === "yolo" ? { confirmed: true, allowlist } : {}) });
-  }
-
-  function handleSettingsEvent(event) {
-    const request = event?.properties ?? event?.data ?? event ?? {};
-    if (request.action === "mode" && Mode.values.includes(request.mode)) {
-      if (request.mode !== "yolo") {
-        confirm("Change self-evolve mode", `Set the global mode to ${request.mode}?`, () => applyMode(request.mode));
-        return;
-      }
-      confirm("Enable elevated yolo mode?", "Yolo may apply validated changes without per-change approval inside the explicit allowlist.", () => {
-        confirm("Confirm yolo allowlist", `Only these roots may be changed:\n${(request.allowlist ?? []).join("\n") || "No roots supplied"}`, () => applyMode("yolo", request.allowlist ?? []));
-      });
-      return;
-    }
-    if (request.action === "allowlist") {
-      confirm("Modify yolo allowlist?", "Changing the allowlist changes where unattended writes may occur.", () => {
-        confirm("Confirm allowlist roots", (request.allowlist ?? []).join("\n") || "No roots supplied", () => applyMode("yolo", request.allowlist ?? []));
-      });
-    }
-  }
-
-  function handleConsentEvent(event) {
-    const request = event?.properties ?? event?.data ?? event ?? {};
-    const definitions = {
-      sanitizedExcerpts: ["Consent to sanitized excerpts?", "Redaction is heuristic, not a secrecy guarantee."],
-      crossRepoAggregation: ["Consent to cross-repository aggregation?", "Only sanitized normalized evidence is aggregated; repository identifiers are excluded."],
-    };
-    if (!definitions[request.key]) return;
-    const [title, message] = definitions[request.key];
-    confirm(title, message, () => executeCommand({ verb: "consent", key: request.key, value: request.value !== false }));
-  }
-
   if (api.kv.get(FIRST_USE_KEY) === undefined) {
     api.ui.DialogConfirm({
       title: "Enable self-evolve proposal dialogs?",
@@ -422,16 +614,32 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     });
   }
 
+  if (typeof api.keymap?.registerLayer === "function" && typeof api.ui?.DialogPrompt === "function") {
+    api.keymap.registerLayer({
+      mode: "base",
+      commands: [{
+        name: "self-evolve.settings",
+        title: "Self-evolve settings",
+        category: "Self-evolve",
+        namespace: "palette",
+        slashName: "self-evolve-settings",
+        run: () => { void openSettings(); },
+      }],
+    });
+  } else {
+    console.warn("self-evolve settings command disabled: native keymap or prompt capabilities are unavailable");
+  }
+
   unsubscribers.push(api.event.on(eventType, queueRefresh));
   unsubscribers.push(api.event.on("session.idle", queueRefresh));
   unsubscribers.push(api.event.on("session.status", queueRefresh));
-  unsubscribers.push(api.event.on("self-evolve.settings", handleSettingsEvent));
-  unsubscribers.push(api.event.on("self-evolve.consent", handleConsentEvent));
+  pollTimer = setInterval(queueRefresh, Math.max(pollMs, debounceMs || pollMs));
 
   const abort = () => {
     disposed = true;
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
+    clearInterval(pollTimer);
   };
   api.lifecycle.signal.addEventListener("abort", abort, { once: true });
   api.lifecycle.onDispose(() => {

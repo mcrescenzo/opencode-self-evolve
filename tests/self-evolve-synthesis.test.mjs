@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { hashSkillContent } from "../self-evolve-inventory.js";
-import { assertRecord, makeProposal, wrapRecord } from "../self-evolve-schemas.js";
+import { assertRecord, makeProposal, transitionProposalState, wrapRecord } from "../self-evolve-schemas.js";
 import {
   CRITIC_AGENT_NAME,
   CRITIC_OUTPUT_SCHEMA,
@@ -14,6 +14,7 @@ import {
   disposeSynthesis,
   parseCriticOutput,
   parseSynthesizerOutput,
+  releaseSynthesisLease,
   runCritic,
   runSynthesis,
 } from "../self-evolve-synthesis.js";
@@ -84,6 +85,7 @@ function criticOutput(overrides = {}) {
 
 function memoryStore() {
   const records = [];
+  const leases = new Map();
   return {
     records,
     appendRecord(envelope) {
@@ -94,6 +96,21 @@ function memoryStore() {
     },
     readRecords(kind, { since = 0 } = {}) {
       return records.filter((record) => record.kind === kind && record.createdAt >= since);
+    },
+    acquireLease(key, { actor }) {
+      if (leases.has(key)) return { ok: false, reason: "lease-busy", currentOwner: leases.get(key).actor };
+      const lease = { pid: process.pid, actor, nonce: H(`${key}:${leases.size}`), expiresAt: NOW + 1_000 };
+      leases.set(key, lease);
+      return { ok: true, nonce: lease.nonce, expiresAt: lease.expiresAt };
+    },
+    releaseLease(key, nonce) {
+      if (leases.get(key)?.nonce !== nonce) return { ok: false, reason: "nonce-mismatch" };
+      leases.delete(key);
+      return { ok: true };
+    },
+    getLeaseStatus(key) {
+      const lease = leases.get(key);
+      return lease ? { state: "held", held: true, reclaimable: false, processAware: true, ownerAlive: true, lease } : { state: "absent", held: false, reclaimable: false, lease: null };
     },
     runCas(kind, id, expectedState, mutate) {
       const current = [...records].reverse().find((record) => record.kind === kind && record.payload.id === id);
@@ -106,6 +123,16 @@ function memoryStore() {
       } catch (error) {
         return { ok: false, reason: error.message };
       }
+    },
+    commitDecision(decision) {
+      const current = [...records].reverse().find((record) => record.kind === "proposal" && record.payload.id === decision.proposalId);
+      if (!current) return { ok: false, reason: "record-not-found" };
+      const transition = transitionProposalState(current.payload, decision, Math.max(NOW, decision.timestamp));
+      if (!transition.ok) return { ok: false, reason: transition.error };
+      const proposalRecord = wrapRecord("proposal", transition.state, NOW);
+      const decisionRecord = wrapRecord("decision", decision, decision.timestamp);
+      records.push(proposalRecord, decisionRecord);
+      return { ok: true, proposal: proposalRecord.payload, decision: decisionRecord.payload };
     },
   };
 }
@@ -196,10 +223,10 @@ test("strict parsers accept valid output and reject malformed or extra fields", 
   assert.equal(parseCriticOutput({ ...criticOutput(), extra: true }).ok, false);
 });
 
-test("synthesizer success persists exactly one pending hash-bound Proposal", async () => {
+test("synthesizer success persists exactly one non-actionable critic-pending hash-bound Proposal", async () => {
   const { result, store, calls } = await synthesize();
   assert.equal(result.ok, true);
-  assert.equal(result.proposal.state, "pending");
+  assert.equal(result.proposal.state, "critic-pending");
   assert.equal(result.proposal.skillTarget.currentHash, H(CURRENT));
   assert.equal(result.proposal.proposedContentHash, H(PROPOSED));
   assert.equal(result.proposal.validDeterministic, true);
@@ -208,6 +235,22 @@ test("synthesizer success persists exactly one pending hash-bound Proposal", asy
   assert.equal(proposals[0].payload.id, result.proposal.id);
   assert.match(result.proposal.rationaleText, new RegExp(OBSERVATION_ID));
   assert.equal(calls.abort.length, 1);
+});
+
+test("a provider call cannot start unless synthesis admission persists", async () => {
+  const base = memoryStore();
+  const store = {
+    ...base,
+    appendRecord(envelope) {
+      if (envelope.kind === "synthesis-attempt") return { ok: false, reason: "admission-disk-failure" };
+      return base.appendRecord(envelope);
+    },
+  };
+  const { result, calls } = await synthesize(synthesisOutput(), { store });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "admission-disk-failure");
+  assert.equal(calls.create.length, 0);
+  assert.equal(calls.prompt.length, 0);
 });
 
 test("no-op is durable as an audit event and creates no proposal", async () => {
@@ -282,14 +325,15 @@ test("stale targets are refused before any model call", async () => {
   assert.equal(sdk.calls.create.length, 0);
 });
 
-test("a duplicate pending content hash is rejected and not persisted twice", async () => {
+test("a live synthesis attempt prevents duplicate provider work for the same cluster and target", async () => {
   const store = memoryStore();
   const first = await synthesize(synthesisOutput(), { store, now: NOW });
   const second = await synthesize(synthesisOutput(), { store, now: NOW + 1 });
   assert.equal(first.result.ok, true);
   assert.equal(second.result.ok, false);
-  assert.match(second.result.reason, /duplicate-pending-proposal/);
-  assert.equal(store.readRecords("proposal").filter((record) => record.payload.state === "pending").length, 1);
+  assert.equal(second.result.reason, "synthesis-lease-busy");
+  assert.equal(second.calls.prompt.length, 0);
+  assert.equal(store.readRecords("proposal").filter((record) => record.payload.state === "critic-pending").length, 1);
 });
 
 test("expired and deterministically ineligible evidence are refused before model calls", async () => {
@@ -331,6 +375,7 @@ test("three synthesis failures in 24h activate persisted cluster backoff", async
   for (let index = 0; index < 3; index += 1) {
     const attempt = await synthesize("bad", { store, now: NOW + index });
     assert.equal(attempt.result.ok, false);
+    assert.equal(releaseSynthesisLease(store, attempt.result.lease).ok, true);
     disposeSynthesis();
   }
   const blocked = await synthesize(synthesisOutput(), { store, now: NOW + 4 });

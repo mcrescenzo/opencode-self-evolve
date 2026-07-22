@@ -1,21 +1,38 @@
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   SCHEMA_VERSION,
+  makeAggregateClaim,
   makeAuditEvent,
+  makeApplyClaim,
+  makeCircuitBreaker,
   makeDecision,
+  makeEligibilityExplanation,
+  makeEpisodeCursor,
+  makeEvidenceCluster,
+  makeGlobalSettings,
+  makeInterventionEpoch,
   makeObservation,
   makeProposal,
+  makeProposalContent,
+  makeReceipt,
+  makeRepoSettings,
+  makeRollbackRecord,
+  makeSynthesisOutcomeAuditEvent,
   wrapRecord,
 } from "../self-evolve-schemas.js";
+import { createControlRequest, createDecisionRequest, makeBridgeResponse, makeControlResponse } from "../self-evolve-bridge.js";
 import {
   hashContent,
   migrate,
   openStore,
   projectFingerprintFor,
+  resolveProjectIdentity,
 } from "../self-evolve-store.js";
 
 const H = (character) => character.repeat(64);
@@ -24,6 +41,34 @@ const SCOPE = H("b");
 const CURRENT = H("c");
 const PROPOSED = H("d");
 const CLUSTER = H("e");
+const CHILD = fileURLToPath(new URL("./fixtures/store-child.mjs", import.meta.url));
+const TRANSACTION_CRASH_CHILD = fileURLToPath(new URL("./fixtures/decision-transaction-crash.mjs", import.meta.url));
+
+function runChild(root, project, operation, value) {
+  return new Promise((resolve, reject) => {
+    const args = [CHILD, root, project, operation, ...(value === undefined ? [] : [String(value)])];
+    const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) reject(new Error(`child-exit-${code}:${stderr}`));
+      else resolve(JSON.parse(stdout));
+    });
+  });
+}
+
+function runKilledChild(script, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [script, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code, signal) => signal === "SIGKILL" ? resolve() : reject(new Error(`expected-SIGKILL:${code}:${signal}:${stderr}`)));
+  });
+}
 
 function fixture(now = 1_000) {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-"));
@@ -76,6 +121,13 @@ function decision() {
   });
 }
 
+function contentChunk(proposalId = "proposal-1", contentHash = PROPOSED, createdAt = 1_000) {
+  return wrapRecord("proposal-content", makeProposalContent({
+    proposalId, contentHash, contentEncoding: "base64", chunkIndex: 0, chunkCount: 1,
+    content: Buffer.from("bounded proposal content", "utf8").toString("base64"),
+  }), createdAt);
+}
+
 function auditEnvelope(state, timestamp = 1_000) {
   const details = { state, target: "review/SKILL.md" };
   const event = makeAuditEvent({
@@ -108,6 +160,7 @@ test("creates the store atomically and appends and reads records", () => {
     assert.equal(statSync(state).mode & 0o777, 0o700);
     assert.equal(statSync(path.join(state, "observations.jsonl")).mode & 0o777, 0o600);
     assert.equal(statSync(path.join(state, "settings.json")).mode & 0o777, 0o600);
+    assert.equal(statSync(path.join(base, "global", "settings.json")).mode & 0o777, 0o600);
   }
   store.close();
 });
@@ -142,6 +195,17 @@ test("compare-and-swap appends a new version and rejects stale state", () => {
   store.close();
 });
 
+test("the mutation lock is reentrant within one store instance", () => {
+  const { store } = fixture();
+  store.appendRecord(wrapRecord("proposal", proposal(), 1_000));
+  const changed = store.runCas("proposal", "proposal-1", "pending", (current) => {
+    assert.equal(store.getSettings().global.mode, "manual");
+    return { ...current, state: "approved", decisionVersion: 1 };
+  });
+  assert.equal(changed.ok, true);
+  store.close();
+});
+
 test("leases are create-exclusive, nonce-bound, releasable, and stale-cleaning", () => {
   let now = 1_000;
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-"));
@@ -159,10 +223,11 @@ test("leases are create-exclusive, nonce-bound, releasable, and stale-cleaning",
   assert.equal(first.isLeaseHeld("target", 1_050), true);
   assert.deepEqual(first.releaseLease("target", acquired.nonce), { ok: true });
 
-  const expiring = first.acquireLease("target", { ttlMs: 100, actor: "first" });
-  assert.equal(expiring.ok, true);
+  const processAware = first.acquireLease("target", { ttlMs: 100, actor: "first" });
+  assert.equal(processAware.ok, true);
   now = 1_101;
-  assert.equal(second.isLeaseHeld("target", now), false);
+  assert.equal(second.isLeaseHeld("target", now), true, "a live process owner remains authoritative past synthetic expiry");
+  first.releaseLease("target", processAware.nonce);
   const reacquired = second.acquireLease("target", { ttlMs: 100, actor: "second" });
   assert.equal(reacquired.ok, true);
   first.close();
@@ -179,12 +244,228 @@ test("retention removes old observations and preserves proposals, decisions, and
   store.appendRecord(wrapRecord("decision", decision(), day));
   store.appendRecord(auditEnvelope("applied", day));
 
-  assert.deepEqual(store.retain(now), { observations: 1 });
+  assert.equal(store.retain(now).observations, 1);
   assert.equal(store.readRecords("observation").length, 1);
   assert.equal(store.readRecords("proposal").length, 1);
   assert.equal(store.readRecords("decision").length, 1);
   assert.equal(store.readRecords("audit-event").length, 1);
   store.close();
+});
+
+test("synthesis outcomes use audit retention and expire without affecting active proposal protection", () => {
+  const day = 86_400_000;
+  const now = 60 * day;
+  const { root, store } = fixture(now);
+  const outcome = makeSynthesisOutcomeAuditEvent({
+    outcomeId: H("8"), projectFingerprint: PROJECT, clusterId: CLUSTER,
+    status: "accepted", success: true, terminalAt: day, reasonCode: "accepted",
+  });
+  store.appendRecord(wrapRecord("audit-event", outcome, day));
+  store.appendRecord(wrapRecord("proposal", proposal("pending"), day));
+
+  assert.equal(store.retain(now).audit, 0, "60-day outcome remains inside the 90-day audit window");
+  assert.equal(store.readRecords("audit-event").some((record) => record.payload.details.action === "synthesis-outcome"), true);
+  assert.equal(store.retain(100 * day).audit, 1, "outcome expires after the audit window");
+  assert.equal(store.readRecords("proposal").some((record) => record.payload.state === "pending"), true);
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("retention applies canonical clocks to every durable record class", () => {
+  const day = 86_400_000;
+  const now = 120 * day;
+  const old = day;
+  const { store } = fixture(now);
+  const records = [
+    ["episode-cursor", makeEpisodeCursor({ sessionIDHash: H("9"), lastIdleAt: old, lastObservedMessageHash: H("8") }), old],
+    ["receipt", makeReceipt({ receiptType: "repeated-command", signatureHash: H("4"), occurrences: 1, firstSeenAt: old, lastSeenAt: old, projectFingerprint: PROJECT, scopeFingerprint: SCOPE }), old],
+    ["observation", observation(old, H("5")), old],
+    ["evidence-cluster", makeEvidenceCluster({ id: H("6"), receiptType: "repeated-command", projectFingerprint: PROJECT, incidentIds: ["old-incident"], scopeFingerprint: SCOPE, occurrencesSum: 1, firstSeenAt: old, lastSeenAt: old }), old],
+    ["eligibility-explanation", makeEligibilityExplanation({ clusterId: H("6"), eligible: false, reasons: ["old"], thresholdsMet: {}, thresholdsMissed: {} }), old],
+    ["proposal", makeProposal({ ...proposal("rejected", 1), id: "proposal-terminal", synthesizedAt: old }), old],
+    ["decision", makeDecision({ ...decision(), proposalId: "proposal-terminal", timestamp: old }), old],
+    ["audit-event", makeAuditEvent({ ...auditEnvelope("failed", old).payload, proposalId: "proposal-terminal", timestamp: old }), old],
+    ["rollback-record", makeRollbackRecord({ proposalId: "proposal-terminal", appliedHash: PROPOSED, rolledBackAt: old, reason: "completed" }), old],
+    ["intervention-epoch", makeInterventionEpoch({ epochId: "old-epoch", startedAt: old, reason: "completed" }), old],
+    ["circuit-breaker", makeCircuitBreaker({ open: true, openedAt: old, reason: "old failure", tripCount: 1 }), old],
+    ["apply-claim", makeApplyClaim({ proposalId: "proposal-terminal", leaseNonce: "expired", acquiredAt: old, expiresAt: old + 1, actor: "test" }), old],
+  ];
+  for (const [kind, payload, timestamp] of records) assert.equal(store.appendRecord(wrapRecord(kind, payload, timestamp)).ok, true);
+  const result = store.retain(now);
+  assert.deepEqual({
+    observations: result.observations,
+    evidence: result.evidence,
+    proposals: result.proposals,
+    decisions: result.decisions,
+    audit: result.audit,
+    rollback: result.rollback,
+    interventions: result.interventions,
+    circuits: result.circuits,
+    applyClaims: result.applyClaims,
+  }, { observations: 1, evidence: 4, proposals: 1, decisions: 1, audit: 1, rollback: 1, interventions: 1, circuits: 1, applyClaims: 1 });
+  assert.equal(store.exportAll().records.length, 0);
+  store.close();
+});
+
+test("retention preserves active proposal chains and required snapshots while removing expired orphans", () => {
+  const day = 86_400_000;
+  const now = 120 * day;
+  const { root, store } = fixture(now);
+  const active = makeProposal({ ...proposal("applied", 2), synthesizedAt: day });
+  store.appendRecord(wrapRecord("proposal", active, day));
+  const required = path.join(store.snapshotRoot, `${encodeURIComponent(active.id)}.${active.proposedContentHash}.before`);
+  const orphan = path.join(store.snapshotRoot, "orphan.before");
+  const freshOrphan = path.join(store.snapshotRoot, "fresh.before");
+  writeFileSync(required, "required", { mode: 0o600 });
+  writeFileSync(orphan, "orphan", { mode: 0o600 });
+  writeFileSync(freshOrphan, "fresh", { mode: 0o600 });
+  utimesSync(required, new Date(day), new Date(day));
+  utimesSync(orphan, new Date(day), new Date(day));
+  utimesSync(freshOrphan, new Date(now), new Date(now));
+  const details = { state: "readback-verified", snapshot: required, appliedHash: active.proposedContentHash, "readback-verified": true };
+  const event = makeAuditEvent({ id: hashContent("required-snapshot"), kind: "apply", proposalId: active.id, actor: "self-evolve-applier", timestamp: day, payloadHash: hashContent(JSON.stringify(details)), details });
+  store.appendRecord(wrapRecord("audit-event", event, day));
+
+  const result = store.retain(now);
+  assert.equal(result.snapshots, 1);
+  assert.equal(existsSync(required), true);
+  assert.equal(existsSync(orphan), false);
+  assert.equal(existsSync(freshOrphan), true);
+  assert.equal(store.getRecord("proposal", active.id).payload.state, "applied");
+  assert.equal(store.readRecords("audit-event").some((record) => record.payload.id === event.id), true);
+  assert.equal(existsSync(path.join(root, "self-evolve", PROJECT)), true);
+  store.close();
+});
+
+test("proposal content remains linked to an active proposal beyond the 90-day audit TTL", () => {
+  const day = 86_400_000;
+  const { root, store } = fixture(120 * day);
+  const active = makeProposal({ ...proposal("pending"), synthesizedAt: day });
+  assert.equal(store.appendRecord(wrapRecord("proposal", active, day)).ok, true);
+  assert.equal(store.appendRecord(contentChunk(active.id, active.proposedContentHash, day)).ok, true);
+  store.retain(120 * day);
+  assert.equal(store.getRecord("proposal", active.id).payload.state, "pending");
+  assert.equal(store.readRecords("proposal-content").length, 1);
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("retention protects an expired critic-pending proposal chain until synthesis recovery", () => {
+  const day = 86_400_000;
+  const now = 120 * day;
+  const { root, store } = fixture(now);
+  const draft = makeProposal({ ...proposal("critic-pending"), criticPassed: false, criticScore: 0, synthesizedAt: day });
+  assert.equal(store.appendRecord(wrapRecord("proposal", draft, day)).ok, true);
+  assert.equal(store.appendRecord(contentChunk(draft.id, draft.proposedContentHash, day)).ok, true);
+  const criticDecision = makeDecision({
+    ...decision(),
+    proposalId: draft.id,
+    actor: "self-evolve-critic",
+    timestamp: day,
+    priorState: "critic-pending",
+    newState: "pending",
+  });
+  assert.equal(store.appendRecord(wrapRecord("decision", criticDecision, day)).ok, true);
+  const details = { action: "critic-admitted", state: "critic-pending" };
+  const audit = makeAuditEvent({ id: hashContent("critic-pending-audit"), kind: "decision", proposalId: draft.id, actor: "self-evolve-synthesis", timestamp: day, payloadHash: hashContent(JSON.stringify(details)), details });
+  assert.equal(store.appendRecord(wrapRecord("audit-event", audit, day)).ok, true);
+
+  store.retain(now);
+  assert.equal(store.getRecord("proposal", draft.id).payload.state, "critic-pending");
+  assert.equal(store.readRecords("proposal-content").some((record) => record.payload.proposalId === draft.id), true);
+  assert.equal(store.readRecords("decision").some((record) => record.payload.proposalId === draft.id), true);
+  assert.equal(store.readRecords("audit-event").some((record) => record.payload.proposalId === draft.id), true);
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("terminal proposal decisions compact content immediately and exports contain no terminal body", () => {
+  const { store } = fixture(2_000);
+  store.appendRecord(wrapRecord("proposal", proposal("pending"), 1_000));
+  store.appendRecord(contentChunk());
+  const rejected = makeDecision({ ...decision(), newState: "rejected" });
+  assert.equal(store.commitDecision(rejected).ok, true);
+  assert.equal(store.readRecords("proposal-content").length, 0);
+  assert.doesNotMatch(JSON.stringify(store.exportAll()), /bounded proposal content|proposal-content/u);
+  store.close();
+});
+
+test("snapshot retention unlinks symlinks without touching their targets", { skip: process.platform === "win32" }, () => {
+  const day = 86_400_000;
+  const now = 120 * day;
+  const { root, store } = fixture(now);
+  const outside = path.join(root, "outside-secret");
+  const link = path.join(store.snapshotRoot, "linked.before");
+  writeFileSync(outside, "must-remain", { mode: 0o600 });
+  symlinkSync(outside, link);
+  assert.equal(store.retain(now).snapshots, 1);
+  assert.equal(existsSync(link), false);
+  assert.equal(readFileSync(outside, "utf8"), "must-remain");
+  store.close();
+});
+
+test("retention removes expired lease files but leaves live leases", () => {
+  let now = 1_000;
+  const { store } = fixture(now);
+  const legacyPath = path.join(store.stateDir, "leases", "expired.lock");
+  writeFileSync(legacyPath, JSON.stringify({ actor: "legacy", acquiredAt: 1_000, expiresAt: 1_010, nonce: "legacy-expired" }), { mode: 0o600 });
+  const live = store.acquireLease("live", { ttlMs: 1_000, actor: "test" });
+  now = 1_100;
+  const result = store.retain(now);
+  assert.equal(result.leases, 1);
+  assert.equal(store.isLeaseHeld("expired", now), false);
+  assert.equal(store.isLeaseHeld("live", now), true);
+  store.releaseLease("live", live.nonce);
+  store.close();
+});
+
+test("a real retention process contends safely with append and decision writers", async () => {
+  const day = 86_400_000;
+  const now = 120 * day;
+  const { root, store } = fixture(now);
+  store.appendRecord(wrapRecord("observation", observation(day, H("7")), day));
+  store.close();
+  const results = await Promise.all([
+    runChild(root, PROJECT, "retain", now),
+    ...Array.from({ length: 6 }, () => runChild(root, PROJECT, "append-at", now)),
+    ...Array.from({ length: 4 }, () => runChild(root, PROJECT, "decision", now)),
+  ]);
+  assert.equal(results.every((result) => result.ok !== false), true);
+  const reopened = openStore(root, { projectFingerprint: PROJECT, now: () => now });
+  assert.equal(reopened.readRecords("observation").length, 6);
+  assert.equal(reopened.readRecords("decision").length, 4);
+  reopened.close();
+});
+
+test("aggregate retention repairs contribution indexes in every project partition", () => {
+  const day = 86_400_000;
+  const now = 40 * day;
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-aggregate-retention-"));
+  const other = H("b");
+  const first = openStore(root, { projectFingerprint: PROJECT, now: () => now });
+  const second = openStore(root, { projectFingerprint: other, now: () => now });
+  const claim = (id, expiresAt) => makeAggregateClaim({
+    schemaVersion: SCHEMA_VERSION,
+    aggregateId: id,
+    claimType: "global-skill-candidate",
+    receiptType: "repeated-command",
+    signatureHash: H("c"),
+    incidentHash: id,
+    occurrenceCount: 1,
+    firstSeenDay: "2026-01-01",
+    lastSeenDay: "2026-01-01",
+    createdAt: day,
+    expiresAt,
+  });
+  first.appendAggregate(claim(H("1"), 20 * day));
+  second.appendAggregate(claim(H("2"), 50 * day));
+  const result = first.retain(now);
+  assert.equal(result.aggregates, 1);
+  assert.equal(result.indexes, 1);
+  assert.equal(existsSync(path.join(first.stateDir, "aggregate-contributions.json")), false);
+  assert.deepEqual(second.readAggregates({ scope: "project", includeExpired: true }).map((record) => record.aggregateId), [H("2")]);
+  first.close();
+  second.close();
 });
 
 test("corrupt and unknown-version records are quarantined without disabling the store", () => {
@@ -212,6 +493,16 @@ test("observation and proposal purge scopes retain audit and closed proposals", 
   assert.equal(store.readRecords("proposal").length, 1);
   assert.equal(store.readRecords("proposal")[0].payload.state, "rejected");
   assert.equal(store.readRecords("audit-event").length, 3);
+  store.close();
+});
+
+test("proposal purge removes every content chunk linked to a removed proposal", () => {
+  const { store } = fixture();
+  store.appendRecord(wrapRecord("proposal", proposal("pending"), 1_000));
+  store.appendRecord(contentChunk());
+  assert.equal(store.purge({ scope: "proposals" }).counts.proposals, 1);
+  assert.equal(store.readRecords("proposal-content").length, 0);
+  assert.doesNotMatch(JSON.stringify(store.exportAll()), /proposal-content/u);
   store.close();
 });
 
@@ -274,9 +565,416 @@ test("startup quarantines a truncated JSONL tail and preserves its valid prefix"
   reopened.close();
 });
 
+test("startup quarantines malformed decision intents and fails closed", () => {
+  for (const source of ["{not-json", JSON.stringify({ protocolVersion: 1 })]) {
+    const { root, store } = fixture();
+    const state = store.stateDir;
+    store.close();
+    writeFileSync(path.join(state, "decision-transaction.json"), source, { mode: 0o600 });
+    assert.throws(() => openStore(root, { projectFingerprint: PROJECT }));
+    assert.equal(existsSync(path.join(state, "decision-transaction.json")), false);
+    assert.equal(readdirSync(path.join(state, "quarantine")).some((name) => name.endsWith(".quarantined")), true);
+  }
+});
+
+test("startup quarantines a structurally valid newer decision intent and fails closed", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-newer-intent-"));
+  const store = openStore(root, {
+    projectFingerprint: PROJECT,
+    now: () => 2_000,
+    faultInjection(point) { if (point === "decision-after-intent-write") throw new Error("leave-intent"); },
+  });
+  store.appendRecord(wrapRecord("proposal", makeProposal({ ...proposal(), id: "newer-intent-proposal" }), 1_000));
+  const item = store.getRecord("proposal", "newer-intent-proposal").payload;
+  const change = makeDecision({ ...decision(), proposalId: item.id });
+  assert.equal(store.commitDecision(change).reason, "leave-intent");
+  const intentPath = path.join(store.stateDir, "decision-transaction.json");
+  const intent = JSON.parse(readFileSync(intentPath, "utf8"));
+  writeFileSync(intentPath, JSON.stringify({ ...intent, protocolVersion: 99 }), { mode: 0o600 });
+  store.close();
+  assert.throws(() => openStore(root, { projectFingerprint: PROJECT }), /unsupported-decision-transaction/u);
+  assert.equal(existsSync(intentPath), false);
+});
+
 test("fingerprints canonicalize remotes and migration rejects newer versions", () => {
-  assert.equal(projectFingerprintFor("https://GitHub.com/example/repo.git/", "/one"), projectFingerprintFor("https://github.com/example/repo", "/two"));
-  assert.equal(projectFingerprintFor("", "/tmp/project"), hashContent(path.resolve("/tmp/project")));
+  assert.equal(projectFingerprintFor("https://GitHub.com/example/repo.git/", "/one"), projectFingerprintFor("https://github.com/example/repo", "/one"));
+  assert.notEqual(projectFingerprintFor("https://github.com/example/repo", "/one"), projectFingerprintFor("https://github.com/example/repo", "/two"));
+  assert.equal(projectFingerprintFor("", "/tmp/project"), hashContent(JSON.stringify(["self-evolve-project-v1", "root", path.resolve("/tmp/project"), path.resolve("/tmp/project")])));
   assert.equal(migrate({ schemaVersion: "9.0.0" }), null);
   assert.equal(migrate({ schemaVersion: "0.1.0", global: {}, repo: {} }).schemaVersion, SCHEMA_VERSION);
+});
+
+test("server and TUI identity inputs resolve equally and isolate checkout locations", () => {
+  const remoteUrl = "git@GitHub.com:Example/Repo.git";
+  const cases = [
+    { label: "no remote", remoteUrl: "", worktree: "/tmp/identity/main" },
+    { label: "explicit remote", remoteUrl, worktree: "/tmp/identity/main" },
+    { label: "linked worktree", remoteUrl, worktree: "/tmp/identity/linked" },
+    { label: "separate clone", remoteUrl, worktree: "/tmp/identity/clone" },
+    { label: "relocated checkout", remoteUrl, worktree: "/tmp/relocated/main" },
+  ];
+  const fingerprints = new Map();
+  for (const item of cases) {
+    const server = resolveProjectIdentity({ remoteUrl: item.remoteUrl, worktreePath: item.worktree, directory: "/ignored/server-directory" });
+    const tui = resolveProjectIdentity({ remoteUrl: item.remoteUrl, worktreePath: item.worktree, directory: "/ignored/tui-directory" });
+    assert.equal(server.projectFingerprint, tui.projectFingerprint, item.label);
+    assert.equal(server.worktreePath, tui.worktreePath, item.label);
+    fingerprints.set(item.label, server.projectFingerprint);
+  }
+  assert.notEqual(fingerprints.get("explicit remote"), fingerprints.get("linked worktree"));
+  assert.notEqual(fingerprints.get("explicit remote"), fingerprints.get("separate clone"));
+  assert.notEqual(fingerprints.get("explicit remote"), fingerprints.get("relocated checkout"));
+});
+
+test("explicit project identity is validated against the shared derived inputs", () => {
+  const worktree = "/tmp/identity/explicit";
+  const remoteUrl = "https://github.com/example/repo.git";
+  const expected = projectFingerprintFor(remoteUrl, worktree);
+  assert.equal(resolveProjectIdentity({ projectFingerprint: expected, remoteUrl, worktreePath: worktree }).projectFingerprint, expected);
+  assert.throws(() => resolveProjectIdentity({ projectFingerprint: "not-a-fingerprint", remoteUrl, worktreePath: worktree }), /invalid-project-fingerprint/);
+  assert.throws(() => resolveProjectIdentity({ projectFingerprint: H("f"), remoteUrl, worktreePath: worktree }), /project-fingerprint-mismatch/);
+  assert.throws(() => resolveProjectIdentity({ remoteUrl }), /project-worktree-unavailable/);
+});
+
+test("legacy combined settings migrate once into global and repository files without merging projects", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-migrate-"));
+  const projectDir = path.join(root, "self-evolve", PROJECT);
+  const other = H("b");
+  const otherDir = path.join(root, "self-evolve", other);
+  mkdirSync(projectDir, { recursive: true });
+  mkdirSync(otherDir, { recursive: true });
+  const combined = (fingerprint, mode, excluded) => ({
+    schemaVersion: SCHEMA_VERSION,
+    projectName: `legacy-${fingerprint[0]}`,
+    global: makeGlobalSettings({ mode, createdAt: 1, updatedAt: 1 }),
+    repo: makeRepoSettings({ projectFingerprint: fingerprint, excluded }),
+  });
+  writeFileSync(path.join(projectDir, "settings.json"), JSON.stringify(combined(PROJECT, "auto", false)));
+  writeFileSync(path.join(otherDir, "settings.json"), JSON.stringify(combined(other, "yolo", true)));
+  writeFileSync(path.join(otherDir, "observations.jsonl"), "project-evidence-must-not-migrate\n");
+
+  const newFingerprint = H("c");
+  const first = openStore(root, { projectFingerprint: newFingerprint, now: () => 2 });
+  assert.equal(first.getSettings().global.mode, "auto");
+  assert.equal(first.getSettings().repo.projectFingerprint, newFingerprint);
+  first.close();
+  const second = openStore(root, { projectFingerprint: other, now: () => 2 });
+  assert.equal(second.getSettings().global.mode, "auto");
+  assert.equal(second.getSettings().repo.excluded, true);
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(path.join(otherDir, "settings.json"), "utf8"))).sort(), ["budgets", "consent", "excluded", "mode", "projectFingerprint", "schemaVersion"]);
+  assert.equal(existsSync(path.join(projectDir, "observations.jsonl")), false);
+  second.close();
+});
+
+test("real child processes serialize appends and duplicate IDs without lost records", async () => {
+  const { root, store } = fixture();
+  store.close();
+  const unique = await Promise.all(Array.from({ length: 12 }, (_, index) => runChild(root, PROJECT, "append", index)));
+  assert.equal(unique.every((result) => result.ok), true);
+  const duplicates = await Promise.all(Array.from({ length: 8 }, () => runChild(root, PROJECT, "append", "duplicate")));
+  assert.equal(duplicates.filter((result) => result.duplicate === false).length, 1);
+  const reopened = openStore(root, { projectName: "fixture", projectFingerprint: PROJECT });
+  assert.equal(reopened.readRecords("observation").length, 13);
+  reopened.close();
+});
+
+test("real child processes permit only one competing CAS transition", async () => {
+  const { root, store } = fixture(10_000);
+  store.appendRecord(wrapRecord("proposal", proposal(), 1_000));
+  store.close();
+  const results = await Promise.all([
+    runChild(root, PROJECT, "cas", "approved"),
+    runChild(root, PROJECT, "cas", "rejected"),
+  ]);
+  assert.equal(results.filter((result) => result.ok).length, 1);
+  assert.equal(results.filter((result) => result.reason === "stale-prior-state").length, 1);
+  const reopened = openStore(root, { projectName: "fixture", projectFingerprint: PROJECT });
+  assert.equal(reopened.readRecords("proposal").length, 2);
+  reopened.close();
+});
+
+for (const point of ["decision-after-intent-write", "decision-after-proposal-write", "decision-after-decision-write"]) {
+  test(`decision transaction recovers idempotently after process kill at ${point}`, async () => {
+    const { root, store } = fixture(2_000);
+    store.appendRecord(wrapRecord("proposal", makeProposal({ ...proposal(), id: "transaction-proposal" }), 1_000));
+    store.close();
+    await runKilledChild(TRANSACTION_CRASH_CHILD, [root, PROJECT, point]);
+
+    let reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 3_000, staleLockMs: 1 });
+    assert.equal(reopened.getRecord("proposal", "transaction-proposal").payload.state, "approved");
+    assert.equal(reopened.readRecords("proposal").filter((record) => record.payload.id === "transaction-proposal").length, 2);
+    assert.equal(reopened.readRecords("decision").filter((record) => record.payload.proposalId === "transaction-proposal").length, 1);
+    reopened.close();
+    reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 4_000, staleLockMs: 1 });
+    assert.equal(reopened.readRecords("proposal").filter((record) => record.payload.id === "transaction-proposal").length, 2);
+    assert.equal(reopened.readRecords("decision").filter((record) => record.payload.proposalId === "transaction-proposal").length, 1);
+    reopened.close();
+  });
+}
+
+for (const point of ["decision-before-content-compaction", "decision-after-content-compaction"]) {
+  test(`terminal decision recovery compacts content idempotently after process kill at ${point}`, async () => {
+    const { root, store } = fixture(2_000);
+    store.appendRecord(wrapRecord("proposal", makeProposal({ ...proposal(), id: "transaction-proposal" }), 1_000));
+    store.appendRecord(contentChunk("transaction-proposal"));
+    store.close();
+    await runKilledChild(TRANSACTION_CRASH_CHILD, [root, PROJECT, point, "rejected"]);
+
+    let reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 3_000, staleLockMs: 1 });
+    assert.equal(reopened.getRecord("proposal", "transaction-proposal").payload.state, "rejected");
+    assert.equal(reopened.readRecords("proposal-content").length, 0);
+    assert.doesNotMatch(readFileSync(path.join(reopened.stateDir, "proposals.jsonl"), "utf8"), /proposal-content/u);
+    reopened.close();
+    reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 4_000, staleLockMs: 1 });
+    assert.equal(reopened.readRecords("proposal-content").length, 0);
+    assert.equal(reopened.readRecords("decision").filter((record) => record.payload.proposalId === "transaction-proposal").length, 1);
+    reopened.close();
+  });
+}
+
+test("global settings written by one project process are fresh in another project process", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-global-"));
+  assert.equal((await runChild(root, PROJECT, "set-global", "auto")).mode, "auto");
+  assert.deepEqual(await runChild(root, H("b"), "read-global"), { mode: "auto" });
+  assert.equal(existsSync(path.join(root, "self-evolve", PROJECT, "settings.json")), true);
+  assert.equal(existsSync(path.join(root, "self-evolve", "global", "settings.json")), true);
+});
+
+test("real child settings updaters preserve unrelated global and repository fields", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-settings-cas-"));
+  const allowlist = path.join(root, "skills");
+  mkdirSync(allowlist);
+  const initial = openStore(root, { projectFingerprint: PROJECT, now: () => 1 });
+  initial.close();
+
+  let results = await Promise.all([
+    runChild(root, PROJECT, "update-global-mode", "auto"),
+    runChild(root, PROJECT, "update-global-consent", "true"),
+  ]);
+  assert.equal(results.every((result) => result.ok), true);
+  let reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 10 });
+  assert.equal(reopened.getSettings().global.mode, "auto");
+  assert.equal(reopened.getSettings().global.consent.sanitizedExcerpts, true);
+  reopened.close();
+
+  results = await Promise.all([
+    runChild(root, PROJECT, "update-global-pause", "true"),
+    runChild(root, PROJECT, "update-global-allowlist", allowlist),
+  ]);
+  assert.equal(results.every((result) => result.ok), true);
+  reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 20 });
+  assert.equal(reopened.getSettings().global.paused, true);
+  assert.deepEqual(reopened.getSettings().global.allowedSkillRoots, [allowlist]);
+  reopened.close();
+
+  results = await Promise.all([
+    runChild(root, PROJECT, "update-repo-mode", "manual"),
+    runChild(root, PROJECT, "update-repo-excluded", "true"),
+  ]);
+  assert.equal(results.every((result) => result.ok), true);
+  reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 30 });
+  assert.equal(reopened.getSettings().repo.mode, "manual");
+  assert.equal(reopened.getSettings().repo.excluded, true);
+  reopened.close();
+});
+
+test("settings CAS reports stale versions without invoking the mutator", () => {
+  const { store } = fixture(100);
+  let called = false;
+  const result = store.updateGlobalSettings(() => { called = true; }, { expectedGlobalUpdatedAt: 99 });
+  assert.deepEqual(result, { ok: false, reason: "stale-settings-version" });
+  assert.equal(called, false);
+  store.close();
+});
+
+test("one project quota covers settings, records, indexes, leases, quarantine, and snapshots", () => {
+  const { root, store } = fixture(100);
+  assert.equal(store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, budgets: { ...repo.budgets, storageQuotaMiB: 1 } })).ok, true);
+  const state = path.join(root, "self-evolve", PROJECT);
+  writeFileSync(path.join(state, "quarantine", "seed.quarantined"), "q".repeat(350_000));
+  writeFileSync(path.join(state, "leases", "seed.lock"), "l".repeat(350_000));
+  writeFileSync(path.join(state, "aggregate-contributions.json"), JSON.stringify({ schemaVersion: SCHEMA_VERSION, aggregateIds: [] }).padEnd(350_000, " "));
+  assert.throws(() => store.writeSnapshot("quota.before", "s".repeat(280_000)), /storage-quota-exceeded/);
+  assert.equal(store.appendRecord(wrapRecord("observation", observation(100, H("9")), 100)).reason, "storage-quota-exceeded");
+  store.close();
+});
+
+test("project quota and export reject symlink-following", () => {
+  const { root, store } = fixture();
+  const outside = path.join(root, "outside");
+  writeFileSync(outside, "outside");
+  symlinkSync(outside, path.join(store.snapshotRoot, "linked.before"));
+  assert.throws(() => store.getProjectUsage(), /storage-symlink-rejected/);
+  assert.throws(() => store.exportAll(), /storage-symlink-rejected|export-symlink-rejected/);
+  store.close();
+});
+
+test("bridge export enforces per-class bounds and rejects bridge symlinks", () => {
+  const { root, store } = fixture();
+  const bridge = path.join(root, "self-evolve", "bridge", PROJECT);
+  const controls = path.join(bridge, "control-responses");
+  mkdirSync(controls, { recursive: true });
+  const oversized = path.join(controls, "oversized.json");
+  writeFileSync(oversized, JSON.stringify({ ok: true }).padEnd(4 * 1024 + 1, " "));
+  assert.throws(() => store.exportAll(), /export-size-exceeded/);
+  rmSync(oversized);
+  const outside = path.join(root, "outside-control.json");
+  writeFileSync(outside, JSON.stringify({ ok: true }));
+  symlinkSync(outside, path.join(controls, "linked.json"));
+  assert.throws(() => store.exportAll(), /storage-symlink-rejected|export-symlink-rejected/);
+  store.close();
+});
+
+test("exports reject hard-linked snapshots and unknown bridge metadata", () => {
+  const { root, store } = fixture();
+  const outside = path.join(root, "outside-snapshot");
+  writeFileSync(outside, "SECRET-CANARY");
+  linkSync(outside, path.join(store.snapshotRoot, "linked.before"));
+  assert.throws(() => store.exportAll(), /hardlink-rejected/);
+  rmSync(path.join(store.snapshotRoot, "linked.before"));
+
+  const requestDir = path.join(root, "self-evolve", "bridge", PROJECT, "requests");
+  mkdirSync(requestDir, { recursive: true });
+  const request = createDecisionRequest({
+    projectFingerprint: PROJECT,
+    proposal: {
+      id: "export-invalid",
+      skillTarget: { canonicalRoot: "/skills", relativePath: "demo/SKILL.md", currentHash: CURRENT },
+      proposedContentHash: PROPOSED,
+      decisionVersion: 0,
+      state: "pending",
+      decisionNonce: "export-invalid-nonce",
+    },
+    newState: "rejected",
+    timestamp: 10_000,
+    requestId: "export-invalid",
+  });
+  writeFileSync(path.join(requestDir, "export-invalid.json"), JSON.stringify({ ...request, rawUnrelatedSecret: "SECRET-BRIDGE" }));
+  assert.throws(() => store.exportAll(), /unknown-field/);
+  store.close();
+});
+
+test("export rejects a regular record file replaced after inventory capture", (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-export-race-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const recordPath = path.join(root, "self-evolve", PROJECT, "observations.jsonl");
+  let replaced = false;
+  const store = openStore(root, {
+    projectFingerprint: PROJECT,
+    now: () => 10_000,
+    faultInjection(point) {
+      if (point !== "export-after-inventory" || replaced) return;
+      replaced = true;
+      renameSync(recordPath, `${recordPath}.captured`);
+      writeFileSync(recordPath, `${JSON.stringify(wrapRecord("observation", observation(10_000, H("9")), 10_000))}\n`);
+    },
+  });
+  assert.equal(store.appendRecord(wrapRecord("observation", observation(10_000), 10_000)).ok, true);
+  assert.throws(() => store.exportAll(), /export-file-replaced|export-tree-replaced/);
+  store.close();
+});
+
+test("export all archives two partitions, global aggregates, bridge metadata, indexes, and classified snapshots", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-export-all-"));
+  const other = H("b");
+  const first = openStore(root, { projectFingerprint: PROJECT, now: () => 10_000 });
+  const second = openStore(root, { projectFingerprint: other, now: () => 10_000 });
+  first.writeSnapshot("first.before", "# first skill snapshot\n");
+  second.writeSnapshot("second.before", "# second skill snapshot\n");
+  first.appendRecord(wrapRecord("observation", observation(10_000), 10_000));
+  const aggregate = makeAggregateClaim({
+    schemaVersion: SCHEMA_VERSION,
+    aggregateId: H("7"), claimType: "global-skill-candidate", receiptType: "repeated-command",
+    signatureHash: H("8"), incidentHash: H("9"), occurrenceCount: 1,
+    firstSeenDay: "1970-01-01", lastSeenDay: "1970-01-01", createdAt: 10_000, expiresAt: 20_000,
+  });
+  assert.equal(first.appendAggregate(aggregate).ok, true);
+  const requestDir = path.join(root, "self-evolve", "bridge", other, "requests");
+  const responseDir = path.join(root, "self-evolve", "bridge", other, "responses");
+  const controlRequestDir = path.join(root, "self-evolve", "bridge", other, "control-requests");
+  const controlResponseDir = path.join(root, "self-evolve", "bridge", other, "control-responses");
+  mkdirSync(requestDir, { recursive: true });
+  mkdirSync(responseDir, { recursive: true });
+  mkdirSync(controlRequestDir, { recursive: true });
+  mkdirSync(controlResponseDir, { recursive: true });
+  const exportedProposal = {
+    id: "export-proposal",
+    skillTarget: { canonicalRoot: "/skills", relativePath: "demo/SKILL.md", currentHash: CURRENT },
+    proposedContentHash: PROPOSED,
+    decisionVersion: 0,
+    state: "pending",
+    decisionNonce: "export-decision-nonce",
+  };
+  const decisionRequest = createDecisionRequest({ projectFingerprint: other, proposal: exportedProposal, newState: "rejected", timestamp: 10_000, requestId: "request" });
+  const decisionResponse = makeBridgeResponse({ schemaVersion: SCHEMA_VERSION, requestId: "request", projectFingerprint: other, proposalId: exportedProposal.id, ok: true, status: "accepted", processedAt: 10_000, reason: null, recovered: false });
+  const exportedControlState = {
+    schemaVersion: SCHEMA_VERSION,
+    projectFingerprint: other,
+    actor: "self-evolve-integration",
+    issuedAt: 10_000,
+    expiresAt: 20_000,
+    settingsUpdatedAt: 10_000,
+    settingsVersion: H("5"),
+    stateRootIdentity: H("6"),
+    nonce: "export-control-nonce",
+    mode: "manual",
+    effectiveMode: "manual",
+    allowedSkillRoots: [],
+    consent: { passiveCalls: false, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false },
+    repoExcluded: false,
+  };
+  const controlRequest = createControlRequest({ controlState: exportedControlState, action: "set-mode", payload: { mode: "auto" }, timestamp: 10_000, requestId: "control" });
+  const controlResponse = makeControlResponse({ schemaVersion: SCHEMA_VERSION, requestId: "control", projectFingerprint: other, ok: true, status: "accepted", processedAt: 10_000, reason: null });
+  writeFileSync(path.join(requestDir, "request.json"), JSON.stringify(decisionRequest));
+  writeFileSync(path.join(responseDir, "request.json"), JSON.stringify(decisionResponse));
+  writeFileSync(path.join(controlRequestDir, "control.json"), JSON.stringify(controlRequest));
+  writeFileSync(path.join(controlResponseDir, "control.json"), JSON.stringify(controlResponse));
+  writeFileSync(path.join(root, "self-evolve", "bridge", other, "control-state.json"), JSON.stringify(exportedControlState));
+
+  const archive = first.exportAll();
+  assert.equal(archive.exportScope, "all");
+  assert.equal(archive.classification, "sensitive-self-evolve-archive");
+  assert.deepEqual(archive.projects.map((project) => project.projectFingerprint).sort(), [PROJECT, other].sort());
+  assert.equal(archive.global.aggregates.length, 1);
+  assert.equal(archive.projects.every((project) => project.snapshots[0].classification === "sensitive-skill-snapshot"), true);
+  assert.equal(archive.projects.find((project) => project.projectFingerprint === PROJECT).indexes.aggregateContributions.length, 1);
+  const bridge = archive.bridge.find((item) => item.projectFingerprint === other);
+  assert.equal(bridge.requests[0].metadata.requestId, "request");
+  assert.equal(bridge.requests[0].classification, "sensitive-decision-request-metadata");
+  assert.equal(bridge.responses[0].classification, "sensitive-decision-response-metadata");
+  assert.equal(bridge.controlRequests[0].metadata.action, "set-mode");
+  assert.equal(bridge.controlRequests[0].classification, "sensitive-control-request-metadata");
+  assert.equal(bridge.controlResponses[0].classification, "sensitive-control-response-metadata");
+  assert.equal(bridge.controlState.metadata.mode, "manual");
+  assert.equal(bridge.controlState.classification, "sensitive-control-state-metadata");
+  assert.equal([bridge.requests[0], bridge.responses[0], bridge.controlRequests[0], bridge.controlResponses[0], bridge.controlState].every((item) => Number.isSafeInteger(item.bytes) && item.bytes > 0), true);
+  assert.doesNotMatch(JSON.stringify(archive), /rawMessage|transcript/u);
+  first.close();
+  second.close();
+});
+
+test("already-open project stores re-read global settings on every get", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-fresh-"));
+  const first = openStore(root, { projectFingerprint: PROJECT, now: () => 1 });
+  const second = openStore(root, { projectFingerprint: H("b"), now: () => 2 });
+  const global = first.getSettings().global;
+  first.setGlobalSettings(makeGlobalSettings({ ...global, mode: "yolo", updatedAt: 3 }));
+  assert.equal(second.getSettings().global.mode, "yolo");
+  first.close();
+  second.close();
+});
+
+test("stale dead-owner locks recover while stale live-owner locks time out", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-lock-"));
+  const lock = path.join(root, ".self-evolve-mutation.lock");
+  const crashed = await runChild(root, PROJECT, "crash-lock");
+  assert.equal(crashed.ok, true);
+  const recovered = openStore(root, { projectFingerprint: PROJECT, staleLockMs: 1, lockTimeoutMs: 500 });
+  recovered.close();
+
+  writeFileSync(lock, JSON.stringify({ pid: process.pid, nonce: "live", acquiredAt: 0 }), { mode: 0o600 });
+  utimesSync(lock, new Date(0), new Date(0));
+  assert.throws(() => openStore(root, { projectFingerprint: PROJECT, staleLockMs: 1, lockTimeoutMs: 30 }), /mutation-lock-timeout/);
+  assert.equal(existsSync(lock), true);
+  rmSync(lock);
 });

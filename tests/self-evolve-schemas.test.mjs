@@ -42,7 +42,9 @@ function proposal(overrides = {}) {
 }
 
 function decision(current, newState, overrides = {}) {
-  const actor = ["applied", "rolled-back"].includes(newState) ? "self-evolve-applier" : "human-reviewer";
+  const actor = current.state === "critic-pending" && newState === "pending"
+    ? "self-evolve-critic"
+    : ["applied", "rolled-back"].includes(newState) ? "self-evolve-applier" : "human-reviewer";
   return schemas.makeDecision({
     proposalId: current.id,
     targetHash: current.skillTarget.currentHash,
@@ -64,6 +66,7 @@ function observation(overrides = {}) {
     receiptIds: [H("2")],
     structuredFields: { receiptType: "repeated-command", scopeFingerprint: SCOPE, occurrences: 2, messageCount: 4 },
     incidentId: "incident-1",
+    sessionLineageHash: H("3"),
     createdAt: 150,
     injectionFlagged: false,
     redacted: true,
@@ -137,6 +140,28 @@ test("settings enforce versions, canonical roots, booleans, retention, and budge
   assert.throws(() => globalSettings({ allowedSkillRoots: Array.from({ length: 33 }, (_, i) => `/skills/${i}`) }), /out-of-bounds/);
 });
 
+test("global aggregate claims use an exact bounded versioned allowlist", () => {
+  const claim = schemas.makeAggregateClaim({
+    schemaVersion: schemas.SCHEMA_VERSION,
+    aggregateId: H("1"),
+    claimType: "global-skill-candidate",
+    receiptType: "repeated-command",
+    signatureHash: H("2"),
+    incidentHash: H("3"),
+    occurrenceCount: 2,
+    firstSeenDay: "2026-07-01",
+    lastSeenDay: "2026-07-22",
+    createdAt: 100,
+    expiresAt: 200,
+  });
+  assert.deepEqual(Object.keys(claim), schemas.AggregateClaim.fields);
+  assert.ok(Object.isFrozen(claim));
+  assert.throws(() => schemas.makeAggregateClaim({ ...claim, rawText: "secret" }), /unexpected field/);
+  assert.throws(() => schemas.makeAggregateClaim({ ...claim, claimType: "unknown" }), /invalid-enum/);
+  assert.throws(() => schemas.makeAggregateClaim({ ...claim, firstSeenDay: "2026-02-30" }), /UTC day/);
+  assert.throws(() => schemas.makeAggregateClaim({ ...claim, expiresAt: 100 }), /expire after creation/);
+});
+
 test("record envelopes are canonical, content-addressed, versioned, and corruption detecting", () => {
   const first = schemas.wrapRecord("proposal", proposal(), 300);
   const reordered = schemas.wrapRecord("proposal", { ...proposal() }, 999);
@@ -186,7 +211,14 @@ test("mode transitions update the requested scope, preserve precedence, and audi
 });
 
 test("episode cursor debounces idle events, rejects leases and out-of-order starts", () => {
-  const cursor = schemas.makeEpisodeCursor({ sessionID: "session-1" });
+  const cursor = schemas.makeEpisodeCursor({ sessionIDHash: H("1") });
+  assert.deepEqual(cursor, {
+    sessionIDHash: H("1"),
+    lastIdleAt: 0,
+    lastObservedMessageHash: null,
+    leaseNonce: null,
+  });
+  assert.throws(() => schemas.makeEpisodeCursor({ sessionID: "session-1" }), /unexpected field/);
   assert.equal(schemas.canStartEpisode(cursor, 100, 1500), true);
   const active = schemas.beginEpisode(cursor, 100, "lease-1");
   assert.equal(active.leaseNonce, "lease-1");
@@ -217,6 +249,8 @@ test("observation accepts only fixed typed primitives and rejects raw bodies or 
   assert.equal(observation().redacted, true);
   assert.throws(() => observation({ rawMessageBody: "secret text" }), /unexpected field/);
   assert.throws(() => observation({ transcript: "complete transcript" }), /unexpected field/);
+  assert.throws(() => observation({ sessionID: "raw-host-session" }), /unexpected field/);
+  assert.throws(() => observation({ sessionLineageHash: "raw-host-session" }), /invalid-sha256/);
   assert.throws(() => observation({ structuredFields: { ...observation().structuredFields, rawMessageBody: "secret" } }), /privacy-field-rejected/);
   assert.throws(() => observation({ structuredFields: { ...observation().structuredFields, transcript: ["secret"] } }), /privacy-field-rejected/);
   assert.throws(() => observation({ structuredFields: { eventKind: { nested: "not primitive" } } }), /malformed-string/);
@@ -234,8 +268,33 @@ test("proposal enforces rationale, target, critic, hashes, state, and coordinati
   assert.throws(() => proposal({ burnedNonceHashes: Array(129).fill(H("1")) }), /out-of-bounds/);
 });
 
+test("proposal content and synthesis admission records have exact bounded structural linkage", () => {
+  const content = schemas.makeProposalContent({
+    proposalId: "proposal-1", contentHash: PROPOSED, contentEncoding: "base64",
+    chunkIndex: 0, chunkCount: 2, content: "YWJj",
+  });
+  const attempt = schemas.makeSynthesisAttempt({
+    outcomeId: H("f"), proposalId: "proposal-1", projectFingerprint: PROJECT,
+    clusterId: CLUSTER, targetHash: CURRENT, admittedAt: 100, state: "admitted",
+  });
+  assert.equal(schemas.wrapRecord("proposal-content", content, 100).kind, "proposal-content");
+  assert.equal(schemas.wrapRecord("synthesis-attempt", attempt, 100).kind, "synthesis-attempt");
+  assert.throws(() => schemas.makeProposalContent({ ...content, content: "not base64!" }), /content must be base64/u);
+  assert.throws(() => schemas.makeProposalContent({ ...content, proposalId: undefined }), /missing proposalId|empty-string|malformed-string/u);
+  assert.throws(() => schemas.makeSynthesisAttempt({ ...attempt, state: "complete" }), /invalid-enum/u);
+  assert.throws(() => schemas.makeSynthesisAttempt({ ...attempt, rawPrompt: "forbidden" }), /unexpected field rawPrompt/u);
+});
+
+test("new-skill proposal and decision schemas accept only the exact must-not-exist sentinel", () => {
+  const item = proposal({ skillTarget: { canonicalRoot: "/skills", relativePath: "new-skill/SKILL.md", currentHash: "must-not-exist" } });
+  assert.equal(schemas.makeProposal(item).skillTarget.currentHash, "must-not-exist");
+  assert.equal(decision(item, "approved").targetHash, "must-not-exist");
+  assert.throws(() => schemas.makeProposal({ ...item, skillTarget: { ...item.skillTarget, currentHash: "MUST-NOT-EXIST" } }), /invalid-sha256/u);
+});
+
 test("every allowed proposal state transition succeeds and emits a decision audit", () => {
   const edges = {
+    "critic-pending": ["pending", "failed-closed"],
     pending: ["approved", "rejected", "superseded", "failed-closed"],
     approved: ["applied", "superseded", "failed-closed"],
     applied: ["rolled-back", "failed-closed"],
@@ -266,6 +325,8 @@ test("proposal CAS rejects stale, duplicate, replayed, out-of-order, unauthorize
 
   const unauthorized = schemas.transitionProposalState(proposal({ state: "approved" }), decision(proposal({ state: "approved" }), "applied", { actor: "human-reviewer" }), 201);
   assert.match(unauthorized.error, /unauthorized-actor/);
+  const unauthorizedCriticCompletion = schemas.transitionProposalState(proposal({ state: "critic-pending" }), decision(proposal({ state: "critic-pending" }), "pending", { actor: "human-reviewer" }), 201);
+  assert.match(unauthorizedCriticCompletion.error, /unauthorized-actor/);
 
   const future = schemas.transitionProposalState(current, decision(current, "approved", { timestamp: 300 }), 201);
   assert.match(future.error, /out-of-order/);
@@ -373,7 +434,7 @@ test("mode authority matrix never applies manual, requires auto decision, and ga
   assert.deepEqual(schemas.evaluateApplyAuthority({ mode: "manual", decisionApproved: true, allowlisted: true, releaseGatesPassed: true }), { allowed: false, reason: "manual-advisory-only" });
   assert.deepEqual(schemas.evaluateApplyAuthority({ mode: "auto" }), { allowed: false, reason: "decision-required" });
   assert.deepEqual(schemas.evaluateApplyAuthority({ mode: "auto", decisionApproved: true }), { allowed: true, reason: "explicit-decision" });
-  assert.deepEqual(schemas.evaluateApplyAuthority({ mode: "auto", decisionApproved: true, headless: true }), { allowed: false, reason: "auto-headless-prohibited" });
+  assert.deepEqual(schemas.evaluateApplyAuthority({ mode: "auto", decisionApproved: true, headless: true }), { allowed: true, reason: "explicit-decision" });
   assert.deepEqual(schemas.evaluateApplyAuthority({ mode: "yolo", allowlisted: false, releaseGatesPassed: true }), { allowed: false, reason: "scope-not-allowlisted" });
   assert.deepEqual(schemas.evaluateApplyAuthority({ mode: "yolo", allowlisted: true, releaseGatesPassed: false }), { allowed: false, reason: "release-gates-failed" });
   assert.deepEqual(schemas.evaluateApplyAuthority({ mode: "yolo", allowlisted: true, releaseGatesPassed: true, headless: true }), { allowed: true, reason: "yolo-release-gates-passed" });
@@ -415,6 +476,20 @@ test("audit, rollback, and intervention records enforce bounded strings and hash
   const epoch = schemas.makeInterventionEpoch({ epochId: "epoch-1", startedAt: 10, reason: "circuit breaker opened" });
   assert.equal(epoch.epochId, "epoch-1");
   assert.throws(() => schemas.makeInterventionEpoch({ ...epoch, epochId: "x".repeat(129) }), /out-of-bounds/);
+});
+
+test("synthesis outcome audits enforce exact terminal status and success semantics", () => {
+  const event = schemas.makeSynthesisOutcomeAuditEvent({
+    outcomeId: H("3"), projectFingerprint: PROJECT, clusterId: CLUSTER,
+    status: "no-change", success: true, terminalAt: 300, reasonCode: "valid-no-change",
+  });
+  assert.deepEqual(schemas.parseSynthesisOutcomeAuditEvent(event), event.details);
+  assert.throws(() => schemas.makeSynthesisOutcomeAuditEvent({
+    outcomeId: H("4"), projectFingerprint: PROJECT, clusterId: CLUSTER,
+    status: "failed", success: true, terminalAt: 300, reasonCode: "synthesis-failed",
+  }), /invalid-synthesis-outcome-success/u);
+  assert.equal(schemas.parseSynthesisOutcomeAuditEvent({ ...event, actor: "fixture" }), null);
+  assert.equal(schemas.parseSynthesisOutcomeAuditEvent({ ...event, details: { ...event.details, extra: "ignored" } }), null);
 });
 
 test("circuit breaker trips, retrips, resets, and rejects inconsistent metadata", () => {

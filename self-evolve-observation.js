@@ -6,6 +6,7 @@ import {
   makeObservation,
   makeReceipt,
   recordIncident,
+  UNKNOWN_SESSION_LINEAGE_HASH,
 } from "./self-evolve-schemas.js";
 
 const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F-\u009F]/gu;
@@ -64,6 +65,18 @@ export function normalizeForSignature(text) {
 
 export function hashSignature(normalizedText) {
   return createHash("sha256").update(String(normalizedText)).digest("hex");
+}
+
+export function hashSessionLineage(sessionID) {
+  if (typeof sessionID !== "string" || !sessionID) throw new TypeError("session-id-required");
+  return hashSignature(`self-evolve-session-lineage-v1\n${sessionID}`);
+}
+
+export function hashMessageCursor(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) throw new TypeError("message-required");
+  const hostID = message.id ?? message.info?.id ?? message.message?.id;
+  if (typeof hostID === "string" && hostID) return hashSignature(`self-evolve-message-id-v1\n${hostID}`);
+  return hashSignature(`self-evolve-message-fallback-v1\n${JSON.stringify(message)}`);
 }
 
 function signature(kind, value) {
@@ -180,6 +193,7 @@ function observationInput(value, signatureHash, incidentId) {
     receiptIds: [signatureHash],
     structuredFields: value.structuredFields,
     incidentId,
+    sessionLineageHash: value.sessionLineageHash ?? UNKNOWN_SESSION_LINEAGE_HASH,
     createdAt: value.createdAt,
     injectionFlagged: value.injectionFlagged || injectionHeuristic(value).flagged,
     redacted: value.redacted,
@@ -187,7 +201,7 @@ function observationInput(value, signatureHash, incidentId) {
 }
 
 function incidentRoot(observation) {
-  return observation.childSessionParentID || observation.quotedIncidentId || observation.sessionID || observation.incidentId;
+  return observation.childSessionParentID || observation.quotedIncidentId || observation.incidentId;
 }
 
 export function correlateObservations(observations) {
@@ -236,7 +250,7 @@ export function correlateObservations(observations) {
       group.cluster = recorded.state;
       group.incidents.set(root, {
         createdAt: observation.createdAt,
-        sessionID: value.sessionID || value.childSessionParentID || root,
+        sessionLineageHash: observation.sessionLineageHash,
       });
     }
   }
@@ -286,7 +300,7 @@ export function evaluateEligibility(clusters, thresholds = {}) {
     if (!metadata) {
       place(false, "correlationMetadata", true, "correlation-metadata-unavailable");
     } else {
-      const distinctSessions = new Set(metadata.incidents.map((item) => item.sessionID)).size;
+      const distinctSessions = new Set(metadata.incidents.map((item) => item.sessionLineageHash ?? UNKNOWN_SESSION_LINEAGE_HASH)).size;
       const now = thresholds.now ?? cluster.lastSeenAt;
       const freshCount = metadata.incidents.filter((item) => item.createdAt <= now && now - item.createdAt <= retentionMs).length;
       const freshnessRatio = metadata.incidents.length ? freshCount / metadata.incidents.length : 0;

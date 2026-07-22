@@ -67,6 +67,15 @@ export function assertNoForbiddenImports(file, source) {
   if (forbidden.length) fail(`${file} imports prohibited runtime modules: ${[...new Set(forbidden)].join(", ")}`);
 }
 
+export function assertServerEntryContract(source) {
+  const defaultExports = source.match(/\bexport\s+default\b/gu) ?? [];
+  const namedExports = source.match(/\bexport\s+(?:const|let|var|function|class|\{)/gu) ?? [];
+  if (defaultExports.length !== 1 || namedExports.length !== 0) fail("Server entry must expose exactly one default export and no named exports");
+  if (/(?:@opencode-ai\/plugin\/tui|@opentui\/|["']\.\/(?:self-evolve-)?tui(?:\.js)?["'])/u.test(source)) {
+    fail("Server entry imports a prohibited TUI/OpenTUI target");
+  }
+}
+
 function parsePackResult(stdout) {
   let result;
   try {
@@ -97,6 +106,7 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
       if (!file.endsWith(".js")) continue;
       assertNoForbiddenImports(file, readFileSync(path.join(extractDir, "package", file), "utf8"));
     }
+    assertServerEntryContract(readFileSync(path.join(extractDir, "package", "self-evolve.js"), "utf8"));
 
     const consumerDir = path.join(tempRoot, "consumer");
     mkdirSync(consumerDir);
@@ -108,6 +118,7 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
     const smoke = [
       `const server = await import(${JSON.stringify(packageJSON.name)});`,
       `if (typeof server.default !== "function") throw new Error("server default export is not a Plugin factory");`,
+      `if (Object.keys(server).join(",") !== "default") throw new Error("server target exposes named exports");`,
       `const tui = await import(${JSON.stringify(`${packageJSON.name}/tui`)});`,
       `if (!tui.default || typeof tui.default.tui !== "function") throw new Error("TUI default export does not have TuiPluginModule shape");`,
     ].join("\n");

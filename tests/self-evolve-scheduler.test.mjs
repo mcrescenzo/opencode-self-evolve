@@ -1,13 +1,30 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { hashSessionLineage } from "../self-evolve-observation.js";
 import { createScheduler } from "../self-evolve-scheduler.js";
+import { openStore } from "../self-evolve-store.js";
 
 const H = (character) => character.repeat(64);
 const PROJECT = H("a");
 const SCOPE = H("b");
+const RESERVATION_CHILD = fileURLToPath(new URL("./fixtures/passive-provider-reservation.mjs", import.meta.url));
+
+function runReservationChild(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [RESERVATION_CHILD, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(`reservation-child-failed:${code}:${stderr}`)));
+  });
+}
 
 function wait(ms = 20) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -153,15 +170,14 @@ test("compaction is audited but does not schedule", async (t) => {
   scheduler.dispose();
 });
 
-test("child session charges the parent budget identity once", async (t) => {
+test("scheduler cycles do not consume passive provider slots", async (t) => {
   const { scheduler, work, records } = fixture(t);
   await scheduler.handleEvent(idle("child", { parentID: "parent" }));
   await waitFor(() => work.length === 1, "child work");
   const passive = (records.get("audit-event") ?? []).filter((record) =>
     record.payload.details.action === "scheduler-budget" && record.payload.details.budgetType === "passive");
-  assert.equal(passive.length, 1);
-  assert.equal(passive[0].payload.details.rootSessionID, "parent");
-  assert.equal(scheduler.runBudgetCheck().passiveCallsRemainingToday, 5);
+  assert.equal(passive.length, 0);
+  assert.equal(scheduler.runBudgetCheck().passiveCallsRemainingThisHour, 6);
   scheduler.dispose();
 });
 
@@ -169,7 +185,8 @@ test("scheduler reserves a cursor without durably advancing it", async (t) => {
   const { scheduler, work, records } = fixture(t);
   await scheduler.handleEvent(idle("cursor"));
   await waitFor(() => work.length === 1, "cursor work");
-  assert.equal(work[0].cursor.sessionID, "cursor");
+  assert.equal(work[0].cursor.sessionIDHash, hashSessionLineage("cursor"));
+  assert.equal(JSON.stringify(work[0].cursor).includes("cursor"), false);
   assert.equal(work[0].cursor.leaseNonce, work[0].leaseNonce);
   assert.equal(records.get("episode-cursor")?.length ?? 0, 0);
   scheduler.dispose();
@@ -221,16 +238,90 @@ test("manual mode returns without scheduling or durable writes", async (t) => {
   scheduler.dispose();
 });
 
-test("seventh passive call in an hour is refused", async (t) => {
-  const { scheduler, work, calls } = fixture(t);
-  for (let index = 0; index < 7; index += 1) {
-    await scheduler.handleEvent(idle(`budget-${index}`));
-    await wait(10);
-  }
-  assert.equal(work.length, 6);
-  assert.equal(calls.acquire.length, 6);
-  assert.equal(scheduler.runBudgetCheck().passiveCallsRemainingToday, 0);
+test("six passive provider slots are the hard hourly ceiling", (t) => {
+  const { scheduler, records } = fixture(t);
+  assert.equal(scheduler.reservePassiveProviderCalls(2, { rootSessionID: "parent" }).ok, true);
+  assert.equal(scheduler.reservePassiveProviderCalls(2, { rootSessionID: "parent" }).ok, true);
+  assert.equal(scheduler.reservePassiveProviderCalls(2, { rootSessionID: "parent" }).ok, true);
+  assert.deepEqual(scheduler.reservePassiveProviderCalls(1, { rootSessionID: "parent" }), {
+    ok: false,
+    reason: "passive-provider-budget-exhausted",
+    requested: 1,
+    remaining: 0,
+  });
+  const passive = (records.get("audit-event") ?? []).filter((record) =>
+    record.payload.details.action === "scheduler-budget" && record.payload.details.budgetType === "passive");
+  assert.equal(passive.length, 6, "durable audit count equals reserved provider slots");
+  assert.equal(passive.every((record) => record.payload.details.rootSessionIDHash === hashSessionLineage("parent")), true);
+  assert.equal(scheduler.runBudgetCheck().passiveCallsRemainingThisHour, 0);
   scheduler.dispose();
+});
+
+test("one remaining passive slot cannot reserve a two-call operation", (t) => {
+  const { scheduler, records } = fixture(t);
+  assert.equal(scheduler.reservePassiveProviderCalls(5, { rootSessionID: "pair" }).ok, true);
+  assert.deepEqual(scheduler.reservePassiveProviderCalls(2, { rootSessionID: "pair" }), {
+    ok: false,
+    reason: "passive-provider-budget-insufficient",
+    requested: 2,
+    remaining: 1,
+  });
+  assert.equal(actions(records, "scheduler-budget").filter((record) => record.payload.details.budgetType === "passive").length, 5);
+  scheduler.dispose();
+});
+
+test("passive reservations re-read the configured budget under the reservation lease", (t) => {
+  const { scheduler, settings } = fixture(t);
+  assert.equal(scheduler.reservePassiveProviderCalls(2, { rootSessionID: "fresh-settings" }).ok, true);
+  settings.global.budgets.passiveCallsPerHour = 2;
+  assert.deepEqual(scheduler.reservePassiveProviderCalls(1, { rootSessionID: "fresh-settings" }), {
+    ok: false,
+    reason: "passive-provider-budget-exhausted",
+    requested: 1,
+    remaining: 0,
+  });
+  scheduler.dispose();
+});
+
+test("uncertain reservation persistence fails closed and charges only confirmed slots", (t) => {
+  const { scheduler, store, records } = fixture(t);
+  const appendRecord = store.appendRecord.bind(store);
+  let passiveWrites = 0;
+  store.appendRecord = (envelope) => {
+    if (envelope.payload?.details?.action === "scheduler-budget" && envelope.payload.details.budgetType === "passive") {
+      passiveWrites += 1;
+      if (passiveWrites === 2) return { ok: false, reason: "injected-reservation-write-failure" };
+    }
+    return appendRecord(envelope);
+  };
+  assert.deepEqual(scheduler.reservePassiveProviderCalls(2, { rootSessionID: "partial-write" }), {
+    ok: false,
+    reason: "injected-reservation-write-failure",
+  });
+  assert.equal(actions(records, "scheduler-budget").filter((record) => record.payload.details.budgetType === "passive").length, 1);
+  scheduler.dispose();
+});
+
+test("concurrent process reservations cannot exceed the durable cap", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-passive-process-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const clock = 2_200_000_000_000;
+  const store = openStore(root, { projectName: "passive-process", projectFingerprint: PROJECT, now: () => clock });
+  const scheduler = createScheduler({ store, budgets: { passiveCallsPerHour: 6 }, now: () => clock, enqueueWork() {} });
+  assert.equal(scheduler.reservePassiveProviderCalls(4, { rootSessionID: "seed" }).ok, true);
+  scheduler.dispose();
+  store.close();
+
+  const results = await Promise.all([
+    runReservationChild([root, PROJECT, String(clock), "two"]),
+    runReservationChild([root, PROJECT, String(clock), "two"]),
+  ]);
+  const readback = openStore(root, { projectName: "passive-process", projectFingerprint: PROJECT, now: () => clock });
+  const passive = readback.readRecords("audit-event").filter((record) =>
+    record.payload.details.action === "scheduler-budget" && record.payload.details.budgetType === "passive");
+  assert.equal(results.filter((result) => result.ok).length, 1);
+  assert.equal(passive.length, 6);
+  readback.close();
 });
 
 test("quiet hours suppress new work", async (t) => {

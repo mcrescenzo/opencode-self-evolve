@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   makeAuditEvent,
   makeDecision,
+  makeGlobalSettings,
   makeObservation,
   makeProposal,
   wrapRecord,
@@ -30,10 +33,41 @@ const PROPOSED = H("e");
 const CLUSTER = H("f");
 const DAY = 86_400_000;
 const NOW = 120 * DAY;
+const CHILD = fileURLToPath(new URL("./fixtures/store-child.mjs", import.meta.url));
+
+function runAggregateChild(root, fingerprint, incidentId) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CHILD, root, fingerprint, "aggregate", incidentId], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(`child-exit-${code}:${stderr}`)));
+  });
+}
+
+function runStoreChild(root, fingerprint, operation, value) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CHILD, root, fingerprint, operation, String(value)], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(`child-exit-${code}:${stderr}`)));
+  });
+}
 
 function fixture({ excerpts = true, aggregate = false, fingerprint = PROJECT_A } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-privacy-"));
   const store = openStore(root, { projectName: "private-project", projectFingerprint: fingerprint, now: () => NOW });
+  const updated = store.updateGlobalSettings((global) => makeGlobalSettings({
+    ...global,
+    consent: { ...global.consent, sanitizedExcerpts: excerpts, crossRepoAggregation: aggregate },
+    updatedAt: NOW,
+  }));
+  assert.equal(updated.ok, true);
   const guard = createPrivacyGuard({
     consent: { sanitizedExcerpts: excerpts, crossRepoAggregation: aggregate },
     projectFingerprint: fingerprint,
@@ -60,6 +94,7 @@ function observation(overrides = {}) {
       ...(overrides.structuredFields ?? {}),
     },
     incidentId: "incident-1",
+    sessionLineageHash: H("4"),
     createdAt: NOW,
     injectionFlagged: false,
     redacted: false,
@@ -215,6 +250,36 @@ test("excerpt scrub applies bounded heuristic redaction", () => {
   store.close();
 });
 
+test("an already-created guard observes same-process consent revocation immediately", () => {
+  const { store, guard } = fixture({ excerpts: true, aggregate: true });
+  assert.equal(guard.scrubExcerpt({ text: "before revocation" }).ok, true);
+  assert.equal(store.updateGlobalSettings((global) => makeGlobalSettings({
+    ...global,
+    consent: { ...global.consent, sanitizedExcerpts: false },
+    updatedAt: global.updatedAt + 1,
+  })).ok, true);
+  assert.equal(guard.scrubExcerpt({ text: "after revocation" }).reason, "sanitized-excerpts-consent-required");
+  assert.equal(guard.contributeAggregate({
+    claimType: "global-skill-candidate", receiptType: "repeated-command", signatureHash: H("4"),
+    incidentId: "revoked", occurrenceCount: 1, firstSeenAt: NOW, lastSeenAt: NOW,
+  }).reason, "sanitized-excerpts-consent-required");
+  store.close();
+});
+
+test("an already-created guard observes cross-process consent revocation immediately", async () => {
+  const { root, store, guard } = fixture({ excerpts: true, aggregate: true });
+  const input = {
+    claimType: "global-skill-candidate", receiptType: "repeated-command", signatureHash: H("4"),
+    incidentId: "before-cross-process-revocation", occurrenceCount: 1, firstSeenAt: NOW, lastSeenAt: NOW,
+  };
+  assert.equal(guard.contributeAggregate(input).ok, true);
+  assert.equal((await runStoreChild(root, PROJECT_A, "update-global-consent", "false")).ok, true);
+  assert.equal(guard.contributeAggregate({ ...input, incidentId: "after-cross-process-revocation" }).reason, "sanitized-excerpts-consent-required");
+  assert.equal(guard.readAggregateClaims().reason, "sanitized-excerpts-consent-required");
+  assert.equal(store.readAggregates({ scope: "project" }).length, 1);
+  store.close();
+});
+
 test("observation scrub rejects never-stored body and transcript fields", () => {
   const { store, guard } = fixture();
   assert.equal(guard.scrubObservation(observation({ structuredFields: { messageBody: "raw" } })).ok, false);
@@ -303,15 +368,19 @@ test("project purge removes records and orphaned lease and quarantine artifacts"
   const lease = path.join(stateDir, "leases", "orphan.lock");
   const quarantined = path.join(stateDir, "quarantine", "orphan.quarantined");
   const cache = path.join(stateDir, "cache", "orphan.cache");
+  const bridge = path.join(root, "self-evolve", "bridge", PROJECT_A, "responses", "orphan.json");
   writeFileSync(lease, "orphan", "utf8");
   writeFileSync(quarantined, "orphan", "utf8");
   mkdirSync(path.dirname(cache), { recursive: true });
   writeFileSync(cache, "orphan", "utf8");
+  mkdirSync(path.dirname(bridge), { recursive: true });
+  writeFileSync(bridge, "orphan", "utf8");
   const result = guard.purgeScope({ scope: "project", projectFingerprint: PROJECT_A });
   assert.deepEqual(result.removedPaths, [`self-evolve/${PROJECT_A}`]);
   assert.equal(existsSync(lease), false);
   assert.equal(existsSync(quarantined), false);
   assert.equal(existsSync(cache), false);
+  assert.equal(existsSync(bridge), false);
   assert.equal(store.readRecords("observation").length, 0);
   store.close();
 });
@@ -337,7 +406,7 @@ test("inspection reports counts and byte usage without raw record content", () =
     observations: 1,
     proposals: 1,
     decisions: 1,
-    auditEvents: 1,
+    auditEvents: 2,
     bytesUsed: 0,
     quotaFraction: 0,
   });
@@ -352,7 +421,7 @@ test("export filters project records and scrubs every observation", () => {
   store.appendRecord(wrapRecord("observation", makeObservation(observation({ id: H("5"), projectFingerprint: PROJECT_B })), NOW));
   store.appendRecord(wrapRecord("proposal", proposal(), NOW));
   const archive = guard.exportScope(PROJECT_A);
-  assert.equal(archive.records.length, 2);
+  assert.equal(archive.records.length, 3);
   assert.equal(archive.records.every((record) => !record.payload.projectFingerprint || record.payload.projectFingerprint === PROJECT_A), true);
   assert.equal(archive.records.find((record) => record.kind === "observation").payload.id, H("1"));
   assert.deepEqual(JSON.parse(JSON.stringify(archive)), archive);
@@ -391,8 +460,103 @@ test("project fingerprints delegate canonical remote and local-path identity", (
   const { store } = fixture();
   assert.equal(
     computeProjectFingerprint({ remoteUrl: "https://GitHub.com/example/repo.git", worktreePath: "/one" }),
+    computeProjectFingerprint({ remoteUrl: "https://github.com/example/repo", worktreePath: "/one" }),
+  );
+  assert.notEqual(
+    computeProjectFingerprint({ remoteUrl: "https://github.com/example/repo", worktreePath: "/one" }),
     computeProjectFingerprint({ remoteUrl: "https://github.com/example/repo", worktreePath: "/two" }),
   );
   assert.match(computeProjectFingerprint({ remoteUrl: "", worktreePath: "/tmp/private-project" }), /^[a-f0-9]{64}$/);
   store.close();
+});
+
+test("aggregate storage requires both consents and rejects non-allowlisted input", () => {
+  const noExcerpts = fixture({ excerpts: false, aggregate: true });
+  const input = {
+    claimType: "global-skill-candidate",
+    receiptType: "repeated-command",
+    signatureHash: H("4"),
+    incidentId: "incident-aggregate",
+    occurrenceCount: 2,
+    firstSeenAt: NOW,
+    lastSeenAt: NOW,
+  };
+  assert.equal(noExcerpts.guard.contributeAggregate(input).reason, "sanitized-excerpts-consent-required");
+  noExcerpts.store.close();
+  const noAggregate = fixture({ excerpts: true, aggregate: false });
+  assert.equal(noAggregate.guard.contributeAggregate(input).reason, "cross-repo-consent-required");
+  noAggregate.store.close();
+  const allowed = fixture({ excerpts: true, aggregate: true });
+  assert.equal(allowed.guard.contributeAggregate({ ...input, rawText: "forbidden" }).reason, "invalid-aggregate-input");
+  assert.equal(allowed.guard.contributeAggregate({ ...input, claimType: "unknown" }).ok, false);
+  allowed.store.close();
+});
+
+test("real child processes serialize strict aggregate contributions across two project partitions", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-aggregate-child-"));
+  const secret = `sk-${"s".repeat(24)}`;
+  const repositoryName = "customer-zephyr-private-repo";
+  const results = await Promise.all([
+    ...Array.from({ length: 6 }, () => runAggregateChild(root, PROJECT_A, `${repositoryName}:${secret}:same`)),
+    ...Array.from({ length: 5 }, (_, index) => runAggregateChild(root, PROJECT_B, `${repositoryName}:${secret}:${index}`)),
+  ]);
+  assert.equal(results.every((result) => result.ok), true);
+  const storeA = openStore(root, { projectFingerprint: PROJECT_A, now: () => 10_000 });
+  const storeB = openStore(root, { projectFingerprint: PROJECT_B, now: () => 10_000 });
+  assert.equal(storeA.readAggregates({ scope: "global" }).length, 6);
+  assert.equal(storeA.readAggregates({ scope: "project" }).length, 1);
+  assert.equal(storeB.readAggregates({ scope: "project" }).length, 5);
+  const serialized = readFileSync(path.join(root, "self-evolve", "global", "aggregates.jsonl"), "utf8");
+  assert.equal(serialized.includes(secret), false);
+  assert.equal(serialized.includes(repositoryName), false);
+  for (const line of serialized.trim().split("\n")) {
+    assert.deepEqual(Object.keys(JSON.parse(line)), [
+      "schemaVersion", "aggregateId", "claimType", "receiptType", "signatureHash", "incidentHash",
+      "occurrenceCount", "firstSeenDay", "lastSeenDay", "createdAt", "expiresAt",
+    ]);
+  }
+  if (process.platform !== "win32") {
+    assert.equal(statSync(path.join(root, "self-evolve", "global", "aggregates.jsonl")).mode & 0o777, 0o600);
+    assert.equal(statSync(path.join(root, "self-evolve", PROJECT_A, "aggregate-contributions.json")).mode & 0o777, 0o600);
+  }
+  storeA.close();
+  storeB.close();
+});
+
+test("aggregate incident hashes are domain-separated, deduplicated, retained, and purged by project index", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-aggregate-purge-"));
+  const storeA = openStore(root, { projectFingerprint: PROJECT_A, now: () => NOW });
+  const storeB = openStore(root, { projectFingerprint: PROJECT_B, now: () => NOW });
+  assert.equal(storeA.updateGlobalSettings((global) => makeGlobalSettings({
+    ...global,
+    consent: { ...global.consent, sanitizedExcerpts: true, crossRepoAggregation: true },
+    updatedAt: NOW,
+  })).ok, true);
+  const guardFor = (store, projectFingerprint) => createPrivacyGuard({
+    consent: { sanitizedExcerpts: true, crossRepoAggregation: true }, projectFingerprint, retentionDays: 30, now: () => NOW, store,
+  });
+  const a = guardFor(storeA, PROJECT_A);
+  const b = guardFor(storeB, PROJECT_B);
+  const input = {
+    claimType: "global-skill-candidate", receiptType: "repeated-command", signatureHash: H("4"), incidentId: "same-incident",
+    occurrenceCount: 2, firstSeenAt: NOW, lastSeenAt: NOW,
+  };
+  assert.equal(a.contributeAggregate(input).duplicate, false);
+  assert.equal(a.contributeAggregate(input).duplicate, true);
+  assert.equal(b.contributeAggregate(input).duplicate, false);
+  const global = a.readAggregateClaims({ scope: "global" });
+  assert.equal(global.records.length, 2);
+  assert.notEqual(global.records[0].incidentHash, global.records[1].incidentHash);
+  assert.equal(a.readAggregateClaims({ scope: "project" }).records.length, 1);
+
+  assert.equal(a.purgeScope({ scope: "project", projectFingerprint: PROJECT_A }).counts.audit, 1);
+  assert.equal(b.readAggregateClaims({ scope: "global" }).records.length, 1);
+  assert.equal(b.readAggregateClaims({ scope: "project" }).records.length, 1);
+  assert.deepEqual(b.retainAggregateClaims(NOW + 31 * DAY), { ok: true, aggregates: 1 });
+  assert.equal(b.readAggregateClaims({ scope: "global", includeExpired: true }).records.length, 0);
+  assert.equal(b.readAggregateClaims({ scope: "project", includeExpired: true }).records.length, 0);
+  b.purgeScope({ scope: "all" });
+  assert.equal(existsSync(path.join(root, "self-evolve")), false);
+  storeA.close();
+  storeB.close();
 });

@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { assertNoForbiddenImports } from "../scripts/pack-artifact-check.mjs";
+import { assertNoForbiddenImports, assertServerEntryContract } from "../scripts/pack-artifact-check.mjs";
 import { createIntegration } from "../self-evolve-integration.js";
 import * as schemas from "../self-evolve-schemas.js";
 
@@ -50,6 +50,12 @@ test("pack import scanner rejects prohibited runtime modules", () => {
   );
 });
 
+test("pack scanner rejects named server exports and TUI imports", () => {
+  assert.doesNotThrow(() => assertServerEntryContract("export default function Plugin() {}\n"));
+  assert.throws(() => assertServerEntryContract("export const helper = 1; export default function Plugin() {}\n"), /no named exports/u);
+  assert.throws(() => assertServerEntryContract('import "@opencode-ai/plugin/tui"; export default function Plugin() {}\n'), /prohibited TUI/u);
+});
+
 test("integration boot aborts only active orphaned self-evolve analyzer sessions", async () => {
   const aborted = [];
   const records = [];
@@ -61,6 +67,7 @@ test("integration boot aborts only active orphaned self-evolve analyzer sessions
     getSettings: () => settings,
     readRecords: () => [],
     appendRecord(record) { records.push(record); return { ok: true }; },
+    retain: () => ({ observations: 0 }),
     cleanupExpiredLeases: () => undefined,
     close() {},
   };

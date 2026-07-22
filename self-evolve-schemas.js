@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const SCHEMA_VERSION = "0.2.0";
+export const UNKNOWN_SESSION_LINEAGE_HASH = createHash("sha256").update("self-evolve-session-lineage-v1\nunknown").digest("hex");
 
 const MAX = Object.freeze({
   string: 1024,
@@ -27,7 +28,9 @@ const RECEIPT_TYPES = Object.freeze([
   "repeated-manual-procedure",
   "repeated-clarification",
 ]);
+const AGGREGATE_CLAIM_TYPES = Object.freeze(["global-skill-candidate"]);
 const PROPOSAL_STATES = Object.freeze([
+  "critic-pending",
   "pending",
   "approved",
   "rejected",
@@ -46,6 +49,13 @@ const AUDIT_KINDS = Object.freeze([
   "lease",
   "corruption",
 ]);
+export const SYNTHESIS_OUTCOME_STATUSES = Object.freeze(["accepted", "no-change", "critic-rejected", "failed"]);
+const SYNTHESIS_OUTCOME_REASON_CODES = Object.freeze({
+  accepted: Object.freeze(["accepted"]),
+  "no-change": Object.freeze(["valid-no-change"]),
+  "critic-rejected": Object.freeze(["critic-rejected"]),
+  failed: Object.freeze(["malformed-output", "timeout", "deterministic-validation-failed", "proposal-content-unavailable", "proposal-content-persistence-failed", "synthesis-failed", "critic-failed", "unknown-failure"]),
+});
 const RECORD_KINDS = Object.freeze([
   "global-settings",
   "repo-settings",
@@ -55,6 +65,8 @@ const RECORD_KINDS = Object.freeze([
   "evidence-cluster",
   "eligibility-explanation",
   "proposal",
+  "proposal-content",
+  "synthesis-attempt",
   "decision",
   "apply-claim",
   "audit-event",
@@ -245,20 +257,25 @@ export const GlobalSettings = deepFreeze({
 export const RepoSettings = deepFreeze({
   fields: ["schemaVersion", "projectFingerprint", "mode", "excluded", "consent", "budgets"],
 });
-export const EpisodeCursor = deepFreeze({ fields: ["sessionID", "lastIdleAt", "lastObservedMessageCount", "leaseNonce"] });
+export const EpisodeCursor = deepFreeze({ fields: ["sessionIDHash", "lastIdleAt", "lastObservedMessageHash", "leaseNonce"] });
 export const Receipt = deepFreeze({ fields: ["receiptType", "signatureHash", "occurrences", "firstSeenAt", "lastSeenAt", "projectFingerprint", "scopeFingerprint"] });
-export const Observation = deepFreeze({ fields: ["id", "projectFingerprint", "receiptIds", "structuredFields", "incidentId", "createdAt", "injectionFlagged", "redacted"] });
+export const Observation = deepFreeze({ fields: ["id", "projectFingerprint", "receiptIds", "structuredFields", "incidentId", "sessionLineageHash", "createdAt", "injectionFlagged", "redacted"] });
 export const EvidenceCluster = deepFreeze({ fields: ["id", "receiptType", "projectFingerprint", "incidentIds", "scopeFingerprint", "occurrencesSum", "firstSeenAt", "lastSeenAt"] });
 export const EligibilityExplanation = deepFreeze({ fields: ["clusterId", "eligible", "reasons", "thresholdsMet", "thresholdsMissed"] });
 export const Proposal = deepFreeze({
   fields: ["id", "projectFingerprint", "clusterId", "skillTarget", "proposedContentHash", "rationaleText", "synthesizedAt", "synthesizerModelId", "criticScore", "criticPassed", "validDeterministic", "state", "injectionFlagged", "decisionVersion", "burnedNonceHashes"],
 });
+export const ProposalContent = deepFreeze({ fields: ["proposalId", "contentHash", "contentEncoding", "chunkIndex", "chunkCount", "content"] });
+export const SynthesisAttempt = deepFreeze({ fields: ["outcomeId", "proposalId", "projectFingerprint", "clusterId", "targetHash", "admittedAt", "state"] });
 export const Decision = deepFreeze({ fields: ["proposalId", "targetHash", "proposedContentHash", "decisionVersion", "actor", "timestamp", "nonce", "priorState", "newState"] });
 export const ApplyClaim = deepFreeze({ fields: ["proposalId", "leaseNonce", "acquiredAt", "expiresAt", "actor"] });
 export const AuditEvent = deepFreeze({ fields: ["id", "kind", "proposalId", "actor", "timestamp", "payloadHash", "details"] });
 export const RollbackRecord = deepFreeze({ fields: ["proposalId", "appliedHash", "rolledBackAt", "reason"] });
 export const InterventionEpoch = deepFreeze({ fields: ["epochId", "startedAt", "reason"] });
 export const CircuitBreaker = deepFreeze({ fields: ["open", "openedAt", "reason", "tripCount"] });
+export const AggregateClaim = deepFreeze({
+  fields: ["schemaVersion", "aggregateId", "claimType", "receiptType", "signatureHash", "incidentHash", "occurrenceCount", "firstSeenDay", "lastSeenDay", "createdAt", "expiresAt"],
+});
 
 export function makeConsentState(data = {}) {
   exactKeys(data, ConsentState.fields, "ConsentState", []);
@@ -316,6 +333,37 @@ export function makeRepoSettings(data) {
   });
 }
 
+function utcDay(value, label) {
+  const clean = asNonEmptyString(value, { max: 10 });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(clean) || new Date(`${clean}T00:00:00.000Z`).toISOString().slice(0, 10) !== clean) {
+    fail("malformed-payload", `${label} must be a UTC day`);
+  }
+  return clean;
+}
+
+export function makeAggregateClaim(data) {
+  exactKeys(data, AggregateClaim.fields, "AggregateClaim");
+  const firstSeenDay = utcDay(data.firstSeenDay, "firstSeenDay");
+  const lastSeenDay = utcDay(data.lastSeenDay, "lastSeenDay");
+  const createdAt = asTimestamp(data.createdAt);
+  const expiresAt = asTimestamp(data.expiresAt);
+  if (lastSeenDay < firstSeenDay) fail("out-of-order", "lastSeenDay precedes firstSeenDay");
+  if (expiresAt <= createdAt) fail("out-of-order", "aggregate must expire after creation");
+  return deepFreeze({
+    schemaVersion: schemaVersion(data.schemaVersion),
+    aggregateId: asSha256Hex(data.aggregateId),
+    claimType: asEnum(data.claimType, AGGREGATE_CLAIM_TYPES),
+    receiptType: asEnum(data.receiptType, RECEIPT_TYPES),
+    signatureHash: asSha256Hex(data.signatureHash),
+    incidentHash: asSha256Hex(data.incidentHash),
+    occurrenceCount: asInt(data.occurrenceCount, { min: 1, max: 1_000_000 }),
+    firstSeenDay,
+    lastSeenDay,
+    createdAt,
+    expiresAt,
+  });
+}
+
 export function resolveMode(globalMode, repoMode = "inherit", overrides = {}) {
   try {
     exactKeys(overrides, ["killSwitchActive", "paused", "circuitBreakerOpen", "processExcluded", "repoOptOut", "hostSupported", "corrupt"], "mode overrides", []);
@@ -333,11 +381,11 @@ export function resolveMode(globalMode, repoMode = "inherit", overrides = {}) {
 }
 
 export function makeEpisodeCursor(data) {
-  exactKeys(data, EpisodeCursor.fields, "EpisodeCursor", ["sessionID"]);
+  exactKeys(data, EpisodeCursor.fields, "EpisodeCursor", ["sessionIDHash"]);
   return deepFreeze({
-    sessionID: asNonEmptyString(data.sessionID, { max: 256 }),
+    sessionIDHash: asSha256Hex(data.sessionIDHash),
     lastIdleAt: asTimestamp(data.lastIdleAt ?? 0),
-    lastObservedMessageCount: asInt(data.lastObservedMessageCount ?? 0, { min: 0 }),
+    lastObservedMessageHash: data.lastObservedMessageHash === undefined || data.lastObservedMessageHash === null ? null : asSha256Hex(data.lastObservedMessageHash),
     leaseNonce: data.leaseNonce === undefined || data.leaseNonce === null ? null : nonceString(data.leaseNonce),
   });
 }
@@ -400,13 +448,14 @@ function structuredObservationFields(value) {
 }
 
 export function makeObservation(data) {
-  exactKeys(data, Observation.fields, "Observation");
+  exactKeys(data, Observation.fields, "Observation", Observation.fields.filter((field) => field !== "sessionLineageHash"));
   return deepFreeze({
     id: asSha256Hex(data.id),
     projectFingerprint: asFingerprint(data.projectFingerprint),
     receiptIds: boundedList(data.receiptIds, "receiptIds", MAX.receiptIds, asSha256Hex, { dedupe: true }),
     structuredFields: structuredObservationFields(data.structuredFields),
     incidentId: nonceString(data.incidentId),
+    sessionLineageHash: asSha256Hex(data.sessionLineageHash ?? UNKNOWN_SESSION_LINEAGE_HASH),
     createdAt: asTimestamp(data.createdAt),
     injectionFlagged: asBoolean(data.injectionFlagged, "injectionFlagged"),
     redacted: asBoolean(data.redacted, "redacted"),
@@ -446,7 +495,8 @@ function skillTarget(value) {
   const canonicalRoot = absolutePath(value.canonicalRoot);
   const relativePath = asPath(value.relativePath);
   if (relativePath.startsWith("/") || /^[A-Za-z]:\//.test(relativePath)) fail("malformed-payload", "relativePath must be relative");
-  return { canonicalRoot, relativePath, currentHash: asSha256Hex(value.currentHash) };
+  const currentHash = value.currentHash === "must-not-exist" ? value.currentHash : asSha256Hex(value.currentHash);
+  return { canonicalRoot, relativePath, currentHash };
 }
 
 export function makeProposal(data) {
@@ -470,11 +520,38 @@ export function makeProposal(data) {
   });
 }
 
+export function makeProposalContent(data) {
+  exactKeys(data, ProposalContent.fields, "ProposalContent");
+  const content = asString(data.content, { max: 512 });
+  if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(content)) fail("malformed-payload", "content must be base64");
+  return deepFreeze({
+    proposalId: idString(data.proposalId),
+    contentHash: asSha256Hex(data.contentHash),
+    contentEncoding: asEnum(data.contentEncoding, ["base64"]),
+    chunkIndex: asInt(data.chunkIndex, { min: 0, max: 1_000_000 }),
+    chunkCount: asInt(data.chunkCount, { min: 1, max: 1_000_000 }),
+    content,
+  });
+}
+
+export function makeSynthesisAttempt(data) {
+  exactKeys(data, SynthesisAttempt.fields, "SynthesisAttempt");
+  return deepFreeze({
+    outcomeId: asSha256Hex(data.outcomeId),
+    proposalId: idString(data.proposalId),
+    projectFingerprint: asFingerprint(data.projectFingerprint),
+    clusterId: asSha256Hex(data.clusterId),
+    targetHash: data.targetHash === "must-not-exist" ? data.targetHash : asSha256Hex(data.targetHash),
+    admittedAt: asTimestamp(data.admittedAt),
+    state: asEnum(data.state, ["admitted"]),
+  });
+}
+
 export function makeDecision(data) {
   exactKeys(data, Decision.fields, "Decision");
   return deepFreeze({
     proposalId: idString(data.proposalId),
-    targetHash: asSha256Hex(data.targetHash),
+    targetHash: data.targetHash === "must-not-exist" ? data.targetHash : asSha256Hex(data.targetHash),
     proposedContentHash: asSha256Hex(data.proposedContentHash),
     decisionVersion: asInt(data.decisionVersion, { min: 1, max: 1_000_000 }),
     actor: asNonEmptyString(data.actor, { max: MAX.actor }),
@@ -491,6 +568,7 @@ export function burnNonce(decision) {
 }
 
 const ALLOWED_TRANSITIONS = deepFreeze({
+  "critic-pending": ["pending", "failed-closed"],
   pending: ["approved", "rejected", "superseded", "failed-closed"],
   approved: ["applied", "superseded", "failed-closed"],
   applied: ["rolled-back", "failed-closed"],
@@ -505,6 +583,7 @@ export function assertCasAllowed(decision, currentProposalState) {
   const current = asEnum(currentProposalState, PROPOSAL_STATES);
   if (clean.priorState !== current) fail("stale-prior-state");
   if (!ALLOWED_TRANSITIONS[current].includes(clean.newState)) fail("invalid-transition", `${current}->${clean.newState}`);
+  if (current === "critic-pending" && clean.newState === "pending" && clean.actor !== "self-evolve-critic") fail("unauthorized-actor");
   if (["applied", "rolled-back"].includes(clean.newState) && clean.actor !== "self-evolve-applier") fail("unauthorized-actor");
   return true;
 }
@@ -548,6 +627,42 @@ export function makeAuditEvent(data) {
     payloadHash: asSha256Hex(data.payloadHash),
     details: primitiveMap(data.details, "details"),
   });
+}
+
+export function makeSynthesisOutcomeAuditEvent(data) {
+  exactKeys(data, ["outcomeId", "projectFingerprint", "clusterId", "status", "success", "terminalAt", "reasonCode"], "SynthesisOutcome");
+  const outcomeId = asSha256Hex(data.outcomeId);
+  const projectFingerprint = asFingerprint(data.projectFingerprint);
+  const clusterId = asSha256Hex(data.clusterId);
+  const status = asEnum(data.status, SYNTHESIS_OUTCOME_STATUSES);
+  const success = asBoolean(data.success, "success");
+  const terminalAt = asTimestamp(data.terminalAt);
+  const reasonCode = asEnum(data.reasonCode, SYNTHESIS_OUTCOME_REASON_CODES[status]);
+  if (success !== ["accepted", "no-change"].includes(status)) fail("invalid-synthesis-outcome-success");
+  const details = primitiveMap({ action: "synthesis-outcome", outcomeId, projectFingerprint, clusterId, status, success, terminalAt, reasonCode }, "details");
+  const payloadHash = sha256(canonicalize(details));
+  return makeAuditEvent({
+    id: sha256(`synthesis-outcome-audit-v1\n${outcomeId}`),
+    kind: "decision",
+    actor: "self-evolve-pipeline",
+    timestamp: terminalAt,
+    payloadHash,
+    details,
+  });
+}
+
+export function parseSynthesisOutcomeAuditEvent(value) {
+  try {
+    const event = makeAuditEvent(value);
+    const details = event.details;
+    exactKeys(details, ["action", "outcomeId", "projectFingerprint", "clusterId", "status", "success", "terminalAt", "reasonCode"], "SynthesisOutcome.details");
+    if (details.action !== "synthesis-outcome" || event.kind !== "decision" || event.actor !== "self-evolve-pipeline" || event.proposalId !== undefined) return null;
+    const { action: _action, ...outcome } = details;
+    const expected = makeSynthesisOutcomeAuditEvent(outcome);
+    return canonicalize(event) === canonicalize(expected) ? expected.details : null;
+  } catch {
+    return null;
+  }
 }
 
 function audit(kind, actor, timestamp, details, proposalId) {
@@ -606,6 +721,8 @@ const RECORD_VALIDATORS = {
   "evidence-cluster": makeEvidenceCluster,
   "eligibility-explanation": makeEligibilityExplanation,
   proposal: makeProposal,
+  "proposal-content": makeProposalContent,
+  "synthesis-attempt": makeSynthesisAttempt,
   decision: makeDecision,
   "apply-claim": makeApplyClaim,
   "audit-event": makeAuditEvent,
@@ -767,7 +884,6 @@ export function evaluateApplyAuthority({ mode, decisionApproved = false, allowli
   }
   if (killSwitchActive || cleanMode === "manual") return deepFreeze({ allowed: false, reason: killSwitchActive ? "kill-switch" : "manual-advisory-only" });
   if (cleanMode === "auto") {
-    if (headless) return deepFreeze({ allowed: false, reason: "auto-headless-prohibited" });
     return deepFreeze({ allowed: decisionApproved, reason: decisionApproved ? "explicit-decision" : "decision-required" });
   }
   if (!allowlisted) return deepFreeze({ allowed: false, reason: "scope-not-allowlisted" });

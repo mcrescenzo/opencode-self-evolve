@@ -88,8 +88,8 @@ function pendingProposal(store, projectFingerprint) {
     .findLast((proposal) => proposal.projectFingerprint === projectFingerprint && proposal.state === "pending") ?? null;
 }
 
-function latestCursor(store, sessionID) {
-  return store.readRecords("episode-cursor").filter((record) => record.payload.sessionID === sessionID).at(-1) ?? null;
+function latestCursor(store, sessionIDHash) {
+  return store.readRecords("episode-cursor").filter((record) => record.payload.sessionIDHash === sessionIDHash).at(-1) ?? null;
 }
 
 function auditSince(store, start) {
@@ -118,7 +118,7 @@ function proposalText(proposal, mode) {
     `Target: ${proposal.skillTarget.relativePath}`,
     `Rationale: ${proposal.rationaleText}`,
     `Review: /self-evolve review ${proposal.id}`,
-    `Approve separately: /self-evolve approve ${proposal.id}`,
+    mode === "manual" ? "Manual mode is advisory and cannot approve or apply." : "Use /self-evolve inbox or review to obtain the current exact approval tuple.",
     "No files were applied by this scan.",
   ].join("\n");
 }
@@ -154,6 +154,56 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     });
     append("audit-event", event, timestamp);
     return event;
+  }
+
+  function outcomeReason(status, reason) {
+    if (status === "accepted") return "accepted";
+    if (status === "no-change") return "valid-no-change";
+    if (status === "critic-rejected") return "critic-rejected";
+    const value = String(reason ?? "").toLowerCase();
+    if (value === "proposal-content-unavailable") return "proposal-content-unavailable";
+    if (value.includes("proposal-content")) return "proposal-content-persistence-failed";
+    if (value.includes("timeout")) return "timeout";
+    if (value.includes("json") || value.includes("malformed") || value.includes("missing") || value.includes("unexpected")) return "malformed-output";
+    if (value.includes("validation") || value.includes("hash") || value.includes("target") || value.includes("unsafe") || value.includes("secret")) return "deterministic-validation-failed";
+    return value.includes("critic") ? "critic-failed" : value ? "synthesis-failed" : "unknown-failure";
+  }
+
+  function persistSynthesisOutcome(synthesized, status, reason, faultInjection) {
+    const attempt = synthesized?.attempt ?? synthesized;
+    if (!attempt) return null;
+    const terminalAt = now();
+    const event = schemas.makeSynthesisOutcomeAuditEvent({
+      outcomeId: attempt.outcomeId,
+      projectFingerprint: attempt.projectFingerprint,
+      clusterId: attempt.clusterId,
+      status,
+      success: status === "accepted" || status === "no-change",
+      terminalAt,
+      reasonCode: outcomeReason(status, reason),
+    });
+    const existing = store.readRecords("audit-event")
+      .map((record) => schemas.parseSynthesisOutcomeAuditEvent(record.payload))
+      .find((outcome) => outcome?.outcomeId === attempt.outcomeId);
+    if (existing) {
+      const same = ["outcomeId", "projectFingerprint", "clusterId", "status", "success", "reasonCode"]
+        .every((key) => existing[key] === event.details[key]);
+      if (!same) throw new Error("synthesis-outcome-conflict");
+      if (synthesized?.lease) synthesis.releaseSynthesisLease?.(store, synthesized.lease);
+      return existing;
+    }
+    const saved = store.appendRecord(schemas.wrapRecord("audit-event", event, terminalAt));
+    if (!saved?.ok) throw new Error(saved?.reason ?? "synthesis-outcome-write-failed");
+    const persisted = schemas.parseSynthesisOutcomeAuditEvent(saved.record?.payload);
+    const same = persisted && ["outcomeId", "projectFingerprint", "clusterId", "status", "success", "reasonCode"]
+      .every((key) => persisted[key] === event.details[key]);
+    if (!same) throw new Error("synthesis-outcome-conflict");
+    faultInjection?.("pipeline-after-outcome-append", { attempt, event });
+    if (synthesized?.lease) {
+      const released = synthesis.releaseSynthesisLease?.(store, synthesized.lease);
+      if (!released?.ok) throw new Error(released?.reason ?? "synthesis-lease-release-failed");
+    }
+    return saved.record.payload;
   }
 
   function inventoryFor(options) {
@@ -194,34 +244,105 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     };
   }
 
-  function persistProposalContent(proposal, content) {
+  function persistProposalContent(proposal, content, faultInjection) {
     if (typeof content !== "string" || inventory.hashSkillContent?.(content) !== proposal.proposedContentHash) {
       throw new Error("proposal-content-unavailable");
     }
     const encoded = Buffer.from(content, "utf8").toString("base64");
     const chunks = encoded.match(new RegExp(`.{1,${CONTENT_CHUNK_SIZE}}`, "gu")) ?? [""];
-    chunks.forEach((chunk, index) => appendAudit("proposal-content", proposal.id, {
-      contentHash: proposal.proposedContentHash,
-      contentEncoding: "base64",
-      chunkIndex: index,
-      chunkCount: chunks.length,
-      content: chunk,
-    }));
+    chunks.forEach((chunk, index) => {
+      append("proposal-content", schemas.makeProposalContent({
+        proposalId: proposal.id,
+        contentHash: proposal.proposedContentHash,
+        contentEncoding: "base64",
+        chunkIndex: index,
+        chunkCount: chunks.length,
+        content: chunk,
+      }));
+      faultInjection?.("pipeline-after-content-chunk", { proposal, chunkIndex: index, chunkCount: chunks.length });
+    });
   }
 
   function readProposalContent(proposal) {
     if (typeof proposal.proposedContent === "string") return proposal.proposedContent;
-    const chunks = store.readRecords("audit-event")
-      .map((record) => record.payload)
-      .filter((event) => event.details?.action === "proposal-content"
-        && event.details?.subjectId === proposal.id
-        && event.details?.contentHash === proposal.proposedContentHash)
-      .sort((left, right) => left.details.chunkIndex - right.details.chunkIndex);
-    if (!chunks.length || chunks.length !== chunks[0].details.chunkCount) return null;
-    if (chunks.some((event, index) => event.details.chunkIndex !== index || event.details.chunkCount !== chunks.length)) return null;
-    if (chunks.some((event) => event.details.contentEncoding !== "base64")) return null;
-    const content = Buffer.from(chunks.map((event) => event.details.content).join(""), "base64").toString("utf8");
+    const all = store.readRecords("proposal-content").map((record) => record.payload).filter((chunk) => chunk.proposalId === proposal.id);
+    if (!all.length || all.some((chunk) => chunk.contentHash !== proposal.proposedContentHash)) return null;
+    const chunks = all.sort((left, right) => left.chunkIndex - right.chunkIndex);
+    if (chunks.length !== chunks[0].chunkCount) return null;
+    if (chunks.some((chunk, index) => chunk.chunkIndex !== index || chunk.chunkCount !== chunks.length || chunk.contentEncoding !== "base64")) return null;
+    const encoded = chunks.map((chunk) => chunk.content).join("");
+    const decoded = Buffer.from(encoded, "base64");
+    if (decoded.toString("base64") !== encoded) return null;
+    const content = decoded.toString("utf8");
     return inventory.hashSkillContent?.(content) === proposal.proposedContentHash ? content : null;
+  }
+
+  function failProposalClosed(proposal, reason, timestamp = now()) {
+    const current = currentProposal(store, proposal.id);
+    if (!current || current.state === "failed-closed") return current;
+    if (!["critic-pending", "pending", "approved", "applied"].includes(current.state)) return current;
+    const decision = schemas.makeDecision({
+      proposalId: current.id,
+      targetHash: current.skillTarget.currentHash,
+      proposedContentHash: current.proposedContentHash,
+      decisionVersion: current.decisionVersion + 1,
+      actor: "self-evolve-pipeline",
+      timestamp,
+      nonce: observation.hashSignature(`synthesis-recovery:${current.id}:${current.decisionVersion + 1}:${reason}`),
+      priorState: current.state,
+      newState: "failed-closed",
+    });
+    const committed = store.commitDecision(decision);
+    if (!committed?.ok) throw new Error(committed?.reason ?? "proposal-failed-closed-write-failed");
+    return committed.proposal;
+  }
+
+  function recoverSynthesisAttempts() {
+    const outcomes = new Map();
+    for (const record of store.readRecords("audit-event")) {
+      const outcome = schemas.parseSynthesisOutcomeAuditEvent(record.payload);
+      if (outcome) outcomes.set(outcome.outcomeId, outcome);
+    }
+    const recovered = [];
+    const attempts = new Map();
+    for (const record of store.readRecords("synthesis-attempt")) {
+      const prior = attempts.get(record.payload.outcomeId);
+      if (prior && JSON.stringify(prior) !== JSON.stringify(record.payload)) throw new Error("synthesis-attempt-conflict");
+      attempts.set(record.payload.outcomeId, record.payload);
+    }
+    for (const attempt of attempts.values()) {
+      const key = synthesis.synthesisLeaseKey?.(attempt)
+        ?? `synthesis_${observation.hashSignature(`synthesis-lease-v1\n${attempt.projectFingerprint}\n${attempt.clusterId}\n${attempt.targetHash}`)}`;
+      const acquired = store.acquireLease?.(key, { ttlMs: 5 * 60 * 1000, actor: "self-evolve-synthesis-recovery" });
+      if (!acquired?.ok) {
+        recovered.push(acquired?.reason === "lease-busy"
+          ? { ok: true, deferred: true, outcomeId: attempt.outcomeId, proposalId: attempt.proposalId, status: "deferred", reason: "lease-busy" }
+          : { ok: false, outcomeId: attempt.outcomeId, proposalId: attempt.proposalId, status: "failed", reason: acquired?.reason ?? "lease-error" });
+        continue;
+      }
+      try {
+      const outcome = outcomes.get(attempt.outcomeId);
+      if (outcome) {
+        if (outcome.projectFingerprint !== attempt.projectFingerprint || outcome.clusterId !== attempt.clusterId) throw new Error("synthesis-outcome-binding-mismatch");
+        continue;
+      }
+      const proposal = currentProposal(store, attempt.proposalId);
+      const content = proposal ? readProposalContent(proposal) : null;
+      if (proposal?.criticPassed === true && proposal.validDeterministic === true && !proposal.injectionFlagged
+        && ["pending", "approved", "applied"].includes(proposal.state) && content !== null) {
+        persistSynthesisOutcome(attempt, "accepted", "accepted");
+        recovered.push({ ok: true, outcomeId: attempt.outcomeId, proposalId: proposal.id, status: "accepted" });
+        continue;
+      }
+      if (proposal && ["critic-pending", "pending", "approved", "applied"].includes(proposal.state)) failProposalClosed(proposal, "incomplete-synthesis-attempt");
+      const reason = proposal && content === null ? "proposal-content-unavailable" : "critic-failed";
+      persistSynthesisOutcome(attempt, "failed", reason);
+      recovered.push({ ok: true, outcomeId: attempt.outcomeId, proposalId: attempt.proposalId, status: "failed" });
+      } finally {
+        store.releaseLease?.(key, acquired.nonce);
+      }
+    }
+    return recovered;
   }
 
   async function runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger, mode, options = {} }) {
@@ -229,12 +350,24 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     const observations = [];
     let eligibility = [];
     try {
-      const cursorRecord = latestCursor(store, sessionID);
-      const cursor = cursorRecord?.payload ?? schemas.makeEpisodeCursor({ sessionID });
+      const sessionIDHash = observation.hashSessionLineage(sessionID);
+      const cursorRecord = latestCursor(store, sessionIDHash);
+      const cursor = cursorRecord?.payload ?? schemas.makeEpisodeCursor({ sessionIDHash });
       const limit = Math.min(256, Number.isSafeInteger(options.messageLimit) && options.messageLimit > 0 ? options.messageLimit : DEFAULT_MESSAGE_LIMIT);
       const messages = await readMessages(ctx, sessionID, limit);
-      const messageCount = messages.length;
-      if (cursor.lastObservedMessageCount === messageCount) {
+      const messageHashes = messages.map((message) => observation.hashMessageCursor(message));
+      const lastObservedMessageHash = messageHashes.at(-1) ?? null;
+      if (cursorRecord && messages.length === 0) {
+        appendAudit("message-window-empty", sessionIDHash, { sessionIDHash, preservedMessageHash: cursor.lastObservedMessageHash });
+        return {
+          result: "no-eligible",
+          observations,
+          eligibility,
+          auditEvents: auditSince(store, auditStart),
+          responseText: "Self-evolve received an empty message window and preserved the prior cursor without creating evidence. No files were applied.",
+        };
+      }
+      if (cursorRecord && cursor.lastObservedMessageHash === lastObservedMessageHash) {
         const proposal = pendingProposal(store, projectFingerprint);
         return {
           result: proposal ? "proposal-pending" : "no-eligible",
@@ -248,26 +381,49 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         };
       }
 
+      const priorIndex = cursor.lastObservedMessageHash === null ? -1 : messageHashes.lastIndexOf(cursor.lastObservedMessageHash);
       const timestamp = now();
+      const nextCursor = schemas.makeEpisodeCursor({ sessionIDHash, lastIdleAt: timestamp, lastObservedMessageHash, leaseNonce: null });
+      const advanceCursor = () => {
+        if (cursorRecord) {
+          const updated = store.runCas("episode-cursor", cursorRecord.id, undefined, () => nextCursor);
+          if (!updated?.ok) throw new Error(updated?.reason ?? "cursor-cas-failed");
+        } else {
+          append("episode-cursor", nextCursor, timestamp);
+        }
+      };
+      if (cursor.lastObservedMessageHash !== null && priorIndex < 0) {
+        advanceCursor();
+        appendAudit("message-cursor-gap", sessionIDHash, { sessionIDHash, priorMessageHash: cursor.lastObservedMessageHash, lastObservedMessageHash });
+        return {
+          result: "no-eligible",
+          observations,
+          eligibility,
+          auditEvents: auditSince(store, auditStart),
+          responseText: "Self-evolve advanced past a bounded message-cursor gap without creating evidence from an unknown overlap. No files were applied.",
+        };
+      }
+
+      const unseenMessages = messages.slice(priorIndex + 1);
       const episode = {
-        sessionID,
         projectFingerprint,
         scopeFingerprint,
         startedAt: timestamp,
         endedAt: timestamp,
-        messages: metadataMessages(messages, privacy),
+        messages: metadataMessages(unseenMessages, privacy),
       };
       const receipts = observation.extractReceipts(episode, { projectFingerprint, scopeFingerprint, now: timestamp });
       const injectionFlagged = episode.messages.some((message) => message.injectionFlagged === true);
       for (const receipt of receipts) {
         append("receipt", receipt, timestamp);
-        const incidentId = observation.hashSignature(`${sessionID}:${messageCount}:${receipt.signatureHash}`).slice(0, 128);
+        const incidentId = observation.hashSignature(`self-evolve-incident-v1\n${sessionIDHash}\n${cursor.lastObservedMessageHash ?? "start"}\n${lastObservedMessageHash ?? "empty"}\n${receipt.signatureHash}`);
         const candidate = schemas.makeObservation({
           id: observation.hashSignature(JSON.stringify({ incidentId, receipt: receipt.signatureHash })),
           projectFingerprint,
           receiptIds: [receipt.signatureHash],
           structuredFields: receiptFields(receipt),
           incidentId,
+          sessionLineageHash: sessionIDHash,
           createdAt: timestamp,
           injectionFlagged,
           redacted: true,
@@ -278,13 +434,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         observations.push(scrubbed.sanitized ?? scrubbed.observation ?? scrubbed);
       }
 
-      const nextCursor = schemas.makeEpisodeCursor({ sessionID, lastIdleAt: timestamp, lastObservedMessageCount: messageCount, leaseNonce: null });
-      if (cursorRecord) {
-        const updated = store.runCas("episode-cursor", cursorRecord.id, undefined, () => nextCursor);
-        if (!updated?.ok) throw new Error(updated?.reason ?? "cursor-cas-failed");
-      } else {
-        append("episode-cursor", nextCursor, timestamp);
-      }
+      advanceCursor();
 
       const allObservations = store.readRecords("observation").map((record) => record.payload)
         .filter((item) => item.projectFingerprint === projectFingerprint && privacy.isObservationEligible?.(item.id) !== false);
@@ -292,7 +442,10 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
       eligibility = observation.evaluateEligibility(clusters, { now: timestamp, ...(options.eligibility ?? {}) });
       clusters.forEach((cluster) => append("evidence-cluster", cluster, timestamp));
       eligibility.forEach((item) => append("eligibility-explanation", item, timestamp));
-      const proposedClusterIds = new Set(store.readRecords("proposal").map((record) => record.payload.clusterId));
+      const proposedClusterIds = new Set([...latestByLogicalId(store.readRecords("proposal")).values()]
+        .map((record) => record.payload)
+        .filter((proposal) => ["critic-pending", "pending", "approved", "applied"].includes(proposal.state))
+        .map((proposal) => proposal.clusterId));
       const eligible = clusters.flatMap((cluster) => {
         const explanation = eligibility.find((item) => item.clusterId === cluster.id);
         if (!explanation?.eligible || proposedClusterIds.has(cluster.id)) return [];
@@ -313,36 +466,78 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
       const captured = new Map();
       const synthesisCtx = captureSynthesisContent(ctx, captured);
       for (const cluster of eligible) {
+        if (typeof options.reservePassiveProviderCalls === "function") {
+          let reservation;
+          try {
+            reservation = await options.reservePassiveProviderCalls(2, { clusterID: cluster.id, projectFingerprint });
+          } catch (error) {
+            reservation = { ok: false, reason: String(error?.message ?? error) };
+          }
+          if (!reservation?.ok) {
+            const reason = String(reservation?.reason ?? "passive-provider-budget-reservation-failed");
+            appendAudit("pipeline-passive-provider-reservation-denied", cluster.id, {
+              reason,
+              requested: 2,
+              remaining: Number.isSafeInteger(reservation?.remaining) ? reservation.remaining : -1,
+            });
+            return {
+              result: "deferred",
+              deferred: true,
+              reason,
+              requested: 2,
+              ...(Number.isSafeInteger(reservation?.remaining) ? { remaining: reservation.remaining } : {}),
+              observations,
+              eligibility,
+              auditEvents: auditSince(store, auditStart),
+              responseText: `Self-evolve deferred synthesis because two passive provider slots could not be reserved: ${reason}. Neither hidden session was started.`,
+            };
+          }
+        }
         const synthesized = await synthesis.runSynthesis({
           ctx: synthesisCtx,
           cluster,
           targetSkill,
           inventory: records,
           privacy,
-          options: { store, currentContent: options.currentContent ?? targetSkill.currentContent ?? "", eligibility: cluster.eligibility, ...(options.synthesis ?? {}) },
+          options: { store, currentContent: options.currentContent ?? targetSkill.currentContent ?? "", eligibility: cluster.eligibility, faultInjection: options.faultInjection, ...(options.synthesis ?? {}) },
           now: timestamp,
         });
         if (!synthesized?.ok || !synthesized.proposal) {
           appendAudit("pipeline-synthesis-failure", cluster.id, { reason: synthesized?.reason ?? (synthesized?.noChange ? "no-change" : "unknown") });
+           persistSynthesisOutcome(synthesized, synthesized?.noChange ? "no-change" : "failed", synthesized?.reason, options.faultInjection);
           continue;
         }
         const cleanProposal = schemas.makeProposal(synthesized.proposal);
         if (!currentProposal(store, cleanProposal.id)) append("proposal", cleanProposal, timestamp);
-        const criticized = await synthesis.runCritic({
+         const criticized = await synthesis.runCritic({
           ctx: synthesisCtx,
           proposal: cleanProposal,
           cluster,
           inventory: records,
-          options: { store, ...(options.critic ?? {}) },
+           options: { store, attemptLease: synthesized.lease, ...(options.critic ?? {}) },
           now: timestamp,
-        });
+         });
+        options.faultInjection?.("pipeline-after-critic-transaction", { synthesized, criticized });
         if (!criticized?.ok || !criticized.proposal?.criticPassed) {
           appendAudit("pipeline-critic-failure", cleanProposal.id, { reason: criticized?.reason ?? "critic-rejected" });
+          persistSynthesisOutcome(synthesized, criticized?.criticResult ? "critic-rejected" : "failed", criticized?.reason, options.faultInjection);
           continue;
         }
         const proposal = criticized.proposal;
         const content = synthesized.proposal.proposedContent ?? captured.get(proposal.proposedContentHash);
-        persistProposalContent(proposal, content);
+        try {
+          persistProposalContent(proposal, content, options.faultInjection);
+          options.faultInjection?.("pipeline-after-content-chunks", { proposal });
+        } catch (error) {
+          const reason = String(error?.message ?? error) === "proposal-content-unavailable"
+            ? "proposal-content-unavailable"
+            : "proposal-content-persistence-failed";
+          failProposalClosed(proposal, reason);
+          persistSynthesisOutcome(synthesized, "failed", reason, options.faultInjection);
+          try { appendAudit("pipeline-proposal-content-failure", proposal.id, { reason }); } catch {}
+          continue;
+        }
+        persistSynthesisOutcome(synthesized, "accepted", undefined, options.faultInjection);
         if (mode === "yolo") {
           const applied = await applier.applyProposal({ proposal: { ...proposal, proposedContent: content }, mode, actor: "self-evolve-applier" });
           if (applied?.ok) return { result: "applied", proposal, observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: `Self-evolve applied proposal ${proposal.id}; appliedHash ${applied.appliedHash}; auditId ${applied.auditId}.` };
@@ -358,12 +553,12 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
       }
       return { result: "failed-closed", observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: "Self-evolve evidence was eligible, but synthesis or critic validation failed closed. No files were applied." };
     } catch (error) {
-      try { appendAudit("pipeline-failure", sessionID, { reason: String(error?.message ?? error).slice(0, 400), trigger: String(trigger?.reason ?? trigger?.kind ?? trigger ?? "manual") }); } catch {}
+      try { appendAudit("pipeline-failure", observation.hashSessionLineage(sessionID), { reason: String(error?.message ?? error).slice(0, 400), trigger: String(trigger?.reason ?? trigger?.kind ?? trigger ?? "manual") }); } catch {}
       return { result: "failed-closed", observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: `Self-evolve failed closed: ${String(error?.message ?? error)}. No files were applied.` };
     }
   }
 
-  async function runApprovalFlow({ ctx, proposalId, actor, mode, projectFingerprint }) {
+  async function runApprovalFlow({ ctx, proposalId, actor, mode, projectFingerprint, headless = false }) {
     const auditStart = store.readRecords("audit-event").length;
     const proposal = currentProposal(store, proposalId);
     if (!proposal || proposal.projectFingerprint !== projectFingerprint) return { result: "failed-closed", auditEvents: [], responseText: `Proposal ${proposalId} was not found in this project.` };
@@ -382,10 +577,10 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     const content = readProposalContent(proposal);
     if (content === null) return { result: "failed-closed", auditEvents: [], responseText: `Proposal ${proposalId} content is unavailable or failed its hash check.` };
     const effectiveMode = mode ?? commands.getEffectiveMode?.({ projectFingerprint }) ?? "manual";
-    const result = await applier.applyProposal({ ctx, proposal: { ...proposal, proposedContent: content }, decision, actor, mode: effectiveMode, headless: false });
+    const result = await applier.applyProposal({ ctx, proposal: { ...proposal, proposedContent: content }, decision, actor, mode: effectiveMode, headless });
     return result?.ok
       ? { result: "applied", auditEvents: auditSince(store, auditStart), responseText: `Applied proposal ${proposalId}; appliedHash ${result.appliedHash}; auditId ${result.auditId}.` }
-      : { result: "failed-closed", auditEvents: auditSince(store, auditStart), responseText: `Proposal ${proposalId} was not applied: ${result?.reason ?? "apply-failed"}.` };
+      : { result: result?.deferred ? "deferred" : "failed-closed", deferred: result?.deferred === true, reason: result?.reason ?? "apply-failed", auditEvents: auditSince(store, auditStart), responseText: `Proposal ${proposalId} was not applied: ${result?.reason ?? "apply-failed"}.` };
   }
 
   async function runRollbackFlow({ ctx, proposalId, actor, reason }) {
@@ -393,7 +588,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     const result = await applier.rollbackApplied({ ctx, proposalId, actor, reason });
     return result?.ok
       ? { result: "rolled-back", auditEvents: auditSince(store, auditStart), responseText: `Rolled back proposal ${proposalId}; restored hash ${result.rolledBackHash}.` }
-      : { result: "failed-closed", auditEvents: auditSince(store, auditStart), responseText: `Rollback for proposal ${proposalId} failed closed: ${result?.reason ?? "rollback-failed"}.` };
+      : { result: "failed-closed", reason: result?.reason ?? "rollback-failed", auditEvents: auditSince(store, auditStart), responseText: `Rollback for proposal ${proposalId} failed closed: ${result?.reason ?? "rollback-failed"}.` };
   }
 
   async function runRecoveryOnStartup() {
@@ -412,5 +607,5 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     store.close?.();
   }
 
-  return Object.freeze({ runEvolutionCycle, runApprovalFlow, runRollbackFlow, runRecoveryOnStartup, close });
+  return Object.freeze({ runEvolutionCycle, runApprovalFlow, runRollbackFlow, runRecoveryOnStartup, recoverSynthesisAttempts, readProposalContent, close });
 }

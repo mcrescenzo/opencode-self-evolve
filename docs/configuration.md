@@ -1,26 +1,62 @@
 # Configuration Reference
 
-`self-evolve` has two configuration layers: 13 legacy manual-analyzer options resolved from `DEFAULT_OPTIONS`, and durable v0.2 autonomy settings stored under the OpenCode state root. Manual is the fail-closed default.
+`self-evolve` has two configuration layers: durable v0.2 autonomy settings stored under the OpenCode state root, plus 13 options for the explicit v0.1 compatibility analyzer. Durable `manual` is the fail-closed package default.
 
 ## Plugin Options
 
+OpenCode 1.18.3 documents package plugin entries as strings; it does not document a `[package, options]` tuple. The ordinary package registration therefore uses:
+
 ```json
 {
-  "plugin": [
-    [
-      "@mcrescenzo/opencode-self-evolve",
-      {
-        "durableAutonomy": true,
-        "mode": "manual",
-        "minConfidence": 0.8,
-        "maxProposals": 2
-      }
-    ]
-  ]
+  "plugin": ["@mcrescenzo/opencode-self-evolve"]
 }
 ```
 
-`durableAutonomy` enables the v0.2 durable integration at startup. The package retains the legacy manual path when this rollout switch is absent or false. `mode` controls passive entrypoint registration for that process; durable mode preference and repository overrides are managed by `/self-evolve manual|auto|yolo` and `/self-evolve repo ...`. Restart OpenCode after changing startup options or mode.
+No wrapper is needed for normal v0.2 use. To supply advanced startup identity or compatibility options, create a project-local `.opencode/plugins/self-evolve.mjs` wrapper and do not also list the npm package in `plugin`:
+
+```js
+import SelfEvolvePlugin from "@mcrescenzo/opencode-self-evolve";
+
+export default (input) => SelfEvolvePlugin(input, {
+  remoteUrl: "https://github.com/example/project",
+});
+```
+
+Durable v0.2 is enabled unless `durableAutonomy: false` explicitly selects legacy v0.1 compatibility. Startup `mode` is not authority and does not initialize or override durable preferences. `/self-evolve manual|auto|yolo` and `/self-evolve repo ...` are authoritative. After the factory returns, the server bounds official health resolution: it uses `client.global.health()` when present, otherwise GET `/global/health` at the exact HTTP(S) origin from official `PluginInput.serverUrl`. It accepts autonomous startup only when the response is healthy and its stable version is `>=1.18.3 <2.0.0`. Unavailable, timed-out, unhealthy, malformed, prerelease, older, and 2.x hosts remain manual and report the observed version or `unknown` with a compatibility reason. `hostVersion`, `hostSupported: true`, and user URL options are not production authority; `hostSupported: false` remains a deliberate narrowing control.
+
+State-root precedence is: validated explicit `stateRoot`; synchronous official host state (`ctx.path.state` server or `api.state.path.state` TUI); bounded official `client.path.get()`; environment reconstruction from `XDG_STATE_HOME` or HOME only when official APIs are absent. A synchronous candidate may be read before validation only to select persisted hook shape. Persisted manual has no passive `event`; persisted auto/yolo may expose a provisional hook whose handler returns immediately while no validated runtime is installed and has no integration or authority. Commands report `startup-validation-pending`. Only after health succeeds does the shared deferred task resolve or validate every root kind, open the store, run boot recovery, and grant command/event authority. Exhausted timeout/unavailability or disagreement fails closed without root migration or merge. Restart after a mode command so hook shape reflects the persisted preference.
+
+Legacy compatibility is deliberate and explicit:
+
+```js
+import SelfEvolvePlugin from "@mcrescenzo/opencode-self-evolve";
+
+export default (input) => SelfEvolvePlugin(input, {
+  durableAutonomy: false,
+  minConfidence: 0.8,
+  maxProposals: 2,
+});
+```
+
+## Durable Layout And Reload
+
+```text
+<stateRoot>/self-evolve/global/settings.json
+<stateRoot>/self-evolve/global/aggregates.jsonl
+<stateRoot>/self-evolve/<projectFingerprint>/settings.json
+<stateRoot>/self-evolve/<projectFingerprint>/*.jsonl
+<stateRoot>/self-evolve/bridge/<projectFingerprint>/{requests,responses}/
+<stateRoot>/self-evolve/bridge/<projectFingerprint>/{control-requests,control-responses}/
+<stateRoot>/self-evolve/bridge/<projectFingerprint>/control-state.json
+```
+
+Global settings are written once in the global namespace and are shared by every project partition. Repository settings and records remain inside the fingerprinted project partition. Every command, scheduled cycle, decision, apply authorization, excerpt operation, and aggregate contribution/read must read fresh global and repository settings before acting; long-lived processes must not treat startup settings as authority. Thus an auto/yolo process observes pauses, consent revocation, mode downgrades, allowlist changes, and kill switches before its next cycle/apply. All field changes use store updater callbacks whose read and write share one cross-process mutation-lock critical section; the combined updater handles transitions that inspect both scopes. Optional global `updatedAt` CAS returns `stale-settings-version` rather than applying stale state. Restart after changing mode or startup-only plugin options.
+
+The TUI command palette entry **Self-evolve settings** (slash name `/self-evolve-settings`) reads only `control-state.json` and submits bounded create-exclusive control requests. The projection includes a SHA-256 identity of the canonical state root; the TUI validates it before reading inbox records or controls and fails closed on mismatch. Supported actions are exactly global manual/auto/yolo mode, all four consent keys, repository exclusion, and canonical allowlist replacement. Yolo requires a non-empty allowlist and two visible confirmations; allowlist replacement requires elevated confirmation. The server verifies the projection nonce, settings hash, `updatedAt`, project, actor, time, and exact action payload under the mailbox/store locks. Stale or replayed controls must be reopened from the settings command to obtain a fresh projection.
+
+Project identity is `SHA-256` over the canonical JSON tuple `['self-evolve-project-v1', sourceKind, canonicalSource, canonicalAbsoluteWorktreePath]`. Both targets call one resolver with the same inputs. A valid explicit `projectFingerprint` is preferred only when it matches the identity derivable from the other supplied inputs; invalid or conflicting values fail closed. Otherwise `remoteUrl` comes from the same plugin option in both targets, and the worktree comes from `ctx.worktree` on the server or `api.state.path.worktree` in the TUI, falling back deterministically to each host's directory. OpenCode 1.18.3 documents TUI path/worktree state but no supported remote URL, so the plugin option is the supported way to provide a remote to both targets. Because the worktree path is always included, clones and linked worktrees partition separately, and repository relocation creates a new partition. Monorepo subprojects are scopes within one checkout partition.
+
+Auto headless approval uses `/self-evolve approve <proposal-id> --target-hash <sha256> --proposed-content-hash <sha256> --decision-version <integer> --nonce <one-use-nonce>`. All values are required and revalidated against the current proposal; a bare ID, stale version, hash mismatch, or replayed nonce fails closed.
 
 The 13 `DEFAULT_OPTIONS` entries are:
 
@@ -67,9 +103,11 @@ All consent keys default to `false` and are independently controlled with `/self
 | `passiveCalls` | `passive` | Permit provider calls at stable idle boundaries. |
 | `durableObservations` | `observations` | Permit automatic durable structured observations. |
 | `sanitizedExcerpts` | `excerpts` | Permit bounded sanitized evidence excerpts; redaction is not a secrecy guarantee. |
-| `crossRepoAggregation` | `cross-repo` | Permit separately sanitized cross-repository aggregation; requires excerpt consent. |
+| `crossRepoAggregation` | `cross-repo` | Permit strict normalized global-skill claims; requires excerpt consent. |
 
-Manual invocation can record bounded observations for that invocation without enabling passive work. Complete transcripts and raw message bodies are never persisted.
+Manual invocation can record bounded observations for that invocation without enabling passive work. Complete transcripts, raw message bodies, and raw host session/message IDs are never persisted. Durable scans store only domain-separated SHA-256 session-lineage and last-message cursor hashes. If the prior cursor is no longer present in the bounded 120-message host window, the scan audits the gap and advances without deriving evidence from the unknown overlap. A transient empty host response preserves an established cursor and derives no evidence.
+
+Cross-project aggregation is disabled unless both `sanitizedExcerpts` and `crossRepoAggregation` are true. Only the exact normalized claim schema in `docs/autonomy-contract.md` may be appended to `global/aggregates.jsonl`; no paths, names, customer details, commands, or text are allowed. Revoking either consent stops new aggregation. Project purge removes that project's indexed contributions; purge-all removes all aggregates.
 
 ## Budgets
 
@@ -84,11 +122,34 @@ Manual invocation can record bounded observations for that invocation without en
 | `storageQuotaMiB` | `8` |
 | `notificationsPerHour` | `3` |
 
-Budget exhaustion fails closed. The scheduler also accepts `quietHours` as process startup periods shaped like `{ "start": 22, "end": 7 }` in local hours; quiet periods suppress autonomous scheduling. `quietHours` is currently a scheduler-only rollout option, not part of the persisted `Budgets` schema.
+`passiveCallsPerHour` is a rolling-hour ceiling on actual hidden provider-call slots used by passive auto/yolo work, not on scheduler cycles. Once evidence is eligible, the scheduler acquires a project-scoped process-aware reservation lease, re-reads current budgets and durable reservations, and writes one durable `scheduler-budget` / `passive` audit per slot before either provider call starts. Synthesis and critic require two slots as one operation; if fewer than two remain, neither hidden session starts. Both slots remain conservatively charged when the later synthesis no-ops or either call fails. Explicit manual scans neither reserve nor consume passive slots.
+
+Budget exhaustion fails closed. `synthesisPerDay` remains a separate scheduler budget. The scheduler accepts `quietHours` as process-startup periods in local time:
+
+`storageQuotaMiB` is one cap over the complete project-associated durable partition: repository settings, all JSONL files, indexes, rollback snapshots, leases, quarantine files, and project bridge files. It is not multiplied by the number of files. Store and TUI mailbox publishers calculate current plus projected replacement bytes under the same cross-process mutation lock and reject symlinks. Decision and control requests share a 64-file ceiling and a mailbox sub-budget of `min(512 KiB, storageQuotaMiB / 8)`; each pending request reserves the maximum 4 KiB response, and growing mailbox writes preserve up to 64 KiB (or one eighth of a smaller quota) for later store writes. A safety-mandatory settings audit envelope of at most 4 KiB is the only documented quota bypass; ordinary records and recursive failure audits remain capped.
+
+```json
+{
+  "quietHours": [
+    { "from": "22:00", "to": "07:00" }
+  ]
+}
+```
+
+Quiet periods suppress autonomous scheduling. Equal endpoints disable a period, and an overnight period wraps across midnight. `quietHours` is currently a scheduler-only rollout option, not part of the persisted `Budgets` schema.
 
 ## Retention
 
-`retentionDays` defaults to `30` for observations. Proposal, decision, and audit records use three times that window, giving the normative 90-day default. Retention runs on startup and daily. Use `/self-evolve export ...` before `/self-evolve purge ...` when an archive is required.
+| Data class | Default |
+|---|---:|
+| Observations, receipts, episode cursors, evidence clusters, and eligibility records | 30 days |
+| Proposals, decisions, audits, rollback/intervention/circuit records, and rollback snapshots | 90 days |
+| Bridge request/response envelopes | 24 hours |
+| Global aggregate claims | 30 days |
+
+`retentionDays` sets the observation/evidence window and the default aggregate `expiresAt` when a claim is created. Proposal, decision, audit, rollback, intervention, circuit, and snapshot retention is three times that value. Existing aggregate claims retain their explicit `expiresAt`; later configuration changes do not rewrite them. Bridge TTL is fixed. Synthesis-attempt and proposal-content recovery runs before the startup sweep and autonomous scheduling; sweeps then run daily on one unrefed timer, with expired bridge files also eligible for removal during idle polling.
+
+The latest `critic-pending`, `pending`, `approved`, or `applied` proposal and its linked decision/audit records are retained past the nominal window until terminal. Typed proposal-content chunks receive the same protection, so an old pending proposal remains review/apply capable. Rejected, failed-closed, superseded, and rolled-back transitions compact those chunks immediately in the recoverable decision transaction; proposal purge removes chunks for every removed draft/pending record. Boot and ordinary reads finish interrupted compaction before inbox/export access. Required applied snapshots remain protected; unlinked snapshots have a 90-day default grace period. Sweeps reclaim dead process-aware leases and expired legacy PID-less leases, compact aggregate claims, repair all project contribution indexes, and remove empty indexes without following symlinks. A live PID remains authoritative even if a synthetic or wall clock passes `expiresAt`. `/self-evolve purge project` includes project records, snapshots, mailbox data, and indexed aggregate contributions but preserves global settings and reinitializes only that project. `/self-evolve purge --all` removes the complete `self-evolve/` subtree and is terminal for the loaded store/integration: timers, scheduler, and mailbox processing stop, later operations return `restart-required-after-purge-all`, and disposal does not recreate state. Restart OpenCode to reinitialize. Use `/self-evolve export ...` before purge when an archive is required. `export all` contains global settings/aggregates, every project and record/index, explicitly classified decision/control requests and responses, the classified control-state projection, active proposal-content chunks, and Base64 rollback snapshots; it never contains content for terminal/purged proposals and excludes raw quarantine, lock/temp files, transcripts, raw messages, and unrelated OpenCode state.
 
 ## Rollout Gates
 
@@ -103,4 +164,6 @@ The integration accepts a `rolloutGates` startup object. These are deployment co
 | `yoloEnablementThreshold.minSynthesesObserved` | `10` | Minimum observed synthesis count before yolo release. |
 | `yoloEnablementThreshold.minSuccessRate` | `0.8` | Minimum synthesis success rate before yolo release. |
 
-These gates cannot override privacy consent, canonical allowlists, deterministic validation, critic approval, budgets, exclusions, circuit breakers, or kill switches.
+Yolo rollout history comes only from retained `synthesis-outcome` audit records in the current project partition. Before every production provider call, a strict content-free `synthesis-attempt` admission binds one stable outcome ID to the project, cluster, target hash, proposal ID, and admission time; failed admission means no call. Every admission converges to exactly one terminal outcome. `accepted` requires deterministic validation, critic pass, and complete hash-verified typed proposal content; valid `no-change` outcomes are also successes. Missing, corrupt, mixed, or partial content produces a failed outcome and never counts as accepted. Boot recovers admissions without outcomes before scheduling and never repeats the provider call. `critic-rejected` and `failed` outcomes are failures. Both the minimum observed count and success rate must pass. Unknown, malformed, cross-project, or duplicate records do not increase authority, and legacy diagnostic audits never count. Startup options or test callbacks named `rolloutMetrics` or `getRolloutMetrics` are not authority inputs.
+
+These gates cannot override privacy consent, canonical allowlists, deterministic validation, critic approval, budgets, exclusions, circuit breakers, or kill switches. Outcome audits use the ordinary proposal/audit retention window, three times `retentionDays`; history can therefore age below the threshold and block yolo again. Active proposal-chain protection is independent and remains unchanged.

@@ -91,7 +91,7 @@ function writeTemp(target, content, nonce) {
   return temporary;
 }
 
-export function createApplier({ store, inventory, privacy, now = () => Date.now() } = {}) {
+export function createApplier({ store, inventory, privacy, now = () => Date.now(), faultInjection } = {}) {
   if (!store || typeof store.acquireLease !== "function" || typeof store.appendRecord !== "function") throw new TypeError("store-required");
   if (!privacy || typeof privacy.scanForForbiddenContent !== "function") throw new TypeError("privacy-required");
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
@@ -102,6 +102,10 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
   let breakerOpen = priorBreakers.at(-1)?.payload?.open === true;
   let tripCount = priorBreakers.at(-1)?.payload?.tripCount ?? 0;
   let closed = false;
+
+  function injectFault(point) {
+    if (typeof faultInjection === "function") faultInjection(point);
+  }
 
   function appendAudit(kind, proposalId, details) {
     const timestamp = now();
@@ -153,6 +157,8 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
   }
 
   function createSnapshot(proposalId, appliedHash, priorContent) {
+    const fileName = `${encodeURIComponent(String(proposalId))}.${appliedHash}.before`;
+    if (typeof store.writeSnapshot === "function") return store.writeSnapshot(fileName, priorContent);
     const destination = snapshotPath(proposalId, appliedHash);
     fs.mkdirSync(path.dirname(destination), { recursive: true, mode: DIR_MODE });
     const temporary = `${destination}.${randomBytes(8).toString("hex")}.tmp`;
@@ -234,13 +240,15 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
 
     const key = leaseKey(proposal.id);
     const acquired = store.acquireLease(key, { ttlMs: CLAIM_TTL_MS, actor: ACTOR });
-    if (!acquired?.ok) return { ok: false, reason: acquired?.reason === "lease-busy" ? "lease-busy" : "lease-error", auditId: auditFailure(proposal, acquired?.reason ?? "lease-error") };
+    if (!acquired?.ok) {
+      if (acquired?.reason === "lease-busy") return { ok: false, reason: "lease-busy", deferred: true };
+      return { ok: false, reason: "lease-error", auditId: auditFailure(proposal, acquired?.reason ?? "lease-error") };
+    }
     held.set(key, acquired.nonce);
 
     // Yield with the claim held so same-process callers observe at-most-once behavior.
     await Promise.resolve();
     let temporary;
-    let reservedNewTarget = false;
     let renamed = false;
     let snapshot;
     let pendingAuditId;
@@ -269,19 +277,11 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
       }
 
       temporary = writeTemp(target, proposal.proposedContent, acquired.nonce);
+      injectFault("apply-after-temp-write");
       const appliedHash = hashSkillContent(proposal.proposedContent);
       if (appliedHash !== proposal.proposedContentHash) throw new Error("proposed-hash-mismatch");
       if (priorContent) snapshot = createSnapshot(proposal.id, appliedHash, priorContent);
 
-      if (isNew) {
-        let descriptor;
-        try {
-          descriptor = fs.openSync(target, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, FILE_MODE);
-          reservedNewTarget = true;
-        } finally {
-          if (descriptor !== undefined) fs.closeSync(descriptor);
-        }
-      }
       assertSafeParent(target, proposal.skillTarget.canonicalRoot);
       let killSwitchBeforeRename = false;
       try { killSwitchBeforeRename = store.getSettings?.().global.killSwitchActive === true; } catch { killSwitchBeforeRename = true; }
@@ -297,6 +297,7 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         } catch {}
         throw new Error("kill-switch");
       }
+      injectFault("apply-before-pending-audit");
       pendingAuditId = appendAudit("apply", proposal.id, {
         state: "applied",
         target,
@@ -306,12 +307,21 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         mode,
         leaseNonce: acquired.nonce,
         snapshot: snapshot ?? "none",
+        temporary,
+        temporaryHash: appliedHash,
         "readback-verified": false,
       });
-      fs.renameSync(temporary, target);
+      injectFault("apply-after-pending-audit");
+      assertSafeParent(target, proposal.skillTarget.canonicalRoot);
+      if (isNew) {
+        fs.linkSync(temporary, target);
+        fs.unlinkSync(temporary);
+      } else {
+        fs.renameSync(temporary, target);
+      }
       temporary = undefined;
-      reservedNewTarget = false;
       renamed = true;
+      injectFault("apply-after-publication");
 
       const readback = fs.readFileSync(target);
       if (hashSkillContent(readback) !== proposal.proposedContentHash) {
@@ -336,8 +346,11 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         mode,
         leaseNonce: acquired.nonce,
         snapshot: snapshot ?? "none",
+        temporary: "none",
+        temporaryHash: appliedHash,
         "readback-verified": true,
       });
+      injectFault("apply-after-readback-audit");
       return { ok: true, appliedHash, auditId };
     } catch (error) {
       const reason = errorReason(error);
@@ -345,7 +358,6 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         const rolledBack = rollbackApplied({ proposalId: proposal.id, actor: ACTOR, reason });
         if (!rolledBack.ok) tripCritical(proposal.id, rolledBack.reason, { target });
       }
-      if (reservedNewTarget) fs.rmSync(target, { force: true });
       return { ok: false, reason, auditId: pendingAuditId ?? auditFailure(proposal, reason, { target }) };
     } finally {
       if (temporary) fs.rmSync(temporary, { force: true });
@@ -424,8 +436,28 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     for (const record of store.getRecoveryPending()) {
       const audit = record.payload;
       const details = audit.details;
+      const key = leaseKey(audit.proposalId);
+      const acquired = store.acquireLease(key, { ttlMs: CLAIM_TTL_MS, actor: `${ACTOR}-recovery` });
+      if (!acquired?.ok) {
+        outcomes.push(acquired?.reason === "lease-busy"
+          ? { ok: true, deferred: true, proposalId: audit.proposalId, reason: "lease-busy" }
+          : { ok: false, proposalId: audit.proposalId, reason: acquired?.reason ?? "lease-error" });
+        continue;
+      }
+      held.set(key, acquired.nonce);
       try {
-        const currentHash = hashSkillContent(fs.readFileSync(details.target));
+        let currentHash;
+        try { currentHash = hashSkillContent(fs.readFileSync(details.target)); }
+        catch (error) {
+          if (error?.code !== "ENOENT" || details.priorHash !== MUST_NOT_EXIST) throw error;
+          const temporary = details.temporary;
+          if (typeof temporary === "string" && temporary !== "none" && path.dirname(temporary) === path.dirname(details.target)
+            && path.basename(temporary).startsWith(`.${path.basename(details.target)}.self-evolve-tmp-`) && fs.existsSync(temporary)
+            && hashSkillContent(fs.readFileSync(temporary)) === details.temporaryHash) fs.unlinkSync(temporary);
+          const auditId = appendAudit("rollback", audit.proposalId, { ...details, state: "rolled-back", rolledBackHash: MUST_NOT_EXIST, reason: "recovery-found-target-absent", "readback-verified": true });
+          outcomes.push({ ok: false, proposalId: audit.proposalId, reason: "apply-not-published", rolledBackHash: MUST_NOT_EXIST, auditId });
+          continue;
+        }
         if (currentHash === details.appliedHash) {
           const auditId = appendAudit("apply", audit.proposalId, { ...details, state: "readback-verified", "readback-verified": true, recovery: true });
           outcomes.push({ ok: true, proposalId: audit.proposalId, appliedHash: currentHash, auditId });
@@ -433,6 +465,9 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
           const auditId = appendAudit("rollback", audit.proposalId, { ...details, state: "rolled-back", rolledBackHash: currentHash, reason: "recovery-found-prior-content", "readback-verified": true });
           if (details.snapshot && details.snapshot !== "none") fs.rmSync(details.snapshot, { force: true });
           outcomes.push({ ok: true, proposalId: audit.proposalId, rolledBackHash: currentHash, auditId });
+        } else if (details.priorHash === MUST_NOT_EXIST) {
+          tripCritical(audit.proposalId, "target-collision", { target: details.target, appliedHash: details.appliedHash });
+          outcomes.push({ ok: false, proposalId: audit.proposalId, reason: "target-collision" });
         } else {
           const rollback = rollbackFromAudit({ proposalId: audit.proposalId, actor: ACTOR, reason: "startup-recovery", ...details });
           if (!rollback.ok) tripCritical(audit.proposalId, rollback.reason, { target: details.target, appliedHash: details.appliedHash });
@@ -442,6 +477,8 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         const reason = errorReason(error, "recovery-failed");
         tripCritical(audit.proposalId, reason, { target: details.target, appliedHash: details.appliedHash });
         outcomes.push({ ok: false, proposalId: audit.proposalId, reason });
+      } finally {
+        release(key, acquired.nonce);
       }
     }
     return outcomes;
@@ -456,5 +493,9 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     closed = true;
   }
 
-  return Object.freeze({ applyProposal, rollbackApplied, recoverPending, circuitBreakerOpen: () => breakerOpen, close });
+  function getApplyLeaseStatus(proposalId) {
+    return store.getLeaseStatus?.(leaseKey(proposalId)) ?? { state: "absent", held: false, reclaimable: false, lease: null };
+  }
+
+  return Object.freeze({ applyProposal, rollbackApplied, recoverPending, getApplyLeaseStatus, circuitBreakerOpen: () => breakerOpen, close });
 }
