@@ -1,0 +1,792 @@
+import { createHash } from "node:crypto";
+
+export const SCHEMA_VERSION = "0.2.0";
+
+const MAX = Object.freeze({
+  string: 1024,
+  path: 1024,
+  actor: 128,
+  reason: 512,
+  rationale: 2048,
+  model: 256,
+  list: 128,
+  roots: 32,
+  receiptIds: 64,
+  incidents: 256,
+  reasons: 32,
+  detailsKeys: 32,
+  structuredKeys: 16,
+  burnedNonces: 128,
+});
+
+const MODES = Object.freeze(["manual", "auto", "yolo"]);
+const REPO_MODES = Object.freeze([...MODES, "inherit"]);
+const RECEIPT_TYPES = Object.freeze([
+  "repeated-command",
+  "repeated-tool-error",
+  "repeated-manual-procedure",
+  "repeated-clarification",
+]);
+const PROPOSAL_STATES = Object.freeze([
+  "pending",
+  "approved",
+  "rejected",
+  "applied",
+  "rolled-back",
+  "superseded",
+  "failed-closed",
+]);
+const AUDIT_KINDS = Object.freeze([
+  "apply",
+  "rollback",
+  "decision",
+  "mode-change",
+  "kill-switch",
+  "purge",
+  "lease",
+  "corruption",
+]);
+const RECORD_KINDS = Object.freeze([
+  "global-settings",
+  "repo-settings",
+  "episode-cursor",
+  "receipt",
+  "observation",
+  "evidence-cluster",
+  "eligibility-explanation",
+  "proposal",
+  "decision",
+  "apply-claim",
+  "audit-event",
+  "rollback-record",
+  "intervention-epoch",
+  "circuit-breaker",
+]);
+
+export const DEFAULT_BUDGETS = Object.freeze({
+  passiveCallsPerHour: 6,
+  synthesisPerDay: 24,
+  tokensPerSynthesis: 8000,
+  concurrentObservationsPerProject: 1,
+  concurrentSynthesesGlobal: 1,
+  idleDebounceMs: 1500,
+  storageQuotaMiB: 8,
+  notificationsPerHour: 3,
+});
+
+function fail(code, detail = "") {
+  throw new TypeError(detail ? `${code}: ${detail}` : code);
+}
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function object(value, label) {
+  if (!isObject(value)) fail("malformed-payload", `${label} must be an object`);
+  return value;
+}
+
+function exactKeys(value, allowed, label, required = allowed) {
+  object(value, label);
+  const extras = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (extras.length) fail("malformed-payload", `${label} has unexpected field ${extras[0]}`);
+  const missing = required.filter((key) => !(key in value));
+  if (missing.length) fail("malformed-payload", `${label} is missing ${missing[0]}`);
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+function canonicalize(value) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) fail("malformed-payload", "non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+  if (isObject(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
+  }
+  fail("malformed-payload", "value is not canonical JSON");
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function boundedList(value, label, max, itemValidator, { dedupe = false, defaultValue } = {}) {
+  const input = value === undefined && defaultValue !== undefined ? defaultValue : value;
+  if (!Array.isArray(input)) fail("malformed-payload", `${label} must be an array`);
+  if (input.length > max) fail("out-of-bounds", `${label} exceeds ${max} items`);
+  const cleaned = input.map((item, index) => itemValidator(item, index));
+  return dedupe ? [...new Set(cleaned)] : cleaned;
+}
+
+function asBoolean(value, label, defaultValue) {
+  const input = value === undefined ? defaultValue : value;
+  if (typeof input !== "boolean") fail("malformed-payload", `${label} must be boolean`);
+  return input;
+}
+
+function schemaVersion(value) {
+  if (value !== SCHEMA_VERSION) fail("unsupported-version", String(value ?? "missing"));
+  return value;
+}
+
+export function asString(value, { max = MAX.string } = {}) {
+  if (typeof value !== "string") fail("malformed-string");
+  if (!Number.isInteger(max) || max < 0) fail("invalid-bound", "max");
+  const cleaned = value.trim();
+  if (cleaned.length > max) fail("out-of-bounds", `string exceeds ${max} characters`);
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u.test(cleaned)) fail("control-character");
+  return cleaned;
+}
+
+export function asNonEmptyString(value, { max = MAX.string } = {}) {
+  const cleaned = asString(value, { max });
+  if (!cleaned) fail("empty-string");
+  return cleaned;
+}
+
+export function asEnum(value, allowed) {
+  if (!Array.isArray(allowed) || !allowed.length) fail("invalid-enum");
+  if (!allowed.includes(value)) fail("invalid-enum", String(value));
+  return value;
+}
+
+export function asInt(value, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  if (!Number.isSafeInteger(value) || value < min || value > max) fail("out-of-bounds", `integer must be ${min}..${max}`);
+  return value;
+}
+
+export function asTimestamp(value) {
+  return asInt(value, { min: 0, max: 8_640_000_000_000_000 });
+}
+
+export function asSha256Hex(value) {
+  const cleaned = asNonEmptyString(value, { max: 64 }).toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(cleaned)) fail("invalid-sha256");
+  return cleaned;
+}
+
+export function asFingerprint(value) {
+  return asSha256Hex(value);
+}
+
+export function asMode(value) {
+  return asEnum(value, MODES);
+}
+
+export function asPath(value) {
+  const cleaned = asNonEmptyString(value, { max: MAX.path }).replace(/\\/g, "/");
+  if (/[*?\[\]{}]/.test(cleaned)) fail("glob-path");
+  if (cleaned.split("/").includes("..")) fail("path-escape");
+  if (cleaned.split("/").includes(".")) fail("ambiguous-path");
+  return cleaned.length > 1 ? cleaned.replace(/\/+$/, "") : cleaned;
+}
+
+function absolutePath(value) {
+  const cleaned = asPath(value);
+  if (!cleaned.startsWith("/") && !/^[A-Za-z]:\//.test(cleaned)) fail("non-canonical-root");
+  return cleaned;
+}
+
+function idString(value, label = "id") {
+  return asNonEmptyString(value, { max: 128 }) || fail("malformed-payload", label);
+}
+
+function nonceString(value) {
+  return asNonEmptyString(value, { max: 128 });
+}
+
+function finiteNumber(value, { min = -Number.MAX_VALUE, max = Number.MAX_VALUE } = {}) {
+  if (!Number.isFinite(value) || value < min || value > max) fail("out-of-bounds", `number must be ${min}..${max}`);
+  return value;
+}
+
+function byteBoundedString(value, maxBytes) {
+  const cleaned = asNonEmptyString(value, { max: maxBytes });
+  if (Buffer.byteLength(cleaned, "utf8") > maxBytes) fail("out-of-bounds", `string exceeds ${maxBytes} bytes`);
+  return cleaned;
+}
+
+function primitiveMap(value, label, maxKeys = MAX.detailsKeys) {
+  object(value, label);
+  const keys = Object.keys(value);
+  if (keys.length > maxKeys) fail("out-of-bounds", `${label} has too many fields`);
+  const output = {};
+  for (const key of keys.sort()) {
+    const cleanKey = asNonEmptyString(key, { max: 64 });
+    const item = value[key];
+    if (typeof item === "string") output[cleanKey] = asString(item, { max: 512 });
+    else if (typeof item === "boolean") output[cleanKey] = item;
+    else if (Number.isSafeInteger(item)) output[cleanKey] = asInt(item, { min: 0 });
+    else if (item === null) output[cleanKey] = null;
+    else fail("malformed-payload", `${label}.${key} must be a bounded primitive`);
+  }
+  return output;
+}
+
+export const Mode = deepFreeze({ values: MODES, default: "manual" });
+export const ConsentState = deepFreeze({
+  fields: ["passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation"],
+  defaults: { passiveCalls: false, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false },
+});
+export const Budgets = deepFreeze({ fields: Object.keys(DEFAULT_BUDGETS), defaults: DEFAULT_BUDGETS });
+export const GlobalSettings = deepFreeze({
+  fields: ["schemaVersion", "mode", "createdAt", "updatedAt", "paused", "killSwitchActive", "allowedSkillRoots", "consent", "budgets", "retentionDays"],
+});
+export const RepoSettings = deepFreeze({
+  fields: ["schemaVersion", "projectFingerprint", "mode", "excluded", "consent", "budgets"],
+});
+export const EpisodeCursor = deepFreeze({ fields: ["sessionID", "lastIdleAt", "lastObservedMessageCount", "leaseNonce"] });
+export const Receipt = deepFreeze({ fields: ["receiptType", "signatureHash", "occurrences", "firstSeenAt", "lastSeenAt", "projectFingerprint", "scopeFingerprint"] });
+export const Observation = deepFreeze({ fields: ["id", "projectFingerprint", "receiptIds", "structuredFields", "incidentId", "createdAt", "injectionFlagged", "redacted"] });
+export const EvidenceCluster = deepFreeze({ fields: ["id", "receiptType", "projectFingerprint", "incidentIds", "scopeFingerprint", "occurrencesSum", "firstSeenAt", "lastSeenAt"] });
+export const EligibilityExplanation = deepFreeze({ fields: ["clusterId", "eligible", "reasons", "thresholdsMet", "thresholdsMissed"] });
+export const Proposal = deepFreeze({
+  fields: ["id", "projectFingerprint", "clusterId", "skillTarget", "proposedContentHash", "rationaleText", "synthesizedAt", "synthesizerModelId", "criticScore", "criticPassed", "validDeterministic", "state", "injectionFlagged", "decisionVersion", "burnedNonceHashes"],
+});
+export const Decision = deepFreeze({ fields: ["proposalId", "targetHash", "proposedContentHash", "decisionVersion", "actor", "timestamp", "nonce", "priorState", "newState"] });
+export const ApplyClaim = deepFreeze({ fields: ["proposalId", "leaseNonce", "acquiredAt", "expiresAt", "actor"] });
+export const AuditEvent = deepFreeze({ fields: ["id", "kind", "proposalId", "actor", "timestamp", "payloadHash", "details"] });
+export const RollbackRecord = deepFreeze({ fields: ["proposalId", "appliedHash", "rolledBackAt", "reason"] });
+export const InterventionEpoch = deepFreeze({ fields: ["epochId", "startedAt", "reason"] });
+export const CircuitBreaker = deepFreeze({ fields: ["open", "openedAt", "reason", "tripCount"] });
+
+export function makeConsentState(data = {}) {
+  exactKeys(data, ConsentState.fields, "ConsentState", []);
+  return deepFreeze({
+    passiveCalls: asBoolean(data.passiveCalls, "passiveCalls", false),
+    durableObservations: asBoolean(data.durableObservations, "durableObservations", false),
+    sanitizedExcerpts: asBoolean(data.sanitizedExcerpts, "sanitizedExcerpts", false),
+    crossRepoAggregation: asBoolean(data.crossRepoAggregation, "crossRepoAggregation", false),
+  });
+}
+
+function validateBudgets(data = {}, partial = false) {
+  exactKeys(data, Budgets.fields, "Budgets", partial ? [] : []);
+  const result = {};
+  for (const key of Budgets.fields) {
+    if (partial && !(key in data)) continue;
+    result[key] = asInt(data[key] ?? DEFAULT_BUDGETS[key], { min: 0, max: 1_000_000_000 });
+  }
+  return deepFreeze(result);
+}
+
+export function makeBudgets(data = {}) {
+  return validateBudgets(data, false);
+}
+
+export function makeGlobalSettings(data = {}) {
+  exactKeys(data, GlobalSettings.fields, "GlobalSettings", []);
+  const createdAt = asTimestamp(data.createdAt ?? 0);
+  const updatedAt = asTimestamp(data.updatedAt ?? createdAt);
+  if (updatedAt < createdAt) fail("out-of-order", "updatedAt precedes createdAt");
+  const roots = boundedList(data.allowedSkillRoots, "allowedSkillRoots", MAX.roots, absolutePath, { dedupe: true, defaultValue: [] });
+  return deepFreeze({
+    schemaVersion: schemaVersion(data.schemaVersion ?? SCHEMA_VERSION),
+    mode: asMode(data.mode ?? "manual"),
+    createdAt,
+    updatedAt,
+    paused: asBoolean(data.paused, "paused", false),
+    killSwitchActive: asBoolean(data.killSwitchActive, "killSwitchActive", false),
+    allowedSkillRoots: roots,
+    consent: makeConsentState(data.consent ?? {}),
+    budgets: makeBudgets(data.budgets ?? {}),
+    retentionDays: asInt(data.retentionDays ?? 30, { min: 1, max: 3650 }),
+  });
+}
+
+export function makeRepoSettings(data) {
+  exactKeys(data, RepoSettings.fields, "RepoSettings", ["projectFingerprint"]);
+  return deepFreeze({
+    schemaVersion: schemaVersion(data.schemaVersion ?? SCHEMA_VERSION),
+    projectFingerprint: asFingerprint(data.projectFingerprint),
+    mode: asEnum(data.mode ?? "inherit", REPO_MODES),
+    excluded: asBoolean(data.excluded, "excluded", false),
+    consent: makeConsentState(data.consent ?? {}),
+    budgets: validateBudgets(data.budgets ?? {}, true),
+  });
+}
+
+export function resolveMode(globalMode, repoMode = "inherit", overrides = {}) {
+  try {
+    exactKeys(overrides, ["killSwitchActive", "paused", "circuitBreakerOpen", "processExcluded", "repoOptOut", "hostSupported", "corrupt"], "mode overrides", []);
+    const global = asMode(globalMode ?? "manual");
+    const repo = asEnum(repoMode ?? "inherit", REPO_MODES);
+    for (const key of ["killSwitchActive", "paused", "circuitBreakerOpen", "processExcluded", "repoOptOut", "corrupt"]) {
+      if (overrides[key] !== undefined && typeof overrides[key] !== "boolean") return "manual";
+    }
+    if (overrides.hostSupported !== undefined && typeof overrides.hostSupported !== "boolean") return "manual";
+    if (overrides.killSwitchActive || overrides.paused || overrides.circuitBreakerOpen || overrides.processExcluded || overrides.repoOptOut || overrides.corrupt || overrides.hostSupported === false) return "manual";
+    return repo === "inherit" ? global : repo;
+  } catch {
+    return "manual";
+  }
+}
+
+export function makeEpisodeCursor(data) {
+  exactKeys(data, EpisodeCursor.fields, "EpisodeCursor", ["sessionID"]);
+  return deepFreeze({
+    sessionID: asNonEmptyString(data.sessionID, { max: 256 }),
+    lastIdleAt: asTimestamp(data.lastIdleAt ?? 0),
+    lastObservedMessageCount: asInt(data.lastObservedMessageCount ?? 0, { min: 0 }),
+    leaseNonce: data.leaseNonce === undefined || data.leaseNonce === null ? null : nonceString(data.leaseNonce),
+  });
+}
+
+export function canStartEpisode(cursor, now, debounceMs) {
+  const current = makeEpisodeCursor(cursor);
+  const timestamp = asTimestamp(now);
+  const debounce = asInt(debounceMs, { min: 0, max: 86_400_000 });
+  return !current.leaseNonce && timestamp >= current.lastIdleAt && (current.lastIdleAt === 0 || timestamp - current.lastIdleAt >= debounce);
+}
+
+export function beginEpisode(cursor, now, nonce) {
+  const current = makeEpisodeCursor(cursor);
+  const timestamp = asTimestamp(now);
+  if (current.leaseNonce) fail("lease-conflict");
+  if (timestamp < current.lastIdleAt) fail("out-of-order");
+  return makeEpisodeCursor({ ...current, lastIdleAt: timestamp, leaseNonce: nonceString(nonce) });
+}
+
+export function makeReceipt(data) {
+  exactKeys(data, Receipt.fields, "Receipt");
+  const firstSeenAt = asTimestamp(data.firstSeenAt);
+  const lastSeenAt = asTimestamp(data.lastSeenAt);
+  if (lastSeenAt < firstSeenAt) fail("out-of-order", "lastSeenAt precedes firstSeenAt");
+  return deepFreeze({
+    receiptType: asEnum(data.receiptType, RECEIPT_TYPES),
+    signatureHash: asSha256Hex(data.signatureHash),
+    occurrences: asInt(data.occurrences, { min: 1, max: 1_000_000 }),
+    firstSeenAt,
+    lastSeenAt,
+    projectFingerprint: asFingerprint(data.projectFingerprint),
+    scopeFingerprint: asFingerprint(data.scopeFingerprint),
+  });
+}
+
+const OBSERVATION_FIELDS = Object.freeze({
+  receiptType: (value) => asEnum(value, RECEIPT_TYPES),
+  scopeFingerprint: asFingerprint,
+  occurrences: (value) => asInt(value, { min: 1, max: 1_000_000 }),
+  eventKind: (value) => asNonEmptyString(value, { max: 64 }),
+  commandSignatureHash: asSha256Hex,
+  toolErrorCode: (value) => asNonEmptyString(value, { max: 128 }),
+  procedureFingerprint: asFingerprint,
+  clarificationCategory: (value) => asNonEmptyString(value, { max: 128 }),
+  messageCount: (value) => asInt(value, { min: 0, max: 1_000_000 }),
+  explicitUserSignal: (value) => asBoolean(value, "explicitUserSignal"),
+  deterministicOutcome: (value) => asBoolean(value, "deterministicOutcome"),
+});
+
+function structuredObservationFields(value) {
+  object(value, "structuredFields");
+  const keys = Object.keys(value);
+  if (keys.length > MAX.structuredKeys) fail("out-of-bounds", "structuredFields has too many fields");
+  const output = {};
+  for (const key of keys.sort()) {
+    if (!OBSERVATION_FIELDS[key]) fail("privacy-field-rejected", key);
+    output[key] = OBSERVATION_FIELDS[key](value[key]);
+  }
+  return output;
+}
+
+export function makeObservation(data) {
+  exactKeys(data, Observation.fields, "Observation");
+  return deepFreeze({
+    id: asSha256Hex(data.id),
+    projectFingerprint: asFingerprint(data.projectFingerprint),
+    receiptIds: boundedList(data.receiptIds, "receiptIds", MAX.receiptIds, asSha256Hex, { dedupe: true }),
+    structuredFields: structuredObservationFields(data.structuredFields),
+    incidentId: nonceString(data.incidentId),
+    createdAt: asTimestamp(data.createdAt),
+    injectionFlagged: asBoolean(data.injectionFlagged, "injectionFlagged"),
+    redacted: asBoolean(data.redacted, "redacted"),
+  });
+}
+
+export function makeEvidenceCluster(data) {
+  exactKeys(data, EvidenceCluster.fields, "EvidenceCluster");
+  const firstSeenAt = asTimestamp(data.firstSeenAt);
+  const lastSeenAt = asTimestamp(data.lastSeenAt);
+  if (lastSeenAt < firstSeenAt) fail("out-of-order", "lastSeenAt precedes firstSeenAt");
+  return deepFreeze({
+    id: asSha256Hex(data.id),
+    receiptType: asEnum(data.receiptType, RECEIPT_TYPES),
+    projectFingerprint: asFingerprint(data.projectFingerprint),
+    incidentIds: boundedList(data.incidentIds, "incidentIds", MAX.incidents, nonceString, { dedupe: true }),
+    scopeFingerprint: asFingerprint(data.scopeFingerprint),
+    occurrencesSum: asInt(data.occurrencesSum, { min: 0, max: 1_000_000_000 }),
+    firstSeenAt,
+    lastSeenAt,
+  });
+}
+
+export function makeEligibilityExplanation(data) {
+  exactKeys(data, EligibilityExplanation.fields, "EligibilityExplanation");
+  return deepFreeze({
+    clusterId: asSha256Hex(data.clusterId),
+    eligible: asBoolean(data.eligible, "eligible"),
+    reasons: boundedList(data.reasons, "reasons", MAX.reasons, (value) => asNonEmptyString(value, { max: MAX.reason }), { dedupe: true }),
+    thresholdsMet: primitiveMap(data.thresholdsMet, "thresholdsMet"),
+    thresholdsMissed: primitiveMap(data.thresholdsMissed, "thresholdsMissed"),
+  });
+}
+
+function skillTarget(value) {
+  exactKeys(value, ["canonicalRoot", "relativePath", "currentHash"], "skillTarget");
+  const canonicalRoot = absolutePath(value.canonicalRoot);
+  const relativePath = asPath(value.relativePath);
+  if (relativePath.startsWith("/") || /^[A-Za-z]:\//.test(relativePath)) fail("malformed-payload", "relativePath must be relative");
+  return { canonicalRoot, relativePath, currentHash: asSha256Hex(value.currentHash) };
+}
+
+export function makeProposal(data) {
+  exactKeys(data, Proposal.fields, "Proposal", Proposal.fields.slice(0, 13));
+  return deepFreeze({
+    id: idString(data.id),
+    projectFingerprint: asFingerprint(data.projectFingerprint),
+    clusterId: asSha256Hex(data.clusterId),
+    skillTarget: skillTarget(data.skillTarget),
+    proposedContentHash: asSha256Hex(data.proposedContentHash),
+    rationaleText: byteBoundedString(data.rationaleText, MAX.rationale),
+    synthesizedAt: asTimestamp(data.synthesizedAt),
+    synthesizerModelId: asNonEmptyString(data.synthesizerModelId, { max: MAX.model }),
+    criticScore: finiteNumber(data.criticScore, { min: 0, max: 1 }),
+    criticPassed: asBoolean(data.criticPassed, "criticPassed"),
+    validDeterministic: asBoolean(data.validDeterministic, "validDeterministic"),
+    state: asEnum(data.state, PROPOSAL_STATES),
+    injectionFlagged: asBoolean(data.injectionFlagged, "injectionFlagged"),
+    decisionVersion: asInt(data.decisionVersion ?? 0, { min: 0, max: 1_000_000 }),
+    burnedNonceHashes: boundedList(data.burnedNonceHashes, "burnedNonceHashes", MAX.burnedNonces, asSha256Hex, { dedupe: true, defaultValue: [] }),
+  });
+}
+
+export function makeDecision(data) {
+  exactKeys(data, Decision.fields, "Decision");
+  return deepFreeze({
+    proposalId: idString(data.proposalId),
+    targetHash: asSha256Hex(data.targetHash),
+    proposedContentHash: asSha256Hex(data.proposedContentHash),
+    decisionVersion: asInt(data.decisionVersion, { min: 1, max: 1_000_000 }),
+    actor: asNonEmptyString(data.actor, { max: MAX.actor }),
+    timestamp: asTimestamp(data.timestamp),
+    nonce: nonceString(data.nonce),
+    priorState: asEnum(data.priorState, PROPOSAL_STATES),
+    newState: asEnum(data.newState, PROPOSAL_STATES),
+  });
+}
+
+export function burnNonce(decision) {
+  const clean = makeDecision(decision);
+  return asSha256Hex(sha256(clean.nonce));
+}
+
+const ALLOWED_TRANSITIONS = deepFreeze({
+  pending: ["approved", "rejected", "superseded", "failed-closed"],
+  approved: ["applied", "superseded", "failed-closed"],
+  applied: ["rolled-back", "failed-closed"],
+  rejected: [],
+  "rolled-back": [],
+  superseded: [],
+  "failed-closed": [],
+});
+
+export function assertCasAllowed(decision, currentProposalState) {
+  const clean = makeDecision(decision);
+  const current = asEnum(currentProposalState, PROPOSAL_STATES);
+  if (clean.priorState !== current) fail("stale-prior-state");
+  if (!ALLOWED_TRANSITIONS[current].includes(clean.newState)) fail("invalid-transition", `${current}->${clean.newState}`);
+  if (["applied", "rolled-back"].includes(clean.newState) && clean.actor !== "self-evolve-applier") fail("unauthorized-actor");
+  return true;
+}
+
+export function makeApplyClaim(data) {
+  exactKeys(data, ApplyClaim.fields, "ApplyClaim");
+  const acquiredAt = asTimestamp(data.acquiredAt);
+  const expiresAt = asTimestamp(data.expiresAt);
+  if (expiresAt <= acquiredAt) fail("out-of-order", "claim must expire after acquisition");
+  return deepFreeze({
+    proposalId: idString(data.proposalId),
+    leaseNonce: nonceString(data.leaseNonce),
+    acquiredAt,
+    expiresAt,
+    actor: asNonEmptyString(data.actor, { max: MAX.actor }),
+  });
+}
+
+export function isExpired(claim, now) {
+  return makeApplyClaim(claim).expiresAt <= asTimestamp(now);
+}
+
+export function oneActiveClaimPerProposal(claims) {
+  const clean = boundedList(claims, "claims", MAX.list, makeApplyClaim);
+  const seen = new Set();
+  for (const claim of clean) {
+    if (seen.has(claim.proposalId)) fail("lease-conflict", claim.proposalId);
+    seen.add(claim.proposalId);
+  }
+  return true;
+}
+
+export function makeAuditEvent(data) {
+  exactKeys(data, AuditEvent.fields, "AuditEvent", ["id", "kind", "actor", "timestamp", "payloadHash", "details"]);
+  return deepFreeze({
+    id: asSha256Hex(data.id),
+    kind: asEnum(data.kind, AUDIT_KINDS),
+    ...(data.proposalId === undefined ? {} : { proposalId: idString(data.proposalId) }),
+    actor: asNonEmptyString(data.actor, { max: MAX.actor }),
+    timestamp: asTimestamp(data.timestamp),
+    payloadHash: asSha256Hex(data.payloadHash),
+    details: primitiveMap(data.details, "details"),
+  });
+}
+
+function audit(kind, actor, timestamp, details, proposalId) {
+  const body = { kind, actor, timestamp, details: primitiveMap(details, "details"), ...(proposalId ? { proposalId } : {}) };
+  const payloadHash = sha256(canonicalize(body.details));
+  return makeAuditEvent({ ...body, id: sha256(canonicalize({ ...body, payloadHash })), payloadHash });
+}
+
+export function makeRollbackRecord(data) {
+  exactKeys(data, RollbackRecord.fields, "RollbackRecord");
+  return deepFreeze({
+    proposalId: idString(data.proposalId),
+    appliedHash: asSha256Hex(data.appliedHash),
+    rolledBackAt: asTimestamp(data.rolledBackAt),
+    reason: asNonEmptyString(data.reason, { max: MAX.reason }),
+  });
+}
+
+export function makeInterventionEpoch(data) {
+  exactKeys(data, InterventionEpoch.fields, "InterventionEpoch");
+  return deepFreeze({
+    epochId: nonceString(data.epochId),
+    startedAt: asTimestamp(data.startedAt),
+    reason: asNonEmptyString(data.reason, { max: MAX.reason }),
+  });
+}
+
+export function makeCircuitBreaker(data = {}) {
+  exactKeys(data, CircuitBreaker.fields, "CircuitBreaker", ["open", "tripCount"]);
+  const open = asBoolean(data.open, "open");
+  if (open && (data.openedAt === undefined || data.reason === undefined)) fail("malformed-payload", "open breaker needs openedAt and reason");
+  if (!open && (data.openedAt !== undefined || data.reason !== undefined)) fail("malformed-payload", "closed breaker cannot retain open metadata");
+  return deepFreeze({
+    open,
+    ...(open ? { openedAt: asTimestamp(data.openedAt), reason: asNonEmptyString(data.reason, { max: MAX.reason }) } : {}),
+    tripCount: asInt(data.tripCount, { min: 0, max: 1_000_000 }),
+  });
+}
+
+export function trip(breaker, reason, now) {
+  const current = makeCircuitBreaker(breaker);
+  return makeCircuitBreaker({ open: true, openedAt: asTimestamp(now), reason: asNonEmptyString(reason, { max: MAX.reason }), tripCount: current.tripCount + 1 });
+}
+
+export function reset(breaker) {
+  const current = makeCircuitBreaker(breaker);
+  return makeCircuitBreaker({ open: false, tripCount: current.tripCount });
+}
+
+const RECORD_VALIDATORS = {
+  "global-settings": makeGlobalSettings,
+  "repo-settings": makeRepoSettings,
+  "episode-cursor": makeEpisodeCursor,
+  receipt: makeReceipt,
+  observation: makeObservation,
+  "evidence-cluster": makeEvidenceCluster,
+  "eligibility-explanation": makeEligibilityExplanation,
+  proposal: makeProposal,
+  decision: makeDecision,
+  "apply-claim": makeApplyClaim,
+  "audit-event": makeAuditEvent,
+  "rollback-record": makeRollbackRecord,
+  "intervention-epoch": makeInterventionEpoch,
+  "circuit-breaker": makeCircuitBreaker,
+};
+
+export function wrapRecord(kind, payload, now) {
+  const cleanKind = asEnum(kind, RECORD_KINDS);
+  const cleanPayload = RECORD_VALIDATORS[cleanKind](payload);
+  return deepFreeze({
+    schemaVersion: SCHEMA_VERSION,
+    kind: cleanKind,
+    id: sha256(`${cleanKind}\n${canonicalize(cleanPayload)}`),
+    createdAt: asTimestamp(now),
+    payload: cleanPayload,
+  });
+}
+
+export function assertRecord(envelope) {
+  exactKeys(envelope, ["schemaVersion", "kind", "id", "createdAt", "payload"], "record envelope");
+  schemaVersion(envelope.schemaVersion);
+  const expected = wrapRecord(envelope.kind, envelope.payload, envelope.createdAt);
+  if (asSha256Hex(envelope.id) !== expected.id) fail("corrupt-record");
+  return expected;
+}
+
+export function transitionMode(currentGlobal, currentRepo, requested, now, actor) {
+  try {
+    const global = makeGlobalSettings(currentGlobal);
+    const repo = makeRepoSettings(currentRepo);
+    const request = typeof requested === "string" ? { scope: "global", mode: requested } : requested;
+    exactKeys(request, ["scope", "mode", "overrides"], "mode request", ["scope", "mode"]);
+    const scope = asEnum(request.scope, ["global", "repo"]);
+    const mode = scope === "repo" ? asEnum(request.mode, REPO_MODES) : asMode(request.mode);
+    const timestamp = asTimestamp(now);
+    const cleanActor = asNonEmptyString(actor, { max: MAX.actor });
+    const nextGlobal = scope === "global" ? makeGlobalSettings({ ...global, mode, updatedAt: timestamp }) : global;
+    const nextRepo = scope === "repo" ? makeRepoSettings({ ...repo, mode }) : repo;
+    const suppliedOverrides = request.overrides ?? {};
+    const effectiveMode = resolveMode(nextGlobal.mode, nextRepo.mode, {
+      ...suppliedOverrides,
+      killSwitchActive: nextGlobal.killSwitchActive || suppliedOverrides.killSwitchActive === true,
+      paused: nextGlobal.paused || suppliedOverrides.paused === true,
+      processExcluded: nextRepo.excluded || suppliedOverrides.processExcluded === true,
+    });
+    const state = deepFreeze({ global: nextGlobal, repo: nextRepo, effectiveMode, unattendedApplyAllowed: effectiveMode === "yolo" });
+    const event = audit("mode-change", cleanActor, timestamp, { scope, requestedMode: mode, effectiveMode });
+    return { ok: true, state, events: [event] };
+  } catch (error) {
+    return { ok: false, state: deepFreeze({ global: currentGlobal, repo: currentRepo, effectiveMode: "manual" }), events: [], error: error.message };
+  }
+}
+
+export function transitionProposalState(proposal, decision, now) {
+  try {
+    const current = makeProposal(proposal);
+    const change = makeDecision(decision);
+    const timestamp = asTimestamp(now);
+    if (change.timestamp > timestamp) fail("out-of-order", "decision is from the future");
+    if (change.proposalId !== current.id) fail("cross-scope", "proposal id mismatch");
+    if (change.targetHash !== current.skillTarget.currentHash || change.proposedContentHash !== current.proposedContentHash) fail("cross-scope", "hash binding mismatch");
+    if (change.decisionVersion !== current.decisionVersion + 1) fail("stale-decision-version");
+    assertCasAllowed(change, current.state);
+    if (change.newState === "applied" && (!current.criticPassed || !current.validDeterministic || current.injectionFlagged)) fail("release-gates-failed");
+    const nonceHash = burnNonce(change);
+    if (current.burnedNonceHashes.includes(nonceHash)) fail("replayed-decision");
+    const state = makeProposal({
+      ...current,
+      state: change.newState,
+      decisionVersion: change.decisionVersion,
+      burnedNonceHashes: [...current.burnedNonceHashes, nonceHash],
+    });
+    return { ok: true, state, events: [audit("decision", change.actor, timestamp, { priorState: change.priorState, newState: change.newState, decisionVersion: change.decisionVersion, nonceHash }, current.id)] };
+  } catch (error) {
+    return { ok: false, state: proposal, events: [], error: error.message };
+  }
+}
+
+export function acquireApplyClaim(claims, proposal, now, ttlMs, actor) {
+  try {
+    const current = makeProposal(proposal);
+    const timestamp = asTimestamp(now);
+    const ttl = asInt(ttlMs, { min: 1, max: 3_600_000 });
+    const cleanActor = asNonEmptyString(actor, { max: MAX.actor });
+    if (cleanActor !== "self-evolve-applier") fail("unauthorized-actor");
+    if (current.state !== "approved") fail("proposal-not-approved");
+    if (!current.criticPassed || !current.validDeterministic || current.injectionFlagged) fail("release-gates-failed");
+    const cleanClaims = boundedList(claims, "claims", MAX.list, makeApplyClaim);
+    if (cleanClaims.some((claim) => claim.proposalId === current.id && !isExpired(claim, timestamp))) fail("lease-conflict");
+    const leaseNonce = sha256(canonicalize({ proposalId: current.id, timestamp, ttl, actor: cleanActor }));
+    const claim = makeApplyClaim({ proposalId: current.id, leaseNonce, acquiredAt: timestamp, expiresAt: timestamp + ttl, actor: cleanActor });
+    const state = deepFreeze([...cleanClaims.filter((item) => item.proposalId !== current.id && !isExpired(item, timestamp)), claim]);
+    return { ok: true, state, events: [audit("lease", cleanActor, timestamp, { action: "acquire", leaseNonce }, current.id)] };
+  } catch (error) {
+    return { ok: false, state: claims, events: [], error: error.message };
+  }
+}
+
+export function releaseApplyClaim(claim, reason) {
+  try {
+    const current = makeApplyClaim(claim);
+    const cleanReason = asNonEmptyString(reason, { max: MAX.reason });
+    return { ok: true, state: null, events: [audit("lease", current.actor, current.acquiredAt, { action: "release", reason: cleanReason, leaseNonce: current.leaseNonce }, current.proposalId)] };
+  } catch (error) {
+    return { ok: false, state: claim, events: [], error: error.message };
+  }
+}
+
+export function recordIncident(cluster, observation, now) {
+  try {
+    const current = makeEvidenceCluster(cluster);
+    const incident = makeObservation(observation);
+    const timestamp = asTimestamp(now);
+    if (incident.projectFingerprint !== current.projectFingerprint) fail("cross-scope", "project fingerprint mismatch");
+    if (incident.structuredFields.receiptType !== current.receiptType || incident.structuredFields.scopeFingerprint !== current.scopeFingerprint) fail("cross-scope", "correlation key mismatch");
+    if (incident.createdAt > timestamp) fail("out-of-order", "observation is from the future");
+    if (current.incidentIds.includes(incident.incidentId)) return { ok: true, state: current, events: [] };
+    if (current.incidentIds.length >= MAX.incidents) fail("out-of-bounds", "incidentIds is full");
+    const state = makeEvidenceCluster({
+      ...current,
+      incidentIds: [...current.incidentIds, incident.incidentId],
+      occurrencesSum: current.occurrencesSum + (incident.structuredFields.occurrences ?? 1),
+      firstSeenAt: Math.min(current.firstSeenAt, incident.createdAt),
+      lastSeenAt: Math.max(current.lastSeenAt, incident.createdAt),
+    });
+    return { ok: true, state, events: [] };
+  } catch (error) {
+    return { ok: false, state: cluster, events: [], error: error.message };
+  }
+}
+
+export function assertEligibility(cluster, thresholds) {
+  const current = makeEvidenceCluster(cluster);
+  exactKeys(thresholds, ["minIncidents", "minOccurrences"], "thresholds", []);
+  const requiredIncidents = asInt(thresholds.minIncidents ?? 3, { min: 1, max: MAX.incidents });
+  const requiredOccurrences = asInt(thresholds.minOccurrences ?? 3, { min: 1, max: 1_000_000 });
+  const values = { incidentCount: current.incidentIds.length, occurrencesSum: current.occurrencesSum };
+  const met = {};
+  const missed = {};
+  (values.incidentCount >= requiredIncidents ? met : missed).minIncidents = requiredIncidents;
+  (values.occurrencesSum >= requiredOccurrences ? met : missed).minOccurrences = requiredOccurrences;
+  const eligible = Object.keys(missed).length === 0;
+  return makeEligibilityExplanation({
+    clusterId: current.id,
+    eligible,
+    reasons: eligible ? ["all-thresholds-met"] : Object.keys(missed).map((key) => `${key}-not-met`),
+    thresholdsMet: met,
+    thresholdsMissed: missed,
+  });
+}
+
+export function evaluateApplyAuthority({ mode, decisionApproved = false, allowlisted = false, releaseGatesPassed = false, headless = false, killSwitchActive = false } = {}) {
+  let cleanMode;
+  try { cleanMode = asMode(mode); } catch { cleanMode = "manual"; }
+  if ([decisionApproved, allowlisted, releaseGatesPassed, headless, killSwitchActive].some((value) => typeof value !== "boolean")) {
+    return deepFreeze({ allowed: false, reason: "ambiguous-authority" });
+  }
+  if (killSwitchActive || cleanMode === "manual") return deepFreeze({ allowed: false, reason: killSwitchActive ? "kill-switch" : "manual-advisory-only" });
+  if (cleanMode === "auto") {
+    if (headless) return deepFreeze({ allowed: false, reason: "auto-headless-prohibited" });
+    return deepFreeze({ allowed: decisionApproved, reason: decisionApproved ? "explicit-decision" : "decision-required" });
+  }
+  if (!allowlisted) return deepFreeze({ allowed: false, reason: "scope-not-allowlisted" });
+  if (!releaseGatesPassed) return deepFreeze({ allowed: false, reason: "release-gates-failed" });
+  return deepFreeze({ allowed: true, reason: "yolo-release-gates-passed" });
+}
+
+export function downgradeOnKillSwitch(state) {
+  try {
+    object(state, "runtime state");
+    exactKeys(state, ["storedMode", "effectiveMode", "yoloApplicationEnabled", "killSwitchActive", "actor", "timestamp"], "runtime state", ["storedMode", "effectiveMode", "yoloApplicationEnabled", "killSwitchActive", "actor", "timestamp"]);
+    const storedMode = asMode(state.storedMode);
+    const effectiveMode = asMode(state.effectiveMode);
+    const timestamp = asTimestamp(state.timestamp);
+    const actor = asNonEmptyString(state.actor, { max: MAX.actor });
+    const next = deepFreeze({ ...state, storedMode, effectiveMode: "manual", yoloApplicationEnabled: false, killSwitchActive: true, actor, timestamp });
+    const changed = effectiveMode !== "manual" || state.yoloApplicationEnabled || !state.killSwitchActive;
+    return { ok: true, state: next, events: changed ? [audit("kill-switch", actor, timestamp, { storedMode, priorEffectiveMode: effectiveMode, effectiveMode: "manual" })] : [] };
+  } catch (error) {
+    return { ok: false, state, events: [], error: error.message };
+  }
+}

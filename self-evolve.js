@@ -493,6 +493,35 @@ async function handleCommand(ctx, input, output, pluginOptions, configuredModel)
   replaceParts(output, displayPart(input), textPart(applied.text));
 }
 
+async function createDurablePipeline(ctx, options) {
+  if (options.pipeline) return options.pipeline;
+  if (typeof options.pipelineFactory === "function") return await options.pipelineFactory({ ctx, options });
+  const stateRoot = options.stateRoot ?? ctx?.client?.path?.state ?? ctx?.path?.state;
+  if (!stateRoot) return null;
+  const [pipelineModule, storeModule, inventoryModule, privacyModule, synthesisModule, applierModule, commandsModule, schemasModule, observationModule, schedulerModule, integrationModule] = await Promise.all([
+    import("./self-evolve-pipeline.js"),
+    import("./self-evolve-store.js"),
+    import("./self-evolve-inventory.js"),
+    import("./self-evolve-privacy.js"),
+    import("./self-evolve-synthesis.js"),
+    import("./self-evolve-applier.js"),
+    import("./self-evolve-commands.js"),
+    import("./self-evolve-schemas.js"),
+    import("./self-evolve-observation.js"),
+    import("./self-evolve-scheduler.js"),
+    import("./self-evolve-integration.js"),
+  ]);
+  const projectFingerprint = options.projectFingerprint ?? storeModule.projectFingerprintFor("", ctx.directory);
+  const durableStore = storeModule.openStore(stateRoot, { projectFingerprint, projectName: options.projectName, now: options.now });
+  const settings = durableStore.getSettings();
+  const privacy = privacyModule.createPrivacyGuard({ consent: settings.global.consent, projectFingerprint, retentionDays: settings.global.retentionDays, storageQuotaMiB: settings.global.budgets.storageQuotaMiB, store: durableStore, now: options.now });
+  const roots = inventoryModule.loadAllowlist({ globalSkillRoots: settings.global.allowedSkillRoots }).canonicalRoots;
+  const records = inventoryModule.discoverSkills(roots);
+  const applier = applierModule.createApplier({ store: durableStore, inventory: { records, canonicalRoots: roots }, privacy, now: options.now });
+  const commands = commandsModule.createCommandPolicy({ store: durableStore, privacy, now: options.now });
+  return integrationModule.createIntegration({ store: durableStore, inventory: inventoryModule, privacy, synthesisModule, applier, commands: commandsModule, pipeline: pipelineModule, scheduler: schedulerModule, schemas: schemasModule, observation: observationModule, options: { ...options, ctx }, now: options.now });
+}
+
 /**
  * @param {OpenCodePluginInput} ctx
  * @param {OpenCodePluginOptions} [options]
@@ -508,8 +537,15 @@ async function SelfEvolvePlugin(ctx, options = {}) {
   currentPluginOptions = resolveOptions(options);
   registry.setOptions(currentPluginOptions);
   let configuredModel = null;
+  let durablePipelinePromise = null;
+  if (currentPluginOptions.durableAutonomy === true) {
+    durablePipelinePromise = createDurablePipeline(ctx, currentPluginOptions).then(async (integration) => {
+      await integration?.boot?.({ ctx, hostVersion: "1.18.3" });
+      return integration;
+    });
+  }
 
-  return {
+  const hooks = {
     config: async (cfg) => {
       configuredModel = cfg.model;
       cfg.agent = cfg.agent ?? {};
@@ -531,6 +567,19 @@ async function SelfEvolvePlugin(ctx, options = {}) {
       // per-instance closure variable) so behavior is consistent even if
       // OpenCode's double-instantiation leaves more than one instance's
       // hooks reachable.
+      const command = parseCommand(input.arguments ?? "");
+      if (currentPluginOptions.durableAutonomy === true && command.verb === "scan") {
+        durablePipelinePromise ??= createDurablePipeline(ctx, currentPluginOptions);
+        const pipeline = await durablePipelinePromise;
+        const sessionID = inputSessionID(input);
+        if (pipeline && sessionID) {
+          const projectFingerprint = currentPluginOptions.projectFingerprint ?? (await import("./self-evolve-store.js")).projectFingerprintFor("", ctx.directory);
+          const scopeFingerprint = currentPluginOptions.scopeFingerprint ?? projectFingerprint;
+          const result = await pipeline.runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger: { kind: "manual", reason: "manual-scan" }, mode: currentPluginOptions.mode ?? "manual", options: currentPluginOptions });
+          replaceParts(output, displayPart(input), textPart(result.responseText));
+          return;
+        }
+      }
       await handleCommand(ctx, input, output, currentPluginOptions, configuredModel);
     },
 
@@ -539,8 +588,18 @@ async function SelfEvolvePlugin(ctx, options = {}) {
       // otherwise retain per-session state for the whole process lifetime. Clear
       // it when opencode unloads the plugin so nothing outlives this instance.
       registry.clear();
+      durablePipelinePromise?.then((pipeline) => pipeline?.shutdown?.() ?? pipeline?.close?.()).catch(() => {});
     },
   };
+
+  if (currentPluginOptions.durableAutonomy === true && (currentPluginOptions.mode ?? "manual") !== "manual") {
+    hooks.event = async (input) => {
+      const integration = await durablePipelinePromise;
+      await integration?.handleEvent?.(input);
+    };
+  }
+
+  return hooks;
 }
 
 SelfEvolvePlugin.__test = {

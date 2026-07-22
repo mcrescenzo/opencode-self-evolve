@@ -1,155 +1,112 @@
-# opencode Self-Evolve Plugin
+# OpenCode Self-Evolve Plugin
 
-Long opencode sessions build up small friction that nobody stops to notice: a skill that's missing a case you keep hitting, a command you keep retyping by hand, a convention that only lives in your head. Most of it just accumulates, session after session, because reviewing your own transcript for "what would have made this smoother?" isn't something you have time to do.
-
-`self-evolve` does that review for you. Run `/self-evolve scan` and it reads the recent conversation and, when it finds one concrete, evidence-backed opportunity to improve your local opencode tooling — a skill, command, agent, workflow, plugin, or project convention — it hands you a single advisory proposal: what it noticed, why, and what you could do about it. No proposal at all is a common and expected result; it only speaks up when it has real evidence.
-
-It's deliberately conservative: it's a first-party opencode plugin that only ever runs when you explicitly type `/self-evolve` or `/self-evolve scan`, and it never edits files, calls internal tooling, writes to external issue trackers or memory systems, publishes, pushes, or mutates any external system. It proposes; you decide.
+`@mcrescenzo/opencode-self-evolve` turns repeated friction in OpenCode sessions into evidence-backed skill improvements. Version 0.2 is a dual-target package: a headless-safe server plugin observes and validates opportunities, while an optional native TUI target presents review and consent dialogs. The same evidence thresholds apply in every mode, and finding no worthwhile change is a normal result.
 
 ## Quick Start
 
-Install the package in your opencode config environment:
-
-```sh
-npm install @mcrescenzo/opencode-self-evolve
-```
-
-Then register it in `opencode.json`:
+Register the package in `opencode.json`:
 
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "plugin": ["@mcrescenzo/opencode-self-evolve"]
 }
 ```
 
-Restart opencode after changing plugin registration — a running session keeps whatever plugin list and instructions it loaded at startup.
+OpenCode uses Bun to install the package at startup and resolves both the server (`.`) and TUI (`./tui`) targets where supported. Installing through the `opencode plugin` CLI is an alternative on hosts that expose that command. A source checkout can instead register `./self-evolve.js`.
 
-Working from a source checkout instead? Register the checkout's entrypoint path rather than the package name:
-
-```json
-{
-  "plugin": ["./self-evolve.js"]
-}
-```
-
-To confirm it loaded, start a new opencode session and run:
+Restart OpenCode after changing registration. Confirm the plugin loaded in a new session:
 
 ```text
 /self-evolve status
 ```
 
-You should see output starting with `Self-evolve status: active`. If the command instead turns into a normal model prompt, the plugin didn't load, or opencode wasn't restarted after you changed the registration.
+OpenCode must be restarted for mode changes and applied skill changes to take full effect; new sessions pick up changes automatically.
+
+## Modes
+
+`manual` is the fail-closed default. All three modes use the same `observe -> persist -> correlate -> synthesize -> validate -> notify | apply` pipeline and evidence gates.
+
+| Behavior | `manual` | `auto` | `yolo` |
+|---|---|---|---|
+| Passive provider calls | Never | At stable idle boundaries | At stable idle boundaries |
+| Durable observations | Only on `/self-evolve` or `scan` | Automatic at idle | Automatic at idle |
+| Correlate, synthesize, validate | On invocation | Automatic | Automatic |
+| Eligible proposal | Command result and toast | Native TUI review at safe idle | Native TUI audit/review at safe idle |
+| Apply | Never; advisory only | Explicit approval for each change | Automatic only in canonical allowlisted skill roots after release gates pass |
+| Headless | Commands and durable inbox | Draft only; approval waits in inbox | Apply only in an explicit allowlist after all gates pass |
+
+Select a mode with `/self-evolve manual`, `/self-evolve auto`, or the deliberately explicit yolo command:
+
+```text
+/self-evolve yolo confirm --allowlist /absolute/path/to/skills
+```
+
+Unknown scopes and non-allowlisted targets always downgrade to pending review. Yolo is high authority: it can change skill files without per-change confirmation. Use narrow allowlisted roots, inspect audit results, and stop autonomous work immediately with `SELF_EVOLVE_KILL=1` or `/self-evolve kill-switch on`.
 
 ## Example
 
-Say you spend a session re-running the same debugging command by hand a few times. Running a scan afterward might surface something like this:
-
 ```text
 $ /self-evolve scan
+Self-evolve recorded bounded observations and found an eligible skill improvement.
+Proposal: clarify the payments log-triage procedure
+Evidence: the same read-only diagnostic sequence occurred in independent incidents.
+Target: payments-debug/SKILL.md
+State: pending review
 ```
 
-```text
-Self-evolve found a possible improvement: Add a skill for the payments log-tailing routine
-
-You ran `docker logs payments-api | grep ERROR | tail -n 50` by hand four times this
-session while tracking down the checkout bug. A small skill would save the retyping
-next time this comes up.
-
-Advisory only: no changes will be made unless you explicitly ask.
-Options:
-- Implement now: ask an agent to make this change.
-- Save follow-up: ask to record it as backlog work for later.
-- Ignore it: run /self-evolve dismiss se-1.
-- Disable self-evolve for this session: run /self-evolve disable.
-
-Proposal ID: se-1
-Placement: repo-local
-Target: .claude/skills/tail-payment-logs.md
-Risk: low. Mitigation: the skill only wraps a read-only log command; review before adding.
-Confidence: 0.81
-Evidence:
-- You ran the same docker logs/grep/tail sequence in 4 separate turns.
-- You said "let's not do this by hand again" after the third repeat.
-
-Suggested action: draft a skill that wraps the docker logs/grep/tail sequence with a
-parameterized service name.
-```
-
-This is an illustrative example, not a canned response — the real analyzer reads your actual transcript, so the title, evidence, and suggested action will reflect your own session (or it may find nothing worth proposing at all, which is fine and expected).
+The real proposal is based on structured receipts from your sessions. It may return no proposal when the evidence is insufficient.
 
 ## Commands
 
-- `/self-evolve` or `/self-evolve scan` — run a manual analysis (these are equivalent).
-- `/self-evolve status` — show session state: pause/disable state, run and proposal counts, pending proposal.
-- `/self-evolve pause` / `/self-evolve resume` — temporarily stop or restart manual scans for this session.
-- `/self-evolve disable` — turn self-evolve off for this session.
-- `/self-evolve dismiss <proposal-id>` — clear a pending proposal.
-- `/self-evolve help` — list the commands.
-
-`status`, `pause`, `resume`, `disable`, and `dismiss` are deterministic — they never invoke a model. Only `/self-evolve` and `/self-evolve scan` call the analyzer.
-
-## Supported Environment
-
-- Node.js `>=20.11.0` is required and declared in `package.json`.
-- opencode CLI `>=1.17.7` is the supported host range for plugin loading and live smoke validation.
-- `npm run smoke:live` uses `OPENCODE_BIN` when set, otherwise `$HOME/.opencode/bin/opencode` or `opencode` on `PATH`.
-- The package uses npm scripts and doesn't pin a `packageManager`; there's no install-time build step.
-- `@opencode-ai/plugin` is a runtime dependency, documenting the plugin API convention that portable plugin installs rely on.
+- `/self-evolve` opens status and the durable inbox; `/self-evolve scan` runs the shared pipeline explicitly.
+- `/self-evolve status`, `health`, and `budget` inspect state without a provider call.
+- `/self-evolve pause` and `resume` control autonomous work.
+- `/self-evolve inbox` and `review [id]` inspect pending proposals.
+- `/self-evolve approve <id>`, `reject <id>`, `snooze <id> [duration]`, and `undo <id>` manage review decisions.
+- `/self-evolve manual`, `auto`, `yolo`, and `repo <manual|auto|yolo|inherit>` manage modes.
+- `/self-evolve exclude` and `include` control the current repository.
+- `/self-evolve consent <passive|observations|excerpts|cross-repo> <on|off>` controls privacy consent.
+- `/self-evolve export [observations|proposals|project|all]` exports state.
+- `/self-evolve purge <observations|proposals|project|all>` and `/self-evolve purge --all` remove state by scope.
+- `/self-evolve kill-switch <on|off>` controls the durable emergency stop.
 
 ## Configuration
 
-Most people never need to touch these, but the two you're most likely to tune are:
+Manual mode requires no allowlist or passive consent. Auto and yolo configuration covers mode and repository overrides, canonical skill-root allowlists, four separate consent keys, provider/token/concurrency/storage/notification budgets, retention, quiet periods, and rollout gates. See [docs/configuration.md](docs/configuration.md) for defaults and exact controls.
 
-```json
-{
-  "plugin": [
-    [
-      "@mcrescenzo/opencode-self-evolve",
-      {
-        "minConfidence": 0.8,
-        "maxProposals": 2
-      }
-    ]
-  ]
-}
+## Storage And Privacy
+
+Durable state lives under:
+
+```text
+<state-root>/self-evolve/<projectFingerprint>/
 ```
 
-- `minConfidence` (default `0.72`) — how confident the analyzer must be before a proposal reaches you. Raise it if you're seeing proposals that feel like a stretch.
-- `maxProposals` (default `3`) — how many accepted proposals a session can produce before scans stop offering new ones.
-- `minIntervalMs` (default `600000`, i.e. 10 minutes) — the cooldown after a scan result before another scan is allowed.
+Observations are retained for 30 days by default. Proposal, decision, and audit records are retained for 90 days. Startup and daily retention sweeps enforce those windows; the export and purge commands provide user-controlled lifecycle management.
 
-There are eight more tunables covering transcript bounds, timeouts, and analyzer run caps — see [docs/configuration.md](docs/configuration.md) for the full table.
+Complete transcripts and raw message bodies are never stored. Deterministic receipts and typed observations are stored without raw text. Short sanitized excerpts require separate explicit consent. Redaction is defensive and is not a secrecy guarantee: model-backed synthesis still sends bounded inputs to the configured provider in manual scans or consented autonomous modes.
 
-## Privacy And Token Use
+The hidden synthesizer and critic use deny-all-tools sessions. The plugin never spawns implementation, shell, or Git agents; never commits, pushes, publishes, or mutates external trackers; never injects proposal turns into the working session; and never writes outside the canonical skill allowlist. The transactional applier is the only skill writer.
 
-- The deterministic control commands (`status`, `pause`, `resume`, `disable`, `dismiss`) never touch a model — they're free and instant.
-- A manual scan (`/self-evolve` or `/self-evolve scan`) reads your recent session messages through the opencode SDK, bounds the transcript by message and character limits, redacts common secret-like values, and sends the analyzer prompt plus that bounded, redacted excerpt to your configured model/provider through a temporary, isolated session.
-- That means a scan can consume provider tokens according to your configured model/provider — it's a deliberate action, not a background one.
-- The analyzer itself is hidden, runs at temperature `0`, takes one step, and has every tool denied; the plugin validates its output locally before showing you anything.
-- The plugin never writes files, persists proposals, publishes packages, pushes git data, writes to external issue trackers or memory systems, or mutates external services.
+Headless hosts load the server target without `@opentui/*`. Pending reviews remain in the durable inbox and all deterministic `/self-evolve` inspection, export, purge, pause, and kill-switch commands remain available. Auto mode does not apply headlessly; yolo can do so only inside its explicit allowlist after release gates pass.
 
-## Limitations
+## Supported Environment
 
-- Redaction is defensive, not a guarantee — don't run a scan over transcript content that should never reach your configured provider.
-- Proposals are advisory only. You (or an agent acting on your behalf) still have to review and apply any suggested change yourself.
-- Session state lives in memory only. Restarting opencode clears pause state, counters, and any pending proposal.
-- Cleaning up the temporary analyzer session is best-effort; a cleanup failure is only reported when it affects the command result.
+- Node.js `>=20.11.0`.
+- OpenCode and `@opencode-ai/plugin` `^1.18.3`; the release contract is verified against 1.18.3.
+- Plain Node ESM with no install-time build.
+- `@opencode-ai/plugin` is both a runtime dependency for portable installation and a peer contract for host compatibility.
 
 ## Troubleshooting
 
-- **`/self-evolve status` becomes a normal model turn:** confirm the package is installed in the opencode config environment, the `plugin` entry is present in `opencode.json`, and opencode was restarted after registration changed.
-- **The command says no proposal was found:** the analyzer either found no safe actionable local tooling improvement, returned low-confidence output, or proposed a duplicate/unsafe target. This is expected for many sessions.
-- **The command reports analyzer failures:** run `/self-evolve status` to check the session state. Repeated malformed analyzer output can disable the session after `maxAnalyzerFailures`.
-- **`npm run smoke:live` cannot find opencode:** install opencode locally or set `OPENCODE_BIN` to the opencode binary path.
-- **`npm run smoke:live` fails to bind `127.0.0.1`:** run it in an environment that permits local loopback server binding. Some sandboxes deny this even though normal local development and CI allow it.
-
-## For AI Agents
-
-If you're an agent operating in a session where this plugin is installed: it only runs when someone explicitly types `/self-evolve` or `/self-evolve scan` — there's no passive `event` or `chat.message` hook watching the conversation, so it never triggers on its own. Everything it returns is advisory only: it never edits files, calls other tools, or writes to external systems. Treat a proposal as something to relay to the user or act on with their separate approval, not as a standing instruction to execute.
+- If `/self-evolve status` becomes a normal model turn, verify registration and restart OpenCode.
+- If autonomous work does not run, inspect `/self-evolve health`, consent, mode, exclusion, budget, circuit-breaker, and kill-switch state.
+- If no proposal appears, evidence or deterministic validation gates were not met; this is expected.
+- If state is corrupt or from a newer schema, autonomous work fails closed to manual and purge remains available.
+- Applied skill changes do not alter already-loaded sessions; restart OpenCode or open a new session.
 
 ## Development
-
-Run from this directory:
 
 ```sh
 npm test
@@ -157,6 +114,4 @@ npm run check
 npm run pack:check
 ```
 
-Run `npm run smoke:live` when you have a local opencode binary available.
-
-See [docs/internals.md](docs/internals.md) for how the plugin's hooks, analyzer contract, and CI checks work under the hood, and [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and repository layout notes.
+`npm run smoke:live` is an optional no-token local OpenCode load check. See [docs/internals.md](docs/internals.md), [SECURITY.md](SECURITY.md), and [CONTRIBUTING.md](CONTRIBUTING.md).

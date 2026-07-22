@@ -5,6 +5,14 @@ recorded here.
 
 This project follows semantic versioning after the first public release.
 
+## 0.2.0 - 2026-07-22
+
+- Added the shared autonomy pipeline with `manual`, `auto`, and `yolo` modes, identical evidence thresholds, durable structured observations, deterministic correlation, hidden synthesis and critic review, and a conservative scheduler.
+- Added a native TUI review target, durable headless inbox, compare-and-swap decisions, privacy/retention/export/purge lifecycle, and a transactional hash-bound skill applier with audit and rollback support.
+- Added release gates, budgets, consent controls, canonical allowlists, emergency kill switches, crash recovery, and an adversarial hardening campaign covering concurrency, injection, stale hashes, quota exhaustion, and rollback failure.
+- **Breaking:** raised the minimum supported OpenCode and `@opencode-ai/plugin` host contract to `^1.18.3`.
+- **Breaking:** the package is now dual-target, exporting the headless-safe server plugin at `.` and the native review module at `./tui`.
+
 ## 0.1.2 - 2026-07-08
 
 - Fixed the documented supported opencode CLI range to `>=1.17.7` (was

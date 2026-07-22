@@ -1,113 +1,127 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const tempRoot = mkdtempSync(path.join(tmpdir(), "self-evolve-pack-"));
-
-const requiredFiles = [
-  "package.json",
-  "LICENSE",
-  "README.md",
-  "SECURITY.md",
-  "CONTRIBUTING.md",
-  "CHANGELOG.md",
-  "CODE_OF_CONDUCT.md",
-  "self-evolve.js",
-  "self-evolve-core.js",
-  "analyzer-prompt.js",
-];
-
-const forbiddenFiles = [
-  ".beads/issues.jsonl",
-  ".claude/settings.json",
-  "AGENTS.md",
-  "CLAUDE.md",
-  // Dev-only test and script files must never ship in the published tarball.
-  "tests/self-evolve-core.test.mjs",
-  "tests/self-evolve-plugin.test.mjs",
-  "scripts/live-command-hook-smoke.mjs",
-  "scripts/pack-artifact-check.mjs",
-];
+const scriptPath = fileURLToPath(import.meta.url);
+const defaultRepoRoot = path.resolve(path.dirname(scriptPath), "..");
+const PRIVATE_PATH_RE = /(?:^|\/)(?:\.opencode|\.beads|\.git|node_modules|\.remember|\.claude)(?:\/|$)|(?:^|\/)\.env(?:\.|$)|(?:^|\/)[^/]*\.logs?$|(?:^|\/)logs?(?:\/|$)/iu;
+const FORBIDDEN_MODULES = ["child_process", "node:child_process", "fetch", "http", "node:http", "https", "node:https", "net", "node:net"];
+const MODULE_SPECIFIER_RE = /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?|\brequire\s*\(\s*)["']([^"']+)["']/gu;
 
 function fail(message, detail = "") {
-  const suffix = detail ? `\n${detail}` : "";
-  throw new Error(`${message}${suffix}`);
+  throw new Error(detail ? `${message}\n${detail}` : message);
 }
 
-function run(command, args, options = {}) {
+function run(command, args, { cwd, env } = {}) {
   const result = spawnSync(command, args, {
-    cwd: repoRoot,
+    cwd,
     encoding: "utf8",
-    ...options,
+    env: env ?? process.env,
   });
   if (result.status !== 0) {
-    fail(
-      `${command} ${args.join(" ")} failed`,
-      [result.stdout, result.stderr].filter(Boolean).join("\n"),
-    );
+    fail(`${command} ${args.join(" ")} failed`, [result.stdout, result.stderr].filter(Boolean).join("\n"));
   }
   return result;
 }
 
-function runNpmPack(args) {
-  const result = spawnSync("npm", ["pack", ...args], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      npm_config_cache: path.join(tempRoot, "npm-cache"),
-    },
-  });
-  if (result.status !== 0) {
-    fail(`npm pack ${args.join(" ")} failed`, [result.stdout, result.stderr].filter(Boolean).join("\n"));
-  }
-  return result;
+function normalizePackagePath(value) {
+  return String(value).replace(/^\.\//u, "").replaceAll("\\", "/").replace(/\/$/u, "");
 }
 
-try {
-  const packageJSON = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
-  const tarballName = `${packageJSON.name.replace(/^@/, "").replace("/", "-")}-${packageJSON.version}.tgz`;
-  runNpmPack(["--ignore-scripts", "--pack-destination", tempRoot]);
+export function assertPublicFilesManifest(packageJSON) {
+  if (!Array.isArray(packageJSON.files) || packageJSON.files.length === 0) fail("package.json files must be a non-empty array");
+  const files = packageJSON.files.map(normalizePackagePath);
+  const unsafe = files.filter((file) => !file || file === "." || file.includes("..") || PRIVATE_PATH_RE.test(file));
+  if (unsafe.length) fail(`package.json files contains forbidden private runtime state: ${unsafe.join(", ")}`);
+  if (new Set(files).size !== files.length) fail("package.json files contains duplicate entries");
+  return files;
+}
 
-  const tarball = path.join(tempRoot, tarballName);
-  if (!existsSync(tarball)) {
-    fail(`Expected npm pack output was not created: ${tarball}`);
+export function expectedArtifactFiles(packageJSON) {
+  return new Set(["package.json", "README.md", "LICENSE", ...assertPublicFilesManifest(packageJSON)]);
+}
+
+export function assertExactArtifactFiles(actualPaths, packageJSON) {
+  const expected = expectedArtifactFiles(packageJSON);
+  const actual = new Set(actualPaths.map(normalizePackagePath));
+  const privateFiles = [...actual].filter((file) => PRIVATE_PATH_RE.test(file));
+  if (privateFiles.length) fail(`Package artifact includes private runtime state: ${privateFiles.join(", ")}`);
+  const missing = [...expected].filter((file) => !actual.has(file));
+  const extra = [...actual].filter((file) => !expected.has(file));
+  if (missing.length || extra.length) {
+    fail("Package artifact file set does not exactly match package.json files plus npm-required metadata", [
+      missing.length ? `Missing: ${missing.join(", ")}` : "",
+      extra.length ? `Unexpected: ${extra.join(", ")}` : "",
+    ].filter(Boolean).join("\n"));
   }
+  return actual;
+}
 
-  const list = run("tar", ["-tzf", tarball], { cwd: tempRoot });
-  const files = new Set(
-    list.stdout
-      .split("\n")
-      .map((file) => file.trim())
-      .filter(Boolean)
-      .map((file) => file.replace(/^package\//, ""))
-      .filter(Boolean),
-  );
-
-  const missing = requiredFiles.filter((file) => !files.has(file));
-  if (missing.length > 0) {
-    fail(`Package artifact is missing required files: ${missing.join(", ")}`);
+export function assertNoForbiddenImports(file, source) {
+  const forbidden = [];
+  for (const match of source.matchAll(MODULE_SPECIFIER_RE)) {
+    if (FORBIDDEN_MODULES.includes(match[1])) forbidden.push(match[1]);
   }
+  if (forbidden.length) fail(`${file} imports prohibited runtime modules: ${[...new Set(forbidden)].join(", ")}`);
+}
 
-  const forbidden = forbiddenFiles.filter((file) => files.has(file));
-  if (forbidden.length > 0) {
-    fail(`Package artifact includes files that must stay repo-only: ${forbidden.join(", ")}`);
+function parsePackResult(stdout) {
+  let result;
+  try {
+    result = JSON.parse(stdout);
+  } catch {
+    fail("npm pack did not return valid JSON", stdout);
   }
+  const pack = Array.isArray(result) ? result[0] : result;
+  if (!pack?.filename || !Array.isArray(pack.files)) fail("npm pack JSON omitted filename or file inventory", stdout);
+  return pack;
+}
 
-  const extractDir = path.join(tempRoot, "extract");
-  mkdirSync(extractDir);
-  run("tar", ["-xzf", tarball, "-C", extractDir], { cwd: tempRoot });
+export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? defaultRepoRoot } = {}) {
+  const tempRoot = mkdtempSync(path.join(tmpdir(), "self-evolve-pack-"));
+  try {
+    const packageJSON = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    assertPublicFilesManifest(packageJSON);
+    const npmEnv = { ...process.env, npm_config_cache: path.join(tempRoot, "npm-cache") };
+    const packed = parsePackResult(run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", tempRoot], { cwd: repoRoot, env: npmEnv }).stdout);
+    const files = assertExactArtifactFiles(packed.files.map((file) => file.path), packageJSON);
+    const tarball = path.join(tempRoot, packed.filename);
+    if (!existsSync(tarball)) fail(`Expected npm pack output was not created: ${tarball}`);
 
-  const entrypoint = path.join(extractDir, "package", "self-evolve.js");
-  const module = await import(pathToFileURL(entrypoint).href);
-  if (typeof module.default !== "function") {
-    fail("Packed artifact entrypoint does not default-export the plugin function");
+    const extractDir = path.join(tempRoot, "extract");
+    mkdirSync(extractDir);
+    run("tar", ["-xzf", tarball, "-C", extractDir], { cwd: tempRoot });
+    for (const file of files) {
+      if (!file.endsWith(".js")) continue;
+      assertNoForbiddenImports(file, readFileSync(path.join(extractDir, "package", file), "utf8"));
+    }
+
+    const consumerDir = path.join(tempRoot, "consumer");
+    mkdirSync(consumerDir);
+    writeFileSync(path.join(consumerDir, "package.json"), `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`);
+    run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--omit=optional", tarball], { cwd: consumerDir, env: npmEnv });
+    const opentuiScope = path.join(consumerDir, "node_modules", "@opentui");
+    if (existsSync(opentuiScope)) fail("Headless consumer unexpectedly installed @opentui peers");
+
+    const smoke = [
+      `const server = await import(${JSON.stringify(packageJSON.name)});`,
+      `if (typeof server.default !== "function") throw new Error("server default export is not a Plugin factory");`,
+      `const tui = await import(${JSON.stringify(`${packageJSON.name}/tui`)});`,
+      `if (!tui.default || typeof tui.default.tui !== "function") throw new Error("TUI default export does not have TuiPluginModule shape");`,
+    ].join("\n");
+    run(process.execPath, ["--input-type=module", "--eval", smoke], { cwd: consumerDir });
+
+    console.log(`Pack artifact check passed: ${files.size} exact files; server and TUI targets imported from a fresh consumer.`);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
   }
+}
 
-  console.log(`Pack artifact check passed: ${files.size} files verified.`);
-} finally {
-  rmSync(tempRoot, { recursive: true, force: true });
+if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
+  main().catch((error) => {
+    console.error(`Pack artifact check failed: ${error.message}`);
+    process.exitCode = 1;
+  });
 }
