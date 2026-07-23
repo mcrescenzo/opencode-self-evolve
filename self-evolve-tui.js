@@ -6,14 +6,17 @@ import {
   createDecisionRequest,
   pollDecisionResponse,
   pollControlResponse,
+  publishTuiHostHealth,
   readControlState,
   readProjectInbox,
+  revokeTuiHostHealth,
   submitControlRequest,
   submitDecisionRequest,
 } from "./self-evolve-bridge.js";
 import { resolveProjectIdentity } from "./self-evolve-store.js";
 import {
   initialStateRootSelection,
+  stateRootIdentity,
   validateProjectedStateRoot,
 } from "./self-evolve-state-root.js";
 
@@ -28,6 +31,7 @@ const LAST_SHOWN_KEY = "self-evolve:last-shown-at";
 const PENDING_REQUESTS_KEY = "self-evolve:pending-request-ids";
 const ACTOR = BRIDGE_ACTOR;
 const MAX_SERVER_WAIT_MS = 5_000;
+const HOST_HEALTH_REFRESH_MS = 15_000;
 const CONSENT_LABELS = Object.freeze({
   passiveCalls: "Passive provider calls",
   durableObservations: "Durable observations",
@@ -199,11 +203,6 @@ export function parseAllowlistInput(value) {
 
 /** @type {TuiPlugin} */
 export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
-  if (typeof api.ui?.DialogConfirm !== "function" || typeof api.ui?.DialogSelect !== "function") {
-    console.warn("self-evolve TUI disabled: native dialog capabilities are unavailable; proposals remain in the durable inbox");
-    return;
-  }
-
   const config = options?.selfEvolve ?? options ?? {};
   const debounceMs = Number.isFinite(config.idleDebounceMs) ? config.idleDebounceMs : DEFAULT_BUDGETS.idleDebounceMs;
   const budget = Number.isFinite(config.notificationsPerHour) ? config.notificationsPerHour : DEFAULT_BUDGETS.notificationsPerHour;
@@ -234,6 +233,55 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     return;
   }
   const projectFingerprint = identity.projectFingerprint;
+  const tuiHostVersion = typeof api.app?.version === "string" ? api.app.version.trim() : "";
+  let hostHealthTimer;
+  let hostHealthNonce;
+  let hostHealthStopped = false;
+  let hostHealthWarningShown = false;
+  const publishHostHealth = () => {
+    if (!tuiHostVersion) return;
+    try {
+      const health = publishTuiHostHealth(stateRoot, {
+        projectFingerprint,
+        stateRootIdentity: stateRootIdentity(stateRoot),
+        hostVersion: tuiHostVersion,
+        nonce: hostHealthNonce,
+        issuedAt: nowFor(api),
+      });
+      hostHealthNonce = health.nonce;
+    } catch (error) {
+      if (!hostHealthWarningShown) {
+        hostHealthWarningShown = true;
+        console.warn(`self-evolve TUI host-health publication failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  };
+  if (tuiHostVersion) {
+    publishHostHealth();
+    hostHealthTimer = setInterval(publishHostHealth, HOST_HEALTH_REFRESH_MS);
+    hostHealthTimer.unref?.();
+  }
+  const stopHostHealth = () => {
+    if (hostHealthStopped) return;
+    hostHealthStopped = true;
+    clearInterval(hostHealthTimer);
+    if (!hostHealthNonce) return;
+    try {
+      revokeTuiHostHealth(stateRoot, projectFingerprint, {
+        nonce: hostHealthNonce,
+        stateRootIdentity: stateRootIdentity(stateRoot),
+      });
+    } catch {}
+  };
+  if (typeof api.ui?.DialogConfirm !== "function" || typeof api.ui?.DialogSelect !== "function") {
+    console.warn("self-evolve TUI dialogs disabled: native dialog capabilities are unavailable; host health remains published and proposals remain in the durable inbox");
+    api.lifecycle.signal.addEventListener("abort", stopHostHealth, { once: true });
+    api.lifecycle.onDispose(() => {
+      stopHostHealth();
+      api.lifecycle.signal.removeEventListener("abort", stopHostHealth);
+    });
+    return;
+  }
   const mailbox = options?.__testMailboxClient ?? api.__testMailboxClient ?? (stateRoot && projectFingerprint ? {
     getInbox: () => {
       const projection = readControlState(stateRoot, projectFingerprint, { now: nowFor(api) });
@@ -640,6 +688,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
     clearInterval(pollTimer);
+    stopHostHealth();
   };
   api.lifecycle.signal.addEventListener("abort", abort, { once: true });
   api.lifecycle.onDispose(() => {
@@ -651,4 +700,4 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   if (dialogsEnabled()) queueRefresh();
 }
 
-export default { tui: SelfEvolveTuiPlugin };
+export default { id: "mcrescenzo.self-evolve", tui: SelfEvolveTuiPlugin };

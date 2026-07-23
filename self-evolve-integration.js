@@ -146,6 +146,7 @@ export function createIntegration({
   let corrupt = false;
   let lastError;
   let hostVersion = String(options.hostVersion ?? "unknown");
+  let hostVersionSource = options.hostVersionSource === "tui-app-version" ? "tui-app-version" : "global-health";
   let ctx = options.ctx;
   let closed = false;
   let terminalPurge = false;
@@ -286,6 +287,7 @@ export function createIntegration({
     privacy,
     schemaVersion: schemas.SCHEMA_VERSION,
     hostVersion,
+    hostVersionSource,
     now,
   });
   const integratedSynthesis = rolloutGates.passiveShadowObservation
@@ -1039,6 +1041,7 @@ export function createIntegration({
       circuitBreakerOpen: circuitBreakerOpen(),
       killSwitchActive: runtimeKillSwitch || current?.global?.killSwitchActive === true,
       hostVersion,
+      hostVersionSource,
       schemaVersion: schemas.SCHEMA_VERSION,
       ...(hostSessionRecovery ? { hostSessionRecovery } : {}),
       ...(lastError ? { lastError } : {}),
@@ -1139,6 +1142,7 @@ export function createIntegration({
     if (terminalPurge) return { ok: false, mode: "manual", reason: "restart-required-after-purge-all", health: { mode: "manual", lastError: "restart-required-after-purge-all" } };
     ctx = args.ctx ?? ctx;
     hostVersion = String(args.hostVersion ?? hostVersion);
+    hostVersionSource = args.hostVersionSource === "tui-app-version" ? "tui-app-version" : hostVersionSource;
     let recovery = [];
     let synthesisRecovery = [];
     let hiddenSessionRecovery = [];
@@ -1190,7 +1194,7 @@ export function createIntegration({
         startMailboxPolling();
       }
       startRetentionTimer();
-      appendAudit("decision", { action: "boot", hostVersion, schemaVersion: schemas.SCHEMA_VERSION, recovered: recovery.length, recoveredSyntheses: synthesisRecovery.length, abortedHiddenSessions: hiddenSessionRecovery.filter((item) => item.ok).length, hiddenSessionRecoveryFailures: hiddenSessionRecovery.filter((item) => !item.ok).length });
+      appendAudit("decision", { action: "boot", hostVersion, hostVersionSource, schemaVersion: schemas.SCHEMA_VERSION, recovered: recovery.length, recoveredSyntheses: synthesisRecovery.length, abortedHiddenSessions: hiddenSessionRecovery.filter((item) => item.ok).length, hiddenSessionRecoveryFailures: hiddenSessionRecovery.filter((item) => !item.ok).length });
       recovery = recovery.map((item) => recoveredFailedClosed.has(item) ? { ...item, recoveredToFailedClosed: true } : item);
     } catch (error) {
       corrupt = true;

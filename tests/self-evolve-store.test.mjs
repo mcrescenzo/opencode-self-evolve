@@ -874,6 +874,31 @@ test("export rejects a regular record file replaced after inventory capture", (t
   store.close();
 });
 
+test("export omits the operational TUI host report and tolerates heartbeat replacement", (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-export-tui-report-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const reportPath = path.join(root, "self-evolve", "bridge", PROJECT, "tui-host-health.json");
+  let replaced = false;
+  const store = openStore(root, {
+    projectFingerprint: PROJECT,
+    now: () => 10_000,
+    faultInjection(point) {
+      if (point !== "export-after-inventory" || replaced) return;
+      replaced = true;
+      writeFileSync(reportPath, "heartbeat-two\n", "utf8");
+    },
+  });
+  mkdirSync(path.dirname(reportPath), { recursive: true });
+  writeFileSync(reportPath, "heartbeat-one\n", "utf8");
+
+  const archive = store.exportAll();
+  const bridge = archive.bridge.find((item) => item.projectFingerprint === PROJECT);
+  assert.equal(replaced, true);
+  assert.equal("tuiHostHealth" in bridge, false);
+  assert.doesNotMatch(JSON.stringify(archive), /heartbeat-(?:one|two)/u);
+  store.close();
+});
+
 test("export all archives two partitions, global aggregates, bridge metadata, indexes, and classified snapshots", () => {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-export-all-"));
   const other = H("b");

@@ -26,8 +26,10 @@ import {
   makeRepoSettings,
 } from "./self-evolve-schemas.js";
 import { withStateMutationLock } from "./self-evolve-lock.js";
+import { stateRootIdentity as computeStateRootIdentity } from "./self-evolve-state-root.js";
 
 export const BRIDGE_TTL_MS = 24 * 60 * 60 * 1000;
+export const TUI_HOST_HEALTH_TTL_MS = 60 * 1000;
 export const BRIDGE_ACTOR = "self-evolve-tui";
 export const BRIDGE_SERVER_ACTOR = "self-evolve-integration";
 export const BRIDGE_REQUEST_FIELDS = Object.freeze([
@@ -50,6 +52,10 @@ export const CONTROL_STATE_FIELDS = Object.freeze([
   "schemaVersion", "projectFingerprint", "actor", "issuedAt", "expiresAt", "settingsUpdatedAt",
   "settingsVersion", "stateRootIdentity", "nonce", "mode", "effectiveMode", "allowedSkillRoots", "consent", "repoExcluded",
 ]);
+export const TUI_HOST_HEALTH_FIELDS = Object.freeze([
+  "schemaVersion", "projectFingerprint", "actor", "issuedAt", "expiresAt",
+  "stateRootIdentity", "hostVersion", "publisherPid", "nonce",
+]);
 export const CONTROL_ACTIONS = Object.freeze(["set-mode", "set-consent", "set-repo-excluded", "update-allowlist"]);
 
 const DIR_MODE = 0o700;
@@ -64,6 +70,7 @@ const MAX_MAILBOX_FILES = 64;
 const MAX_STORE_RESERVE_BYTES = 64 * 1024;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
+const HOST_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/u;
 const CONSENT_KEYS = new Set(["passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation"]);
 const NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) && constants.O_NOFOLLOW !== 0 ? constants.O_NOFOLLOW : null;
 export const BRIDGE_RESPONSE_RESERVE_BYTES = MAX_RESPONSE_BYTES;
@@ -171,6 +178,7 @@ function bridgePaths(stateRoot, projectFingerprint, { create = false } = {}) {
     boundary, fingerprint, root, requests, responses, controlRequests, controlResponses,
     lock: path.join(root, "consumer.lock"),
     controlState: path.join(root, "control-state.json"),
+    tuiHostHealth: path.join(root, "tui-host-health.json"),
   };
 }
 
@@ -214,6 +222,41 @@ function secureRead(paths, filePath, maxBytes, label) {
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
+}
+
+function effectiveUserId(override) {
+  const value = override === undefined && typeof process.geteuid === "function"
+    ? process.geteuid()
+    : override;
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("tui-host-health-owner-validation-unsupported");
+  return value;
+}
+
+function assertTuiHostHealthAncestors(paths, uid) {
+  const boundary = lstatSync(paths.boundary);
+  if (!boundary.isDirectory() || boundary.isSymbolicLink()) throw new Error("tui-host-health-state-root-rejected");
+  if (boundary.uid !== uid) throw new Error("tui-host-health-state-root-owner-rejected");
+  if ((boundary.mode & 0o022) !== 0) throw new Error("tui-host-health-state-root-permissions-rejected");
+  const relative = path.relative(paths.boundary, paths.root);
+  let current = paths.boundary;
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    const stat = lstatSync(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("tui-host-health-ancestor-rejected");
+    if (stat.uid !== uid) throw new Error("tui-host-health-ancestor-owner-rejected");
+    if ((stat.mode & 0o022) !== 0) throw new Error("tui-host-health-ancestor-permissions-rejected");
+  }
+}
+
+function secureReadTuiHostHealth(paths, { effectiveUid } = {}) {
+  const uid = effectiveUserId(effectiveUid);
+  assertTuiHostHealthAncestors(paths, uid);
+  const read = secureRead(paths, paths.tuiHostHealth, MAX_RESPONSE_BYTES, "tui-host-health");
+  if (!read) return null;
+  if (read.stat.uid !== uid) throw new Error("tui-host-health-file-owner-rejected");
+  if ((read.stat.mode & 0o777) !== FILE_MODE) throw new Error("tui-host-health-mode-rejected");
+  assertTuiHostHealthAncestors(paths, uid);
+  return read;
 }
 
 function safeTreeUsage(paths, directory) {
@@ -355,6 +398,11 @@ function atomicWrite(paths, filePath, source, { exclusive = false } = {}) {
 function processIsAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
+}
+
+function sameAccountProcessIsAlive(pid, signalProcess = process.kill) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { signalProcess(pid, 0); return true; } catch { return false; }
 }
 
 export function makeBridgeRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_TTL_MS, projectFingerprint } = {}) {
@@ -530,6 +578,32 @@ export function makeControlState(value, { now = Date.now(), projectFingerprint }
   return state;
 }
 
+export function makeTuiHostHealth(value, { now = Date.now(), projectFingerprint, stateRootIdentity } = {}) {
+  exactKeys(value, TUI_HOST_HEALTH_FIELDS, "tui-host-health");
+  if (value.schemaVersion !== SCHEMA_VERSION) throw new TypeError("unsupported-schema-version");
+  const hostVersion = String(value.hostVersion ?? "");
+  if (!HOST_VERSION_PATTERN.test(hostVersion)) throw new TypeError("invalid-host-version");
+  const health = Object.freeze({
+    schemaVersion: value.schemaVersion,
+    projectFingerprint: validHash(value.projectFingerprint, "project-fingerprint"),
+    actor: value.actor,
+    issuedAt: validTimestamp(value.issuedAt, "issued-at"),
+    expiresAt: validTimestamp(value.expiresAt, "expires-at"),
+    stateRootIdentity: validHash(value.stateRootIdentity, "state-root-identity"),
+    hostVersion,
+    publisherPid: Number.isSafeInteger(value.publisherPid) && value.publisherPid > 0
+      ? value.publisherPid
+      : (() => { throw new TypeError("invalid-tui-host-health-publisher-pid"); })(),
+    nonce: validId(value.nonce, "nonce"),
+  });
+  if (health.actor !== BRIDGE_ACTOR) throw new TypeError("invalid-tui-host-health-actor");
+  if (projectFingerprint && health.projectFingerprint !== projectFingerprint) throw new TypeError("cross-project-tui-host-health");
+  if (stateRootIdentity && health.stateRootIdentity !== stateRootIdentity) throw new TypeError("state-root-tui-host-health-mismatch");
+  if (health.expiresAt <= health.issuedAt || health.expiresAt - health.issuedAt > TUI_HOST_HEALTH_TTL_MS || health.expiresAt <= now) throw new TypeError("expired-tui-host-health");
+  if (health.issuedAt > now + 30_000) throw new TypeError("future-tui-host-health");
+  return health;
+}
+
 export function validateBridgeExportMetadata(type, value, { projectFingerprint, requestId } = {}) {
   let clean;
   if (type === "decision-request") {
@@ -634,6 +708,76 @@ export function readControlState(stateRoot, projectFingerprint, { now = Date.now
   const read = secureRead(paths, paths.controlState, MAX_CONTROL_STATE_BYTES, "control-state");
   if (!read) return null;
   return makeControlState(JSON.parse(read.source), { now, projectFingerprint });
+}
+
+export function publishTuiHostHealth(stateRoot, {
+  projectFingerprint,
+  stateRootIdentity,
+  hostVersion,
+  publisherPid = process.pid,
+  issuedAt = Date.now(),
+  expiresAt = issuedAt + TUI_HOST_HEALTH_TTL_MS,
+  nonce = randomBytes(16).toString("hex"),
+} = {}) {
+  const clean = makeTuiHostHealth({
+    schemaVersion: SCHEMA_VERSION,
+    projectFingerprint,
+    actor: BRIDGE_ACTOR,
+    issuedAt,
+    expiresAt,
+    stateRootIdentity,
+    hostVersion,
+    publisherPid,
+    nonce,
+  }, { now: issuedAt, projectFingerprint, stateRootIdentity });
+  const source = boundedJson(clean, MAX_RESPONSE_BYTES, "tui-host-health");
+  const boundary = stateBoundary(stateRoot);
+  return withStateMutationLock(boundary, () => {
+    const paths = bridgePaths(boundary, clean.projectFingerprint, { create: true });
+    const uid = effectiveUserId();
+    assertTuiHostHealthAncestors(paths, uid);
+    assertMailboxPublication(paths, paths.tuiHostHealth, source);
+    atomicWrite(paths, paths.tuiHostHealth, source);
+    const published = lstatSync(paths.tuiHostHealth);
+    if (published.uid !== uid) throw new Error("tui-host-health-file-owner-rejected");
+    if ((published.mode & 0o777) !== FILE_MODE) throw new Error("tui-host-health-mode-rejected");
+    assertTuiHostHealthAncestors(paths, uid);
+    return clean;
+  });
+}
+
+export function readTuiHostHealth(stateRoot, projectFingerprint, {
+  now = Date.now(),
+  stateRootIdentity,
+  requireLivePublisher = true,
+  __testEffectiveUid,
+  __testSignalProcess,
+} = {}) {
+  const paths = bridgePaths(stateRoot, projectFingerprint);
+  if (!paths) return null;
+  const read = secureReadTuiHostHealth(paths, { effectiveUid: __testEffectiveUid });
+  if (!read) return null;
+  const health = makeTuiHostHealth(JSON.parse(read.source), { now, projectFingerprint, stateRootIdentity });
+  if (requireLivePublisher && !sameAccountProcessIsAlive(health.publisherPid, __testSignalProcess)) throw new Error("stale-tui-host-health-publisher");
+  return health;
+}
+
+export function revokeTuiHostHealth(stateRoot, projectFingerprint, { nonce, stateRootIdentity } = {}) {
+  const paths = bridgePaths(stateRoot, projectFingerprint);
+  if (!paths) return false;
+  const expectedNonce = validId(nonce, "nonce");
+  return withStateMutationLock(paths.boundary, () => {
+    const read = secureReadTuiHostHealth(paths);
+    if (!read) return false;
+    const value = JSON.parse(read.source);
+    const health = makeTuiHostHealth(value, {
+      now: value?.issuedAt,
+      projectFingerprint,
+      stateRootIdentity,
+    });
+    if (health.nonce !== expectedNonce) return false;
+    return secureUnlink(paths, paths.tuiHostHealth, read.stat);
+  });
 }
 
 function readJsonl(paths, filePath) {
@@ -873,6 +1017,20 @@ export function cleanupBridge(stateRoot, projectFingerprint, { now = Date.now(),
       } catch {
         const state = lstatOptional(paths.controlState);
         if (state?.isFile() && state.nlink === 1 && secureUnlink(paths, paths.controlState, state)) removed += 1;
+      }
+      try {
+        const read = secureReadTuiHostHealth(paths);
+        if (read) {
+          const health = makeTuiHostHealth(JSON.parse(read.source), {
+            now,
+            projectFingerprint,
+            stateRootIdentity: computeStateRootIdentity(paths.boundary),
+          });
+          if (!sameAccountProcessIsAlive(health.publisherPid)) throw new Error("stale-tui-host-health-publisher");
+        }
+      } catch {
+        const health = lstatOptional(paths.tuiHostHealth);
+        if (health?.isFile() && health.nlink === 1 && secureUnlink(paths, paths.tuiHostHealth, health)) removed += 1;
       }
     });
     return { ok: true, removed };

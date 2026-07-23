@@ -1157,7 +1157,12 @@ export function openStore(rootDir, {
   }
 
   function captureExportInventory() {
-    return new Map(safeTreeFiles(baseDir, { optional: false }).map((filePath) => [path.resolve(filePath), lstatSync(filePath)]));
+    return new Map(safeTreeFiles(baseDir, { optional: false })
+      .filter((filePath) => {
+        const parts = path.relative(baseDir, filePath).split(path.sep);
+        return !(parts.length === 3 && parts[0] === "bridge" && /^[a-f0-9]{64}$/u.test(parts[1]) && parts[2] === "tui-host-health.json");
+      })
+      .map((filePath) => [path.resolve(filePath), lstatSync(filePath)]));
   }
 
   function withExportInventory(action) {

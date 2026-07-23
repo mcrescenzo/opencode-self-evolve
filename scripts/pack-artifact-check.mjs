@@ -120,7 +120,7 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
       `if (typeof server.default !== "function") throw new Error("server default export is not a Plugin factory");`,
       `if (Object.keys(server).join(",") !== "default") throw new Error("server target exposes named exports");`,
       `const tui = await import(${JSON.stringify(`${packageJSON.name}/tui`)});`,
-      `if (!tui.default || typeof tui.default.tui !== "function") throw new Error("TUI default export does not have TuiPluginModule shape");`,
+      `if (!tui.default || tui.default.id !== "mcrescenzo.self-evolve" || typeof tui.default.tui !== "function") throw new Error("TUI default export does not have TuiPluginModule shape");`,
     ].join("\n");
     run(process.execPath, ["--input-type=module", "--eval", smoke], { cwd: consumerDir });
 

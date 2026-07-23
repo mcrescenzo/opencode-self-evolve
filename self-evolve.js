@@ -24,7 +24,9 @@ import {
   initialStateRootSelection,
   officialClientStateRoot,
   resolveStateRoot,
+  stateRootIdentity,
 } from "./self-evolve-state-root.js";
+import { readTuiHostHealth } from "./self-evolve-bridge.js";
 
 /**
  * @typedef {import("@opencode-ai/plugin").Plugin} OpenCodePlugin
@@ -44,6 +46,14 @@ import {
 // factory-reassignable piece; option-resolution reads it at call time.
 const registry = createRegistry();
 
+// Durable late-start recovery is coordinated separately from the legacy
+// session registry. OpenCode may keep hooks from more than one factory
+// instance reachable, so a post-start command must not boot duplicate
+// integrations for the same host/project/state-root tuple.
+const lateDurableRecoveryRegistry = new Map();
+const durableHostObjectIDs = new WeakMap();
+let nextDurableHostObjectID = 1;
+
 // Reassigned on every SelfEvolvePlugin(...) call so the most recently
 // resolved options are always used by hook bodies and by
 // `registry.setOptions()`. This is what "re-seeds options" means in
@@ -53,6 +63,56 @@ let currentPluginOptions = resolveOptions();
 
 function now(options) {
   return typeof options?.now === "function" ? options.now() : Date.now();
+}
+
+function durableHostIdentity(ctx) {
+  try {
+    return `origin:${new URL(officialGlobalHealthUrl(ctx?.serverUrl)).origin}`;
+  } catch {
+    const hostObject = ctx?.client && typeof ctx.client === "object" ? ctx.client : ctx;
+    if (!hostObject || (typeof hostObject !== "object" && typeof hostObject !== "function")) return "host:unavailable";
+    let id = durableHostObjectIDs.get(hostObject);
+    if (!id) {
+      id = nextDurableHostObjectID;
+      nextDurableHostObjectID += 1;
+      durableHostObjectIDs.set(hostObject, id);
+    }
+    return `object:${id}`;
+  }
+}
+
+function durableOptionIdentity(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value !== "object" && typeof value !== "function") return `${typeof value}:${String(value)}`;
+  let id = durableHostObjectIDs.get(value);
+  if (!id) {
+    id = nextDurableHostObjectID;
+    nextDurableHostObjectID += 1;
+    durableHostObjectIDs.set(value, id);
+  }
+  return `reference:${id}`;
+}
+
+function lateDurableRecoveryKey(ctx, options, selection) {
+  return JSON.stringify({
+    host: durableHostIdentity(ctx),
+    directory: String(ctx?.directory ?? ""),
+    worktree: String(options?.worktree ?? ctx?.worktree ?? ""),
+    stateRoot: String(selection?.stateRoot ?? options?.stateRoot ?? ""),
+    projectFingerprint: String(options?.projectFingerprint ?? ""),
+    remoteUrl: String(options?.remoteUrl ?? ""),
+    projectName: String(options?.projectName ?? ""),
+    scopeFingerprint: String(options?.scopeFingerprint ?? ""),
+    hostSupported: options?.hostSupported !== false,
+    processExcluded: durableOptionIdentity(options?.processExcluded),
+    repoOptOut: durableOptionIdentity(options?.repoOptOut),
+    rolloutGates: durableOptionIdentity(options?.rolloutGates ?? options?.settings?.rolloutGates),
+    pipeline: durableOptionIdentity(options?.pipeline),
+    pipelineFactory: durableOptionIdentity(options?.pipelineFactory),
+    clock: durableOptionIdentity(options?.now),
+    faultInjection: durableOptionIdentity(options?.faultInjection),
+  });
 }
 
 function textPart(text, options = {}) {
@@ -218,9 +278,12 @@ async function withTimeout(task, timeoutMs, label) {
 }
 
 const DEFAULT_HOST_HEALTH_TIMEOUT_MS = 2_000;
+const DEFAULT_HOST_HEALTH_RETRY_WINDOW_MS = 5_000;
+const DEFAULT_HOST_HEALTH_RETRY_DELAY_MS = 100;
+const MAX_HOST_HEALTH_RETRY_DELAY_MS = 1_000;
 
-function hostCompatibility(hostVersion, supported, reason) {
-  return Object.freeze({ hostVersion, supported, reason });
+function hostCompatibility(hostVersion, supported, reason, diagnostic) {
+  return Object.freeze({ hostVersion, supported, reason, ...(diagnostic ? { diagnostic } : {}) });
 }
 
 function officialGlobalHealthUrl(serverUrl) {
@@ -247,48 +310,251 @@ async function abortableTask(task, signal) {
   }
 }
 
-async function resolveRunningHostCompatibility(ctx, options = {}) {
-  const health = ctx?.client?.global?.health;
-  let result;
-  try {
-    result = await withTimeout(() => abortableTask(async () => {
-      if (typeof health === "function") return await health.call(ctx.client.global);
-      const healthUrl = officialGlobalHealthUrl(ctx?.serverUrl);
-      const fetchImplementation = ctx?.__testOnlySelfEvolveFetch ?? globalThis.fetch;
-      if (typeof fetchImplementation !== "function") throw new Error("host-health-fetch-unavailable");
-      const response = await fetchImplementation(healthUrl, { method: "GET", redirect: "error", headers: { accept: "application/json" }, ...(options.__startupSignal ? { signal: options.__startupSignal } : {}) });
-      if (!response?.ok) throw new Error(`host-health-http-${response?.status ?? "error"}`);
-      return { data: await response.json() };
-    }, options.__startupSignal), options.__testHostHealthTimeoutMs ?? DEFAULT_HOST_HEALTH_TIMEOUT_MS, "OpenCode global health");
-  } catch (error) {
-    const reason = String(error?.message ?? error).startsWith("OpenCode global health timed out")
-      ? "host-health-timeout"
-      : "host-health-unavailable";
-    return hostCompatibility("unknown", false, reason);
+function boundedHostHealthDuration(value, fallback, maximum) {
+  return Number.isFinite(value) ? Math.min(maximum, Math.max(0, value)) : fallback;
+}
+
+function waitForHostHealthRetry(delayMs, signal) {
+  if (delayMs <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("host-health-aborted"));
+      return;
+    }
+    let settled = false;
+    const finish = (callback) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(new Error("host-health-aborted")));
+    const timer = setTimeout(() => finish(resolve), delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function hostHealthErrorDiagnostic(error) {
+  const code = error?.cause?.code ?? error?.code;
+  if (typeof code === "string") {
+    const knownCodes = new Map([
+      ["ABORT_ERR", "aborted"],
+      ["EAI_AGAIN", "dns-temporary"],
+      ["ECONNREFUSED", "connection-refused"],
+      ["ECONNRESET", "connection-reset"],
+      ["EHOSTUNREACH", "host-unreachable"],
+      ["ENETUNREACH", "network-unreachable"],
+      ["ENOTFOUND", "dns-not-found"],
+      ["ETIMEDOUT", "timeout"],
+      ["UND_ERR_CONNECT_TIMEOUT", "connect-timeout"],
+      ["UND_ERR_SOCKET", "socket-error"],
+    ]);
+    if (knownCodes.has(code.toUpperCase())) return knownCodes.get(code.toUpperCase());
+    return "error";
   }
-  if (result?.error) return hostCompatibility("unknown", false, "host-health-unavailable");
-  const data = result?.data;
-  const observedVersion = typeof data?.version === "string" && data.version.trim() ? data.version.trim() : "unknown";
-  if (data?.healthy === false) return hostCompatibility(observedVersion, false, "host-health-unhealthy");
-  if (data?.healthy !== true) return hostCompatibility(observedVersion, false, "host-health-malformed");
-  if (observedVersion === "unknown") return hostCompatibility(observedVersion, false, "host-version-malformed");
+  const message = String(error?.message ?? error ?? "");
+  const httpStatus = /^host-health-http-(error|[1-5][0-9]{2})$/u.exec(message)?.[1];
+  if (httpStatus) return `http-${httpStatus}`;
+  for (const [pattern, label] of [
+    [/host-health-server-url-unavailable/u, "server-url-unavailable"],
+    [/host-health-server-url-invalid/u, "server-url-invalid"],
+    [/host-health-fetch-unavailable/u, "fetch-unavailable"],
+    [/connection refused|econnrefused/iu, "connection-refused"],
+    [/fetch failed/iu, "fetch-failed"],
+    [/aborted|aborterror/iu, "aborted"],
+  ]) {
+    if (pattern.test(message)) return label;
+  }
+  const knownNames = new Map([
+    ["AbortError", "aborted"],
+    ["Error", "error"],
+    ["FetchError", "fetch-error"],
+    ["TimeoutError", "timeout"],
+    ["TypeError", "type-error"],
+  ]);
+  return knownNames.get(String(error?.name ?? "")) ?? "error";
+}
+
+function sdkHealthTransportFailure(error, responseStatus) {
+  const status = Number(responseStatus ?? error?.status ?? error?.statusCode ?? error?.data?.status ?? error?.response?.status);
+  if (Number.isInteger(status)) {
+    return [404, 405].includes(status);
+  }
+  const code = String(error?.cause?.code ?? error?.code ?? "").toUpperCase();
+  if (new Set([
+    "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH",
+    "ENOTFOUND", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET",
+  ]).has(code)) return true;
+  const message = String(error?.message ?? error ?? "");
+  return /\b(connection refused|econnrefused|fetch failed|network (?:error|unavailable)|transport unavailable|sdk unavailable|not listening)\b/iu.test(message);
+}
+
+function compatibilityFromObservedVersion(value, options = {}, diagnostic) {
+  const observedVersion = typeof value === "string" && value.trim() ? value.trim() : "unknown";
+  if (observedVersion === "unknown" || observedVersion.length > 64) return { compatibility: hostCompatibility(observedVersion, false, "host-version-malformed", diagnostic), retryable: false };
   if (/^[0-9]+\.[0-9]+\.[0-9]+-/u.test(observedVersion)) {
-    return hostCompatibility(observedVersion, false, "host-version-prerelease-unsupported");
+    return { compatibility: hostCompatibility(observedVersion, false, "host-version-prerelease-unsupported", diagnostic), retryable: false };
   }
-  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u.exec(observedVersion);
-  if (!match) return hostCompatibility(observedVersion, false, "host-version-malformed");
+  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u.exec(observedVersion);
+  if (!match) return { compatibility: hostCompatibility(observedVersion, false, "host-version-malformed", diagnostic), retryable: false };
   const [, majorText, minorText, patchText] = match;
   const major = Number(majorText);
   const minor = Number(minorText);
   const patch = Number(patchText);
+  if (![major, minor, patch].every(Number.isSafeInteger)) return { compatibility: hostCompatibility(observedVersion, false, "host-version-malformed", diagnostic), retryable: false };
   const inDeclaredRange = major === 1 && (minor > 18 || (minor === 18 && patch >= 3));
-  if (!inDeclaredRange) return hostCompatibility(observedVersion, false, "host-version-unsupported");
-  if (options.hostSupported === false) return hostCompatibility(observedVersion, false, "host-support-disabled-by-option");
-  return hostCompatibility(observedVersion, true, "host-compatible");
+  if (!inDeclaredRange) return { compatibility: hostCompatibility(observedVersion, false, "host-version-unsupported", diagnostic), retryable: false };
+  if (options.hostSupported === false) return { compatibility: hostCompatibility(observedVersion, false, "host-support-disabled-by-option", diagnostic), retryable: false };
+  return { compatibility: hostCompatibility(observedVersion, true, "host-compatible", diagnostic), retryable: false };
+}
+
+async function resolveRunningHostCompatibilityAttempt(ctx, options = {}) {
+  const health = ctx?.client?.global?.health;
+  let result;
+  let fetchController;
+  let onStartupAbort;
+  let attemptActive = true;
+  try {
+    result = await withTimeout(() => abortableTask(async () => {
+      const fetchOfficialHealth = async () => {
+        const healthUrl = officialGlobalHealthUrl(ctx?.serverUrl);
+        const fetchImplementation = ctx?.__testOnlySelfEvolveFetch ?? globalThis.fetch;
+        if (typeof fetchImplementation !== "function") throw new Error("host-health-fetch-unavailable");
+        fetchController = new AbortController();
+        if (options.__startupSignal?.aborted) fetchController.abort();
+        else if (options.__startupSignal) {
+          onStartupAbort = () => fetchController.abort();
+          options.__startupSignal.addEventListener("abort", onStartupAbort, { once: true });
+        }
+        const response = await fetchImplementation(healthUrl, { method: "GET", redirect: "manual", headers: { accept: "application/json" }, signal: fetchController.signal });
+        if (!response?.ok) {
+          const status = response?.status;
+          const error = new Error(`host-health-http-${status ?? "error"}`);
+          if (Number.isInteger(status) && ![404, 405].includes(status)) {
+            error.selfEvolveAuthoritativeHealthFailure = true;
+          }
+          throw error;
+        }
+        try {
+          return { data: await response.json() };
+        } catch (cause) {
+          const error = new Error("host-health-response-malformed");
+          error.cause = cause;
+          error.selfEvolveAuthoritativeHealthFailure = true;
+          throw error;
+        }
+      };
+      if (typeof health !== "function") return await fetchOfficialHealth();
+      let sdkError;
+      let sdkResponseStatus;
+      try {
+        const sdkResult = await health.call(ctx.client.global);
+        if (!sdkResult?.error) return sdkResult;
+        sdkError = sdkResult.error;
+        sdkResponseStatus = sdkResult?.response?.status;
+      } catch (error) {
+        sdkError = error;
+      }
+      if (!sdkHealthTransportFailure(sdkError, sdkResponseStatus)) {
+        const error = new Error("host-health-sdk-authoritative-error");
+        error.cause = sdkError;
+        error.selfEvolveAuthoritativeHealthFailure = true;
+        throw error;
+      }
+      if (!attemptActive || options.__startupSignal?.aborted) throw new Error("host-health-attempt-inactive");
+      try {
+        return await fetchOfficialHealth();
+      } catch (fallbackError) {
+        const error = new Error(`host-health-sdk-${hostHealthErrorDiagnostic(sdkError)}-fallback-${hostHealthErrorDiagnostic(fallbackError)}`);
+        error.selfEvolveAuthoritativeHealthFailure = fallbackError?.selfEvolveAuthoritativeHealthFailure === true;
+        throw error;
+      }
+    }, options.__startupSignal), options.__testHostHealthTimeoutMs ?? DEFAULT_HOST_HEALTH_TIMEOUT_MS, "OpenCode global health");
+  } catch (error) {
+    attemptActive = false;
+    fetchController?.abort();
+    const message = String(error?.message ?? error);
+    const reason = error?.selfEvolveAuthoritativeHealthFailure === true
+      ? "host-health-authoritative-error"
+      : message.startsWith("OpenCode global health timed out")
+      ? "host-health-timeout"
+      : "host-health-unavailable";
+    const diagnostic = message.startsWith("host-health-sdk-")
+      ? message.slice("host-health-".length, "host-health-".length + 160)
+      : `${fetchController ? "fallback" : "sdk"}-${hostHealthErrorDiagnostic(error)}`;
+    const retryable = (reason === "host-health-unavailable" || (reason === "host-health-timeout" && fetchController !== undefined))
+      && !options.__startupSignal?.aborted
+      && ![
+        "host-health-aborted",
+        "host-health-fetch-unavailable",
+        "host-health-server-url-invalid",
+        "host-health-server-url-unavailable",
+      ].some((marker) => message.includes(marker));
+    return { compatibility: hostCompatibility("unknown", false, reason, diagnostic), retryable };
+  } finally {
+    attemptActive = false;
+    if (onStartupAbort) options.__startupSignal?.removeEventListener("abort", onStartupAbort);
+  }
+  if (result?.error) return { compatibility: hostCompatibility("unknown", false, "host-health-authoritative-error", `sdk-${hostHealthErrorDiagnostic(result.error)}`), retryable: false };
+  const data = result?.data;
+  const observedVersion = typeof data?.version === "string" && data.version.trim() ? data.version.trim() : "unknown";
+  if (data?.healthy === false) return { compatibility: hostCompatibility(observedVersion, false, "host-health-unhealthy"), retryable: false };
+  if (data?.healthy !== true) return { compatibility: hostCompatibility(observedVersion, false, "host-health-malformed"), retryable: false };
+  return compatibilityFromObservedVersion(observedVersion, options);
+}
+
+async function resolveRunningHostCompatibility(ctx, options = {}) {
+  const retryWindowMs = boundedHostHealthDuration(
+    options.__testHostHealthRetryWindowMs,
+    DEFAULT_HOST_HEALTH_RETRY_WINDOW_MS,
+    DEFAULT_HOST_HEALTH_RETRY_WINDOW_MS,
+  );
+  const initialRetryDelayMs = boundedHostHealthDuration(
+    options.__testHostHealthRetryDelayMs,
+    DEFAULT_HOST_HEALTH_RETRY_DELAY_MS,
+    MAX_HOST_HEALTH_RETRY_DELAY_MS,
+  );
+  const attemptTimeoutMs = boundedHostHealthDuration(
+    options.__testHostHealthTimeoutMs,
+    DEFAULT_HOST_HEALTH_TIMEOUT_MS,
+    30_000,
+  );
+  const startedAt = Date.now();
+  let retryDelayMs = initialRetryDelayMs;
+  let latest = hostCompatibility("unknown", false, "host-health-unavailable");
+  let attempts = 0;
+
+  while (true) {
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = Math.max(0, retryWindowMs - elapsedMs);
+    if (attempts > 0 && remainingMs <= 0) return latest;
+    attempts += 1;
+    const currentTimeoutMs = retryWindowMs === 0
+      ? attemptTimeoutMs
+      : Math.max(1, Math.min(attemptTimeoutMs, remainingMs));
+    const attempt = await resolveRunningHostCompatibilityAttempt(ctx, {
+      ...options,
+      __testHostHealthTimeoutMs: currentTimeoutMs,
+    });
+    latest = attempt.compatibility;
+    if (!attempt.retryable || retryWindowMs === 0 || options.__startupSignal?.aborted) return latest;
+
+    const afterAttemptRemainingMs = retryWindowMs - (Date.now() - startedAt);
+    if (afterAttemptRemainingMs <= 0) return latest;
+    const waitMs = Math.min(retryDelayMs, afterAttemptRemainingMs);
+    try {
+      await waitForHostHealthRetry(waitMs, options.__startupSignal);
+    } catch {
+      return hostCompatibility("unknown", false, "host-health-unavailable");
+    }
+    retryDelayMs = Math.min(MAX_HOST_HEALTH_RETRY_DELAY_MS, Math.max(1, retryDelayMs * 2));
+  }
 }
 
 function unsupportedHostCommandText(command, compatibility) {
-  const detail = `host ${compatibility.hostVersion}; compatibility ${compatibility.reason}`;
+  const diagnostic = compatibility.diagnostic ? `; diagnostic ${compatibility.diagnostic}` : "";
+  const detail = `host ${compatibility.hostVersion}; compatibility ${compatibility.reason}${diagnostic}`;
   if (["default", "status"].includes(command.verb)) {
     return `Self-evolve status: effective mode manual; autonomous authority disabled; ${detail}.`;
   }
@@ -298,7 +564,7 @@ function unsupportedHostCommandText(command, compatibility) {
   if (command.verb === "mode" && command.mode === "manual") {
     return `Self-evolve remains in effective mode manual because autonomous authority is disabled; ${detail}. No files were changed.`;
   }
-  return `Self-evolve autonomous authority unavailable (${compatibility.reason}); host ${compatibility.hostVersion}; effective mode manual. No mode change, provider call, or file write was attempted.`;
+  return `Self-evolve autonomous authority unavailable (${compatibility.reason}); host ${compatibility.hostVersion}${diagnostic}; effective mode manual. No mode change, self-evolve analyzer call, or file write was attempted.`;
 }
 
 function inputSessionID(input) {
@@ -654,7 +920,7 @@ async function createDurablePipeline(ctx, options, selectedStateRoot, compatibil
     const roots = inventoryModule.loadAllowlist({ globalSkillRoots: settings.global.allowedSkillRoots }).canonicalRoots;
     const records = inventoryModule.discoverSkills(roots);
     const applier = applierModule.createApplier({ store: durableStore, inventory: { records, canonicalRoots: roots }, privacy, now: options.now });
-    const integration = integrationModule.createIntegration({ store: durableStore, inventory: inventoryModule, privacy, synthesisModule, applier, commands: commandsModule, pipeline: pipelineModule, scheduler: schedulerModule, schemas: schemasModule, observation: observationModule, options: { ...options, hostVersion: compatibility?.hostVersion ?? "unknown", hostSupported: compatibility?.supported === true, stateRoot, projectFingerprint, ctx }, now: options.now });
+    const integration = integrationModule.createIntegration({ store: durableStore, inventory: inventoryModule, privacy, synthesisModule, applier, commands: commandsModule, pipeline: pipelineModule, scheduler: schedulerModule, schemas: schemasModule, observation: observationModule, options: { ...options, hostVersion: compatibility?.hostVersion ?? "unknown", hostVersionSource: compatibility?.diagnostic === "tui-app-version" ? "tui-app-version" : "global-health", hostSupported: compatibility?.supported === true, stateRoot, projectFingerprint, ctx }, now: options.now });
     return { integration, identity };
   } catch (error) {
     try { durableStore?.close(); } catch {}
@@ -685,11 +951,15 @@ async function SelfEvolvePlugin(ctx, options = {}) {
   let resolveDeferredRuntime;
   let startupValidationPending = false;
   let startupTask;
-  const startupController = new AbortController();
+  let lateRecoveryPromise = null;
+  const durableInstanceToken = {};
+  let lateRecoveryCoordination = null;
+  let usesSharedLateRuntime = false;
   let disposed = false;
   let durableUnavailableReason;
   let runningHostCompatibility = hostCompatibility("unknown", false, "host-health-unavailable");
   let initialSelection;
+  let initialIdentity;
   let startupMode = "manual";
   if (durableEnabled) {
     initialSelection = initialStateRootSelection({
@@ -700,18 +970,220 @@ async function SelfEvolvePlugin(ctx, options = {}) {
     });
     if (initialSelection?.stateRoot) {
       const storeModule = await import("./self-evolve-store.js");
-      const identity = storeModule.resolveProjectIdentity({
+      initialIdentity = storeModule.resolveProjectIdentity({
         projectFingerprint: instancePluginOptions.projectFingerprint,
         remoteUrl: instancePluginOptions.remoteUrl,
         worktreePath: instancePluginOptions.worktree ?? ctx?.worktree,
         directory: ctx?.directory,
       });
       const provisionalCompatibility = hostCompatibility("unknown", instancePluginOptions.hostSupported !== false, "startup-validation-pending");
-      startupMode = await provisionalStartupMode(initialSelection.stateRoot, identity, instancePluginOptions, provisionalCompatibility);
+      startupMode = await provisionalStartupMode(initialSelection.stateRoot, initialIdentity, instancePluginOptions, provisionalCompatibility);
     }
     startupValidationPending = true;
     durableRuntimePromise = new Promise((resolve) => { resolveDeferredRuntime = resolve; });
+    const coordinationKey = lateDurableRecoveryKey(ctx, instancePluginOptions, initialSelection);
+    lateRecoveryCoordination = lateDurableRecoveryRegistry.get(coordinationKey);
+    if (lateRecoveryCoordination?.closingPromise) {
+      try { await lateRecoveryCoordination.closingPromise; } catch {}
+      lateRecoveryCoordination = lateDurableRecoveryRegistry.get(coordinationKey);
+    }
+    if (!lateRecoveryCoordination) {
+      lateRecoveryCoordination = {
+        key: coordinationKey,
+        users: new Set(),
+        controller: new AbortController(),
+        recoveryPromise: null,
+        closingPromise: null,
+        runtime: null,
+        compatibility: null,
+        unavailableReason: undefined,
+        commandDispatches: new WeakMap(),
+        eventDispatches: new WeakMap(),
+        lateRecoveryAttempted: false,
+      };
+      lateDurableRecoveryRegistry.set(coordinationKey, lateRecoveryCoordination);
+    }
+    lateRecoveryCoordination.users.add(durableInstanceToken);
   }
+
+  const buildValidatedDurableRuntime = async () => {
+    let runtime;
+    const sharedSignal = lateRecoveryCoordination?.controller?.signal;
+    const sharedRecoveryCancelled = () => sharedSignal?.aborted || !lateRecoveryCoordination || lateRecoveryCoordination.users.size === 0;
+    try {
+      runningHostCompatibility = await resolveRunningHostCompatibility(ctx, { ...instancePluginOptions, __startupSignal: sharedSignal });
+      if (sharedRecoveryCancelled()) return null;
+      if (
+        runningHostCompatibility.reason === "host-health-unavailable"
+        && initialSelection?.stateRoot
+        && initialIdentity?.projectFingerprint
+      ) {
+        try {
+          const tuiHealth = readTuiHostHealth(initialSelection.stateRoot, initialIdentity.projectFingerprint, {
+            now: Date.now(),
+            stateRootIdentity: stateRootIdentity(initialSelection.stateRoot),
+          });
+          if (tuiHealth) runningHostCompatibility = compatibilityFromObservedVersion(tuiHealth.hostVersion, instancePluginOptions, "tui-app-version").compatibility;
+          else runningHostCompatibility = hostCompatibility("unknown", false, "host-health-unavailable", `${runningHostCompatibility.diagnostic ?? "global-unavailable"}-tui-unavailable`.slice(0, 160));
+        } catch (error) {
+          runningHostCompatibility = hostCompatibility("unknown", false, "host-health-unavailable", `${runningHostCompatibility.diagnostic ?? "global-unavailable"}-tui-${hostHealthErrorDiagnostic(error)}`.slice(0, 160));
+        }
+      }
+      if (!runningHostCompatibility.supported) {
+        durableUnavailableReason = runningHostCompatibility.reason;
+        return null;
+      }
+      const selectedRoot = initialSelection?.provisional
+        ? await validateOfficialRootAfterStartup(ctx, initialSelection.stateRoot, instancePluginOptions)
+        : initialSelection?.stateRoot ?? await resolveStateRoot(ctx, instancePluginOptions);
+      if (sharedRecoveryCancelled()) return null;
+      runtime = await createDurablePipeline(ctx, instancePluginOptions, selectedRoot, runningHostCompatibility);
+      if (!runtime?.integration) throw new Error("durable-initialization-failed");
+      if (typeof runtime.integration.boot === "function") {
+        const boot = await runtime.integration.boot({ ctx, hostVersion: runningHostCompatibility.hostVersion, hostVersionSource: runningHostCompatibility.diagnostic === "tui-app-version" ? "tui-app-version" : "global-health", recoverHostSessions: false });
+        if (boot?.ok !== true) throw new Error(boot?.health?.lastError ?? "durable-boot-failed");
+      }
+      if (sharedRecoveryCancelled()) {
+        try { await (runtime.integration.shutdown?.() ?? runtime.integration.close?.()); } catch {}
+        return null;
+      }
+      durableUnavailableReason = undefined;
+      return runtime;
+    } catch (error) {
+      try { await (runtime?.integration?.shutdown?.() ?? runtime?.integration?.close?.()); } catch {}
+      durableUnavailableReason = String(error?.message ?? error ?? "startup-validation-failed").split(":", 1)[0];
+      return null;
+    }
+  };
+
+  const acquireCoordinatedDurableRuntime = async () => {
+    if (disposed || !durableEnabled || !durableRuntimePromise || !lateRecoveryCoordination) {
+      return { runtime: null, compatibility: runningHostCompatibility, unavailableReason: durableUnavailableReason };
+    }
+    if (lateRecoveryCoordination.runtime) {
+      return {
+        runtime: lateRecoveryCoordination.runtime,
+        compatibility: lateRecoveryCoordination.compatibility,
+        unavailableReason: lateRecoveryCoordination.unavailableReason,
+      };
+    }
+    let sharedRecovery = lateRecoveryCoordination.recoveryPromise;
+    if (!sharedRecovery) {
+      sharedRecovery = (async () => {
+        const runtime = await buildValidatedDurableRuntime();
+        const sharedOutcome = {
+          runtime,
+          compatibility: runningHostCompatibility,
+          unavailableReason: durableUnavailableReason,
+        };
+        lateRecoveryCoordination.runtime = runtime;
+        lateRecoveryCoordination.compatibility = runningHostCompatibility;
+        lateRecoveryCoordination.unavailableReason = durableUnavailableReason;
+        if (runtime) void Promise.resolve(runtime.integration?.recoverHostSessions?.()).catch(() => {});
+        return sharedOutcome;
+      })();
+      lateRecoveryCoordination.recoveryPromise = sharedRecovery;
+      void sharedRecovery.finally(() => {
+        if (lateRecoveryCoordination?.recoveryPromise === sharedRecovery) lateRecoveryCoordination.recoveryPromise = null;
+      }).catch(() => {});
+    }
+    return await sharedRecovery;
+  };
+
+  const installCoordinatedRuntime = (outcome) => {
+    runningHostCompatibility = outcome.compatibility ?? hostCompatibility("unknown", false, "host-health-unavailable");
+    durableUnavailableReason = outcome.unavailableReason;
+    const runtime = outcome.runtime;
+    if (!runtime || disposed) return null;
+    settledRuntime = runtime;
+    durableRuntimePromise = Promise.resolve(runtime);
+    usesSharedLateRuntime = true;
+    return runtime;
+  };
+
+  const recoverLateTuiHost = async () => {
+    if (disposed || !durableEnabled || !durableRuntimePromise || !lateRecoveryCoordination) return null;
+    if (lateRecoveryPromise) return await lateRecoveryPromise;
+    if (!lateRecoveryCoordination.lateRecoveryAttempted && lateRecoveryCoordination.recoveryPromise) {
+      const initialRecovery = lateRecoveryCoordination.recoveryPromise;
+      await initialRecovery;
+      if (lateRecoveryCoordination.recoveryPromise === initialRecovery) lateRecoveryCoordination.recoveryPromise = null;
+    }
+    if (lateRecoveryCoordination.lateRecoveryAttempted) {
+      if (lateRecoveryCoordination.recoveryPromise) await lateRecoveryCoordination.recoveryPromise;
+      return installCoordinatedRuntime({
+        runtime: lateRecoveryCoordination.runtime,
+        compatibility: lateRecoveryCoordination.compatibility,
+        unavailableReason: lateRecoveryCoordination.unavailableReason,
+      });
+    }
+    lateRecoveryCoordination.lateRecoveryAttempted = true;
+    startupValidationPending = true;
+    lateRecoveryPromise = (async () => {
+      const outcome = await acquireCoordinatedDurableRuntime();
+      runningHostCompatibility = outcome.compatibility ?? hostCompatibility("unknown", false, "host-health-unavailable");
+      durableUnavailableReason = outcome.unavailableReason;
+      return installCoordinatedRuntime(outcome);
+    })();
+    try {
+      return await lateRecoveryPromise;
+    } finally {
+      startupValidationPending = false;
+      lateRecoveryPromise = null;
+    }
+  };
+
+  const executeSelfEvolveCommand = async (input, output) => {
+    // Read the module-level `currentPluginOptions` at call time (not a
+    // per-instance closure variable) so behavior is consistent even if
+    // OpenCode's double-instantiation leaves more than one instance's
+    // hooks reachable.
+    const command = parseCommand(input.arguments ?? "");
+    if (durableEnabled && currentPluginOptions.durableAutonomy !== false) {
+      if (startupValidationPending) {
+        replaceParts(output, displayPart(input), textPart("Self-evolve durable integration unavailable (startup-validation-pending). Host compatibility and state-root validation must complete before commands gain authority. No mode change, self-evolve analyzer call, or file write was attempted."));
+        return;
+      }
+      if (!runningHostCompatibility.supported) {
+        const runtime = runningHostCompatibility.reason === "host-health-unavailable"
+          ? await recoverLateTuiHost()
+          : null;
+        if (!runtime) {
+          replaceParts(output, displayPart(input), textPart(unsupportedHostCommandText(command, runningHostCompatibility)));
+          return;
+        }
+      }
+      const runtime = await durableRuntimePromise;
+      const pipeline = runtime?.integration;
+      const sessionID = inputSessionID(input);
+      if (pipeline) {
+        const projectFingerprint = runtime.identity.projectFingerprint;
+        const scopeFingerprint = currentPluginOptions.scopeFingerprint ?? projectFingerprint;
+        if (typeof pipeline.handleCommand === "function") {
+          const result = await pipeline.handleCommand({
+            command: input.arguments ?? "",
+            ctx,
+            sessionID,
+            projectFingerprint,
+            scopeFingerprint,
+          });
+          replaceParts(output, displayPart(input), textPart(result?.responseText ?? "Self-evolve command failed: durable integration returned no response."));
+          return;
+        }
+        // Keep the injected pre-integration test seam compatible with v0.2.0:
+        // older pipeline stubs expose only runEvolutionCycle().
+        if (command.verb === "scan" && sessionID) {
+          const result = await pipeline.runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger: { kind: "manual", reason: "manual-scan" }, mode: currentPluginOptions.mode ?? "manual", options: currentPluginOptions });
+          replaceParts(output, displayPart(input), textPart(result.responseText));
+          return;
+        }
+      }
+      const detail = durableUnavailableReason ? ` (${durableUnavailableReason})` : "";
+      replaceParts(output, displayPart(input), textPart(`Self-evolve durable integration unavailable${detail}. No mode change or files were applied. Configure an explicit stateRoot and restart OpenCode if host state-path validation cannot complete.`));
+      return;
+    }
+    await handleCommand(ctx, input, output, currentPluginOptions, configuredModel);
+  };
 
   const hooks = {
     config: async (cfg) => {
@@ -731,69 +1203,74 @@ async function SelfEvolvePlugin(ctx, options = {}) {
 
     "command.execute.before": async (input, output) => {
       if (input.command !== "self-evolve") return;
-      // Read the module-level `currentPluginOptions` at call time (not a
-      // per-instance closure variable) so behavior is consistent even if
-      // OpenCode's double-instantiation leaves more than one instance's
-      // hooks reachable.
-      const command = parseCommand(input.arguments ?? "");
-      if (currentPluginOptions.durableAutonomy !== false) {
-        if (startupValidationPending) {
-          replaceParts(output, displayPart(input), textPart("Self-evolve durable integration unavailable (startup-validation-pending). Host compatibility and state-root validation must complete before commands gain authority. No mode change, provider call, or file write was attempted."));
+      if (lateRecoveryCoordination && input && typeof input === "object") {
+        const priorDispatch = lateRecoveryCoordination.commandDispatches.get(input);
+        if (priorDispatch) {
+          await priorDispatch.promise;
+          if (priorDispatch.output !== output) replaceParts(output, ...(priorDispatch.output?.parts ?? []));
           return;
         }
-        if (!runningHostCompatibility.supported) {
-          replaceParts(output, displayPart(input), textPart(unsupportedHostCommandText(command, runningHostCompatibility)));
-          return;
-        }
-        const runtime = await durableRuntimePromise;
-        const pipeline = runtime?.integration;
-        const sessionID = inputSessionID(input);
-        if (pipeline) {
-          const projectFingerprint = runtime.identity.projectFingerprint;
-          const scopeFingerprint = currentPluginOptions.scopeFingerprint ?? projectFingerprint;
-          if (typeof pipeline.handleCommand === "function") {
-            const result = await pipeline.handleCommand({
-              command: input.arguments ?? "",
-              ctx,
-              sessionID,
-              projectFingerprint,
-              scopeFingerprint,
-            });
-            replaceParts(output, displayPart(input), textPart(result?.responseText ?? "Self-evolve command failed: durable integration returned no response."));
-            return;
-          }
-          // Keep the injected pre-integration test seam compatible with v0.2.0:
-          // older pipeline stubs expose only runEvolutionCycle().
-          if (command.verb === "scan" && sessionID) {
-            const result = await pipeline.runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger: { kind: "manual", reason: "manual-scan" }, mode: currentPluginOptions.mode ?? "manual", options: currentPluginOptions });
-            replaceParts(output, displayPart(input), textPart(result.responseText));
-            return;
-          }
-        }
-        const detail = durableUnavailableReason ? ` (${durableUnavailableReason})` : "";
-        replaceParts(output, displayPart(input), textPart(`Self-evolve durable integration unavailable${detail}. No mode change or files were applied. Configure an explicit stateRoot and restart OpenCode if host state-path validation cannot complete.`));
+        const dispatch = executeSelfEvolveCommand(input, output);
+        lateRecoveryCoordination.commandDispatches.set(input, { promise: dispatch, output });
+        await dispatch;
         return;
       }
-      await handleCommand(ctx, input, output, currentPluginOptions, configuredModel);
+      await executeSelfEvolveCommand(input, output);
     },
 
     dispose: async () => {
+      if (disposed) return;
       // The module-level registry is keyed by runtime session IDs and would
       // otherwise retain per-session state for the whole process lifetime. Clear
       // it when opencode unloads the plugin so nothing outlives this instance.
       registry.clear();
       disposed = true;
-      startupController.abort();
       if (hostRecoveryTimer) clearTimeout(hostRecoveryTimer);
       hostRecoveryTimer = null;
       resolveDeferredRuntime?.(null);
       resolveDeferredRuntime = undefined;
       startupValidationPending = false;
+      const coordination = lateRecoveryCoordination;
+      let ownsCoordinatorClose = false;
+      let resolveCoordinatorClose;
+      if (coordination) {
+        coordination.users.delete(durableInstanceToken);
+        if (
+          coordination.users.size === 0
+          && !coordination.closingPromise
+          && lateDurableRecoveryRegistry.get(coordination.key) === coordination
+        ) {
+          ownsCoordinatorClose = true;
+          coordination.closingPromise = new Promise((resolve) => { resolveCoordinatorClose = resolve; });
+          coordination.controller.abort();
+        }
+      }
       try { await startupTask; } catch {}
-      try {
-        const pipeline = (await durableRuntimePromise)?.integration;
-        await (pipeline?.shutdown?.() ?? pipeline?.close?.());
-      } catch {}
+      try { await lateRecoveryPromise; } catch {}
+      if (coordination && ownsCoordinatorClose) {
+        try { await coordination.recoveryPromise; } catch {}
+        const sharedRuntime = coordination.runtime;
+        try {
+          const pipeline = sharedRuntime?.integration;
+          await (pipeline?.shutdown?.() ?? pipeline?.close?.());
+        } catch {
+        } finally {
+          coordination.runtime = null;
+          if (lateDurableRecoveryRegistry.get(coordination.key) === coordination) {
+            lateDurableRecoveryRegistry.delete(coordination.key);
+          }
+          coordination.closingPromise = null;
+          resolveCoordinatorClose?.();
+        }
+      } else if (coordination?.closingPromise && coordination.users.size === 0) {
+        try { await coordination.closingPromise; } catch {}
+      }
+      if (!usesSharedLateRuntime) {
+        try {
+          const pipeline = (await durableRuntimePromise)?.integration;
+          await (pipeline?.shutdown?.() ?? pipeline?.close?.());
+        } catch {}
+      }
       settledRuntime = null;
     },
   };
@@ -802,6 +1279,17 @@ async function SelfEvolvePlugin(ctx, options = {}) {
     hooks.event = async (input) => {
       const integration = settledRuntime?.integration;
       if (!integration) return;
+      if (lateRecoveryCoordination && input && typeof input === "object") {
+        const priorDispatch = lateRecoveryCoordination.eventDispatches.get(input);
+        if (priorDispatch) {
+          await priorDispatch;
+          return;
+        }
+        const dispatch = Promise.resolve(integration?.handleEvent?.(input));
+        lateRecoveryCoordination.eventDispatches.set(input, dispatch);
+        await dispatch;
+        return;
+      }
       await integration?.handleEvent?.(input);
     };
   }
@@ -813,42 +1301,12 @@ async function SelfEvolvePlugin(ctx, options = {}) {
       startupTask = (async () => {
         if (!resolveDeferredRuntime || disposed) return;
         const deferredResolve = resolveDeferredRuntime;
-        let runtime;
-        try {
-          runningHostCompatibility = await resolveRunningHostCompatibility(ctx, { ...instancePluginOptions, __startupSignal: startupController.signal });
-          if (disposed) return;
-          if (!runningHostCompatibility.supported) {
-            durableUnavailableReason = runningHostCompatibility.reason;
-            startupValidationPending = false;
-            resolveDeferredRuntime = undefined;
-            deferredResolve(null);
-            return;
-          }
-          const selectedRoot = initialSelection?.provisional
-            ? await validateOfficialRootAfterStartup(ctx, initialSelection.stateRoot, instancePluginOptions)
-            : initialSelection?.stateRoot ?? await resolveStateRoot(ctx, instancePluginOptions);
-          if (disposed) return;
-          runtime = await createDurablePipeline(ctx, instancePluginOptions, selectedRoot, runningHostCompatibility);
-          if (!runtime?.integration) throw new Error("durable-initialization-failed");
-          if (typeof runtime.integration.boot === "function") {
-            const boot = await runtime.integration.boot({ ctx, hostVersion: runningHostCompatibility.hostVersion, recoverHostSessions: false });
-            if (boot?.ok !== true) throw new Error(boot?.health?.lastError ?? "durable-boot-failed");
-          }
-          if (disposed) {
-            try { await (runtime.integration.shutdown?.() ?? runtime.integration.close?.()); } catch {}
-            return;
-          }
-          startupValidationPending = false;
-          settledRuntime = runtime;
+        const outcome = await acquireCoordinatedDurableRuntime();
+        const runtime = installCoordinatedRuntime(outcome);
+        if (!disposed) {
           resolveDeferredRuntime = undefined;
           deferredResolve(runtime);
-          void Promise.resolve(runtime?.integration?.recoverHostSessions?.()).catch(() => {});
-        } catch (error) {
-          try { await (runtime?.integration?.shutdown?.() ?? runtime?.integration?.close?.()); } catch {}
-          durableUnavailableReason = String(error?.message ?? error ?? "startup-validation-failed").split(":", 1)[0];
           startupValidationPending = false;
-          resolveDeferredRuntime = undefined;
-          deferredResolve(null);
         }
       })();
     }, delayMs);

@@ -203,7 +203,7 @@ function durationMs(value) {
   return Number.isSafeInteger(result) && result > 0 ? result : null;
 }
 
-export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VERSION, hostVersion = "unknown", now = () => Date.now() } = {}) {
+export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VERSION, hostVersion = "unknown", hostVersionSource = "global-health", now = () => Date.now() } = {}) {
   if (!store || typeof store.getSettings !== "function") throw new TypeError("command-store-required");
   if (!privacy || typeof privacy.exportScope !== "function" || typeof privacy.purgeScope !== "function") throw new TypeError("command-privacy-required");
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
@@ -354,6 +354,7 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     if (!current.ok) {
       return {
         hostVersion,
+        hostVersionSource,
         schemaVersion,
         circuitBreakerOpen: false,
         killSwitchActive: false,
@@ -365,6 +366,7 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     const breaker = latestCircuitBreaker();
     return {
       hostVersion,
+      hostVersionSource,
       schemaVersion,
       circuitBreakerOpen: breaker?.open === true,
       killSwitchActive: current.settings.global.killSwitchActive,
@@ -417,7 +419,7 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
       const current = settingsResult().settings;
       return { responseText: `Self-evolve status: stored mode ${health.mode}; effective mode ${getEffectiveMode({ projectFingerprint })}; repo mode ${health.repoMode}; paused ${current.global.paused}; excluded ${current.repo.excluded}.` };
     }
-    if (verb === "health") return { responseText: `Self-evolve health: host ${health.hostVersion}; schema ${health.schemaVersion}; mode ${health.mode}; repo mode ${health.repoMode}; circuit breaker ${health.circuitBreakerOpen ? "open" : "closed"}; kill switch ${health.killSwitchActive ? "on" : "off"}.${health.lastError ? ` Last error: ${health.lastError}` : ""}` };
+    if (verb === "health") return { responseText: `Self-evolve health: host ${health.hostVersion}; source ${health.hostVersionSource ?? "global-health"}; schema ${health.schemaVersion}; mode ${health.mode}; repo mode ${health.repoMode}; circuit breaker ${health.circuitBreakerOpen ? "open" : "closed"}; kill switch ${health.killSwitchActive ? "on" : "off"}.${health.lastError ? ` Last error: ${health.lastError}` : ""}` };
     if (verb === "mode") {
       if (commandValue.requiresConfirmation && !commandValue.confirmed) return { responseText: buildResponse(commandValue) };
       const result = setMode(commandValue.mode, { confirmed: commandValue.confirmed, allowlist: commandValue.allowlist });

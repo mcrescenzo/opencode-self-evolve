@@ -5,7 +5,7 @@
 **Verified runtime basis:** OpenCode host 1.18.3 + `@opencode-ai/plugin` 1.18.3 (see `self-evolve-0so.1` closeout notes).
 
 **Implementation status:** The v0.2 runtime implements this contract. Automated
-tests cover native TUI API behavior with mocks; the no-token OpenCode smoke proves
+tests cover native TUI API behavior with mocks; the no-external-token OpenCode smoke proves
 target loading and durable server behavior but does not claim live native dialog rendering.
 
 ---
@@ -291,9 +291,11 @@ One npm package exposes two target-only modules:
   only. Imports only from `@opencode-ai/plugin` (the `.` target) and Node
   built-ins. **Must not statically import `./tui` or `@opencode-ai/plugin/tui`**
   — those peers are not installed in headless contexts.
-- **TUI entry** (new, e.g. `self-evolve-tui.js` reached via `package.json`
-  `exports["./tui"]`): imports from `@opencode-ai/plugin/tui`, `@opentui/solid`,
-  and the package's own pure-ESM helpers. Default-exports a `TuiPlugin`.
+- **TUI entry** (`self-evolve-tui.js` reached via `package.json`
+  `exports["./tui"]`): uses the supported `@opencode-ai/plugin/tui` contract
+  and the package's own pure-ESM helpers without requiring an OpenTUI runtime
+  import. It default-exports one `TuiPluginModule` with stable ID
+  `mcrescenzo.self-evolve` and a `tui` function.
 - Both modules may import shared pure helpers (`self-evolve-core.js`,
   `self-evolve-schemas.js`, etc.) that themselves import nothing from either
   target.
@@ -311,6 +313,21 @@ One npm package exposes two target-only modules:
   are never merged or migrated automatically.
 - The server projection binds a SHA-256 canonical-root identity. The TUI checks
   it before inbox or control reads and fails closed on disagreement.
+- Host compatibility first uses server-side `client.global.health()` and the
+  exact-origin `/global/health` fallback. If both are unavailable in an
+  embedded TUI, this package's separately registered TUI target may relay the
+  official current `api.app.version` through a strict `0600`
+  `tui-host-health.json` runtime report. The report binds project and canonical
+  root, publisher PID, generation nonce, issue/expiry times, and version; its
+  same-account publisher must still be live and its lifetime cannot exceed 60
+  seconds. Consumption requires effective-UID ownership of the state root,
+  bridge ancestors, and report, exact `0600` report permissions, and no
+  group/other writes on the state root or bridge ancestors; `EPERM` and
+  unavailable ownership validation fail closed. The TUI refreshes every 15 seconds and removes only
+  its own current generation on disposal. The server still validates the
+  official state root before opening the store or granting authority.
+  Authoritative SDK/authentication failures do not fall through to either HTTP
+  or TUI reporting.
 - Both targets call the same project-identity resolver with an explicit
   fingerprint, the same plugin `remoteUrl`, and their supported OpenCode
   worktree path (`ctx.worktree` server; `api.state.path.worktree` TUI), with a
@@ -319,6 +336,8 @@ One npm package exposes two target-only modules:
 - Server plugin is the **sole writer** of observation/proposal/audit records.
 - TUI plugin is **read-only** with respect to global settings and every project
   record. It must not append decisions, proposals, audits, or skill content.
+  Its only replaceable write is the bounded runtime report above; decision and
+  control writes remain create-exclusive requests.
 - Cross-process decisions use a filesystem request/response mailbox at
   `<state-root>/self-evolve/bridge/<projectFingerprint>/`, with `requests/` and
   `responses/` children. There is no arbitrary client extension, undocumented
@@ -327,7 +346,8 @@ One npm package exposes two target-only modules:
   schema version, request ID, project fingerprint, proposal ID, current target
   hash, proposed-content hash, expected decision version and prior state,
   requested state, actor, creation time, and server-issued one-use nonce.
-  Unknown fields or an invalid binding reject the whole request. The TUI may
+  Unknown fields or an invalid binding reject the whole request. Apart from
+  decision/control requests and its one runtime-report generation, the TUI may
   write no other file under the state root.
 - Durable controls use a separate `control-requests/` and `control-responses/`
   namespace, not decision fields. The TUI reads a strict server-authored
@@ -444,13 +464,14 @@ Redaction is **not** a secrecy guarantee. The plugin must disclose this in
 | Project observations, receipts, episode cursors, evidence clusters, and eligibility records | 30 days |
 | Proposals, decisions, audit records, rollback/intervention/circuit records, and rollback snapshots | 90 days |
 | Bridge requests and responses | 24 hours |
+| TUI host-version runtime report | At most 60 seconds; revoked on clean disposal |
 | Global aggregate claims | 30 days |
 
 - `retentionDays` configures the observation/evidence window and the default
   aggregate `expiresAt` assigned when a claim is created; the proposal/audit
   window is three times that value. Existing aggregate claims always expire by
   their stored `expiresAt` and are not rewritten by later settings changes. The
-  bridge TTL is a fixed safety bound. Retention sweep runs at process startup and once per day
+  decision/control bridge TTL and the shorter operational TUI-report TTL are fixed safety bounds. Retention sweep runs at process startup and once per day
   while the process lives. Mailbox polling may remove already-expired bridge
   files sooner.
 - Record age uses the class's canonical event timestamp (for example,
@@ -577,12 +598,27 @@ an overnight range wraps across midnight.
 - The `package.json` `engines` field requires `@opencode-ai/plugin@^1.18.3`.
   After the factory returns, production startup derives the running OpenCode
   version from bounded official health: `client.global.health()` when present,
-  otherwise exact-origin GET `/global/health` from `PluginInput.serverUrl`.
-  Only healthy stable versions `>=1.18.3 <2.0.0` proceed. Unavailable,
-  malformed, prerelease, older, and 2.x hosts receive deterministic manual
-  diagnostics and refuse autonomous work. A persisted-auto/yolo provisional
-  hook has no integration while validation is pending and remains inert on
-  failure. Configuration can narrow but cannot widen this authority.
+  followed only after a recognized SDK transport/capability error by exact-origin GET
+  `/global/health` from `PluginInput.serverUrl`; a missing SDK method uses that
+  fallback directly.
+  Transient rejected/error responses and cancellable exact-origin fallback
+  timeouts retry with exponential backoff inside a fixed five-second startup
+  window. A timed-out generated SDK call fails closed without an overlapping
+  retry; invalid official inputs and authoritative unhealthy, malformed, or
+  unsupported responses also fail without retry.
+  If both server-side global-health paths are unavailable in an embedded TUI,
+  the separately registered package TUI target may relay official
+  `api.app.version` through the short-lived, root/project-bound, live-publisher
+  runtime report specified in §5.2. After an exhausted startup, only the first
+  later `/self-evolve` command may run one fresh bounded version-and-boot
+  attempt. The command receives no authority unless version resolution, root
+  validation, integration creation, and boot all succeed. Only healthy or
+  current-TUI-reported stable versions `>=1.18.3 <2.0.0` proceed; stable build
+  metadata is accepted and prereleases are not. Unavailable, authoritative-
+  error, malformed, prerelease, older, and 2.x hosts receive deterministic
+  manual diagnostics and refuse autonomous work. A persisted-auto/yolo
+  provisional hook has no integration while validation is pending and remains
+  inert on failure. Configuration can narrow but cannot widen this authority.
 
 ## 12. Permanent prohibitions
 
@@ -622,7 +658,8 @@ Per-bead validation:
 - **Scheduler (.12)**: duplicate idle dedup; lease contention; non-blocking
   handler contract (must return within bounded ms).
 - **TUI (.13)**: pure render tests against TuiPluginApi shape; consent capture;
-  readback of decision records.
+  readback of decision records; `api.app.version` runtime-report publication,
+  live-publisher/root/project/expiry validation, and disposal revocation.
 - **Mode integration (.14)**: end-to-end auto/yolo authority tests with mocked
   analyzer and applier.
 - **Hardening (.15)**: adversarial injection fixtures; concurrency storm;

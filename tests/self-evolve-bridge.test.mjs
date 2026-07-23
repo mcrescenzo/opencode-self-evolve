@@ -9,17 +9,23 @@ import { openStore } from "../self-evolve-store.js";
 import {
   BRIDGE_REQUEST_FIELDS,
   CONTROL_REQUEST_FIELDS,
+  TUI_HOST_HEALTH_FIELDS,
+  TUI_HOST_HEALTH_TTL_MS,
   cleanupBridge,
   consumeDecisionRequests,
   createControlRequest,
   createDecisionRequest,
   makeBridgeRequest,
   makeControlRequest,
+  makeTuiHostHealth,
   pollDecisionResponse,
   pollControlResponse,
   publishControlState,
+  publishTuiHostHealth,
   readControlState,
+  readTuiHostHealth,
   readProjectInbox,
+  revokeTuiHostHealth,
   submitControlRequest,
   submitDecisionRequest,
 } from "../self-evolve-bridge.js";
@@ -76,6 +82,147 @@ test("request envelopes are exact, bounded, hash-bound, and reject stale or cros
   assert.throws(() => makeBridgeRequest({ ...request, projectFingerprint: "e".repeat(64) }, { projectFingerprint: PROJECT }), /cross-project/u);
   assert.throws(() => makeBridgeRequest({ ...request, timestamp: Date.now() - 86_400_001 }, { now: Date.now() }), /stale-request/u);
   assert.throws(() => makeBridgeRequest({ ...request, targetHash: "wrong" }), /invalid-target-hash/u);
+});
+
+test("TUI host-health runtime report is exact, root-bound, short-lived, and securely published", (t) => {
+  const root = fixture(t);
+  const issuedAt = Date.now();
+  const identity = stateRootIdentity(root);
+  const health = publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: identity,
+    hostVersion: "1.18.3",
+    issuedAt,
+    nonce: "tui-health-nonce",
+  });
+  assert.deepEqual(Object.keys(health), TUI_HOST_HEALTH_FIELDS);
+  assert.equal(health.publisherPid, process.pid);
+  const filePath = path.join(root, "self-evolve", "bridge", PROJECT, "tui-host-health.json");
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+  assert.equal(readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: identity }).hostVersion, "1.18.3");
+  assert.throws(() => readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: "f".repeat(64) }), /state-root.*mismatch/u);
+  assert.throws(() => readTuiHostHealth(root, PROJECT, { now: issuedAt + TUI_HOST_HEALTH_TTL_MS + 1, stateRootIdentity: identity }), /expired/u);
+  assert.throws(() => makeTuiHostHealth({ ...health, extra: true }, { now: issuedAt }), /unknown-field/u);
+  assert.equal(revokeTuiHostHealth(root, PROJECT, { nonce: "different-nonce", stateRootIdentity: identity }), false);
+  assert.equal(revokeTuiHostHealth(root, PROJECT, { nonce: health.nonce, stateRootIdentity: identity }), true);
+  assert.equal(fs.existsSync(filePath), false);
+});
+
+test("TUI host-health rejects dead publishers and stale revocation cannot delete a newer generation", (t) => {
+  const root = fixture(t);
+  const issuedAt = Date.now();
+  const identity = stateRootIdentity(root);
+  publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: identity,
+    hostVersion: "1.18.3",
+    publisherPid: 999_999_999,
+    issuedAt,
+    nonce: "dead-publisher",
+  });
+  assert.throws(() => readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: identity }), /stale.*publisher/u);
+
+  publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: identity,
+    hostVersion: "1.18.3",
+    issuedAt,
+    nonce: "new-live-publisher",
+  });
+  assert.equal(revokeTuiHostHealth(root, PROJECT, { nonce: "dead-publisher", stateRootIdentity: identity }), false);
+  assert.equal(readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: identity }).nonce, "new-live-publisher");
+
+  publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: identity,
+    hostVersion: "1.18.3",
+    publisherPid: 999_999_999,
+    issuedAt,
+    nonce: "dead-publisher-cleanup",
+  });
+  const cleanup = cleanupBridge(root, PROJECT, { now: issuedAt });
+  assert.equal(cleanup.ok, true);
+  assert.equal(cleanup.removed, 1);
+  assert.equal(readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: identity }), null);
+});
+
+test("TUI host-health rejects writable state roots, permissive files, writable bridge ancestors, and foreign ownership", (t) => {
+  const root = fixture(t);
+  const issuedAt = Date.now();
+  const identity = stateRootIdentity(root);
+  fs.chmodSync(root, 0o770);
+  assert.throws(
+    () => publishTuiHostHealth(root, {
+      projectFingerprint: PROJECT,
+      stateRootIdentity: identity,
+      hostVersion: "1.18.3",
+      issuedAt,
+      nonce: "insecure-root-report",
+    }),
+    /tui-host-health-state-root-permissions-rejected/u,
+  );
+  fs.chmodSync(root, 0o700);
+  publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: identity,
+    hostVersion: "1.18.3",
+    issuedAt,
+    nonce: "permission-bound-report",
+  });
+  const filePath = path.join(root, "self-evolve", "bridge", PROJECT, "tui-host-health.json");
+  const reportOwner = fs.statSync(filePath).uid;
+
+  fs.chmodSync(filePath, 0o644);
+  assert.throws(
+    () => readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: identity }),
+    /tui-host-health-mode-rejected/u,
+  );
+
+  fs.chmodSync(filePath, 0o600);
+  fs.chmodSync(root, 0o770);
+  assert.throws(
+    () => readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: identity }),
+    /tui-host-health-state-root-permissions-rejected/u,
+  );
+
+  fs.chmodSync(root, 0o700);
+  fs.chmodSync(path.dirname(filePath), 0o770);
+  assert.throws(
+    () => readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: identity }),
+    /tui-host-health-ancestor-permissions-rejected/u,
+  );
+
+  fs.chmodSync(path.dirname(filePath), 0o700);
+  assert.throws(
+    () => readTuiHostHealth(root, PROJECT, {
+      now: issuedAt,
+      stateRootIdentity: identity,
+      __testEffectiveUid: reportOwner + 1,
+    }),
+    /tui-host-health-(?:state-root|ancestor|file)-owner-rejected/u,
+  );
+});
+
+test("TUI host-health treats an EPERM publisher probe as foreign rather than live", (t) => {
+  const root = fixture(t);
+  const issuedAt = Date.now();
+  const identity = stateRootIdentity(root);
+  publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: identity,
+    hostVersion: "1.18.3",
+    issuedAt,
+    nonce: "foreign-process-report",
+  });
+  const permissionError = Object.assign(new Error("not permitted"), { code: "EPERM" });
+  assert.throws(
+    () => readTuiHostHealth(root, PROJECT, {
+      now: issuedAt,
+      stateRootIdentity: identity,
+      __testSignalProcess: () => { throw permissionError; },
+    }),
+    /stale-tui-host-health-publisher/u,
+  );
 });
 
 test("request publication and responses are restrictive, atomic, replay-safe files", async (t) => {

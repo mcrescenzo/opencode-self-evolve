@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -45,7 +46,7 @@ async function commandOutput(command, args, options = {}) {
 }
 
 async function getFreePort() {
-  const server = createServer();
+  const server = createNetServer();
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
@@ -53,6 +54,81 @@ async function getFreePort() {
   const port = server.address().port;
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   return port;
+}
+
+async function startMockProvider() {
+  const requests = [];
+  const server = createHttpServer((request, response) => {
+    let source = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { source += chunk; });
+    request.on("end", () => {
+      let body = null;
+      try { body = source ? JSON.parse(source) : null; } catch {}
+      requests.push({ method: request.method, url: request.url, body });
+      if (request.method === "GET" && request.url?.endsWith("/models")) {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ object: "list", data: [{ id: "self-evolve-smoke", object: "model", owned_by: "self-evolve-smoke" }] }));
+        return;
+      }
+      if (request.method !== "POST" || !request.url?.endsWith("/chat/completions")) {
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "unsupported mock-provider route" } }));
+        return;
+      }
+      const model = body?.model ?? "self-evolve-smoke";
+      const created = Math.floor(Date.now() / 1000);
+      if (body?.stream === false) {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          id: "chatcmpl-self-evolve-smoke",
+          object: "chat.completion",
+          created,
+          model,
+          choices: [{ index: 0, message: { role: "assistant", content: "self-evolve command hook exercised" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }));
+        return;
+      }
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      response.write(`data: ${JSON.stringify({ id: "chatcmpl-self-evolve-smoke", object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant", content: "self-evolve command hook exercised" }, finish_reason: null }] })}\n\n`);
+      response.write(`data: ${JSON.stringify({ id: "chatcmpl-self-evolve-smoke", object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+      response.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  return {
+    baseURL: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    close: async () => await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+}
+
+async function executeSessionCommand(baseUrl, sessionId, directory) {
+  const response = await fetch(`${baseUrl}/session/${encodeURIComponent(sessionId)}/command?directory=${encodeURIComponent(directory)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ command: "self-evolve", arguments: "health", model: "smoke/self-evolve-smoke" }),
+  });
+  const source = await response.text();
+  if (!response.ok) throw new Error(`session command ${response.status}: ${source}`);
+  return source ? JSON.parse(source) : null;
+}
+
+async function readSessionMessages(baseUrl, sessionId, directory) {
+  const response = await fetch(`${baseUrl}/session/${encodeURIComponent(sessionId)}/message?directory=${encodeURIComponent(directory)}`);
+  const source = await response.text();
+  if (!response.ok) throw new Error(`session messages ${response.status}: ${source}`);
+  const value = source ? JSON.parse(source) : [];
+  return Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
 }
 
 async function fetchHealth(baseUrl) {
@@ -163,6 +239,120 @@ async function runRestartProbe({ phase, probePlugin, projectDir, baseEnv, config
   }
 }
 
+async function runDirectPluginChildProbe({ pluginPath, projectDir, baseEnv, configPath }) {
+  const port = await getFreePort();
+  let mockProvider;
+  let child;
+  let stdout = "";
+  let stderr = "";
+  let report;
+  try {
+    mockProvider = await startMockProvider();
+    const configContent = JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      model: "smoke/self-evolve-smoke",
+      small_model: "smoke/self-evolve-smoke",
+      plugin: [pluginPath],
+      command: { "self-evolve": { description: "Exercise the self-evolve command hook", template: "$ARGUMENTS" } },
+      provider: {
+        smoke: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Self-evolve local smoke provider",
+          options: { baseURL: mockProvider.baseURL, apiKey: "self-evolve-smoke" },
+          models: { "self-evolve-smoke": { name: "Self-evolve local smoke" } },
+        },
+      },
+      instructions: [],
+      mcp: {},
+      permission: { read: "deny", edit: "deny", bash: "deny", task: "deny" },
+    });
+    await writeFile(configPath, configContent, "utf8");
+    const childConfigHome = path.join(path.dirname(configPath), "direct-plugin-config");
+    const childOpencodeConfigDir = path.join(childConfigHome, "opencode");
+    const childStateHome = path.join(path.dirname(configPath), "direct-plugin-state");
+    await mkdir(childOpencodeConfigDir, { recursive: true });
+    await writeFile(path.join(childOpencodeConfigDir, "opencode.json"), configContent, "utf8");
+    const env = { ...baseEnv, XDG_CONFIG_HOME: childConfigHome, XDG_STATE_HOME: childStateHome, OPENCODE_CONFIG: configPath, OPENCODE_CONFIG_CONTENT: configContent };
+    let resolveListening;
+    let rejectListening;
+    const listening = new Promise((resolve, reject) => {
+      resolveListening = resolve;
+      rejectListening = reject;
+    });
+    let buffer = "";
+    child = spawn(opencodeCommand, ["serve", "--hostname", "127.0.0.1", "--port", String(port), "--log-level", "ERROR"], {
+      cwd: projectDir,
+      env,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8").on("data", (chunk) => {
+      stdout += chunk;
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const match = line.match(/opencode server listening on (http:\/\/[^\s]+)/);
+        if (match) resolveListening(match[1]);
+      }
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", rejectListening);
+    child.once("exit", (code, signal) => rejectListening(new Error(`direct plugin child exited early (code=${code}, signal=${signal})`)));
+
+    const baseUrl = await withTimeout(listening, "direct plugin child listen");
+    const officialHealth = await fetchHealth(baseUrl);
+    const session = await createSession(baseUrl, projectDir);
+    const sessionId = session?.id ?? session?.data?.id;
+    if (typeof sessionId !== "string" || !sessionId) throw new Error(`direct plugin child returned no session id: ${JSON.stringify(session)}`);
+    const commandResponse = await fetch(`${baseUrl}/command`);
+    if (!commandResponse.ok) throw new Error(`direct plugin child command registry ${commandResponse.status}: ${await commandResponse.text()}`);
+    const commands = await commandResponse.json();
+    const commandRegistered = Array.isArray(commands) && commands.some((item) => item?.name === "self-evolve" || item?.id === "self-evolve");
+    const stateRoot = path.join(childStateHome, "opencode");
+    const settingsPath = path.join(stateRoot, "self-evolve", "global", "settings.json");
+    for (let attempt = 0; !existsSync(settingsPath) && attempt < 200; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const stateLayoutCreated = existsSync(settingsPath);
+    if (!stateLayoutCreated) throw new Error(`direct plugin child did not boot durable state at ${settingsPath}`);
+    const commandResult = await withTimeout(executeSessionCommand(baseUrl, sessionId, projectDir), "direct plugin child command");
+    const messages = await readSessionMessages(baseUrl, sessionId, projectDir);
+    const commandHookExecuted = messages.some((message) => (message?.parts ?? []).some((part) => (
+      typeof part?.text === "string"
+      && /Self-evolve health: host 1\.18\.3; source global-health/u.test(part.text)
+    )));
+    report = {
+      pid: child.pid,
+      sessionId,
+      officialHealth,
+      stateRoot,
+      stateLayoutCreated,
+      commandRegistered,
+      commandHookExecuted,
+      commandResultReturned: Boolean(commandResult?.info && Array.isArray(commandResult?.parts)),
+      localProviderRequests: mockProvider.requests.length,
+      directRegistration: true,
+      processAliveBeforeStop: child.exitCode === null && child.signalCode === null,
+    };
+    return report;
+  } catch (error) {
+    error.message += `\nstdout: ${stdout}\nstderr: ${stderr}`;
+    throw error;
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      if (process.platform === "win32") child.kill("SIGTERM");
+      else process.kill(-child.pid, "SIGTERM");
+      await waitForExit(child).catch(() => {
+        if (process.platform === "win32") child.kill("SIGKILL");
+        else process.kill(-child.pid, "SIGKILL");
+      });
+    }
+    if (report) report.processAliveAfterStop = child ? child.exitCode === null && child.signalCode === null : false;
+    await mockProvider?.close().catch(() => {});
+  }
+}
+
 async function main() {
   const tempRoot = await mkdtemp(path.join(tmpdir(), "self-evolve-live-smoke-"));
   let child;
@@ -180,6 +370,7 @@ async function main() {
     const fixturePlugin = path.join(tempRoot, "self-evolve-live-fixture.mjs");
     const restartProbePlugin = path.join(tempRoot, "self-evolve-restart-probe.mjs");
     const restartProbeConfig = path.join(tempRoot, "opencode-restart-probe.json");
+    const directProbeConfig = path.join(tempRoot, "opencode-direct-probe.json");
     const explicitConfig = path.join(tempRoot, "opencode.json");
     const port = await getFreePort();
 
@@ -200,6 +391,8 @@ import * as schemas from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "sel
 import * as commands from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-commands.js")).href)};
 import * as inventory from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-inventory.js")).href)};
 import { createControlRequest, pollControlResponse, readControlState, submitControlRequest } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-bridge.js")).href)};
+
+let smokeStarted = false;
 
 function text(output) {
   return (output.parts || []).map((part) => part.text || part.content || "").filter(Boolean).join("\\n");
@@ -224,6 +417,8 @@ async function waitForStartup(hooks, sessionID) {
 export default async function SelfEvolveLiveSmokePlugin(ctx) {
   return {
     config: async (cfg) => {
+      if (smokeStarted) return;
+      smokeStarted = true;
       const compatibilityHooks = await CompatibilitySelfEvolvePlugin(ctx, { durableAutonomy: false, now: () => 42_000 });
       cfg.model = cfg.model || "noop/noop";
       cfg.agent = cfg.agent || {};
@@ -411,7 +606,7 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
 
       const actualOpenCodeProcess = {
         serverTargetLoaded: typeof SelfEvolvePlugin === "function",
-        tuiTargetLoaded: Boolean(SelfEvolveTuiModule && typeof SelfEvolveTuiModule.tui === "function"),
+        tuiTargetLoaded: Boolean(SelfEvolveTuiModule?.id === "mcrescenzo.self-evolve" && typeof SelfEvolveTuiModule.tui === "function"),
         durableIntegrationBooted: /Self-evolve status:/u.test(text(durableManualOutput)),
         runningVersionFromGlobalHealth: runningHealth?.data?.healthy === true && typeof runningHealth?.data?.version === "string",
         durableHealthReportsGlobalVersion: text(durableHealthOutput).includes("host " + runningHealth.data.version),
@@ -452,7 +647,7 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
         commands: { status, pause, pausedStatus, resume, finalStatus, lifecycle },
         checks: {
           analyzerRegistered: Boolean(analyzer?.hidden && analyzer?.permission?.edit === "deny" && analyzer?.permission?.bash === "deny"),
-          tuiTargetImported: Boolean(SelfEvolveTuiModule && typeof SelfEvolveTuiModule.tui === "function"),
+          tuiTargetImported: Boolean(SelfEvolveTuiModule?.id === "mcrescenzo.self-evolve" && typeof SelfEvolveTuiModule.tui === "function"),
           statusText: /Self-evolve status: active/.test(status.text),
           pauseText: /paused/i.test(pause.text),
           pausedStatusText: /Self-evolve status: paused/.test(pausedStatus.text),
@@ -641,10 +836,25 @@ export default async function SelfEvolveRestartProbe(ctx) {
       persistedManualFreshProcessNoHook: manualRestart.passiveHook === false && /effective mode manual|stored mode manual/u.test(manualRestart.before),
       noPassiveChatHooks: restartPhases.every((item) => item.chatHookAbsent === true),
       serverTuiStateRootsMatch: restartPhases.every((item) => item.serverStateRoot === item.tuiStateRoot && item.serverStateRoot === path.join(stateHome, "opencode")),
-      productionPluginReportsCliVersion: restartPhases.every((item) => item.officialHealth?.version === cliVersion && item.healthText.includes("host " + cliVersion)),
+      productionPluginReportsCliVersion: restartPhases.every((item) => item.officialHealth?.version === cliVersion && item.healthText.includes("host " + cliVersion) && item.healthText.includes("source global-health")),
     };
     const failedRestartChecks = Object.entries(restartChecks).filter(([, value]) => !value).map(([key]) => key);
     if (failedRestartChecks.length) throw new Error(`fresh-process restart checks failed: ${failedRestartChecks.join(", ")}\n${JSON.stringify(restartPhases)}`);
+    const directChildSessionEvidence = await runDirectPluginChildProbe({ pluginPath, projectDir, baseEnv: env, configPath: directProbeConfig });
+    if (
+      directChildSessionEvidence.directRegistration !== true
+      || typeof directChildSessionEvidence.sessionId !== "string"
+      || directChildSessionEvidence.officialHealth?.version !== cliVersion
+      || directChildSessionEvidence.stateLayoutCreated !== true
+      || directChildSessionEvidence.commandRegistered !== true
+      || directChildSessionEvidence.commandHookExecuted !== true
+      || directChildSessionEvidence.commandResultReturned !== true
+      || directChildSessionEvidence.localProviderRequests < 1
+      || directChildSessionEvidence.processAliveBeforeStop !== true
+      || directChildSessionEvidence.processAliveAfterStop !== false
+    ) {
+      throw new Error(`direct plugin child-session checks failed: ${JSON.stringify(directChildSessionEvidence)}`);
+    }
     report = {
       ok: true,
       smoke: "self-evolve-live-command-hook",
@@ -653,10 +863,13 @@ export default async function SelfEvolveRestartProbe(ctx) {
       runningVersionEvidence: {
         cliEqualsGlobalHealth: cliVersion === health.version,
         pluginReportsGlobalHealthVersion: payload.checks.durableHealthReportsGlobalVersion === true,
+        directChildSessionBootedAgainstGlobalHealth: directChildSessionEvidence.stateLayoutCreated === true && directChildSessionEvidence.officialHealth?.version === cliVersion,
+        directChildProductionCommandExecuted: directChildSessionEvidence.commandHookExecuted === true && directChildSessionEvidence.commandResultReturned === true,
       },
       evidence: payload.checks,
       evidenceSplit: payload.evidenceSplit,
       restartEvidence: { phases: restartPhases, checks: restartChecks },
+      directChildSessionEvidence,
       cleanup: { tempRoot, processAliveBeforeStop: child.exitCode === null && child.signalCode === null },
     };
   } catch (error) {

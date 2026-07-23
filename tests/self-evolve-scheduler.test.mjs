@@ -221,7 +221,7 @@ test("two schedulers contend on one cross-process lease", async (t) => {
   const first = fixture(t, { clock, leases, records, process: "one" });
   const second = fixture(t, { clock, leases, records, process: "two" });
   await Promise.all([first.scheduler.handleEvent(idle("shared")), second.scheduler.handleEvent(idle("shared"))]);
-  await waitFor(() => first.work.length + second.work.length === 1, "lease winner");
+  await waitFor(() => first.work.length + second.work.length === 1 && actions(records, "lease-busy").length === 1, "lease winner and contention audit");
   assert.equal(first.work.length + second.work.length, 1);
   assert.equal(actions(records, "lease-busy").length, 1);
   first.scheduler.dispose();

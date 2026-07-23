@@ -5,8 +5,10 @@ import path from "node:path";
 import { beforeEach, test } from "node:test";
 import { ANALYZER_TOOLS } from "../analyzer-prompt.js";
 import { SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SOURCE } from "../self-evolve-core.js";
+import { publishTuiHostHealth } from "../self-evolve-bridge.js";
 import DefaultSelfEvolvePlugin from "../self-evolve.js";
 import { makeGlobalSettings } from "../self-evolve-schemas.js";
+import { stateRootIdentity } from "../self-evolve-state-root.js";
 import { openStore, projectFingerprintFor } from "../self-evolve-store.js";
 
 const SelfEvolvePlugin = Object.assign(
@@ -1003,10 +1005,12 @@ function durableFixture(t) {
 
 const hostCompatibilityCases = [
   { name: "minimum supported 1.18.3", response: { data: { healthy: true, version: "1.18.3" } }, supported: true },
+  { name: "stable build metadata", response: { data: { healthy: true, version: "1.18.3+orca.1" } }, supported: true },
   { name: "newer supported 1.x", response: { data: { healthy: true, version: "1.99.0" } }, supported: true },
   { name: "older 1.18.2", response: { data: { healthy: true, version: "1.18.2" } }, version: "1.18.2", reason: "host-version-unsupported" },
   { name: "legacy 1.17.7", response: { data: { healthy: true, version: "1.17.7" } }, version: "1.17.7", reason: "host-version-unsupported" },
   { name: "malformed version", response: { data: { healthy: true, version: "not-semver" } }, version: "not-semver", reason: "host-version-malformed" },
+  { name: "unsafe numeric version", response: { data: { healthy: true, version: "1.999999999999999999999.0" } }, version: "1.999999999999999999999.0", reason: "host-version-malformed" },
   { name: "unhealthy host", response: { data: { healthy: false, version: "1.18.3" } }, version: "1.18.3", reason: "host-health-unhealthy" },
   { name: "prerelease host", response: { data: { healthy: true, version: "1.19.0-beta.1" } }, version: "1.19.0-beta.1", reason: "host-version-prerelease-unsupported" },
   { name: "2.0 host", response: { data: { healthy: true, version: "2.0.0" } }, version: "2.0.0", reason: "host-version-unsupported" },
@@ -1027,7 +1031,8 @@ for (const hostCase of hostCompatibilityCases) {
     const output = { parts: [] };
     await hooks["command.execute.before"]({ command: "self-evolve", sessionID: `health-${hostCase.name}`, arguments: "health" }, output);
     if (hostCase.supported) {
-      assert.match(output.parts.at(-1).text, new RegExp(`host ${hostCase.response.data.version.replaceAll(".", "\\.")}`));
+      assert.ok(output.parts.at(-1).text.includes(`host ${hostCase.response.data.version}`));
+      assert.match(output.parts.at(-1).text, /source global-health/u);
     } else {
       assert.match(output.parts.at(-1).text, new RegExp(`host ${hostCase.version ?? "unknown"}`));
       assert.match(output.parts.at(-1).text, new RegExp(hostCase.reason));
@@ -1046,16 +1051,454 @@ test("unavailable and timed-out global health fail persisted-auto startup closed
     const settings = seeded.getSettings();
     seeded.setGlobalSettings(makeGlobalSettings({ ...settings.global, mode: "auto", updatedAt: settings.global.updatedAt + 1 }));
     seeded.close();
-    f.ctx.client.global.health = health;
-    const hooks = await DefaultSelfEvolvePlugin(f.ctx, { __testHostHealthTimeoutMs: 10, hostVersion: "1.99.0", hostSupported: true });
+    let healthCalls = 0;
+    f.ctx.client.global.health = async () => {
+      healthCalls += 1;
+      return await health();
+    };
+    const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+      __testHostHealthTimeoutMs: 10,
+      __testHostHealthRetryWindowMs: 30,
+      __testHostHealthRetryDelayMs: 1,
+      hostVersion: "1.99.0",
+      hostSupported: true,
+    });
     assert.equal(typeof hooks.event, "function", `${name} may retain only the persisted-auto provisional hook`);
     await waitForDurableStartup(hooks, `startup-${name}`);
     const output = { parts: [] };
     await hooks["command.execute.before"]({ command: "self-evolve", sessionID: `health-${name}`, arguments: "health" }, output);
     assert.match(output.parts.at(-1).text, /host unknown/u);
     assert.match(output.parts.at(-1).text, new RegExp(reason));
+    if (name === "timeout") assert.equal(healthCalls, 1, "an uncancellable timed-out SDK request must not overlap a retry");
+    else assert.ok(healthCalls > 1, "transient rejected SDK requests should retry within the bounded window");
     await hooks.dispose();
   }
+});
+
+test("transient startup health failure retries until the official host becomes available", async (t) => {
+  const f = durableFixture(t);
+  let healthCalls = 0;
+  f.ctx.client.global.health = async () => {
+    healthCalls += 1;
+    if (healthCalls === 1) throw new Error("connection refused during host startup");
+    return { data: { healthy: true, version: "1.18.3" } };
+  };
+
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthTimeoutMs: 20,
+    __testHostHealthRetryWindowMs: 100,
+    __testHostHealthRetryDelayMs: 1,
+  });
+  t.after(async () => hooks.dispose());
+  await waitForDurableStartup(hooks, "startup-transient-health");
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "health-transient", arguments: "health" }, output);
+
+  assert.equal(healthCalls, 2);
+  assert.match(output.parts.at(-1).text, /host 1\.18\.3/u);
+});
+
+test("a command recovers durable startup after the TUI host becomes reachable late", async (t) => {
+  const f = durableFixture(t);
+  let hostReady = false;
+  let healthCalls = 0;
+  f.ctx.client.global.health = async () => {
+    healthCalls += 1;
+    if (!hostReady) {
+      const error = new Error("embedded TUI host is not listening yet");
+      error.code = "ECONNREFUSED";
+      throw error;
+    }
+    return { data: { healthy: true, version: "1.18.3" } };
+  };
+
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthRetryWindowMs: 30,
+    __testHostHealthRetryDelayMs: 1,
+  });
+  t.after(async () => hooks.dispose());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const startupCalls = healthCalls;
+  assert.ok(startupCalls > 0);
+
+  hostReady = true;
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "late-tui-host", arguments: "health" }, output);
+
+  assert.ok(healthCalls > startupCalls, "the post-start command must re-check official health");
+  assert.match(output.parts.at(-1).text, /host 1\.18\.3/u);
+});
+
+test("late command recovery remains fail-closed while official health is unavailable", async (t) => {
+  const f = durableFixture(t);
+  let healthCalls = 0;
+  f.ctx.client.global.health = async () => {
+    healthCalls += 1;
+    const error = new Error("embedded TUI host remains unavailable");
+    error.code = "ECONNREFUSED";
+    throw error;
+  };
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthRetryWindowMs: 20,
+    __testHostHealthRetryDelayMs: 1,
+  });
+  t.after(async () => hooks.dispose());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "late-tui-unavailable", arguments: "auto" }, output);
+  assert.match(output.parts.at(-1).text, /host-health-unavailable/u);
+  assert.match(output.parts.at(-1).text, /No mode change, self-evolve analyzer call, or file write was attempted/u);
+  const callsAfterLateAttempt = healthCalls;
+  const repeated = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "late-tui-unavailable-repeat", arguments: "health" }, repeated);
+  assert.equal(healthCalls, callsAfterLateAttempt, "only the first post-start command may run late recovery");
+
+  const store = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+  assert.equal(store.getSettings().global.mode, "manual");
+  store.close();
+});
+
+test("same-context factory hooks share one late durable recovery runtime", async (t) => {
+  const f = durableFixture(t);
+  let hostReady = false;
+  let factoryCalls = 0;
+  let recoveryCalls = 0;
+  let shutdownCalls = 0;
+  f.ctx.client.global.health = async () => {
+    if (!hostReady) {
+      const error = new Error("embedded TUI host is not ready");
+      error.code = "ECONNREFUSED";
+      throw error;
+    }
+    return { data: { healthy: true, version: "1.18.3" } };
+  };
+  const integration = {
+    async boot() { return { ok: true }; },
+    async handleCommand() { return { responseText: "shared durable recovery" }; },
+    async recoverHostSessions() { recoveryCalls += 1; },
+    async shutdown() { shutdownCalls += 1; },
+  };
+  const options = {
+    __testHostHealthRetryWindowMs: 20,
+    __testHostHealthRetryDelayMs: 1,
+    pipelineFactory: async () => {
+      factoryCalls += 1;
+      return integration;
+    },
+  };
+  const first = await DefaultSelfEvolvePlugin(f.ctx, options);
+  const second = await DefaultSelfEvolvePlugin(f.ctx, options);
+  t.after(async () => {
+    await first.dispose();
+    await second.dispose();
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  hostReady = true;
+  const firstOutput = { parts: [] };
+  const secondOutput = { parts: [] };
+  await Promise.all([
+    first["command.execute.before"]({ command: "self-evolve", sessionID: "shared-first", arguments: "status" }, firstOutput),
+    second["command.execute.before"]({ command: "self-evolve", sessionID: "shared-second", arguments: "status" }, secondOutput),
+  ]);
+
+  assert.equal(factoryCalls, 1, "double-instantiated hooks must not create duplicate durable integrations");
+  assert.match(firstOutput.parts.at(-1).text, /shared durable recovery/u);
+  assert.match(secondOutput.parts.at(-1).text, /shared durable recovery/u);
+  assert.equal(recoveryCalls, 1);
+  await first.dispose();
+  assert.equal(shutdownCalls, 0, "the shared runtime must remain live for the second factory instance");
+  await second.dispose();
+  assert.equal(shutdownCalls, 1, "the final factory disposal must close the shared runtime exactly once");
+});
+
+test("disposing the initiating factory does not abort shared late recovery for a surviving factory", async (t) => {
+  const f = durableFixture(t);
+  let latePhase = false;
+  let resolveLateHealth;
+  let markLateHealthStarted;
+  const lateHealthStarted = new Promise((resolve) => { markLateHealthStarted = resolve; });
+  f.ctx.client.global.health = async () => {
+    if (!latePhase) {
+      const error = new Error("embedded TUI host is not ready");
+      error.code = "ECONNREFUSED";
+      throw error;
+    }
+    markLateHealthStarted();
+    return await new Promise((resolve) => { resolveLateHealth = resolve; });
+  };
+  let factoryCalls = 0;
+  let shutdownCalls = 0;
+  const options = {
+    __testHostHealthRetryWindowMs: 0,
+    __testHostHealthTimeoutMs: 1_000,
+    pipelineFactory: async () => {
+      factoryCalls += 1;
+      return {
+        async boot() { return { ok: true }; },
+        async handleCommand() { return { responseText: "surviving shared runtime" }; },
+        async shutdown() { shutdownCalls += 1; },
+      };
+    },
+  };
+  const first = await DefaultSelfEvolvePlugin(f.ctx, options);
+  const second = await DefaultSelfEvolvePlugin(f.ctx, options);
+  t.after(async () => {
+    await first.dispose();
+    await second.dispose();
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  latePhase = true;
+  const firstOutput = { parts: [] };
+  const firstCommand = first["command.execute.before"]({ command: "self-evolve", sessionID: "disposing-initiator", arguments: "status" }, firstOutput);
+  await lateHealthStarted;
+  const firstDispose = first.dispose();
+  resolveLateHealth({ data: { healthy: true, version: "1.18.3" } });
+  await Promise.all([firstCommand, firstDispose]);
+
+  const secondOutput = { parts: [] };
+  await second["command.execute.before"]({ command: "self-evolve", sessionID: "surviving-factory", arguments: "status" }, secondOutput);
+  assert.equal(factoryCalls, 1);
+  assert.match(secondOutput.parts.at(-1).text, /surviving shared runtime/u);
+  assert.equal(shutdownCalls, 0, "the shared runtime must stay live for the surviving factory");
+  await second.dispose();
+  assert.equal(shutdownCalls, 1);
+});
+
+test("same-context initial boot and duplicate command delivery use one shared runtime", async (t) => {
+  const f = durableFixture(t);
+  let factoryCalls = 0;
+  let commandCalls = 0;
+  let shutdownCalls = 0;
+  const integration = {
+    async boot() { return { ok: true }; },
+    async handleCommand() {
+      commandCalls += 1;
+      return { responseText: "one shared command" };
+    },
+    async shutdown() { shutdownCalls += 1; },
+  };
+  const options = {
+    pipelineFactory: async () => {
+      factoryCalls += 1;
+      return integration;
+    },
+  };
+  const first = await DefaultSelfEvolvePlugin(f.ctx, options);
+  const second = await DefaultSelfEvolvePlugin(f.ctx, options);
+  t.after(async () => {
+    await first.dispose();
+    await second.dispose();
+  });
+  await Promise.all([
+    waitForDurableStartup(first, "shared-initial-first"),
+    waitForDurableStartup(second, "shared-initial-second"),
+  ]);
+  assert.equal(factoryCalls, 1, "initial startup must be coordinated across factory instances");
+  commandCalls = 0;
+
+  const input = { command: "self-evolve", sessionID: "same-logical-command", arguments: "status" };
+  const firstOutput = { parts: [] };
+  const secondOutput = { parts: [] };
+  await Promise.all([
+    first["command.execute.before"](input, firstOutput),
+    second["command.execute.before"](input, secondOutput),
+  ]);
+  assert.equal(commandCalls, 1, "the same command hook delivery must reach the integration once");
+  assert.match(firstOutput.parts.at(-1).text, /one shared command/u);
+  assert.match(secondOutput.parts.at(-1).text, /one shared command/u);
+
+  await first.dispose();
+  await second.dispose();
+  assert.equal(shutdownCalls, 1);
+});
+
+test("durable coordination isolates different official host origins", async (t) => {
+  const f = durableFixture(t);
+  const makeContext = (port) => ({
+    ...f.ctx,
+    serverUrl: new URL(`http://127.0.0.1:${port}/`),
+    client: {
+      ...f.ctx.client,
+      global: { health: async () => ({ data: { healthy: true, version: "1.18.3" } }) },
+    },
+  });
+  let firstFactories = 0;
+  let secondFactories = 0;
+  const first = await DefaultSelfEvolvePlugin(makeContext(43101), {
+    pipelineFactory: async () => {
+      firstFactories += 1;
+      return { async boot() { return { ok: true }; }, async handleCommand() { return { responseText: "host A" }; }, async shutdown() {} };
+    },
+  });
+  const second = await DefaultSelfEvolvePlugin(makeContext(43102), {
+    pipelineFactory: async () => {
+      secondFactories += 1;
+      return { async boot() { return { ok: true }; }, async handleCommand() { return { responseText: "host B" }; }, async shutdown() {} };
+    },
+  });
+  t.after(async () => {
+    await first.dispose();
+    await second.dispose();
+  });
+  await Promise.all([
+    waitForDurableStartup(first, "different-host-a"),
+    waitForDurableStartup(second, "different-host-b"),
+  ]);
+  const firstOutput = { parts: [] };
+  const secondOutput = { parts: [] };
+  await first["command.execute.before"]({ command: "self-evolve", sessionID: "host-a", arguments: "status" }, firstOutput);
+  await second["command.execute.before"]({ command: "self-evolve", sessionID: "host-b", arguments: "status" }, secondOutput);
+
+  assert.equal(firstFactories, 1);
+  assert.equal(secondFactories, 1);
+  assert.match(firstOutput.parts.at(-1).text, /host A/u);
+  assert.match(secondOutput.parts.at(-1).text, /host B/u);
+});
+
+test("durable coordination does not share across authority-narrowing options", async (t) => {
+  const f = durableFixture(t);
+  let unrestrictedFactories = 0;
+  let excludedFactories = 0;
+  const unrestricted = await DefaultSelfEvolvePlugin(f.ctx, {
+    pipelineFactory: async () => {
+      unrestrictedFactories += 1;
+      return { async boot() { return { ok: true }; }, async handleCommand() { return { responseText: "unrestricted runtime" }; }, async shutdown() {} };
+    },
+  });
+  const excluded = await DefaultSelfEvolvePlugin(f.ctx, {
+    processExcluded: true,
+    pipelineFactory: async () => {
+      excludedFactories += 1;
+      return { async boot() { return { ok: true }; }, async handleCommand() { return { responseText: "excluded runtime" }; }, async shutdown() {} };
+    },
+  });
+  t.after(async () => {
+    await unrestricted.dispose();
+    await excluded.dispose();
+  });
+  await Promise.all([
+    waitForDurableStartup(unrestricted, "unrestricted-runtime"),
+    waitForDurableStartup(excluded, "excluded-runtime"),
+  ]);
+  const unrestrictedOutput = { parts: [] };
+  const excludedOutput = { parts: [] };
+  await unrestricted["command.execute.before"]({ command: "self-evolve", sessionID: "unrestricted", arguments: "status" }, unrestrictedOutput);
+  await excluded["command.execute.before"]({ command: "self-evolve", sessionID: "excluded", arguments: "status" }, excludedOutput);
+
+  assert.equal(unrestrictedFactories, 1);
+  assert.equal(excludedFactories, 1);
+  assert.match(unrestrictedOutput.parts.at(-1).text, /unrestricted runtime/u);
+  assert.match(excludedOutput.parts.at(-1).text, /excluded runtime/u);
+});
+
+test("duplicate passive event delivery reaches a shared integration once", async (t) => {
+  const f = durableFixture(t);
+  const seeded = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+  const settings = seeded.getSettings();
+  seeded.setGlobalSettings(makeGlobalSettings({ ...settings.global, mode: "auto", updatedAt: settings.global.updatedAt + 1 }));
+  seeded.close();
+  let eventCalls = 0;
+  const integration = {
+    async boot() { return { ok: true }; },
+    async handleEvent() { eventCalls += 1; },
+    async shutdown() {},
+  };
+  const options = { pipelineFactory: async () => integration };
+  const first = await DefaultSelfEvolvePlugin(f.ctx, options);
+  const second = await DefaultSelfEvolvePlugin(f.ctx, options);
+  t.after(async () => {
+    await first.dispose();
+    await second.dispose();
+  });
+  await Promise.all([
+    waitForDurableStartup(first, "shared-event-first"),
+    waitForDurableStartup(second, "shared-event-second"),
+  ]);
+  assert.equal(typeof first.event, "function");
+  assert.equal(typeof second.event, "function");
+  const event = { type: "session.idle", properties: { sessionID: "same-event" } };
+  await Promise.all([first.event(event), second.event(event)]);
+  assert.equal(eventCalls, 1);
+});
+
+test("a new factory waits for final shared-runtime shutdown before joining", async (t) => {
+  const f = durableFixture(t);
+  let factoryCalls = 0;
+  let releaseFirstShutdown;
+  let firstShutdownStarted = false;
+  const firstShutdownGate = new Promise((resolve) => { releaseFirstShutdown = resolve; });
+  const options = {
+    pipelineFactory: async () => {
+      factoryCalls += 1;
+      const ordinal = factoryCalls;
+      return {
+        async boot() { return { ok: true }; },
+        async handleCommand() { return { responseText: `runtime ${ordinal}` }; },
+        async shutdown() {
+          if (ordinal === 1) {
+            firstShutdownStarted = true;
+            await firstShutdownGate;
+          }
+        },
+      };
+    },
+  };
+  const first = await DefaultSelfEvolvePlugin(f.ctx, options);
+  await waitForDurableStartup(first, "closing-race-first");
+  const firstDispose = first.dispose();
+  const deadline = Date.now() + 500;
+  while (!firstShutdownStarted && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(firstShutdownStarted, true);
+
+  let secondResolved = false;
+  const secondPromise = DefaultSelfEvolvePlugin(f.ctx, options).then((hooks) => {
+    secondResolved = true;
+    return hooks;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(secondResolved, false, "a new factory must not adopt a runtime that is closing");
+  releaseFirstShutdown();
+  await firstDispose;
+  const second = await secondPromise;
+  t.after(async () => second.dispose());
+  await waitForDurableStartup(second, "closing-race-second");
+  assert.equal(factoryCalls, 2, "the post-close factory must create a fresh runtime");
+  const output = { parts: [] };
+  await second["command.execute.before"]({ command: "self-evolve", sessionID: "closing-race", arguments: "status" }, output);
+  assert.match(output.parts.at(-1).text, /runtime 2/u);
+});
+
+test("an explicit legacy instance cannot enter durable recovery after a later factory call", async (t) => {
+  const f = durableFixture(t);
+  let legacyFactoryCalls = 0;
+  const legacy = await DefaultSelfEvolvePlugin(f.ctx, {
+    durableAutonomy: false,
+    pipelineFactory: async () => {
+      legacyFactoryCalls += 1;
+      return { async handleCommand() { return { responseText: "unexpected durable legacy" }; } };
+    },
+  });
+  const durable = await DefaultSelfEvolvePlugin(f.ctx, {
+    pipeline: {
+      async boot() { return { ok: true }; },
+      async handleCommand() { return { responseText: "durable" }; },
+      async shutdown() {},
+    },
+  });
+  t.after(async () => {
+    await legacy.dispose();
+    await durable.dispose();
+  });
+  await waitForDurableStartup(durable, "mixed-instance-durable");
+
+  const output = { parts: [] };
+  await legacy["command.execute.before"]({ command: "self-evolve", sessionID: "mixed-instance-legacy", arguments: "status" }, output);
+  assert.equal(legacyFactoryCalls, 0);
+  assert.match(output.parts.at(-1).text, /Self-evolve status: active/u);
+  assert.doesNotMatch(output.parts.at(-1).text, /unexpected durable legacy/u);
 });
 
 test("hostSupported false narrows actual supported health and spoof options never widen it", async (t) => {
@@ -1137,8 +1580,196 @@ test("serverUrl fallback fetches only the official origin global-health path", a
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "http://127.0.0.1:43210/global/health");
   assert.equal(calls[0].options.method, "GET");
-  assert.equal(calls[0].options.redirect, "error");
+  assert.equal(calls[0].options.redirect, "manual");
+  assert.match(output.parts.at(-1).text, /source global-health/u);
   await hooks.dispose();
+});
+
+test("a rejected generated SDK health call falls back to official serverUrl health", async (t) => {
+  const f = durableFixture(t);
+  f.ctx.serverUrl = new URL("http://127.0.0.1:4322/");
+  f.ctx.client.global.health = async () => { throw new Error("generated SDK transport unavailable"); };
+  const calls = [];
+  f.ctx.__testOnlySelfEvolveFetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, async json() { return { healthy: true, version: "1.18.3" }; } };
+  };
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx);
+  t.after(async () => hooks.dispose());
+  await waitForDurableStartup(hooks, "sdk-to-server-url-fallback");
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "sdk-to-fallback", arguments: "health" }, output);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://127.0.0.1:4322/global/health");
+  assert.equal(calls[0].options.redirect, "manual");
+  assert.match(output.parts.at(-1).text, /host 1\.18\.3/u);
+});
+
+test("fresh official TUI app-version runtime report recovers an embedded host without HTTP health", async (t) => {
+  const f = durableFixture(t);
+  f.ctx.serverUrl = new URL("http://127.0.0.1:4326/");
+  f.ctx.client.global.health = async () => ({ error: { message: "route unavailable" }, response: { status: 404 } });
+  f.ctx.__testOnlySelfEvolveFetch = async () => ({ ok: false, status: 404 });
+  fs.mkdirSync(f.stateRoot, { recursive: true, mode: 0o700 });
+  publishTuiHostHealth(f.stateRoot, {
+    projectFingerprint: f.projectFingerprint,
+    stateRootIdentity: stateRootIdentity(f.stateRoot),
+    hostVersion: "1.18.3",
+  });
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthRetryWindowMs: 20,
+    __testHostHealthRetryDelayMs: 1,
+  });
+  t.after(async () => hooks.dispose());
+  await waitForDurableStartup(hooks, "tui-app-version-runtime-report");
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "tui-app-version", arguments: "health" }, output);
+
+  assert.match(output.parts.at(-1).text, /host 1\.18\.3/u);
+  assert.match(output.parts.at(-1).text, /source tui-app-version/u);
+});
+
+test("host-health diagnostics classify both official paths without leaking error text", async (t) => {
+  const f = durableFixture(t);
+  f.ctx.serverUrl = new URL("http://127.0.0.1:4323/");
+  f.ctx.client.global.health = async () => {
+    const error = new Error("sdk secret marker SHOULD_NOT_LEAK");
+    error.code = "ECONNRESET";
+    error.privateCode = "APIKEY_SUPERSECRET_123";
+    throw error;
+  };
+  f.ctx.__testOnlySelfEvolveFetch = async () => {
+    const error = new Error("fallback secret marker ALSO_SHOULD_NOT_LEAK");
+    error.name = "TOKEN_PRIVATE_456";
+    throw error;
+  };
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthRetryWindowMs: 20,
+    __testHostHealthRetryDelayMs: 1,
+  });
+  t.after(async () => hooks.dispose());
+  await waitForDurableStartup(hooks, "sdk-and-fallback-unavailable");
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "sdk-and-fallback", arguments: "status" }, output);
+  const text = output.parts.at(-1).text;
+
+  assert.match(text, /diagnostic sdk-connection-reset-fallback-error/u);
+  assert.doesNotMatch(text, /SHOULD_NOT_LEAK/u);
+  assert.doesNotMatch(text, /secret marker/u);
+});
+
+test("authoritative SDK health errors neither fall back to HTTP nor accept a TUI report", async (t) => {
+  const f = durableFixture(t);
+  f.ctx.serverUrl = new URL("http://127.0.0.1:4327/");
+  f.ctx.client.global.health = async () => ({ error: { message: "unauthorized SECRET_SHOULD_NOT_LEAK" }, response: { status: 401 } });
+  let fallbackCalls = 0;
+  f.ctx.__testOnlySelfEvolveFetch = async () => {
+    fallbackCalls += 1;
+    return { ok: true, async json() { return { healthy: true, version: "1.18.3" }; } };
+  };
+  fs.mkdirSync(f.stateRoot, { recursive: true, mode: 0o700 });
+  publishTuiHostHealth(f.stateRoot, {
+    projectFingerprint: f.projectFingerprint,
+    stateRootIdentity: stateRootIdentity(f.stateRoot),
+    hostVersion: "1.18.3",
+  });
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthRetryWindowMs: 20,
+    __testHostHealthRetryDelayMs: 1,
+  });
+  t.after(async () => hooks.dispose());
+  await waitForDurableStartup(hooks, "authoritative-sdk-health-error");
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "authoritative-sdk-health-error", arguments: "health" }, output);
+
+  assert.equal(fallbackCalls, 0);
+  assert.match(output.parts.at(-1).text, /host-health-authoritative-error/u);
+  assert.doesNotMatch(output.parts.at(-1).text, /SECRET_SHOULD_NOT_LEAK/u);
+});
+
+test("a responding SDK 5xx is authoritative and cannot be replaced by HTTP or TUI health", async (t) => {
+  const f = durableFixture(t);
+  f.ctx.serverUrl = new URL("http://127.0.0.1:4328/");
+  f.ctx.client.global.health = async () => ({ error: { message: "service unavailable" }, response: { status: 503 } });
+  let fallbackCalls = 0;
+  f.ctx.__testOnlySelfEvolveFetch = async () => {
+    fallbackCalls += 1;
+    return { ok: true, async json() { return { healthy: true, version: "1.18.3" }; } };
+  };
+  fs.mkdirSync(f.stateRoot, { recursive: true, mode: 0o700 });
+  publishTuiHostHealth(f.stateRoot, {
+    projectFingerprint: f.projectFingerprint,
+    stateRootIdentity: stateRootIdentity(f.stateRoot),
+    hostVersion: "1.18.3",
+  });
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthRetryWindowMs: 20,
+    __testHostHealthRetryDelayMs: 1,
+  });
+  t.after(async () => hooks.dispose());
+  await waitForDurableStartup(hooks, "authoritative-sdk-5xx");
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "authoritative-sdk-5xx", arguments: "health" }, output);
+
+  assert.equal(fallbackCalls, 0);
+  assert.match(output.parts.at(-1).text, /host-health-authoritative-error/u);
+});
+
+for (const fallbackCase of [
+  { name: "503 response", response: { ok: false, status: 503 } },
+  { name: "302 redirect response", response: { ok: false, status: 302 } },
+  { name: "malformed JSON", response: { ok: true, status: 200, async json() { throw new SyntaxError("SECRET_PARSE_TEXT"); } } },
+]) {
+  test(`a responding HTTP fallback ${fallbackCase.name} is authoritative and blocks TUI relay`, async (t) => {
+    const f = durableFixture(t);
+    delete f.ctx.client.global;
+    f.ctx.serverUrl = new URL("http://127.0.0.1:4329/");
+    f.ctx.__testOnlySelfEvolveFetch = async (_url, init) => {
+      assert.equal(init.redirect, "manual", "redirect responses must remain observable and authoritative");
+      return fallbackCase.response;
+    };
+    fs.mkdirSync(f.stateRoot, { recursive: true, mode: 0o700 });
+    publishTuiHostHealth(f.stateRoot, {
+      projectFingerprint: f.projectFingerprint,
+      stateRootIdentity: stateRootIdentity(f.stateRoot),
+      hostVersion: "1.18.3",
+    });
+    const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+      __testHostHealthRetryWindowMs: 20,
+      __testHostHealthRetryDelayMs: 1,
+    });
+    t.after(async () => hooks.dispose());
+    await waitForDurableStartup(hooks, `authoritative-http-${fallbackCase.name}`);
+    const output = { parts: [] };
+    await hooks["command.execute.before"]({ command: "self-evolve", sessionID: `authoritative-http-${fallbackCase.name}`, arguments: "health" }, output);
+
+    assert.match(output.parts.at(-1).text, /host-health-authoritative-error/u);
+    assert.doesNotMatch(output.parts.at(-1).text, /SECRET_PARSE_TEXT/u);
+    assert.equal(fs.existsSync(path.join(f.stateRoot, "self-evolve", "global", "settings.json")), false);
+  });
+}
+
+test("a generated SDK health timeout cannot launch fallback after late settlement", async (t) => {
+  const f = durableFixture(t);
+  f.ctx.serverUrl = new URL("http://127.0.0.1:4324/");
+  let rejectSdk;
+  f.ctx.client.global.health = async () => await new Promise((_, reject) => { rejectSdk = reject; });
+  let fallbackCalls = 0;
+  f.ctx.__testOnlySelfEvolveFetch = async () => {
+    fallbackCalls += 1;
+    return { ok: true, async json() { return { healthy: true, version: "1.18.3" }; } };
+  };
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthTimeoutMs: 10,
+    __testHostHealthRetryWindowMs: 0,
+  });
+  t.after(async () => hooks.dispose());
+  await waitForDurableStartup(hooks, "sdk-timeout-no-late-fallback");
+  assert.equal(fallbackCalls, 0);
+  rejectSdk(new Error("late SDK rejection"));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fallbackCalls, 0, "a timed-out SDK continuation must remain unable to launch fallback");
 });
 
 for (const fallbackCase of [
@@ -1163,12 +1794,21 @@ test("serverUrl fallback timeout and invalid or user-supplied URLs fail closed",
   const timed = durableFixture(t);
   delete timed.ctx.client.global;
   timed.ctx.serverUrl = "http://localhost:4321/";
-  timed.ctx.__testOnlySelfEvolveFetch = async () => new Promise(() => {});
-  const timedHooks = await DefaultSelfEvolvePlugin(timed.ctx, { __testHostHealthTimeoutMs: 10 });
+  let timedSignal;
+  timed.ctx.__testOnlySelfEvolveFetch = async (_url, options) => {
+    timedSignal = options.signal;
+    return await new Promise(() => {});
+  };
+  const timedHooks = await DefaultSelfEvolvePlugin(timed.ctx, {
+    __testHostHealthTimeoutMs: 10,
+    __testHostHealthRetryWindowMs: 30,
+    __testHostHealthRetryDelayMs: 1,
+  });
   await waitForDurableStartup(timedHooks, "fallback-timeout");
   const timedOutput = { parts: [] };
   await timedHooks["command.execute.before"]({ command: "self-evolve", sessionID: "fallback-timeout", arguments: "health" }, timedOutput);
   assert.match(timedOutput.parts.at(-1).text, /host-health-timeout/u);
+  assert.equal(timedSignal?.aborted, true, "a timed-out fallback fetch must be aborted before any retry");
   await timedHooks.dispose();
 
   for (const serverUrl of ["file:///tmp/opencode", "http://user:pass@localhost/", "http://localhost/base", "http://localhost/?target=elsewhere"]) {
@@ -1223,6 +1863,27 @@ test("deferred health grants no integration authority before resolution and disp
   const started = Date.now();
   await blockedHooks.dispose();
   assert.ok(Date.now() - started < 500, "dispose must abort and settle pending startup");
+});
+
+test("dispose interrupts host-health retry backoff before another attempt starts", async (t) => {
+  const f = durableFixture(t);
+  let healthCalls = 0;
+  f.ctx.client.global.health = async () => {
+    healthCalls += 1;
+    throw new Error("connection refused during startup");
+  };
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    __testHostHealthRetryWindowMs: 5_000,
+    __testHostHealthRetryDelayMs: 1_000,
+  });
+  const deadline = Date.now() + 500;
+  while (healthCalls === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(healthCalls, 1);
+
+  const started = Date.now();
+  await hooks.dispose();
+  assert.ok(Date.now() - started < 500, "dispose must abort the retry delay rather than await its timer");
+  assert.equal(healthCalls, 1, "disposal must not permit another health attempt");
 });
 
 test("plain registration boots durable v0.2 in persisted manual mode", async (t) => {

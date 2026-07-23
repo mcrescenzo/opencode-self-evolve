@@ -15,7 +15,7 @@ import {
   shouldShowProposal,
 } from "../self-evolve-tui.js";
 import tuiModule from "../self-evolve-tui.js";
-import { publishControlState } from "../self-evolve-bridge.js";
+import { publishControlState, readTuiHostHealth } from "../self-evolve-bridge.js";
 import { openStore, projectFingerprintFor } from "../self-evolve-store.js";
 import * as schemas from "../self-evolve-schemas.js";
 import { stateRootIdentity } from "../self-evolve-state-root.js";
@@ -176,8 +176,30 @@ function actionDialog(h) {
 }
 
 test("default export is a TUI-only plugin module", () => {
-  assert.deepEqual(Object.keys(tuiModule), ["tui"]);
+  assert.deepEqual(Object.keys(tuiModule), ["id", "tui"]);
+  assert.equal(tuiModule.id, "mcrescenzo.self-evolve");
   assert.equal(tuiModule.tui, SelfEvolveTuiPlugin);
+});
+
+test("TUI publishes current api.app.version as a root-bound host-health runtime report", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-health-"));
+  const stateRoot = path.join(root, "state");
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(worktree, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const h = harness({ kv: enabledKv(), clock: 2_000 });
+  t.after(async () => h.dispose());
+  h.api.app = { version: "1.18.3" };
+  h.api.state.path = { state: stateRoot, config: path.join(root, "config"), worktree, directory: worktree };
+  await SelfEvolveTuiPlugin(h.api);
+  const projectFingerprint = projectFingerprintFor("", worktree);
+  const health = readTuiHostHealth(stateRoot, projectFingerprint, { now: 2_000, stateRootIdentity: stateRootIdentity(stateRoot) });
+
+  assert.equal(health.hostVersion, "1.18.3");
+  assert.equal(health.projectFingerprint, projectFingerprint);
+  await h.dispose();
+  assert.equal(readTuiHostHealth(stateRoot, projectFingerprint, { now: 2_000, stateRootIdentity: stateRootIdentity(stateRoot) }), null);
 });
 
 test("first-use consent is shown once and persists across TUI restarts", async () => {
