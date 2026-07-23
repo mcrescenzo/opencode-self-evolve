@@ -343,7 +343,9 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       }, timestamp);
       return;
     }
-    const until = backoffUntil.get(state.rootSessionID) ?? 0;
+    const failureKey = schedulingFailureKey(state.rootSessionID);
+    const until = backoffUntil.get(failureKey) ?? persistedBackoffUntil(failureKey, timestamp);
+    if (until > 0) backoffUntil.set(failureKey, until);
     if (until > timestamp) {
       scheduleDebounce(state, until - timestamp);
       return;
@@ -493,6 +495,18 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       && event.details?.failureKey === key).length;
   }
 
+  function schedulingFailureKey(rootSessionID) {
+    return hashSessionLineage(rootSessionID);
+  }
+
+  function persistedBackoffUntil(key, timestamp) {
+    const latest = schedulerAudits(store).findLast((event) =>
+      event.timestamp >= timestamp - FAILURE_WINDOW_MS
+      && event.details?.action === "work-failure"
+      && event.details?.failureKey === key);
+    return Number.isSafeInteger(latest?.details?.backoffUntil) ? latest.details.backoffUntil : 0;
+  }
+
   function recordWorkResult(workItem, result = {}) {
     const timestamp = now();
     const state = sessions.get(workItem?.sessionID);
@@ -514,10 +528,18 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       }
     }
     if (normalizeResultFailure(result)) {
-      const failureKey = result.clusterID ? String(result.clusterID) : hashSessionLineage(state?.rootSessionID ?? workItem.sessionID);
-      audit("work-failure", { failureKey, sessionIDHash: hashSessionLineage(workItem.sessionID) }, timestamp);
-      const failures = persistedFailures(failureKey, timestamp);
-      backoffUntil.set(failureKey, timestamp + Math.min(STALE_SESSION_MS, backoffBaseMs * (2 ** Math.max(0, failures - 1))));
+      const failureKey = schedulingFailureKey(state?.rootSessionID ?? workItem.sessionID);
+      const priorFailures = persistedFailures(failureKey, timestamp);
+      const failures = priorFailures + 1;
+      const delayMs = Math.min(STALE_SESSION_MS, backoffBaseMs * (2 ** Math.max(0, failures - 1)));
+      const nextBackoffUntil = timestamp + delayMs;
+      audit("work-failure", {
+        failureKey,
+        sessionIDHash: hashSessionLineage(workItem.sessionID),
+        backoffUntil: nextBackoffUntil,
+        ...(result.clusterID ? { clusterID: String(result.clusterID).slice(0, 160) } : {}),
+      }, timestamp);
+      backoffUntil.set(failureKey, nextBackoffUntil);
       if (failures >= 3 && !breaker.open) tripCircuitBreaker("three-failures-in-24h");
     }
     if (state?.pendingAfterFlight && !disposed && cachedMode !== "manual" && !breaker.open) {

@@ -194,6 +194,23 @@ function scan(f, sessionID, options = {}) {
   });
 }
 
+test("durable message read timeout settles the cycle and permits later work", async (t) => {
+  const f = fixture(t);
+  const original = f.ctx.client.session.messages;
+  f.ctx.client.session.messages = async () => await new Promise(() => {});
+  const timed = await scan(f, "hung-messages", { sdkTimeoutMs: 2 });
+  assert.equal(timed.result, "failed-closed");
+  assert.match(timed.responseText, /session\.messages timed out/u);
+  assert.equal(f.runtime.store.readRecords("audit-event").some((record) =>
+    record.payload.details.action === "pipeline-failure"
+    && /session\.messages timed out/u.test(record.payload.details.reason)), true);
+
+  f.ctx.client.session.messages = original;
+  f.messages.set("later-messages", commandMessages("/later"));
+  const later = await scan(f, "later-messages", { sdkTimeoutMs: 20 });
+  assert.equal(later.result, "no-eligible");
+});
+
 async function seedEligible(f, prefix = "episode", command = "/verify") {
   let result;
   for (let index = 1; index <= 3; index += 1) {

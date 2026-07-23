@@ -361,7 +361,7 @@ test("11 bounded cost and concurrency: ten idle events stay under six calls and 
   t.after(() => { scheduler.dispose(); store.close(); });
   for (let index = 0; index < 10; index += 1) {
     const sessionID = `session-${index % 3}`;
-    await scheduler.handleEvent({ type: "session.idle", properties: { sessionID, scopeFingerprint: SCOPE } });
+    await scheduler.handleEvent({ type: "session.idle", properties: { sessionID, parentID: "shared-root-session", scopeFingerprint: SCOPE } });
     if (index < 3) {
       await waitFor(() => work.length === index + 1, `work ${index + 1}`);
       active -= 1;

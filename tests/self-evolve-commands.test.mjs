@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  MAX_OBSERVATION_INSPECTION,
   MIGRATION_NOTE,
   buildResponse,
   createCommandPolicy,
@@ -128,6 +129,20 @@ test("parser covers the complete command surface and rejects malformed input", (
   assert.equal(parseSelfEvolveCommand("approve").ok, false);
   assert.equal(parseSelfEvolveCommand("purge").ok, false);
   assert.equal(parseSelfEvolveCommand("wat").ok, false);
+});
+
+test("observation inspection limit accepts only bounded positive safe integers", () => {
+  assert.equal(command("inspect observations").limit, 20);
+  assert.equal(command(`inspect observations ${MAX_OBSERVATION_INSPECTION}`).limit, MAX_OBSERVATION_INSPECTION);
+  for (const value of [
+    "0", "-1", "1.5", "1e2", "Infinity", "9007199254740992",
+    String(MAX_OBSERVATION_INSPECTION + 1),
+    "9".repeat(400),
+  ]) {
+    const result = parseSelfEvolveCommand(`inspect observations ${value}`);
+    assert.equal(result.ok, false, value);
+    assert.match(result.error, new RegExp(String(MAX_OBSERVATION_INSPECTION)));
+  }
 });
 
 test("approval parser requires one exact tuple and rejects every malformed shape", () => {

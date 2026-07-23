@@ -342,7 +342,9 @@ test("observation purge removes observations and preserves other record classes"
   store.appendRecord(wrapRecord("proposal", proposal(), NOW));
   store.appendRecord(wrapRecord("decision", decision(), NOW));
   store.appendRecord(wrapRecord("audit-event", audit(), NOW));
-  assert.equal(guard.purgeScope({ scope: "observations", projectFingerprint: PROJECT_A }).counts.observations, 1);
+  const result = guard.purgeScope({ scope: "observations", projectFingerprint: PROJECT_A });
+  assert.equal(result.ok, true);
+  assert.equal(result.counts.observations, 1);
   assert.equal(store.readRecords("observation").length, 0);
   assert.equal(store.readRecords("proposal").length, 1);
   assert.equal(store.readRecords("decision").length, 1);
@@ -355,7 +357,9 @@ test("proposal purge removes pending proposals and keeps closed proposals and au
   store.appendRecord(wrapRecord("proposal", proposal("pending", "proposal-pending"), NOW));
   store.appendRecord(wrapRecord("proposal", proposal("rejected", "proposal-closed"), NOW));
   store.appendRecord(wrapRecord("audit-event", audit(), NOW));
-  assert.equal(guard.purgeScope({ scope: "proposals" }).counts.proposals, 1);
+  const result = guard.purgeScope({ scope: "proposals" });
+  assert.equal(result.ok, true);
+  assert.equal(result.counts.proposals, 1);
   assert.deepEqual(store.readRecords("proposal").map((record) => record.payload.state), ["rejected"]);
   assert.equal(store.readRecords("audit-event").length >= 2, true);
   store.close();
@@ -376,6 +380,7 @@ test("project purge removes records and orphaned lease and quarantine artifacts"
   mkdirSync(path.dirname(bridge), { recursive: true });
   writeFileSync(bridge, "orphan", "utf8");
   const result = guard.purgeScope({ scope: "project", projectFingerprint: PROJECT_A });
+  assert.equal(result.ok, true);
   assert.deepEqual(result.removedPaths, [`self-evolve/${PROJECT_A}`]);
   assert.equal(existsSync(lease), false);
   assert.equal(existsSync(quarantined), false);
@@ -389,6 +394,7 @@ test("all purge removes the complete self-evolve subtree", () => {
   const { root, store, guard } = fixture();
   store.appendRecord(wrapRecord("observation", makeObservation(observation()), NOW));
   const result = guard.purgeScope({ scope: "all" });
+  assert.equal(result.ok, true);
   assert.deepEqual(result.removedPaths, ["self-evolve"]);
   assert.equal(existsSync(path.join(root, "self-evolve")), false);
   store.close();

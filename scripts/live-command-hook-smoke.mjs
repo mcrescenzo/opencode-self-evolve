@@ -320,7 +320,7 @@ async function runDirectPluginChildProbe({ pluginPath, projectDir, baseEnv, conf
     const messages = await readSessionMessages(baseUrl, sessionId, projectDir);
     const commandHookExecuted = messages.some((message) => (message?.parts ?? []).some((part) => (
       typeof part?.text === "string"
-      && /Self-evolve health: host 1\.18\.3; source global-health/u.test(part.text)
+      && part.text.includes(`Self-evolve health: host ${officialHealth.version}; source global-health`)
     )));
     report = {
       pid: child.pid,

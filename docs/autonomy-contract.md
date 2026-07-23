@@ -595,7 +595,7 @@ an overnight range wraps across midnight.
   `durableAutonomy: false` compatibility option. Startup `mode` is not durable
   authority and does not override an existing preference; commands own later
   mode changes, and restart reshapes passive hooks from persisted effective mode.
-- The `package.json` `engines` field requires `@opencode-ai/plugin@^1.18.3`.
+- The package supports the verified OpenCode 1.18 patch line `>=1.18.3 <1.19.0`. `@opencode-ai/plugin` is an optional `~1.18.3` peer contract and a development-only contract dependency; runtime entries do not import it.
   After the factory returns, production startup derives the running OpenCode
   version from bounded official health: `client.global.health()` when present,
   followed only after a recognized SDK transport/capability error by exact-origin GET
@@ -613,7 +613,7 @@ an overnight range wraps across midnight.
   later `/self-evolve` command may run one fresh bounded version-and-boot
   attempt. The command receives no authority unless version resolution, root
   validation, integration creation, and boot all succeed. Only healthy or
-  current-TUI-reported stable versions `>=1.18.3 <2.0.0` proceed; stable build
+  current-TUI-reported stable versions `>=1.18.3 <1.19.0` proceed; stable build
   metadata is accepted and prereleases are not. Unavailable, authoritative-
   error, malformed, prerelease, older, and 2.x hosts receive deterministic
   manual diagnostics and refuse autonomous work. A persisted-auto/yolo

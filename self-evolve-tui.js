@@ -32,6 +32,8 @@ const PENDING_REQUESTS_KEY = "self-evolve:pending-request-ids";
 const ACTOR = BRIDGE_ACTOR;
 const MAX_SERVER_WAIT_MS = 5_000;
 const HOST_HEALTH_REFRESH_MS = 15_000;
+export const REVIEW_BOOKKEEPING_CAP = 256;
+export const REVIEW_BOOKKEEPING_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 const CONSENT_LABELS = Object.freeze({
   passiveCalls: "Passive provider calls",
   durableObservations: "Durable observations",
@@ -107,19 +109,49 @@ export function formatEligibilityExplanation(eligibility = {}) {
 
 export function safeIdlePredicate(api, debounceMs) {
   let idleSince;
+  let routedSessionID;
+  let priorKind;
   return () => {
     const sessionID = api.route?.current?.params?.sessionID;
     const status = typeof api.state?.session?.status === "function" ? api.state.session.status(sessionID) : api.state?.session?.status;
     const kind = typeof status === "string" ? status : status?.type ?? status?.status;
+    const routeChanged = routedSessionID !== undefined && sessionID !== routedSessionID;
+    if (sessionID !== routedSessionID) {
+      routedSessionID = sessionID;
+      idleSince = undefined;
+    }
     if (kind !== "idle") {
       idleSince = undefined;
+      priorKind = kind;
       return false;
     }
     const now = nowFor(api);
     const reportedSince = status && typeof status === "object" ? status.since ?? status.updatedAt : undefined;
-    if (idleSince === undefined) idleSince = Number.isFinite(reportedSince) ? reportedSince : now;
+    if (idleSince === undefined) {
+      idleSince = routeChanged || (priorKind !== undefined && priorKind !== "idle")
+        ? now
+        : Number.isFinite(reportedSince) ? reportedSince : now;
+    }
+    priorKind = kind;
     return now - idleSince >= debounceMs;
   };
+}
+
+export function pruneReviewBookkeeping({ proposals = [], dismissedIds = [], lastShownAt = {}, now = Date.now(), cap = REVIEW_BOOKKEEPING_CAP } = {}) {
+  const boundedCap = Number.isSafeInteger(cap) && cap >= 0 ? cap : REVIEW_BOOKKEEPING_CAP;
+  const visibleIds = new Set(proposals
+    .filter((proposal) => proposal && ["pending", "applied", "failed-closed"].includes(proposal.state))
+    .map((proposal) => proposal.id));
+  const dismissed = [...new Set(Array.isArray(dismissedIds) ? dismissedIds.filter((id) => typeof id === "string" && visibleIds.has(id)) : [])]
+    .slice(-boundedCap);
+  const shown = Object.entries(lastShownAt && typeof lastShownAt === "object" && !Array.isArray(lastShownAt) ? lastShownAt : {})
+    .filter(([id, timestamp]) => typeof id === "string"
+      && Number.isFinite(timestamp)
+      && visibleIds.has(id)
+      && timestamp >= now - REVIEW_BOOKKEEPING_MAX_AGE_MS)
+    .sort((left, right) => left[1] - right[1])
+    .slice(-boundedCap);
+  return { dismissedIds: dismissed, lastShownAt: Object.fromEntries(shown) };
 }
 
 export function notificationRateLimiter(api, budgetPerHour) {
@@ -303,9 +335,11 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const limiter = notificationRateLimiter(api, budget);
   const inFlight = new Set();
   const unsubscribers = [];
-  const timers = new Set();
   let disposed = false;
-  let refreshQueued = false;
+  let refreshPending = false;
+  let refreshInFlight = false;
+  let refreshMicrotaskQueued = false;
+  let refreshTimer = null;
   let pollTimer;
 
   const dismissedIds = () => {
@@ -318,12 +352,16 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   };
   const dialogsEnabled = () => api.kv.get(FIRST_USE_KEY) === true;
 
-  function setTimer(fn, delay) {
-    const handle = setTimeout(() => {
-      timers.delete(handle);
-      fn();
-    }, delay);
-    timers.add(handle);
+  function saveReviewBookkeeping(proposals) {
+    const pruned = pruneReviewBookkeeping({
+      proposals,
+      dismissedIds: dismissedIds(),
+      lastShownAt: lastShownAt(),
+      now: nowFor(api),
+    });
+    api.kv.set(DISMISSED_KEY, pruned.dismissedIds);
+    api.kv.set(LAST_SHOWN_KEY, pruned.lastShownAt);
+    return pruned;
   }
 
   async function boundedMailboxCall(task) {
@@ -615,18 +653,18 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   }
 
   async function refreshInbox() {
-    refreshQueued = false;
     if (disposed || api.lifecycle.signal.aborted || !dialogsEnabled()) return { ok: false, reason: "dialogs-disabled" };
     if (!idle()) {
-      setTimer(queueRefresh, debounceMs);
       return { ok: false, reason: "session-not-idle" };
     }
     try {
       await refreshResponses();
       const proposals = await getInbox();
+      if (disposed || api.lifecycle.signal.aborted) return { ok: false, reason: "disposed" };
+      const bookkeeping = saveReviewBookkeeping(proposals);
       const proposal = proposals.find((item) => shouldShowProposal(item, {
-        lastShownAt: lastShownAt(),
-        dismissedIds: dismissedIds(),
+        lastShownAt: bookkeeping.lastShownAt,
+        dismissedIds: bookkeeping.dismissedIds,
         now: nowFor(api),
       }));
       if (!proposal) return { ok: false, reason: "inbox-empty" };
@@ -644,10 +682,42 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     }
   }
 
+  async function runRefresh() {
+    refreshMicrotaskQueued = false;
+    if (disposed || api.lifecycle.signal.aborted || refreshInFlight || !refreshPending) return;
+    refreshPending = false;
+    refreshInFlight = true;
+    let result;
+    try {
+      result = await refreshInbox();
+    } finally {
+      refreshInFlight = false;
+      if (result?.reason === "session-not-idle") scheduleRefresh(Math.max(1, debounceMs));
+      else if (refreshPending && !refreshTimer) scheduleRefresh(0);
+    }
+  }
+
+  function scheduleRefresh(delay = 0) {
+    if (disposed || api.lifecycle.signal.aborted) return;
+    refreshPending = true;
+    if (refreshInFlight || refreshTimer || refreshMicrotaskQueued) return;
+    if (delay > 0) {
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        if (!disposed) void runRefresh();
+      }, delay);
+      return;
+    }
+    refreshMicrotaskQueued = true;
+    queueMicrotask(() => void runRefresh());
+  }
+
   function queueRefresh() {
-    if (refreshQueued || disposed || api.lifecycle.signal.aborted) return;
-    refreshQueued = true;
-    queueMicrotask(() => void refreshInbox());
+    if (refreshTimer && idle()) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    scheduleRefresh(0);
   }
 
   if (api.kv.get(FIRST_USE_KEY) === undefined) {
@@ -685,8 +755,10 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
 
   const abort = () => {
     disposed = true;
-    for (const timer of timers) clearTimeout(timer);
-    timers.clear();
+    refreshPending = false;
+    refreshMicrotaskQueued = false;
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
     clearInterval(pollTimer);
     stopHostHealth();
   };

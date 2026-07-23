@@ -17,6 +17,9 @@ jobs:
         node-version:
           - "20"
           - "22"
+        opencode-plugin-version:
+          - "1.18.3"
+          - "1.18.4"
 
     steps:
       - name: Check out repository
@@ -29,6 +32,9 @@ jobs:
 
       - name: Install package dependencies
         run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Select OpenCode contract version
+        run: npm install --ignore-scripts --no-audit --no-fund --no-save @opencode-ai/plugin@${{ matrix.opencode-plugin-version }}
 
       - name: Unit tests
         run: npm test

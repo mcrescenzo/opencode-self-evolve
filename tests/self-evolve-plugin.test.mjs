@@ -378,7 +378,7 @@ test("cleanup failure after a valid analyzer result preserves the accepted propo
   const state = SelfEvolvePlugin.__test.registry.getOrCreate("cleanup-fails", 5400);
   assert.equal(calls.create.length, 1);
   assert.equal(calls.prompt.length, 1);
-  assert.equal(calls.abort.length, 4);
+  assert.equal(calls.abort.length, 5);
   assert.equal(calls.promptAsync.length, 0);
   assert.equal(state.disabled, false);
   assert.equal(state.analyzerFailures, 0);
@@ -769,7 +769,7 @@ test("dispose hook clears the registry so per-session state does not outlive the
   assert.equal(SelfEvolvePlugin.__test.registry.map.size, 0);
 });
 
-test("double-instantiation preserves existing registry state and still re-seeds options for new sessions (regression)", async () => {
+test("double-instantiation preserves existing state and seeds new sessions from the invoking instance", async () => {
   // OpenCode calls every exported plugin factory and may instantiate
   // SelfEvolvePlugin more than once per process. Session state (pause,
   // disable, pending proposal, rate-limit counters) must survive a second
@@ -813,10 +813,58 @@ test("double-instantiation preserves existing registry state and still re-seeds 
   await hooksB["command.execute.before"]({ command: "self-evolve", sessionID: "double-instance", arguments: "status" }, statusOutput);
   assert.match(statusOutput.parts.at(-1).text, /paused/i);
 
-  // Options still re-seed for brand-new sessions created after the second
-  // instantiation, proving the fix does not just freeze options forever.
+  const freshOutput = { parts: [] };
+  await hooksB["command.execute.before"]({ command: "self-evolve", sessionID: "fresh-after-second-instance", arguments: "status" }, freshOutput);
   const freshState = SelfEvolvePlugin.__test.registry.getOrCreate("fresh-after-second-instance", 17100);
   assert.equal(freshState.options.maxAnalyzerRuns, 5);
+});
+
+test("legacy factory options remain isolated in both creation orders", async () => {
+  const first = await SelfEvolvePlugin(createMockContext().ctx, {
+    now: () => 18_000,
+    maxAnalyzerRuns: 2,
+    maxProposals: 1,
+    scopeFingerprint: "first-scope",
+  });
+  const second = await SelfEvolvePlugin(createMockContext().ctx, {
+    now: () => 18_100,
+    maxAnalyzerRuns: 7,
+    maxProposals: 6,
+    scopeFingerprint: "second-scope",
+  });
+  await first["command.execute.before"]({ command: "self-evolve", sessionID: "first-owned", arguments: "status" }, { parts: [] });
+  await second["command.execute.before"]({ command: "self-evolve", sessionID: "second-owned", arguments: "status" }, { parts: [] });
+  assert.equal(SelfEvolvePlugin.__test.registry.get("first-owned").options.maxAnalyzerRuns, 2);
+  assert.equal(SelfEvolvePlugin.__test.registry.get("first-owned").options.maxProposals, 1);
+  assert.equal(SelfEvolvePlugin.__test.registry.get("second-owned").options.maxAnalyzerRuns, 7);
+  assert.equal(SelfEvolvePlugin.__test.registry.get("second-owned").options.maxProposals, 6);
+
+  const shared = SelfEvolvePlugin.__test.registry.get("first-owned");
+  await second["command.execute.before"]({ command: "self-evolve", sessionID: "first-owned", arguments: "pause" }, { parts: [] });
+  assert.equal(SelfEvolvePlugin.__test.registry.get("first-owned"), shared);
+  assert.equal(shared.options.maxAnalyzerRuns, 2);
+  await first.dispose();
+  await second.dispose();
+});
+
+test("shared legacy registry clears only after the final owner disposes", async () => {
+  const first = await SelfEvolvePlugin(createMockContext().ctx, { now: () => 18_200 });
+  const second = await SelfEvolvePlugin(createMockContext().ctx, { now: () => 18_300 });
+  const output = { parts: [] };
+  await first["command.execute.before"]({ command: "self-evolve", sessionID: "shared-lifetime", arguments: "pause" }, output);
+  const state = SelfEvolvePlugin.__test.registry.get("shared-lifetime");
+  state.pendingProposal = { id: "pending", title: "pending", fingerprint: "pending" };
+  state.analyzerRuns = 2;
+
+  await first.dispose();
+  await first.dispose();
+  assert.equal(SelfEvolvePlugin.__test.registry.get("shared-lifetime"), state);
+  assert.equal(state.paused, true);
+  assert.equal(state.pendingProposal.id, "pending");
+  assert.equal(state.analyzerRuns, 2);
+
+  await second.dispose();
+  assert.equal(SelfEvolvePlugin.__test.registry.has("shared-lifetime"), false);
 });
 
 test("durable state root precedence prefers explicit, synchronous host, then SDK over environment", async () => {
@@ -860,7 +908,7 @@ test("provisional standard root validates after startup before durable initializ
   const ctx = {
     directory: worktree,
     worktree,
-    client: { global: { health: async () => ({ data: { healthy: true, version: "1.24.6" } }) }, path: { get: async () => { sdkCalls += 1; return { data: { state: stateRoot } }; } }, session: {} },
+    client: { global: { health: async () => ({ data: { healthy: true, version: "1.18.4" } }) }, path: { get: async () => { sdkCalls += 1; return { data: { state: stateRoot } }; } }, session: {} },
   };
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
@@ -876,7 +924,7 @@ test("provisional standard root validates after startup before durable initializ
   assert.match(output.parts.at(-1).text, /effective mode manual|stored mode manual/u);
   assert.equal(fs.existsSync(path.join(stateRoot, "self-evolve", "global", "settings.json")), true);
   await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "matched-root", arguments: "health" }, output);
-  assert.match(output.parts.at(-1).text, /host 1\.24\.6/u, "deferred boot must retain the version resolved before provisional root selection");
+  assert.match(output.parts.at(-1).text, /host 1\.18\.4/u, "deferred boot must retain the version resolved before provisional root selection");
   await hooks.dispose();
 });
 
@@ -1006,7 +1054,8 @@ function durableFixture(t) {
 const hostCompatibilityCases = [
   { name: "minimum supported 1.18.3", response: { data: { healthy: true, version: "1.18.3" } }, supported: true },
   { name: "stable build metadata", response: { data: { healthy: true, version: "1.18.3+orca.1" } }, supported: true },
-  { name: "newer supported 1.x", response: { data: { healthy: true, version: "1.99.0" } }, supported: true },
+  { name: "current supported patch", response: { data: { healthy: true, version: "1.18.4" } }, supported: true },
+  { name: "newer unsupported minor", response: { data: { healthy: true, version: "1.19.0" } }, version: "1.19.0", reason: "host-version-unsupported" },
   { name: "older 1.18.2", response: { data: { healthy: true, version: "1.18.2" } }, version: "1.18.2", reason: "host-version-unsupported" },
   { name: "legacy 1.17.7", response: { data: { healthy: true, version: "1.17.7" } }, version: "1.17.7", reason: "host-version-unsupported" },
   { name: "malformed version", response: { data: { healthy: true, version: "not-semver" } }, version: "not-semver", reason: "host-version-malformed" },
@@ -1510,18 +1559,67 @@ test("an explicit legacy instance cannot enter durable recovery after a later fa
   assert.doesNotMatch(output.parts.at(-1).text, /unexpected durable legacy/u);
 });
 
+test("durable and legacy instances retain their own mode, scope, and caps in either order", async (t) => {
+  async function runCase(durableFirst) {
+    const f = durableFixture(t);
+    let captured;
+    const pipelineFactory = async ({ options }) => {
+      captured = options;
+      return {
+        async boot() { return { ok: true }; },
+        async handleCommand() { return { responseText: `durable ${options.mode} ${options.scopeFingerprint}` }; },
+        async shutdown() {},
+      };
+    };
+    const makeDurable = () => DefaultSelfEvolvePlugin(f.ctx, {
+      pipelineFactory,
+      mode: "yolo",
+      scopeFingerprint: "durable-scope",
+      maxAnalyzerRuns: 9,
+    });
+    const makeLegacy = () => DefaultSelfEvolvePlugin(f.ctx, {
+      durableAutonomy: false,
+      mode: "manual",
+      scopeFingerprint: "legacy-scope",
+      maxAnalyzerRuns: 2,
+    });
+    const first = await (durableFirst ? makeDurable() : makeLegacy());
+    const second = await (durableFirst ? makeLegacy() : makeDurable());
+    const durable = durableFirst ? first : second;
+    const legacy = durableFirst ? second : first;
+    await waitForDurableStartup(durable, `mixed-options-${durableFirst}`);
+
+    const durableOutput = { parts: [] };
+    await durable["command.execute.before"]({ command: "self-evolve", sessionID: `durable-${durableFirst}`, arguments: "status" }, durableOutput);
+    assert.match(durableOutput.parts.at(-1).text, /durable yolo durable-scope/u);
+    assert.equal(captured.mode, "yolo");
+    assert.equal(captured.scopeFingerprint, "durable-scope");
+    assert.equal(captured.maxAnalyzerRuns, 9);
+
+    await legacy["command.execute.before"]({ command: "self-evolve", sessionID: `legacy-${durableFirst}`, arguments: "status" }, { parts: [] });
+    const legacyState = SelfEvolvePlugin.__test.registry.get(`legacy-${durableFirst}`);
+    assert.equal(legacyState.options.scopeFingerprint, "legacy-scope");
+    assert.equal(legacyState.options.maxAnalyzerRuns, 2);
+    await legacy.dispose();
+    await durable.dispose();
+  }
+
+  await runCase(true);
+  await runCase(false);
+});
+
 test("hostSupported false narrows actual supported health and spoof options never widen it", async (t) => {
   const narrowed = durableFixture(t);
   const narrowedStore = openStore(narrowed.stateRoot, { projectFingerprint: narrowed.projectFingerprint });
   const narrowedSettings = narrowedStore.getSettings();
   narrowedStore.setGlobalSettings(makeGlobalSettings({ ...narrowedSettings.global, mode: "auto", updatedAt: narrowedSettings.global.updatedAt + 1 }));
   narrowedStore.close();
-  narrowed.ctx.client.global.health = async () => ({ data: { healthy: true, version: "1.19.0" } });
+  narrowed.ctx.client.global.health = async () => ({ data: { healthy: true, version: "1.18.4" } });
   const narrowedHooks = await DefaultSelfEvolvePlugin(narrowed.ctx, { hostSupported: false });
   await waitForDurableStartup(narrowedHooks, "startup-narrowed");
   const narrowedOutput = { parts: [] };
   await narrowedHooks["command.execute.before"]({ command: "self-evolve", sessionID: "health-narrowed", arguments: "health" }, narrowedOutput);
-  assert.match(narrowedOutput.parts.at(-1).text, /host 1\.19\.0/u);
+  assert.match(narrowedOutput.parts.at(-1).text, /host 1\.18\.4/u);
   assert.match(narrowedOutput.parts.at(-1).text, /host-support-disabled-by-option/u);
   await narrowedHooks.dispose();
 
@@ -1576,7 +1674,7 @@ test("serverUrl fallback fetches only the official origin global-health path", a
   const calls = [];
   f.ctx.__testOnlySelfEvolveFetch = async (url, options) => {
     calls.push({ url, options });
-    return { ok: true, status: 200, json: async () => ({ healthy: true, version: "1.20.4" }) };
+    return { ok: true, status: 200, json: async () => ({ healthy: true, version: "1.18.4" }) };
   };
   const hooks = await DefaultSelfEvolvePlugin(f.ctx);
   const pending = { parts: [] };
@@ -1585,7 +1683,7 @@ test("serverUrl fallback fetches only the official origin global-health path", a
   await waitForDurableStartup(hooks, "fallback-startup");
   const output = { parts: [] };
   await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "fallback-health", arguments: "health" }, output);
-  assert.match(output.parts.at(-1).text, /host 1\.20\.4/u);
+  assert.match(output.parts.at(-1).text, /host 1\.18\.4/u);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "http://127.0.0.1:43210/global/health");
   assert.equal(calls[0].options.method, "GET");

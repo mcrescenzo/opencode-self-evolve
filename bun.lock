@@ -4,12 +4,15 @@
   "workspaces": {
     "": {
       "name": "@mcrescenzo/opencode-self-evolve",
-      "dependencies": {
-        "@opencode-ai/plugin": "^1.18.3",
+      "devDependencies": {
+        "@opencode-ai/plugin": "~1.18.3",
       },
       "peerDependencies": {
-        "@opencode-ai/plugin": "^1.18.3",
+        "@opencode-ai/plugin": "~1.18.3",
       },
+      "optionalPeers": [
+        "@opencode-ai/plugin",
+      ],
     },
   },
   "packages": {

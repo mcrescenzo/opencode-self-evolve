@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -142,6 +142,29 @@ function auditEnvelope(state, timestamp = 1_000) {
   return wrapRecord("audit-event", event, timestamp);
 }
 
+function legacyContentAudit(proposalId, content, overrides = {}, timestamp = 1_000) {
+  const encoded = Buffer.from(content, "utf8").toString("base64");
+  const details = {
+    action: "proposal-content",
+    chunkCount: 1,
+    chunkIndex: 0,
+    content: encoded,
+    contentEncoding: "base64",
+    contentHash: hashContent(content),
+    subjectId: proposalId,
+    ...overrides,
+  };
+  const event = makeAuditEvent({
+    id: hashContent(JSON.stringify(["legacy-content", proposalId, timestamp, details])),
+    kind: "decision",
+    actor: "self-evolve-synthesis",
+    timestamp,
+    payloadHash: hashContent(JSON.stringify(details)),
+    details,
+  });
+  return wrapRecord("audit-event", event, timestamp);
+}
+
 test("creates the store atomically and appends and reads records", () => {
   const { root, store } = fixture();
   const envelope = wrapRecord("observation", observation(), 1_000);
@@ -232,6 +255,56 @@ test("leases are create-exclusive, nonce-bound, releasable, and stale-cleaning",
   assert.equal(reacquired.ok, true);
   first.close();
   second.close();
+});
+
+test("corrupt leases are classified, quarantined once, and repaired only while acquiring", () => {
+  const { root, store } = fixture(2_000);
+  const leaseFile = path.join(store.stateDir, "leases", "broken.lock");
+  writeFileSync(leaseFile, "{not-json", { mode: 0o600 });
+  assert.equal(store.getLeaseStatus("broken").state, "corrupt");
+  const acquired = store.acquireLease("broken", { ttlMs: 100, actor: "repair" });
+  assert.equal(acquired.ok, true);
+  assert.equal(acquired.repairedCorruptLease, true);
+  const quarantined = readdirSync(path.join(root, "self-evolve", PROJECT, "quarantine"))
+    .filter((name) => name.startsWith("lease-broken-") && name.endsWith(".quarantined"));
+  assert.equal(quarantined.length, 1);
+  assert.deepEqual(store.releaseLease("broken", acquired.nonce), { ok: true });
+
+  writeFileSync(leaseFile, JSON.stringify({ actor: "", acquiredAt: 1, expiresAt: 2, nonce: "x" }), { mode: 0o600 });
+  assert.equal(store.cleanupExpiredLeases().corruptLeases, 1);
+  assert.equal(readdirSync(path.join(root, "self-evolve", PROJECT, "quarantine"))
+    .filter((name) => name.startsWith("lease-broken-") && name.endsWith(".quarantined")).length, 2);
+  store.close();
+});
+
+test("lease release and store close retain ownership until unlink succeeds", { skip: process.platform === "win32" }, () => {
+  const { store } = fixture(2_000);
+  const acquired = store.acquireLease("retry", { ttlMs: 100, actor: "owner" });
+  const leases = path.join(store.stateDir, "leases");
+  chmodSync(leases, 0o500);
+  const failed = store.releaseLease("retry", acquired.nonce);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, "lease-release-error");
+  assert.equal(store.close().ok, false);
+  chmodSync(leases, 0o700);
+  assert.deepEqual(store.releaseLease("retry", acquired.nonce), { ok: true });
+  assert.equal(store.close().ok, true);
+});
+
+test("unreadable lease files are distinct from absent or corrupt leases", { skip: process.platform === "win32" }, () => {
+  const { store } = fixture(2_000);
+  const leaseFile = path.join(store.stateDir, "leases", "unreadable.lock");
+  writeFileSync(leaseFile, JSON.stringify({ actor: "owner", acquiredAt: 1, expiresAt: 3_000, nonce: "nonce" }), { mode: 0o600 });
+  chmodSync(leaseFile, 0o000);
+  const status = store.getLeaseStatus("unreadable");
+  assert.equal(status.state, "error");
+  assert.equal(status.reason, "lease-read-error");
+  const acquired = store.acquireLease("unreadable", { ttlMs: 100, actor: "other" });
+  assert.equal(acquired.ok, false);
+  assert.equal(acquired.reason, "lease-read-error");
+  chmodSync(leaseFile, 0o600);
+  rmSync(leaseFile);
+  store.close();
 });
 
 test("retention removes old observations and preserves proposals, decisions, and audit", () => {
@@ -388,6 +461,76 @@ test("terminal proposal decisions compact content immediately and exports contai
   assert.equal(store.readRecords("proposal-content").length, 0);
   assert.doesNotMatch(JSON.stringify(store.exportAll()), /bounded proposal content|proposal-content/u);
   store.close();
+});
+
+test("legacy proposal content migration classifies every group without silently dropping active corruption", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-migration-"));
+  const content = "bounded migrated content";
+  const valid = makeProposal({ ...proposal(), id: "valid-active", proposedContentHash: hashContent(content) });
+  const invalid = makeProposal({ ...proposal(), id: "invalid-active", proposedContentHash: hashContent("expected") });
+  const terminal = makeProposal({ ...proposal("rejected", 1), id: "terminal-proposal", proposedContentHash: hashContent(content) });
+  let store = openStore(root, { projectFingerprint: PROJECT, now: () => 2_000 });
+  for (const item of [valid, invalid, terminal]) assert.equal(store.appendRecord(wrapRecord("proposal", item, 1_000)).ok, true);
+  store.close();
+
+  const auditPath = path.join(root, "self-evolve", PROJECT, "audit.jsonl");
+  for (const record of [
+    legacyContentAudit(valid.id, content, {}, 1_001),
+    legacyContentAudit(invalid.id, "wrong", {}, 1_002),
+    legacyContentAudit(terminal.id, content, {}, 1_003),
+    legacyContentAudit("missing-proposal", content, {}, 1_004),
+  ]) appendFileSync(auditPath, `${JSON.stringify(record)}\n`);
+
+  store = openStore(root, { projectFingerprint: PROJECT, now: () => 2_000 });
+  assert.equal(store.readRecords("proposal-content").filter((record) => record.payload.proposalId === valid.id).length, 1);
+  assert.equal(store.getRecord("proposal", invalid.id).payload.state, "failed-closed");
+  const audits = store.readRecords("audit-event");
+  assert.equal(audits.some((record) => record.payload.details.action === "proposal-content"), false);
+  assert.deepEqual(new Set(audits
+    .filter((record) => record.payload.details.action === "legacy-proposal-content-migration")
+    .map((record) => record.payload.details.outcome)), new Set(["converted", "invalid-active", "terminal", "orphan"]));
+  assert.equal(readdirSync(path.join(root, "self-evolve", PROJECT, "quarantine"))
+    .filter((name) => name.startsWith("legacy-proposal-") && name.endsWith(".quarantined")).length, 1);
+  const counts = {
+    proposal: store.readRecords("proposal").length,
+    content: store.readRecords("proposal-content").length,
+    audit: store.readRecords("audit-event").length,
+  };
+  store.close();
+  store = openStore(root, { projectFingerprint: PROJECT, now: () => 3_000 });
+  assert.deepEqual({
+    proposal: store.readRecords("proposal").length,
+    content: store.readRecords("proposal-content").length,
+    audit: store.readRecords("audit-event").length,
+  }, counts);
+  store.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("legacy active corruption remains failed closed across an interrupted migration", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-migration-crash-"));
+  const item = makeProposal({ ...proposal(), id: "crash-invalid", proposedContentHash: hashContent("expected") });
+  let store = openStore(root, { projectFingerprint: PROJECT, now: () => 2_000 });
+  assert.equal(store.appendRecord(wrapRecord("proposal", item, 1_000)).ok, true);
+  store.close();
+  appendFileSync(path.join(root, "self-evolve", PROJECT, "audit.jsonl"), `${JSON.stringify(legacyContentAudit(item.id, "wrong", {}, 1_001))}\n`);
+
+  assert.throws(() => openStore(root, {
+    projectFingerprint: PROJECT,
+    now: () => 2_000,
+    faultInjection(point) {
+      if (point === "legacy-migration-after-proposal-write") throw new Error("simulated-crash");
+    },
+  }), /simulated-crash/);
+
+  store = openStore(root, { projectFingerprint: PROJECT, now: () => 3_000 });
+  assert.equal(store.getRecord("proposal", item.id).payload.state, "failed-closed");
+  const migration = store.readRecords("audit-event").find((record) => record.payload.details.action === "legacy-proposal-content-migration");
+  assert.equal(migration.payload.details.outcome, "invalid-active");
+  assert.match(migration.payload.details.reason, /invalid-legacy-chunk-shape|hash-mismatch/);
+  assert.equal(store.readRecords("audit-event").some((record) => record.payload.details.action === "proposal-content"), false);
+  store.close();
+  rmSync(root, { recursive: true, force: true });
 });
 
 test("snapshot retention unlinks symlinks without touching their targets", { skip: process.platform === "win32" }, () => {

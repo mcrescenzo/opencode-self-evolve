@@ -115,8 +115,8 @@ export function createRegistry(options = {}) {
   // away and recreating the whole registry.
   let registryOptions = resolveOptions(options);
   const map = new Map();
-  function evictInactiveSessions(keepSessionID) {
-    const maxSessions = registryOptions.maxRegistrySessions;
+  function evictInactiveSessions(keepSessionID, options = registryOptions) {
+    const maxSessions = options.maxRegistrySessions;
     // Only a non-finite cap means "uncapped". A maxRegistrySessions <= 0 means
     // "cap at zero" and must fall through so eviction runs eagerly — otherwise
     // the registry Map would grow without any ceiling. The keepSessionID (and
@@ -139,10 +139,11 @@ export function createRegistry(options = {}) {
     setOptions(newOptions) {
       registryOptions = resolveOptions(newOptions);
     },
-    getOrCreate(sessionID, nowMs = Date.now()) {
-      if (!map.has(sessionID)) map.set(sessionID, createSessionState(sessionID, registryOptions, nowMs));
+    getOrCreate(sessionID, nowMs = Date.now(), seedOptions) {
+      const options = seedOptions === undefined ? registryOptions : resolveOptions(seedOptions);
+      if (!map.has(sessionID)) map.set(sessionID, createSessionState(sessionID, options, nowMs));
       else map.get(sessionID).updatedAt = Math.max(map.get(sessionID).updatedAt, nowMs);
-      evictInactiveSessions(sessionID);
+      evictInactiveSessions(sessionID, options);
       return map.get(sessionID);
     },
   };

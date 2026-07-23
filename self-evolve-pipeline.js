@@ -1,32 +1,7 @@
+import { readSessionMessages } from "./self-evolve-client.js";
+
 const DEFAULT_MESSAGE_LIMIT = 120;
 const CONTENT_CHUNK_SIZE = 400;
-
-function messageList(result) {
-  if (Array.isArray(result?.data)) return result.data;
-  if (Array.isArray(result?.data?.messages)) return result.data.messages;
-  if (Array.isArray(result?.messages)) return result.messages;
-  return [];
-}
-
-async function readMessages(ctx, sessionID, limit) {
-  const method = ctx?.client?.session?.messages;
-  if (typeof method !== "function") throw new Error("session.messages-unavailable");
-  let lastError;
-  for (const invoke of [
-    () => method.call(ctx.client.session, { path: { id: sessionID }, query: { directory: ctx.directory, limit } }),
-    () => method.call(ctx.client.session, { path: { sessionID }, query: { directory: ctx.directory, limit } }),
-    () => method.call(ctx.client.session, { sessionID, directory: ctx.directory, limit }),
-  ]) {
-    try {
-      const result = await invoke();
-      if (!result?.error) return messageList(result).slice(-limit);
-      lastError = result.error;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw new Error(String(lastError?.message ?? lastError ?? "session-messages-failed"));
-}
 
 function messageText(message) {
   const parts = message?.parts ?? message?.info?.parts ?? message?.message?.parts ?? [];
@@ -354,7 +329,10 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
       const cursorRecord = latestCursor(store, sessionIDHash);
       const cursor = cursorRecord?.payload ?? schemas.makeEpisodeCursor({ sessionIDHash });
       const limit = Math.min(256, Number.isSafeInteger(options.messageLimit) && options.messageLimit > 0 ? options.messageLimit : DEFAULT_MESSAGE_LIMIT);
-      const messages = await readMessages(ctx, sessionID, limit);
+      const messages = await readSessionMessages(ctx, sessionID, limit, {
+        timeoutMs: options.sdkTimeoutMs ?? 15_000,
+        label: "Self-evolve durable session.messages",
+      });
       const messageHashes = messages.map((message) => observation.hashMessageCursor(message));
       const lastObservedMessageHash = messageHashes.at(-1) ?? null;
       if (cursorRecord && messages.length === 0) {

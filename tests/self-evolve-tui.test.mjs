@@ -11,6 +11,7 @@ import {
   formatEligibilityExplanation,
   formatProposalDigest,
   notificationRateLimiter,
+  pruneReviewBookkeeping,
   safeIdlePredicate,
   shouldShowProposal,
 } from "../self-evolve-tui.js";
@@ -162,6 +163,7 @@ function harness({ kv, proposals = [], clock = 2_000, status = { type: "idle", s
     event(type, payload = {}) { for (const handler of events.get(type) ?? []) handler(payload); },
     setClock(value) { clock = value; },
     setStatus(value) { sessionStatus = value; },
+    setSession(value) { api.route.current.params.sessionID = value; },
     setInbox(value) { inbox = value; },
     async dispose() { controller.abort(); await dispose?.(); },
   };
@@ -433,7 +435,11 @@ test("safe-idle gating defers dialogs until idle has lasted 1500ms", async () =>
   h.event("session.idle");
   await flush();
   assert.equal(h.selects.length, 0);
-  h.setClock(2_500);
+  h.setClock(3_998);
+  h.event("session.idle");
+  await flush();
+  assert.equal(h.selects.length, 0);
+  h.setClock(3_999);
   h.event("session.idle");
   await flush();
   assert.ok(actionDialog(h));
@@ -448,6 +454,67 @@ test("safeIdlePredicate resets its debounce when a session becomes busy", () => 
   assert.equal(idle(), false);
   h.setStatus("idle");
   assert.equal(idle(), false);
+});
+
+test("safeIdlePredicate restarts the full debounce when the routed session changes", () => {
+  const h = harness({ clock: 2_000, status: { type: "idle", since: 0 } });
+  const idle = safeIdlePredicate(h.api, 1_500);
+  assert.equal(idle(), true);
+  h.setSession("session-2");
+  assert.equal(idle(), false);
+  h.setClock(3_499);
+  assert.equal(idle(), false);
+  h.setClock(3_500);
+  assert.equal(idle(), true);
+});
+
+test("review bookkeeping prunes stale and absent entries to a fixed cap", () => {
+  const now = 100 * 24 * 60 * 60 * 1000;
+  const proposals = Array.from({ length: 300 }, (_, index) => proposal({ id: `proposal-${index}` }));
+  const result = pruneReviewBookkeeping({
+    proposals,
+    dismissedIds: [...proposals.map((item) => item.id), "absent"],
+    lastShownAt: Object.fromEntries([
+      ...proposals.map((item, index) => [item.id, now - index]),
+      ["stale", 0],
+      ["absent", now],
+    ]),
+    now,
+  });
+  assert.equal(result.dismissedIds.length, 256);
+  assert.equal(Object.keys(result.lastShownAt).length, 256);
+  assert.equal(result.dismissedIds.includes("absent"), false);
+  assert.equal(Object.hasOwn(result.lastShownAt, "absent"), false);
+});
+
+test("busy refresh bursts coalesce and late inbox completion is inert after dispose", async () => {
+  const h = harness({ kv: enabledKv(), proposals: [proposal()], status: "busy" });
+  let reads = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  h.bridge.getInbox = async () => {
+    reads += 1;
+    await gate;
+    return [proposal()];
+  };
+  await SelfEvolveTuiPlugin(h.api, { idleDebounceMs: 0, mailboxPollMs: 5_000 });
+  for (let index = 0; index < 100; index += 1) {
+    h.event(index % 2 ? "session.status" : "self-evolve.proposal");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(reads, 0);
+
+  h.setStatus("idle");
+  h.setClock(2_001);
+  h.event("session.idle");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  h.setClock(2_002);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(reads, 1);
+  await h.dispose();
+  release();
+  await flush();
+  assert.equal(h.selects.length, 0);
 });
 
 test("proposal filtering honors state, dismissal, snooze, and last-shown time", () => {

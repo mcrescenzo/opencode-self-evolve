@@ -14,16 +14,31 @@ function fail(message, detail = "") {
   throw new Error(detail ? `${message}\n${detail}` : message);
 }
 
+function commandText(command, args) {
+  return [command, ...args].join(" ");
+}
+
+export function assertSpawnSucceeded(result, command, args) {
+  const label = commandText(command, args);
+  if (result?.error) {
+    const code = String(result.error.code ?? "spawn-error");
+    fail(`${label} could not be executed (${code})`, String(result.error.message ?? result.error));
+  }
+  if (result?.signal) fail(`${label} was terminated by signal ${result.signal}`);
+  if (result?.status !== 0) {
+    const status = result?.status === null || result?.status === undefined ? "unknown" : result.status;
+    fail(`${label} exited with status ${status}`, [result?.stdout, result?.stderr].filter(Boolean).join("\n"));
+  }
+  return result;
+}
+
 function run(command, args, { cwd, env } = {}) {
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf8",
     env: env ?? process.env,
   });
-  if (result.status !== 0) {
-    fail(`${command} ${args.join(" ")} failed`, [result.stdout, result.stderr].filter(Boolean).join("\n"));
-  }
-  return result;
+  return assertSpawnSucceeded(result, command, args);
 }
 
 function normalizePackagePath(value) {
@@ -77,6 +92,7 @@ export function assertServerEntryContract(source) {
 }
 
 function parsePackResult(stdout) {
+  if (typeof stdout !== "string" || !stdout.trim()) fail("npm pack returned empty output");
   let result;
   try {
     result = JSON.parse(stdout);
@@ -111,7 +127,10 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
     const consumerDir = path.join(tempRoot, "consumer");
     mkdirSync(consumerDir);
     writeFileSync(path.join(consumerDir, "package.json"), `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`);
-    run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--omit=optional", tarball], { cwd: consumerDir, env: npmEnv });
+    run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--omit=optional", "--omit=peer", tarball], { cwd: consumerDir, env: npmEnv });
+    if (existsSync(path.join(consumerDir, "node_modules", "@opencode-ai", "plugin"))) {
+      fail("Fresh consumer unexpectedly installed the optional @opencode-ai/plugin peer");
+    }
     const opentuiScope = path.join(consumerDir, "node_modules", "@opentui");
     if (existsSync(opentuiScope)) fail("Headless consumer unexpectedly installed @opentui peers");
 

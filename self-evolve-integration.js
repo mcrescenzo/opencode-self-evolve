@@ -8,6 +8,7 @@ import {
 } from "./self-evolve-bridge.js";
 import { isDurableLifecycleEvent } from "./self-evolve-core.js";
 import { stateRootIdentity } from "./self-evolve-state-root.js";
+import { boundedHostCall, cleanupSession, listSessions } from "./self-evolve-client.js";
 
 const RESTART_REMINDER = "OpenCode must be restarted for the new skill content to load in existing sessions; new sessions will pick it up automatically.";
 const DEFAULT_ROLLOUT_GATES = Object.freeze({
@@ -36,50 +37,13 @@ function errorReason(error) {
   return String(error?.message ?? error ?? "unknown-error").split(":", 1)[0];
 }
 
-function listedSessions(result) {
-  const value = result?.data ?? result;
-  if (Array.isArray(value)) return value;
-  return value?.sessions ?? value?.items ?? [];
-}
-
 function analyzerSessionState(session) {
   return String(session?.state ?? session?.status?.type ?? session?.status ?? "").toLowerCase();
 }
 
-async function abortSession(client, directory, id) {
-  const abort = client?.session?.abort;
-  if (typeof abort !== "function") throw new Error("session-abort-unavailable");
-  let lastError;
-  for (const args of [{ path: { id }, query: { directory } }, { path: { sessionID: id }, query: { directory } }, { sessionID: id, directory }, { id }, id]) {
-    try {
-      const result = await abort.call(client.session, args);
-      if (!result?.error) return;
-      lastError = result.error;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError ?? new Error("session-abort-failed");
-}
-
-function boundedHostCall(task, timeoutMs, signal, label) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(new Error("host-recovery-cancelled"));
-    const timer = setTimeout(() => reject(new Error(`${label}-timeout`)), timeoutMs);
-    const abort = () => { clearTimeout(timer); reject(new Error("host-recovery-cancelled")); };
-    signal?.addEventListener("abort", abort, { once: true });
-    Promise.resolve().then(task).then(
-      (value) => { clearTimeout(timer); signal?.removeEventListener("abort", abort); resolve(value); },
-      (error) => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(error); },
-    );
-  });
-}
-
 async function recoverOrphanedAnalyzerSessions(client, directory, { timeoutMs = 2_000, signal, maxSessions = 32 } = {}) {
-  const list = client?.session?.list;
-  if (typeof list !== "function") return [];
-  const result = await boundedHostCall(() => list.call(client.session, { query: { directory } }), timeoutMs, signal, "session-list");
-  const candidates = listedSessions(result).filter((session) => {
+  const ctx = { client, directory };
+  const candidates = (await listSessions(ctx, { timeoutMs, signal, label: "session-list" })).filter((session) => {
     const agent = session?.agent ?? session?.mode ?? session?.info?.agent;
     const state = analyzerSessionState(session);
     return HIDDEN_ANALYZER_AGENTS.has(agent) && state && !TERMINAL_SESSION_STATES.has(state);
@@ -89,7 +53,7 @@ async function recoverOrphanedAnalyzerSessions(client, directory, { timeoutMs = 
     const id = session?.id ?? session?.sessionID;
     if (!id) continue;
     try {
-      await boundedHostCall(() => abortSession(client, directory, id), timeoutMs, signal, "session-abort");
+      await cleanupSession(ctx, id, { timeoutMs, signal, label: "session-abort" });
       outcomes.push({ id, ok: true });
     } catch (error) {
       outcomes.push({ id, ok: false, reason: errorReason(error) });
@@ -151,6 +115,7 @@ export function createIntegration({
   let hostVersionSource = options.hostVersionSource === "tui-app-version" ? "tui-app-version" : "global-health";
   let ctx = options.ctx;
   let closed = false;
+  let shutdownDegraded = false;
   let terminalPurge = false;
   let mailboxTimer;
   let mailboxPolling = false;
@@ -994,6 +959,7 @@ export function createIntegration({
   }
 
   async function handleCommand(input, output) {
+    if (closed) return { ok: false, reason: "integration-closed" };
     if (terminalPurge) {
       const result = { ok: false, terminal: true, responseText: "Self-evolve state was purged. Restart OpenCode to reinitialize durable self-evolve state." };
       if (output && typeof output === "object") output.responseText = result.responseText;
@@ -1114,7 +1080,10 @@ export function createIntegration({
         } catch (error) {
           reason = errorReason(error);
           if (attempts > retries || signal.aborted) break;
-          await boundedHostCall(() => new Promise((resolve) => setTimeout(resolve, backoffMs * (2 ** (attempts - 1)))), backoffMs * (2 ** (attempts - 1)) + 10, signal, "host-recovery-backoff").catch(() => {});
+          await boundedHostCall(
+            () => new Promise((resolve) => setTimeout(resolve, backoffMs * (2 ** (attempts - 1)))),
+            { timeoutMs: backoffMs * (2 ** (attempts - 1)) + 10, signal, label: "host-recovery-backoff" },
+          ).catch(() => {});
         }
       }
       const report = {
@@ -1251,21 +1220,33 @@ export function createIntegration({
   }
 
   async function shutdown() {
-    if (closed) return;
-    closed = true;
-    hostRecoveryController?.abort();
-    clearMailboxInterval(mailboxTimer);
-    mailboxTimer = undefined;
-    clearRetentionInterval(retentionTimer);
-    retentionTimer = undefined;
-    await mailboxTask;
-    await retentionTask;
-    await hostRecoveryTask;
-    schedulerInstance.dispose?.();
-    applier.close?.();
+    if (closed && !shutdownDegraded) return { ok: true, alreadyClosed: true };
+    if (!closed) {
+      closed = true;
+      hostRecoveryController?.abort();
+      clearMailboxInterval(mailboxTimer);
+      mailboxTimer = undefined;
+      clearRetentionInterval(retentionTimer);
+      retentionTimer = undefined;
+      await mailboxTask;
+      await retentionTask;
+      await hostRecoveryTask;
+      schedulerInstance.dispose?.();
+    }
+    const applierClose = await applier.close?.();
+    if (applierClose?.ok === false) {
+      shutdownDegraded = true;
+      return { ok: false, reason: "applier-close-degraded", applier: applierClose };
+    }
     synthesisModule?.disposeSynthesis?.();
     if (!terminalPurge) await store.flushAudit?.();
-    store.close?.();
+    const storeClose = await store.close?.();
+    if (storeClose?.ok === false) {
+      shutdownDegraded = true;
+      return { ok: false, reason: "store-close-degraded", store: storeClose };
+    }
+    shutdownDegraded = false;
+    return { ok: true };
   }
 
   const testBridge = Object.freeze({

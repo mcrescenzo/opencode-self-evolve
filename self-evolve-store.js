@@ -344,6 +344,24 @@ export function openStore(rootDir, {
     return recordPath;
   }
 
+  function quarantineDeterministic(record, reason, label) {
+    let serialized;
+    try { serialized = typeof record === "string" ? record : JSON.stringify(record); } catch { serialized = String(record); }
+    const bounded = serialized.slice(0, 64 * 1024);
+    const identity = hashContent(JSON.stringify([String(label), String(reason), bounded]));
+    const recordPath = path.join(quarantineDir, `${label}-${identity}.quarantined`);
+    const reasonPath = `${recordPath}.reason.json`;
+    if (existsSync(recordPath) && existsSync(reasonPath)) return recordPath;
+    const changes = new Map([
+      [path.resolve(recordPath), `${bounded}\n`],
+      [path.resolve(reasonPath), json({ reason: String(reason) })],
+    ]);
+    assertProjectQuotaUnlocked(changes);
+    if (!existsSync(recordPath)) atomicWrite(recordPath, changes.get(path.resolve(recordPath)));
+    if (!existsSync(reasonPath)) atomicWrite(reasonPath, changes.get(path.resolve(reasonPath)));
+    return recordPath;
+  }
+
   function parseJsonlSource(source, validator) {
     const records = [];
     const damaged = [];
@@ -397,40 +415,122 @@ export function openStore(rootDir, {
     const groups = new Map();
     for (const record of legacy) {
       const details = record.payload.details;
-      const id = details.subjectId;
-      if (typeof id !== "string") continue;
+      const id = typeof details.subjectId === "string" ? details.subjectId : `orphan:${record.id}`;
       const group = groups.get(id) ?? [];
       group.push({ record, details });
       groups.set(id, group);
     }
-    const converted = [];
+    const additions = [];
+    const outcomes = [];
+    const existingIds = new Set(proposalRecords.map((record) => record.id));
+    const existingMigrationAuditIds = new Set(audit
+      .filter((record) => record.kind === "audit-event" && record.payload?.details?.action === "legacy-proposal-content-migration")
+      .map((record) => record.payload.id));
+    const expectedKeys = ["action", "chunkCount", "chunkIndex", "content", "contentEncoding", "contentHash", "subjectId"].sort().join(",");
+
+    function validateActiveGroup(proposalId, proposal, entries) {
+      if (entries.some(({ record, details }) => record.payload.proposalId !== undefined
+        || Object.keys(details).sort().join(",") !== expectedKeys
+        || details.subjectId !== proposalId
+        || details.contentHash !== proposal.proposedContentHash
+        || details.contentEncoding !== "base64"
+        || !Number.isSafeInteger(details.chunkIndex)
+        || !Number.isSafeInteger(details.chunkCount)
+        || details.chunkIndex < 0
+        || details.chunkCount < 1
+        || typeof details.content !== "string")) return { ok: false, reason: "invalid-legacy-chunk-shape" };
+      const sorted = [...entries].sort((left, right) => left.details.chunkIndex - right.details.chunkIndex);
+      if (sorted.some(({ details }, index) => details.chunkIndex !== index || details.chunkCount !== sorted.length)) {
+        return { ok: false, reason: "incomplete-or-duplicate-legacy-chunks" };
+      }
+      const encoded = sorted.map(({ details }) => details.content).join("");
+      let decoded;
+      try { decoded = Buffer.from(encoded, "base64"); } catch { return { ok: false, reason: "invalid-legacy-base64" }; }
+      if (decoded.toString("base64") !== encoded || hashContent(decoded.toString("utf8")) !== proposal.proposedContentHash) {
+        return { ok: false, reason: "legacy-content-hash-mismatch" };
+      }
+      return { ok: true, sorted };
+    }
+
+    function migrationAudit(proposalId, outcome, reason, entries) {
+      const timestamp = Math.max(0, Math.min(...entries.map(({ record }) => record.createdAt)));
+      const details = {
+        action: "legacy-proposal-content-migration",
+        outcome,
+        reason,
+        subjectId: proposalId,
+        chunks: entries.length,
+      };
+      const id = hashContent(JSON.stringify(["legacy-proposal-content-migration-v1", proposalId, outcome, reason]));
+      if (existingMigrationAuditIds.has(id)) return null;
+      const event = makeAuditEvent({
+        id,
+        kind: "corruption",
+        ...(proposalId.startsWith("orphan:") ? {} : { proposalId }),
+        actor: "self-evolve-store",
+        timestamp,
+        payloadHash: hashContent(JSON.stringify(details)),
+        details,
+      });
+      existingMigrationAuditIds.add(id);
+      return wrapRecord("audit-event", event, timestamp);
+    }
+
     for (const [proposalId, entries] of groups) {
       const proposal = latest.get(proposalId);
-      if (!proposal || !["critic-pending", "pending", "approved", "applied"].includes(proposal.state)) continue;
-      const expectedKeys = ["action", "chunkCount", "chunkIndex", "content", "contentEncoding", "contentHash", "subjectId"];
-      if (entries.some(({ record, details }) => record.payload.proposalId !== undefined
-        || Object.keys(details).sort().join(",") !== expectedKeys.sort().join(",")
-        || details.contentHash !== proposal.proposedContentHash
-        || details.contentEncoding !== "base64")) continue;
-      entries.sort((left, right) => left.details.chunkIndex - right.details.chunkIndex);
-      if (entries.some(({ details }, index) => details.chunkIndex !== index || details.chunkCount !== entries.length)) continue;
-      const encoded = entries.map(({ details }) => details.content).join("");
-      const decoded = Buffer.from(encoded, "base64");
-      if (decoded.toString("base64") !== encoded || hashContent(decoded.toString("utf8")) !== proposal.proposedContentHash) continue;
-      for (const { record, details } of entries) {
-        converted.push(wrapRecord("proposal-content", makeProposalContent({
-          proposalId,
-          contentHash: details.contentHash,
-          contentEncoding: details.contentEncoding,
-          chunkIndex: details.chunkIndex,
-          chunkCount: details.chunkCount,
-          content: details.content,
-        }), record.createdAt));
+      let outcome;
+      let reason;
+      if (!proposal) {
+        outcome = "orphan";
+        reason = "proposal-not-found";
+      } else if (!ACTIVE_PROPOSAL_STATES.has(proposal.state)) {
+        const validation = validateActiveGroup(proposalId, proposal, entries);
+        const quarantinePrefix = `legacy-proposal-${hashContent(proposalId).slice(0, 24)}-`;
+        const priorInvalidMigration = proposal.state === "failed-closed"
+          && readdirSync(quarantineDir).some((name) => name.startsWith(quarantinePrefix) && name.endsWith(".quarantined"));
+        outcome = priorInvalidMigration ? "invalid-active" : "terminal";
+        reason = priorInvalidMigration && !validation.ok ? validation.reason : `proposal-${proposal.state}`;
+      } else {
+        const validation = validateActiveGroup(proposalId, proposal, entries);
+        if (validation.ok) {
+          outcome = "converted";
+          reason = "valid-active-content";
+          for (const { record, details } of validation.sorted) {
+            const converted = wrapRecord("proposal-content", makeProposalContent({
+              proposalId,
+              contentHash: details.contentHash,
+              contentEncoding: details.contentEncoding,
+              chunkIndex: details.chunkIndex,
+              chunkCount: details.chunkCount,
+              content: details.content,
+            }), record.createdAt);
+            if (!existingIds.has(converted.id)) {
+              additions.push(converted);
+              existingIds.add(converted.id);
+            }
+          }
+        } else {
+          outcome = "invalid-active";
+          reason = validation.reason;
+          quarantineDeterministic(entries.map(({ record }) => record), reason, `legacy-proposal-${hashContent(proposalId).slice(0, 24)}`);
+          const failed = wrapRecord("proposal", makeProposal({
+            ...proposal,
+            state: "failed-closed",
+            decisionVersion: proposal.decisionVersion + 1,
+          }), now());
+          if (!existingIds.has(failed.id)) {
+            additions.push(failed);
+            existingIds.add(failed.id);
+          }
+        }
       }
+      const event = migrationAudit(proposalId, outcome, reason, entries);
+      if (event) outcomes.push(event);
     }
-    const existingIds = new Set(proposalRecords.map((record) => record.id));
-    writeRecords(STORE_FILES.proposal, [...proposalRecords, ...converted.filter((record) => !existingIds.has(record.id))]);
-    writeRecords(STORE_FILES["audit-event"], audit.filter((record) => !legacy.includes(record)));
+    if (additions.length) writeRecords(STORE_FILES.proposal, [...proposalRecords, ...additions]);
+    injectFault("legacy-migration-after-proposal-write");
+    writeRecords(STORE_FILES["audit-event"], [...audit.filter((record) => !legacy.includes(record)), ...outcomes]);
+    injectFault("legacy-migration-after-audit-write");
     return legacy.length;
   }
 
@@ -803,13 +903,34 @@ export function openStore(rootDir, {
     return path.join(leasesDir, `${leaseKey}.lock`);
   }
 
-  function readLease(leaseKey) {
-    try { return JSON.parse(readFileSync(leasePath(leaseKey), "utf8")); } catch { return null; }
+  function readLeaseState(leaseKey) {
+    let source;
+    try {
+      source = readFileSync(leasePath(leaseKey), "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") return { state: "absent", lease: null };
+      return { state: "error", lease: null, reason: "lease-read-error", code: String(error?.code ?? "UNKNOWN") };
+    }
+    let lease;
+    try {
+      lease = JSON.parse(source);
+    } catch {
+      return { state: "corrupt", lease: null, reason: "lease-invalid-json", source };
+    }
+    const valid = lease && typeof lease === "object" && !Array.isArray(lease)
+      && typeof lease.actor === "string" && lease.actor.length > 0 && lease.actor.length <= 256
+      && Number.isSafeInteger(lease.acquiredAt) && lease.acquiredAt >= 0
+      && Number.isSafeInteger(lease.expiresAt) && lease.expiresAt >= lease.acquiredAt
+      && typeof lease.nonce === "string" && lease.nonce.length > 0 && lease.nonce.length <= 256
+      && (lease.pid === undefined || (Number.isSafeInteger(lease.pid) && lease.pid > 0));
+    if (!valid) return { state: "corrupt", lease: null, reason: "lease-invalid-shape", source };
+    return { state: "valid", lease };
   }
 
   function leaseStatusUnlocked(leaseKey, nowMs = now()) {
-    const current = readLease(leaseKey);
-    if (!current) return { state: "absent", held: false, reclaimable: false, lease: null };
+    const read = readLeaseState(leaseKey);
+    if (read.state !== "valid") return { ...read, held: false, reclaimable: false };
+    const current = read.lease;
     const processAware = Number.isSafeInteger(current.pid) && current.pid > 0;
     const ownerAlive = processAware ? processIsAlive(current.pid) : null;
     const unexpired = Number.isSafeInteger(current.expiresAt) && current.expiresAt > nowMs;
@@ -833,37 +954,55 @@ export function openStore(rootDir, {
   }
 
   function acquireLease(leaseKey, { ttlMs, actor }) {
-    return withMutationLock(() => {
+    try {
+      return withMutationLock(() => {
       if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) return { ok: false, reason: "invalid-ttl" };
       const filePath = leasePath(leaseKey);
       const acquiredAt = now();
       const nonce = randomBytes(24).toString("hex");
       const status = leaseStatusUnlocked(leaseKey, acquiredAt);
+      if (status.state === "error") return { ok: false, reason: status.reason, code: status.code };
       if (status.held) return { ok: false, reason: "lease-busy", currentOwner: status.lease?.actor ?? null };
+      let repairedCorruptLease = false;
+      if (status.state === "corrupt") {
+        quarantineDeterministic(status.source, status.reason, `lease-${leaseKey}`);
+        removeLeaseUnlocked(leaseKey);
+        repairedCorruptLease = true;
+      }
       if (status.lease) removeLeaseUnlocked(leaseKey, status.lease);
       const source = json({ pid: process.pid, actor: String(actor), acquiredAt, expiresAt: acquiredAt + ttlMs, nonce });
       assertProjectQuotaUnlocked(new Map([[path.resolve(filePath), source]]));
       writeFileSync(filePath, source, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
       ownedLeases.set(leaseKey, nonce);
-      return { ok: true, nonce, expiresAt: acquiredAt + ttlMs };
-    });
+      return { ok: true, nonce, expiresAt: acquiredAt + ttlMs, ...(repairedCorruptLease ? { repairedCorruptLease: true } : {}) };
+      });
+    } catch (error) {
+      return { ok: false, reason: "lease-acquire-error", code: String(error?.code ?? reasonCode(error)) };
+    }
   }
 
   function releaseLease(leaseKey, nonce) {
-    return withMutationLock(() => {
-      const current = readLease(leaseKey);
-      if (!current) return { ok: false, reason: "lease-not-found" };
+    try {
+      return withMutationLock(() => {
+      const read = readLeaseState(leaseKey);
+      if (read.state === "absent") return { ok: false, reason: "lease-not-found" };
+      if (read.state === "error") return { ok: false, reason: read.reason, code: read.code };
+      if (read.state === "corrupt") return { ok: false, reason: "lease-corrupt" };
+      const current = read.lease;
       if (current.nonce !== nonce) return { ok: false, reason: "nonce-mismatch" };
       try { unlinkSync(leasePath(leaseKey)); } catch (error) { if (error?.code !== "ENOENT") throw error; }
       ownedLeases.delete(leaseKey);
       return { ok: true };
-    });
+      });
+    } catch (error) {
+      return { ok: false, reason: "lease-release-error", code: String(error?.code ?? reasonCode(error)) };
+    }
   }
 
   function isLeaseHeld(leaseKey, nowMs = now()) {
     return withMutationLock(() => {
       const status = leaseStatusUnlocked(leaseKey, nowMs);
-      if (status.held || !status.lease) return status.held;
+      if (status.held || status.state !== "valid") return status.held;
       removeLeaseUnlocked(leaseKey, status.lease);
       return false;
     });
@@ -877,20 +1016,30 @@ export function openStore(rootDir, {
     return withMutationLock(() => {
       if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new TypeError("invalid-retention-time");
       let removed = 0;
+      let corruptLeases = 0;
+      const errors = [];
       for (const entry of readdirSync(leasesDir, { withFileTypes: true })) {
         if (!entry.isFile() || !entry.name.endsWith(".lock")) continue;
         const filePath = path.join(leasesDir, entry.name);
-        let lease;
-        try { lease = JSON.parse(readFileSync(filePath, "utf8")); } catch { continue; }
         const key = entry.name.slice(0, -".lock".length);
         const status = leaseStatusUnlocked(key, nowMs);
+        if (status.state === "error") {
+          errors.push({ leaseKey: key, reason: status.reason, code: status.code });
+          continue;
+        }
+        if (status.state === "corrupt") {
+          quarantineDeterministic(status.source, status.reason, `lease-${key}`);
+          removeLeaseUnlocked(key);
+          corruptLeases += 1;
+          continue;
+        }
         if (!status.reclaimable) continue;
         try { unlinkSync(filePath); removed += 1; } catch (error) { if (error?.code !== "ENOENT") throw error; }
-        for (const [key, nonce] of ownedLeases) {
-          if (lease.nonce === nonce) ownedLeases.delete(key);
+        for (const [ownedKey, nonce] of ownedLeases) {
+          if (status.lease.nonce === nonce) ownedLeases.delete(ownedKey);
         }
       }
-      return { leases: removed };
+      return { leases: removed, corruptLeases, errors };
     });
   }
 
@@ -1047,6 +1196,13 @@ export function openStore(rootDir, {
         const filePath = path.join(leasesDir, entry.name);
         const key = entry.name.slice(0, -".lock".length);
         const status = leaseStatusUnlocked(key, nowMs);
+        if (status.state === "corrupt") {
+          quarantineDeterministic(status.source, status.reason, `lease-${key}`);
+          removeLeaseUnlocked(key);
+          removed.leases += 1;
+          continue;
+        }
+        if (status.state === "error") continue;
         if (!status.reclaimable) continue;
         unlinkSync(filePath);
         removed.leases += 1;
@@ -1439,20 +1595,46 @@ export function openStore(rootDir, {
   }
 
   function close() {
-    if (closed) return;
+    if (closed) return { ok: true, released: 0 };
     if (terminal || terminalRoots.has(root)) {
       ownedLeases.clear();
       closed = true;
-      return;
+      return { ok: true, released: 0 };
     }
-    withMutationLock(() => {
-      for (const [leaseKey, nonce] of ownedLeases) {
-        const current = readLease(leaseKey);
-        if (current?.nonce === nonce) try { unlinkSync(leasePath(leaseKey)); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-      }
-      ownedLeases.clear();
-    });
+    const failures = [];
+    let released = 0;
+    try {
+      withMutationLock(() => {
+        for (const [leaseKey, nonce] of ownedLeases) {
+          const read = readLeaseState(leaseKey);
+          if (read.state === "absent") {
+            ownedLeases.delete(leaseKey);
+            continue;
+          }
+          if (read.state !== "valid") {
+            failures.push({ leaseKey, reason: read.state === "error" ? read.reason : "lease-corrupt", ...(read.code ? { code: read.code } : {}) });
+            continue;
+          }
+          if (read.lease.nonce !== nonce) {
+            failures.push({ leaseKey, reason: "nonce-mismatch" });
+            continue;
+          }
+          try {
+            unlinkSync(leasePath(leaseKey));
+            ownedLeases.delete(leaseKey);
+            released += 1;
+          } catch (error) {
+            if (error?.code === "ENOENT") ownedLeases.delete(leaseKey);
+            else failures.push({ leaseKey, reason: "lease-release-error", code: String(error?.code ?? reasonCode(error)) });
+          }
+        }
+      });
+    } catch (error) {
+      failures.push({ leaseKey: null, reason: "lease-release-error", code: String(error?.code ?? reasonCode(error)) });
+    }
+    if (failures.length) return { ok: false, released, failures };
     closed = true;
+    return { ok: true, released };
   }
 
   withMutationLock(() => {

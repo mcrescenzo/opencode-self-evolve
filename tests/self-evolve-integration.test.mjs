@@ -89,6 +89,7 @@ function harness(t, config = {}) {
     settingsReads: 0,
     recordReads: 0,
     recordWrites: 0,
+    applierCloses: 0,
   };
   const integrationStore = config.instrumentStore
     ? {
@@ -131,7 +132,10 @@ function harness(t, config = {}) {
       calls.recoveries += 1;
       return config.recovery ?? [];
     },
-    close() {},
+    close() {
+      calls.applierCloses += 1;
+      return config.applierClose?.(calls.applierCloses);
+    },
   };
 
   const pipelineModule = {
@@ -818,6 +822,26 @@ test("shutdown cancels retention scheduling and awaits an in-flight sweep before
   await stopping;
   assert.equal(cleared, true);
   assert.deepEqual(h.integration.getRetentionState(), { scheduled: false, inFlight: false });
+});
+
+test("shutdown remains closed while retrying a degraded applier lease release", async (t) => {
+  const h = harness(t, {
+    applierClose(attempt) {
+      return attempt === 1
+        ? { ok: false, unreleased: [{ key: "apply_retry", reason: "lease-release-error" }] }
+        : { ok: true, unreleased: [] };
+    },
+  });
+  await h.integration.boot({ ctx: h.ctx, hostVersion: "1.18.3" });
+  const first = await h.integration.shutdown();
+  assert.equal(first.ok, false);
+  assert.equal(first.reason, "applier-close-degraded");
+  assert.deepEqual(await h.integration.handleCommand({ command: "self-evolve", arguments: "status", sessionID: "closed" }), {
+    ok: false,
+    reason: "integration-closed",
+  });
+  assert.deepEqual(await h.integration.shutdown(), { ok: true });
+  assert.equal(h.calls.applierCloses, 2);
 });
 
 test("purge all is terminal through timer ticks, later events and commands, and shutdown", async (t) => {

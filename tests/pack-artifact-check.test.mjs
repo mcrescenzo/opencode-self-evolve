@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { assertNoForbiddenImports, assertServerEntryContract } from "../scripts/pack-artifact-check.mjs";
+import { assertNoForbiddenImports, assertServerEntryContract, assertSpawnSucceeded } from "../scripts/pack-artifact-check.mjs";
 import { createIntegration } from "../self-evolve-integration.js";
 import * as schemas from "../self-evolve-schemas.js";
 
@@ -54,6 +54,24 @@ test("pack scanner rejects named server exports and TUI imports", () => {
   assert.doesNotThrow(() => assertServerEntryContract("export default function Plugin() {}\n"));
   assert.throws(() => assertServerEntryContract("export const helper = 1; export default function Plugin() {}\n"), /no named exports/u);
   assert.throws(() => assertServerEntryContract('import "@opencode-ai/plugin/tui"; export default function Plugin() {}\n'), /prohibited TUI/u);
+});
+
+test("pack command diagnostics distinguish spawn, signal, and exit failures", () => {
+  for (const code of ["ENOENT", "EACCES", "EPERM"]) {
+    const error = Object.assign(new Error(`synthetic ${code}`), { code });
+    assert.throws(
+      () => assertSpawnSucceeded({ error, status: null }, "npm", ["pack"]),
+      new RegExp(`could not be executed \\(${code}\\)`),
+    );
+  }
+  assert.throws(
+    () => assertSpawnSucceeded({ signal: "SIGTERM", status: null }, "npm", ["pack"]),
+    /terminated by signal SIGTERM/u,
+  );
+  assert.throws(
+    () => assertSpawnSucceeded({ status: 7, stdout: "", stderr: "synthetic failure" }, "npm", ["pack"]),
+    /exited with status 7[\s\S]*synthetic failure/u,
+  );
 });
 
 test("integration boot aborts only active orphaned self-evolve analyzer sessions", async () => {

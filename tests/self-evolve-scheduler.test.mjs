@@ -360,6 +360,46 @@ test("three failures in 24 hours trip the circuit breaker with backoff", async (
   scheduler.dispose();
 });
 
+test("failure backoff uses stable root lineage, doubles, and survives restart", async (t) => {
+  const clock = { value: 3_000_000 };
+  const records = new Map();
+  const first = fixture(t, {
+    clock,
+    records,
+    budgets: { idleDebounceMs: 0, backoffBaseMs: 20 },
+  });
+  await first.scheduler.handleEvent(idle("child-a", { parentID: "root" }));
+  await waitFor(() => first.work.length === 1, "first lineage work");
+  first.scheduler.recordWorkResult(first.work[0], { ok: false, clusterID: "cluster-a" });
+  const firstFailure = actions(records, "work-failure").at(-1);
+  assert.equal(firstFailure.payload.details.failureKey, hashSessionLineage("root"));
+  assert.equal(firstFailure.payload.details.clusterID, "cluster-a");
+  assert.equal(firstFailure.payload.details.backoffUntil, 3_000_020);
+
+  clock.value = 3_000_019;
+  await first.scheduler.handleEvent(idle("child-b", { parentID: "root" }));
+  await wait(8);
+  assert.equal(first.work.length, 1, "sibling lineage must remain suppressed before expiry");
+  clock.value = 3_000_020;
+  await waitFor(() => first.work.length === 2, "work at first backoff expiry");
+  first.scheduler.recordWorkResult(first.work[1], { ok: false });
+  assert.equal(actions(records, "work-failure").at(-1).payload.details.backoffUntil, 3_000_060);
+  first.scheduler.dispose();
+
+  const restarted = fixture(t, {
+    clock,
+    records,
+    budgets: { idleDebounceMs: 0, backoffBaseMs: 20 },
+  });
+  clock.value = 3_000_059;
+  await restarted.scheduler.handleEvent(idle("child-c", { parentID: "root" }));
+  await wait(8);
+  assert.equal(restarted.work.length, 0, "persisted backoff must suppress restarted scheduler");
+  clock.value = 3_000_060;
+  await waitFor(() => restarted.work.length === 1, "restarted work at persisted expiry");
+  restarted.scheduler.dispose();
+});
+
 test("idle state older than 30 minutes has its pending timer cleared", async (t) => {
   const clock = { value: 5_000 };
   const { scheduler, work } = fixture(t, { clock, budgets: { idleDebounceMs: 50 } });

@@ -171,9 +171,29 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     return destination;
   }
 
-  function release(key, nonce) {
-    held.delete(key);
-    return store.releaseLease(key, nonce);
+  function release(key, nonce, operation, proposalId) {
+    let result;
+    try {
+      result = store.releaseLease(key, nonce);
+    } catch (error) {
+      result = { ok: false, reason: errorReason(error, "lease-release-error") };
+    }
+    if (result?.ok) {
+      held.delete(key);
+      return { leaseStatus: "released" };
+    }
+    const reason = result?.reason ?? "lease-release-error";
+    try {
+      appendAudit("lease", proposalId ?? "unknown", {
+        state: "warning",
+        action: "lease-release",
+        operation,
+        reason,
+        leaseKey: key,
+        "readback-verified": false,
+      });
+    } catch {}
+    return { leaseStatus: "degraded", leaseWarning: reason };
   }
 
   function quotaAvailable(proposal) {
@@ -252,6 +272,7 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     let renamed = false;
     let snapshot;
     let pendingAuditId;
+    let outcome;
     const target = path.resolve(proposal.skillTarget.canonicalRoot, proposal.skillTarget.relativePath);
     try {
       const validated = validateProposalTarget(proposal, inventoryRecords);
@@ -335,7 +356,8 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
           reason: "readback-mismatch",
         });
         if (!rolledBack.ok) tripCritical(proposal.id, rolledBack.reason, { target, appliedHash });
-        return { ok: false, reason: "readback-mismatch", auditId: pendingAuditId };
+        outcome = { ok: false, reason: "readback-mismatch", auditId: pendingAuditId };
+        return outcome;
       }
       const auditId = appendAudit("apply", proposal.id, {
         state: "readback-verified",
@@ -351,18 +373,21 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         "readback-verified": true,
       });
       injectFault("apply-after-readback-audit");
-      return { ok: true, appliedHash, auditId };
+      outcome = { ok: true, appliedHash, auditId };
+      return outcome;
     } catch (error) {
       const reason = errorReason(error);
       if (renamed) {
         const rolledBack = rollbackApplied({ proposalId: proposal.id, actor: ACTOR, reason });
         if (!rolledBack.ok) tripCritical(proposal.id, rolledBack.reason, { target });
       }
-      return { ok: false, reason, auditId: pendingAuditId ?? auditFailure(proposal, reason, { target }) };
+      outcome = { ok: false, reason, auditId: pendingAuditId ?? auditFailure(proposal, reason, { target }) };
+      return outcome;
     } finally {
       if (temporary) fs.rmSync(temporary, { force: true });
       if (snapshot && !pendingAuditId) fs.rmSync(snapshot, { force: true });
-      release(key, acquired.nonce);
+      const releaseResult = release(key, acquired.nonce, "apply", proposal.id);
+      if (outcome) Object.assign(outcome, releaseResult);
     }
   }
 
@@ -407,28 +432,50 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
   function rollbackApplied({ proposalId, actor = ACTOR, reason = "requested" } = {}) {
     const audit = latestVerifiedApply(proposalId);
     if (!audit) return { ok: false, reason: "applied-audit-not-found" };
-    try {
-      const currentHash = hashSkillContent(fs.readFileSync(audit.details.target));
-      if (currentHash !== audit.details.appliedHash) {
-        appendAudit("rollback", proposalId, {
-          state: "refused",
-          target: audit.details.target,
-          appliedHash: audit.details.appliedHash,
-          actor: String(actor),
-          reason: "hash-drift",
-          "readback-verified": false,
-        });
-        tripCritical(proposalId, "hash-drift", { target: audit.details.target, appliedHash: audit.details.appliedHash });
-        return { ok: false, reason: "hash-drift" };
-      }
-    } catch (error) {
-      const failure = errorReason(error, "rollback-failed");
-      tripCritical(proposalId, failure, { target: audit.details.target, appliedHash: audit.details.appliedHash });
-      return { ok: false, reason: failure };
+    const key = leaseKey(proposalId);
+    const existingNonce = held.get(key);
+    const acquired = existingNonce
+      ? { ok: true, nonce: existingNonce }
+      : store.acquireLease(key, { ttlMs: CLAIM_TTL_MS, actor: `${ACTOR}-rollback` });
+    if (!acquired?.ok) {
+      return acquired?.reason === "lease-busy"
+        ? { ok: false, reason: "lease-busy", deferred: true }
+        : { ok: false, reason: acquired?.reason ?? "lease-error" };
     }
-    const result = rollbackFromAudit({ proposalId, actor, reason, ...audit.details });
-    if (!result.ok) tripCritical(proposalId, result.reason, { target: audit.details.target, appliedHash: audit.details.appliedHash });
-    return result;
+    const acquiredHere = !existingNonce;
+    if (acquiredHere) held.set(key, acquired.nonce);
+    let outcome;
+    try {
+      try {
+        const currentHash = hashSkillContent(fs.readFileSync(audit.details.target));
+        if (currentHash !== audit.details.appliedHash) {
+          appendAudit("rollback", proposalId, {
+            state: "refused",
+            target: audit.details.target,
+            appliedHash: audit.details.appliedHash,
+            actor: String(actor),
+            reason: "hash-drift",
+            "readback-verified": false,
+          });
+          tripCritical(proposalId, "hash-drift", { target: audit.details.target, appliedHash: audit.details.appliedHash });
+          outcome = { ok: false, reason: "hash-drift" };
+          return outcome;
+        }
+      } catch (error) {
+        const failure = errorReason(error, "rollback-failed");
+        tripCritical(proposalId, failure, { target: audit.details.target, appliedHash: audit.details.appliedHash });
+        outcome = { ok: false, reason: failure };
+        return outcome;
+      }
+      outcome = rollbackFromAudit({ proposalId, actor, reason, ...audit.details });
+      if (!outcome.ok) tripCritical(proposalId, outcome.reason, { target: audit.details.target, appliedHash: audit.details.appliedHash });
+      return outcome;
+    } finally {
+      if (acquiredHere) {
+        const releaseResult = release(key, acquired.nonce, "rollback", proposalId);
+        if (outcome) Object.assign(outcome, releaseResult);
+      }
+    }
   }
 
   function recoverPending() {
@@ -445,6 +492,7 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         continue;
       }
       held.set(key, acquired.nonce);
+      let outcome;
       try {
         let currentHash;
         try { currentHash = hashSkillContent(fs.readFileSync(details.target)); }
@@ -455,42 +503,52 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
             && path.basename(temporary).startsWith(`.${path.basename(details.target)}.self-evolve-tmp-`) && fs.existsSync(temporary)
             && hashSkillContent(fs.readFileSync(temporary)) === details.temporaryHash) fs.unlinkSync(temporary);
           const auditId = appendAudit("rollback", audit.proposalId, { ...details, state: "rolled-back", rolledBackHash: MUST_NOT_EXIST, reason: "recovery-found-target-absent", "readback-verified": true });
-          outcomes.push({ ok: false, proposalId: audit.proposalId, reason: "apply-not-published", rolledBackHash: MUST_NOT_EXIST, auditId });
+          outcome = { ok: false, proposalId: audit.proposalId, reason: "apply-not-published", rolledBackHash: MUST_NOT_EXIST, auditId };
+          outcomes.push(outcome);
           continue;
         }
         if (currentHash === details.appliedHash) {
           const auditId = appendAudit("apply", audit.proposalId, { ...details, state: "readback-verified", "readback-verified": true, recovery: true });
-          outcomes.push({ ok: true, proposalId: audit.proposalId, appliedHash: currentHash, auditId });
+          outcome = { ok: true, proposalId: audit.proposalId, appliedHash: currentHash, auditId };
+          outcomes.push(outcome);
         } else if (currentHash === details.priorHash) {
           const auditId = appendAudit("rollback", audit.proposalId, { ...details, state: "rolled-back", rolledBackHash: currentHash, reason: "recovery-found-prior-content", "readback-verified": true });
           if (details.snapshot && details.snapshot !== "none") fs.rmSync(details.snapshot, { force: true });
-          outcomes.push({ ok: true, proposalId: audit.proposalId, rolledBackHash: currentHash, auditId });
+          outcome = { ok: true, proposalId: audit.proposalId, rolledBackHash: currentHash, auditId };
+          outcomes.push(outcome);
         } else if (details.priorHash === MUST_NOT_EXIST) {
           tripCritical(audit.proposalId, "target-collision", { target: details.target, appliedHash: details.appliedHash });
-          outcomes.push({ ok: false, proposalId: audit.proposalId, reason: "target-collision" });
+          outcome = { ok: false, proposalId: audit.proposalId, reason: "target-collision" };
+          outcomes.push(outcome);
         } else {
           const rollback = rollbackFromAudit({ proposalId: audit.proposalId, actor: ACTOR, reason: "startup-recovery", ...details });
           if (!rollback.ok) tripCritical(audit.proposalId, rollback.reason, { target: details.target, appliedHash: details.appliedHash });
-          outcomes.push({ ok: false, proposalId: audit.proposalId, reason: rollback.reason });
+          outcome = { ok: false, proposalId: audit.proposalId, reason: rollback.reason };
+          outcomes.push(outcome);
         }
       } catch (error) {
         const reason = errorReason(error, "recovery-failed");
         tripCritical(audit.proposalId, reason, { target: details.target, appliedHash: details.appliedHash });
-        outcomes.push({ ok: false, proposalId: audit.proposalId, reason });
+        outcome = { ok: false, proposalId: audit.proposalId, reason };
+        outcomes.push(outcome);
       } finally {
-        release(key, acquired.nonce);
+        const releaseResult = release(key, acquired.nonce, "recovery", audit.proposalId);
+        if (outcome) Object.assign(outcome, releaseResult);
       }
     }
     return outcomes;
   }
 
   function close() {
-    if (closed) return;
+    if (closed) return { ok: true, unreleased: [] };
+    const unreleased = [];
     for (const [key, nonce] of held) {
-      try { store.releaseLease(key, nonce); } catch {}
+      const status = release(key, nonce, "close");
+      if (status.leaseStatus !== "released") unreleased.push({ key, reason: status.leaseWarning });
     }
-    held.clear();
+    if (unreleased.length) return { ok: false, unreleased };
     closed = true;
+    return { ok: true, unreleased: [] };
   }
 
   function getApplyLeaseStatus(proposalId) {

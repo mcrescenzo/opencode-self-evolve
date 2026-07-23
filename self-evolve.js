@@ -28,6 +28,14 @@ import {
   stateRootIdentity,
 } from "./self-evolve-state-root.js";
 import { readTuiHostHealth } from "./self-evolve-bridge.js";
+import {
+  cleanupSession,
+  createSession,
+  createdSessionID,
+  promptSession,
+  readSessionMessages,
+  sessionOutput,
+} from "./self-evolve-client.js";
 
 /**
  * @typedef {import("@opencode-ai/plugin").Plugin} OpenCodePlugin
@@ -41,11 +49,10 @@ import { readTuiHostHealth } from "./self-evolve-bridge.js";
 // than once per process (documented double-instantiation); reassigning this
 // binding inside the factory would silently wipe all session state (pause,
 // disable, pending proposal, rate-limit counters) on the second call. Instead,
-// the factory calls `registry.setOptions(...)` to re-seed the configured
-// options (so `/self-evolve status` shows the real caps) without discarding
-// any existing registry entries. `currentPluginOptions` below is the
-// factory-reassignable piece; option-resolution reads it at call time.
+// each factory passes its resolved options when it creates a new session.
+// Existing session objects remain shared by session ID.
 const registry = createRegistry();
+const legacyOwners = new Set();
 
 // Durable late-start recovery is coordinated separately from the legacy
 // session registry. OpenCode may keep hooks from more than one factory
@@ -54,13 +61,6 @@ const registry = createRegistry();
 const lateDurableRecoveryRegistry = new Map();
 const durableHostObjectIDs = new WeakMap();
 let nextDurableHostObjectID = 1;
-
-// Reassigned on every SelfEvolvePlugin(...) call so the most recently
-// resolved options are always used by hook bodies and by
-// `registry.setOptions()`. This is what "re-seeds options" means in
-// practice: the shared module-level registry survives, only the options used
-// for NEW session state (and the eviction cap) are refreshed.
-let currentPluginOptions = resolveOptions();
 
 function now(options) {
   return typeof options?.now === "function" ? options.now() : Date.now();
@@ -162,28 +162,6 @@ function modelOption(model) {
   return { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
 }
 
-async function callSessionMethod(ctx, methodName, sessionID, body) {
-  const method = ctx?.client?.session?.[methodName];
-  if (typeof method !== "function") throw new Error(`OpenCode session.${methodName} is unavailable.`);
-  const attempts = [
-    () => method.call(ctx.client.session, { path: { id: sessionID }, query: { directory: ctx.directory }, body }),
-    () => method.call(ctx.client.session, { path: { sessionID }, query: { directory: ctx.directory }, body }),
-    () => method.call(ctx.client.session, { sessionID, directory: ctx.directory, ...body }),
-  ];
-
-  let lastError;
-  for (const attempt of attempts) {
-    try {
-      const result = await attempt();
-      if (!result?.error) return result;
-      lastError = result.error;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw new Error(errorMessage(lastError, `OpenCode session.${methodName} failed.`));
-}
-
 function analyzerPermissionNames() {
   return [...new Set(["*", ...Object.keys(ANALYZER_TOOLS), "external_directory"])];
 }
@@ -194,75 +172,6 @@ function analyzerPermissionRules() {
 
 function analyzerPermissionConfig() {
   return Object.fromEntries(analyzerPermissionNames().map((permission) => [permission, "deny"]));
-}
-
-function omitKeys(value, keys) {
-  const omit = new Set(keys);
-  return Object.fromEntries(Object.entries(value || {}).filter(([key]) => !omit.has(key)));
-}
-
-async function callSessionCreate(ctx, body) {
-  const method = ctx?.client?.session?.create;
-  if (typeof method !== "function") throw new Error("OpenCode session.create is unavailable.");
-
-  const bodies = [
-    body,
-    omitKeys(body, ["permission"]),
-    omitKeys(body, ["permission", "parentID"]),
-  ];
-  const seen = new Set();
-  let lastError;
-
-  for (const candidate of bodies) {
-    const key = JSON.stringify(candidate);
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    const attempts = [
-      () => method.call(ctx.client.session, { body: candidate, query: { directory: ctx.directory } }),
-      () => method.call(ctx.client.session, { directory: ctx.directory, ...candidate }),
-    ];
-
-    for (const attempt of attempts) {
-      try {
-        const result = await attempt();
-        if (!result?.error) return result;
-        lastError = result.error;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-  }
-  throw new Error(errorMessage(lastError, "OpenCode session.create failed."));
-}
-
-function createdSessionID(result) {
-  return result?.data?.id ?? result?.data?.sessionID ?? result?.data?.session?.id ?? result?.id ?? result?.sessionID ?? result?.session?.id;
-}
-
-async function callSessionCleanup(ctx, sessionID) {
-  const session = ctx?.client?.session;
-  const methodName = typeof session?.abort === "function" ? "abort" : typeof session?.interrupt === "function" ? "interrupt" : null;
-  if (!methodName) throw new Error("OpenCode session cleanup is unavailable.");
-  const method = session[methodName];
-  const attempts = [
-    () => method.call(session, { path: { id: sessionID }, query: { directory: ctx.directory } }),
-    () => method.call(session, { path: { sessionID }, query: { directory: ctx.directory } }),
-    () => method.call(session, { sessionID, directory: ctx.directory }),
-    () => method.call(session, sessionID),
-  ];
-
-  let lastError;
-  for (const attempt of attempts) {
-    try {
-      const result = await attempt();
-      if (!result?.error) return result;
-      lastError = result.error;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw new Error(errorMessage(lastError, `OpenCode session.${methodName} cleanup failed.`));
 }
 
 async function withTimeout(task, timeoutMs, label) {
@@ -404,7 +313,7 @@ function compatibilityFromObservedVersion(value, options = {}, diagnostic) {
   const minor = Number(minorText);
   const patch = Number(patchText);
   if (![major, minor, patch].every(Number.isSafeInteger)) return { compatibility: hostCompatibility(observedVersion, false, "host-version-malformed", diagnostic), retryable: false };
-  const inDeclaredRange = major === 1 && (minor > 18 || (minor === 18 && patch >= 3));
+  const inDeclaredRange = major === 1 && minor === 18 && patch >= 3;
   if (!inDeclaredRange) return { compatibility: hostCompatibility(observedVersion, false, "host-version-unsupported", diagnostic), retryable: false };
   if (options.hostSupported === false) return { compatibility: hostCompatibility(observedVersion, false, "host-support-disabled-by-option", diagnostic), retryable: false };
   return { compatibility: hostCompatibility(observedVersion, true, "host-compatible", diagnostic), retryable: false };
@@ -572,63 +481,6 @@ function inputSessionID(input) {
   return input?.sessionID ?? input?.sessionId ?? input?.session?.id;
 }
 
-function resultData(result) {
-  if (!result || result.error) return [];
-  if (Array.isArray(result.data)) return result.data;
-  if (Array.isArray(result.data?.messages)) return result.data.messages;
-  if (Array.isArray(result.messages)) return result.messages;
-  return [];
-}
-
-async function readRecentMessages(ctx, sessionID, limit) {
-  const attempts = [
-    () => ctx.client.session.messages({
-      path: { id: sessionID },
-      query: { directory: ctx.directory, limit },
-    }),
-    () => ctx.client.session.messages({
-      path: { sessionID },
-      query: { directory: ctx.directory, limit },
-    }),
-    () => ctx.client.session.messages({ sessionID, directory: ctx.directory, limit }),
-  ];
-
-  let lastError;
-  for (const attempt of attempts) {
-    try {
-      const result = await attempt();
-      if (!result?.error) return { ok: true, messages: resultData(result) };
-      lastError = result.error;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  return { ok: false, error: lastError };
-}
-
-function responseText(result) {
-  const candidates = [
-    result?.data?.parts,
-    result?.data?.message?.parts,
-    result?.message?.parts,
-    result?.parts,
-  ];
-  for (const parts of candidates) {
-    if (Array.isArray(parts)) {
-      const text = parts.map((part) => part?.text || part?.content || "").filter(Boolean).join("\n");
-      if (text.trim()) return text;
-    }
-  }
-  return String(result?.data?.text ?? result?.text ?? result?.message?.text ?? "");
-}
-
-function analyzerOutput(result) {
-  const structured = result?.data?.info?.structured_output ?? result?.data?.structured_output ?? result?.info?.structured_output ?? result?.structured_output ??
-    result?.data?.info?.structured ?? result?.data?.structured ?? result?.info?.structured ?? result?.structured;
-  if (structured !== undefined) return structured;
-  return responseText(result);
-}
-
 async function runHiddenAnalyzer(ctx, sessionID, transcript, trigger, configuredModel, options) {
   const prompt = buildAnalyzerPrompt({ transcript, trigger, directory: ctx.directory });
   const model = modelOption(configuredModel);
@@ -648,51 +500,31 @@ async function runHiddenAnalyzer(ctx, sessionID, transcript, trigger, configured
     parts: [textPart(prompt, { metadata: { kind: "analysis" } })],
   };
   try {
-    // withTimeout()/Promise.race cannot cancel the underlying session.create. If the
-    // SDK call is merely slow and resolves AFTER sdkTimeoutMs, a session has still been
-    // created server-side but analyzerSessionID stays undefined, so the finally block's
-    // cleanup never fires and the session is orphaned. Attach a late-resolution handler
-    // that cleans up such an orphan. The timedOut guard ensures we only clean up on the
-    // late path — in the fast (in-time) path this handler runs first as a microtask with
-    // timedOut still false and returns, leaving cleanup to the normal flow / finally block
-    // so we never abort the live session we are about to use.
-    let timedOut = false;
-    const createPromise = callSessionCreate(ctx, createBody);
-    createPromise.then(
-      (r) => {
-        if (!timedOut) return;
-        const lateID = createdSessionID(r);
-        if (lateID) callSessionCleanup(ctx, lateID).catch(() => {});
+    // A timed-out or cancelled create can still resolve server-side. The adapter invokes
+    // this late handler only after the caller has already ended, so the orphan is cleaned.
+    const created = await createSession(ctx, createBody, {
+      timeoutMs: options.sdkTimeoutMs,
+      label: "Self-evolve session.create",
+      onLateResolve: (late) => {
+        const lateID = createdSessionID(late);
+        if (lateID) return cleanupSession(ctx, lateID, { timeoutMs: options.cleanupTimeoutMs, optional: true });
       },
-      () => {},
-    );
-    let created;
-    try {
-      created = await withTimeout(
-        () => createPromise,
-        options.sdkTimeoutMs,
-        "Self-evolve session.create",
-      );
-    } catch (error) {
-      timedOut = true;
-      throw error;
-    }
+    });
     analyzerSessionID = createdSessionID(created);
     if (!analyzerSessionID) throw new Error("OpenCode did not return a self-evolve analyzer session ID.");
-    const result = await withTimeout(
-      () => callSessionMethod(ctx, "prompt", analyzerSessionID, body),
-      options.analyzerTimeoutMs,
-      "Self-evolve analyzer",
-    );
-    return analyzerOutput(result);
+    const result = await promptSession(ctx, analyzerSessionID, body, {
+      timeoutMs: options.analyzerTimeoutMs,
+      label: "Self-evolve analyzer",
+    });
+    return sessionOutput(result);
   } finally {
     if (analyzerSessionID) {
       try {
-        await withTimeout(
-          () => callSessionCleanup(ctx, analyzerSessionID),
-          options.cleanupTimeoutMs,
-          "Self-evolve analyzer cleanup",
-        );
+        await cleanupSession(ctx, analyzerSessionID, {
+          timeoutMs: options.cleanupTimeoutMs,
+          label: "Self-evolve analyzer cleanup",
+          optional: true,
+        });
       } catch {}
     }
   }
@@ -777,28 +609,21 @@ function scanText(result) {
 
 async function runAnalysis(ctx, sessionID, trigger, pluginOptions, configuredModel) {
   const options = resolveOptions(pluginOptions);
-  const state = registry.getOrCreate(sessionID, now(options));
+  const state = registry.getOrCreate(sessionID, now(options), options);
   const reserve = reserveAnalysis(state, trigger, now(options), options);
   if (!reserve.allowed) return { accepted: false, blocked: true, reason: reserve.reason };
   let analyzedMessageCount = state.lastSeenMessageCount;
 
   try {
-    const messagesResult = await withTimeout(
-      () => readRecentMessages(ctx, sessionID, options.messageLimit),
-      options.sdkTimeoutMs,
-      "Self-evolve message read",
-    );
-    if (!messagesResult.ok) {
-      if (state.currentAnalysisToken !== reserve.token || state.disabled || state.paused) {
-        return finishAnalysisSuppressed(state, "Analysis failure ignored because self-evolve state changed while reading messages.", now(options), options, state.lastSeenMessageCount, false, reserve.token);
-      }
-      return finishAnalysisFailure(state, "Could not read recent session messages for self-evolve analysis.", now(options), options, state.lastSeenMessageCount, reserve.token);
-    }
+    const messages = await readSessionMessages(ctx, sessionID, options.messageLimit, {
+      timeoutMs: options.sdkTimeoutMs,
+      label: "Self-evolve message read",
+    });
 
-    const transcript = buildTranscript(messagesResult.messages, options);
+    const transcript = buildTranscript(messages, options);
     analyzedMessageCount = transcript.messageCount;
     // A concurrent /self-evolve disable or pause may have landed while we awaited
-    // readRecentMessages. Bail before beginAnalyzerRun so a cancelled session does
+    // the bounded host read. Bail before beginAnalyzerRun so a cancelled session does
     // not consume an analyzerRuns slot and a full LLM round-trip. (Forced
     // suppression: preserves analyzerFailures.)
     if (state.currentAnalysisToken !== reserve.token || state.disabled || state.paused) {
@@ -837,7 +662,7 @@ async function handleCommand(ctx, input, output, pluginOptions, configuredModel)
     replaceParts(output, displayPart(input), textPart("Self-evolve command skipped: no session ID was provided."));
     return;
   }
-  const state = registry.getOrCreate(sessionID, now(pluginOptions));
+  const state = registry.getOrCreate(sessionID, now(pluginOptions), pluginOptions);
   const command = parseCommand(input.arguments ?? "");
 
   if (command.verb === "scan") {
@@ -935,17 +760,11 @@ async function createDurablePipeline(ctx, options, selectedStateRoot, compatibil
  * @returns {Promise<OpenCodePluginHooks>}
  */
 async function SelfEvolvePlugin(ctx, options = {}) {
-  // Re-seed the shared module-level `currentPluginOptions` and the shared
-  // module-level `registry`'s options. This must NEVER reassign `registry`
-  // itself (see the module-level comment above) — `setOptions()` updates the
-  // options used for new session state and the eviction cap in place, so any
-  // existing per-session state (pause/disable, pending proposal, rate-limit
-  // counters) survives a second SelfEvolvePlugin(...) call.
-  currentPluginOptions = resolveOptions(options);
-  registry.setOptions(currentPluginOptions);
-  const instancePluginOptions = currentPluginOptions;
+  const instancePluginOptions = resolveOptions(options);
   let configuredModel = null;
-  const durableEnabled = currentPluginOptions.durableAutonomy !== false;
+  const durableEnabled = instancePluginOptions.durableAutonomy !== false;
+  const legacyOwnerToken = {};
+  if (!durableEnabled) legacyOwners.add(legacyOwnerToken);
   let durableRuntimePromise = null;
   let settledRuntime = null;
   let hostRecoveryTimer = null;
@@ -1135,12 +954,8 @@ async function SelfEvolvePlugin(ctx, options = {}) {
   };
 
   const executeSelfEvolveCommand = async (input, output) => {
-    // Read the module-level `currentPluginOptions` at call time (not a
-    // per-instance closure variable) so behavior is consistent even if
-    // OpenCode's double-instantiation leaves more than one instance's
-    // hooks reachable.
     const command = parseCommand(input.arguments ?? "");
-    if (durableEnabled && currentPluginOptions.durableAutonomy !== false) {
+    if (durableEnabled) {
       if (startupValidationPending) {
         replaceParts(output, displayPart(input), textPart("Self-evolve durable integration unavailable (startup-validation-pending). Host compatibility and state-root validation must complete before commands gain authority. No mode change, self-evolve analyzer call, or file write was attempted."));
         return;
@@ -1159,7 +974,7 @@ async function SelfEvolvePlugin(ctx, options = {}) {
       const sessionID = inputSessionID(input);
       if (pipeline) {
         const projectFingerprint = runtime.identity.projectFingerprint;
-        const scopeFingerprint = currentPluginOptions.scopeFingerprint ?? projectFingerprint;
+        const scopeFingerprint = instancePluginOptions.scopeFingerprint ?? projectFingerprint;
         if (typeof pipeline.handleCommand === "function") {
           const result = await pipeline.handleCommand({
             command: input.arguments ?? "",
@@ -1174,7 +989,7 @@ async function SelfEvolvePlugin(ctx, options = {}) {
         // Keep the injected pre-integration test seam compatible with v0.2.0:
         // older pipeline stubs expose only runEvolutionCycle().
         if (command.verb === "scan" && sessionID) {
-          const result = await pipeline.runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger: { kind: "manual", reason: "manual-scan" }, mode: currentPluginOptions.mode ?? "manual", options: currentPluginOptions });
+          const result = await pipeline.runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger: { kind: "manual", reason: "manual-scan" }, mode: instancePluginOptions.mode ?? "manual", options: instancePluginOptions });
           replaceParts(output, displayPart(input), textPart(result.responseText));
           return;
         }
@@ -1183,7 +998,7 @@ async function SelfEvolvePlugin(ctx, options = {}) {
       replaceParts(output, displayPart(input), textPart(`Self-evolve durable integration unavailable${detail}. No mode change or files were applied. Configure an explicit stateRoot and restart OpenCode if host state-path validation cannot complete.`));
       return;
     }
-    await handleCommand(ctx, input, output, currentPluginOptions, configuredModel);
+    await handleCommand(ctx, input, output, instancePluginOptions, configuredModel);
   };
 
   const hooks = {
@@ -1221,11 +1036,11 @@ async function SelfEvolvePlugin(ctx, options = {}) {
 
     dispose: async () => {
       if (disposed) return;
-      // The module-level registry is keyed by runtime session IDs and would
-      // otherwise retain per-session state for the whole process lifetime. Clear
-      // it when opencode unloads the plugin so nothing outlives this instance.
-      registry.clear();
       disposed = true;
+      if (!durableEnabled) {
+        legacyOwners.delete(legacyOwnerToken);
+        if (legacyOwners.size === 0) registry.clear();
+      }
       if (hostRecoveryTimer) clearTimeout(hostRecoveryTimer);
       hostRecoveryTimer = null;
       resolveDeferredRuntime?.(null);
@@ -1326,14 +1141,15 @@ SelfEvolvePlugin.__test = {
   handleCommand,
   humanizeScanReason,
   proposalNotification,
-  readRecentMessages,
   replaceParts,
   resolveStateRoot,
-  responseText,
   runAnalysis,
   scanText,
   showProposalToast,
-  __resetRegistryForTests: () => registry.clear(),
+  __resetRegistryForTests: () => {
+    registry.clear();
+    legacyOwners.clear();
+  },
 };
 
 export default SelfEvolvePlugin;

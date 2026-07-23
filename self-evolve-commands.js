@@ -27,6 +27,8 @@ const CONSENT_KEYS = Object.freeze({
   "cross-repo": "crossRepoAggregation",
 });
 const RESTART_NOTICE = "OpenCode must be restarted for the new mode to take full effect.";
+export const MAX_OBSERVATION_INSPECTION = 100;
+const DEFAULT_OBSERVATION_INSPECTION = 20;
 export const HEADLESS_APPROVAL_USAGE = "/self-evolve approve <proposal-id> --target-hash <sha256> --proposed-content-hash <sha256> --decision-version <integer> --nonce <one-use-nonce>";
 const SHA256_RE = /^[a-f0-9]{64}$/u;
 const NONCE_RE = /^[a-f0-9]{48}$/u;
@@ -129,8 +131,13 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
   if (verb === "inspect") {
     const subject = args[0]?.toLowerCase();
     if (subject === "observations" && args.length <= 2) {
-      if (args[1] !== undefined && (!/^\d+$/.test(args[1]) || Number(args[1]) < 1)) return error("Observation limit must be a positive integer.");
-      return parsed("inspect", { subject, limit: args[1] === undefined ? 20 : Number(args[1]) });
+      if (args[1] === undefined) return parsed("inspect", { subject, limit: DEFAULT_OBSERVATION_INSPECTION });
+      if (!/^[1-9]\d*$/u.test(args[1])) return error(`Observation limit must be a positive safe integer no greater than ${MAX_OBSERVATION_INSPECTION}.`);
+      const limit = Number(args[1]);
+      if (!Number.isSafeInteger(limit) || limit > MAX_OBSERVATION_INSPECTION) {
+        return error(`Observation limit must be a positive safe integer no greater than ${MAX_OBSERVATION_INSPECTION}.`);
+      }
+      return parsed("inspect", { subject, limit });
     }
     if (subject === "eligibility" && args.length <= 2) return parsed("inspect", { subject, clusterId: args[1] });
     return error("Usage: /self-evolve inspect observations [N] | inspect eligibility [clusterId]");

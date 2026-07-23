@@ -26,7 +26,7 @@ function skill(name, body = "# Guidance\nKeep deterministic checks bounded.\n") 
   return `---\nname: ${name}\ndescription: Handles deterministic workflow checks safely.\n---\n${body}`;
 }
 
-function fixture(t, { existing = true, quota = 8 } = {}) {
+function fixture(t, { existing = true, quota = 8, releaseLease } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-applier-"));
   t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
   const root = path.join(temp, "skills");
@@ -54,7 +54,8 @@ function fixture(t, { existing = true, quota = 8 } = {}) {
     appendRecord: (...args) => baseStore.appendRecord(...args),
     readRecords: (...args) => baseStore.readRecords(...args),
     acquireLease: (...args) => baseStore.acquireLease(...args),
-    releaseLease: (...args) => baseStore.releaseLease(...args),
+    releaseLease: (...args) => releaseLease ? releaseLease(baseStore, ...args) : baseStore.releaseLease(...args),
+    getLeaseStatus: (...args) => baseStore.getLeaseStatus(...args),
     getRecoveryPending: (...args) => baseStore.getRecoveryPending(...args),
     exportAll: (...args) => baseStore.exportAll(...args),
   });
@@ -360,6 +361,58 @@ test("successful apply writes one verified apply event", async (t) => {
   assert.equal(result.ok, true);
   assert.equal(verifiedApplies(f, p.id).length, 1);
   assert.equal(verifiedApplies(f, p.id)[0].payload.details.appliedHash, result.appliedHash);
+});
+
+test("successful apply reports degraded release and retains the claim for close retry", async (t) => {
+  let releases = 0;
+  const f = fixture(t, {
+    releaseLease(baseStore, ...args) {
+      releases += 1;
+      return releases === 1 ? { ok: false, reason: "simulated-release-failure" } : baseStore.releaseLease(...args);
+    },
+  });
+  const p = proposal(f);
+  const result = await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" });
+  assert.equal(result.ok, true);
+  assert.equal(result.leaseStatus, "degraded");
+  assert.equal(result.leaseWarning, "simulated-release-failure");
+  assert.equal(f.applier.getApplyLeaseStatus(p.id).held, true);
+  assert.equal(f.baseStore.readRecords("audit-event").some((record) => record.payload.kind === "lease"
+    && record.payload.details.state === "warning" && record.payload.details.operation === "apply"), true);
+  assert.deepEqual(f.applier.close(), { ok: true, unreleased: [] });
+  assert.equal(f.applier.getApplyLeaseStatus(p.id).held, false);
+});
+
+test("rollback and recovery preserve successful work while surfacing lease release failure", async (t) => {
+  let releases = 0;
+  const f = fixture(t, {
+    releaseLease(baseStore, ...args) {
+      releases += 1;
+      if (releases === 2 || releases === 4) return { ok: false, reason: "simulated-release-failure" };
+      return baseStore.releaseLease(...args);
+    },
+  });
+  const p = proposal(f);
+  assert.equal((await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" })).ok, true);
+  const rollback = f.applier.rollbackApplied({ proposalId: p.id });
+  assert.equal(rollback.ok, true);
+  assert.equal(rollback.leaseStatus, "degraded");
+  assert.equal(fs.readFileSync(f.target, "utf8"), f.before);
+  assert.equal(f.applier.close().ok, true);
+
+  const recoveryProposal = { ...p, id: "proposal-recovery-release" };
+  fs.writeFileSync(f.target, recoveryProposal.proposedContent);
+  appendPending(f, recoveryProposal, {
+    target: f.target,
+    priorHash: hashSkillContent(f.before),
+    appliedHash: recoveryProposal.proposedContentHash,
+    snapshot: "none",
+  });
+  const recoveryApplier = createApplier({ store: f.store, inventory: f.inventory, privacy: f.privacy, now: () => ++clock });
+  const recovered = recoveryApplier.recoverPending().find((item) => item.proposalId === recoveryProposal.id);
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.leaseStatus, "degraded");
+  assert.equal(recoveryApplier.close().ok, true);
 });
 
 test("recovery confirms an applied hash", (t) => {

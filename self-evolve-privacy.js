@@ -429,7 +429,7 @@ export function createPrivacyGuard({
       : scope === "project"
         ? [path.posix.join("self-evolve", projectFingerprint)]
         : [];
-    return { counts: result.counts, removedPaths: [...removedPaths, ...snapshotGlobs] };
+    return { ok: true, counts: result.counts, removedPaths: [...removedPaths, ...snapshotGlobs] };
   }
 
   function appendPrivacyAudit(action, details) {
