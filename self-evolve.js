@@ -4,6 +4,7 @@ import {
   buildTranscript,
   completeAnalysis,
   createRegistry,
+  isDurableLifecycleEvent,
   finishAnalysisFailure,
   finishAnalysisSuppressed,
   parseCommand,
@@ -1277,6 +1278,7 @@ async function SelfEvolvePlugin(ctx, options = {}) {
 
   if (durableEnabled && startupMode !== "manual") {
     hooks.event = async (input) => {
+      if (!isDurableLifecycleEvent(input)) return;
       const integration = settledRuntime?.integration;
       if (!integration) return;
       if (lateRecoveryCoordination && input && typeof input === "object") {

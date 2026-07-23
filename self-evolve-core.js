@@ -31,6 +31,19 @@ export const PLACEMENTS = Object.freeze(["global", "repo-local", "plugin-local",
 export const SELF_EVOLVE_SOURCE = "self-evolve-plugin";
 export const SELF_EVOLVE_ANALYZER_AGENT = "self-evolve-analyzer";
 export const PRIVACY_DISCLOSURE = "Privacy: a manual scan sends a bounded, redacted recent-session transcript to the configured model provider for analysis.";
+const DURABLE_LIFECYCLE_EVENT_TYPES = new Set([
+  "session.compacted",
+  "session.idle",
+  "session.status",
+]);
+
+export function durableEventBody(input) {
+  return input?.event && typeof input.event === "object" ? input.event : input;
+}
+
+export function isDurableLifecycleEvent(input) {
+  return DURABLE_LIFECYCLE_EVENT_TYPES.has(durableEventBody(input)?.type);
+}
 
 const VAGUE_TARGET_RE = /^(repo|repository|project|codebase|workspace|everything|various|misc|unknown|general|tooling)$/i;
 const UNSAFE_TARGET_RE = /(^|[/\\])(?:\.env(?:\.|$)|\.git(?:[/\\]|$)|\.opencode(?:[/\\]|$)|\.remember(?:[/\\]|$)|\.beads(?:[/\\]|$)|node_modules(?:[/\\]|$)|logs?(?:[/\\]|$)|\.npmrc(?:$|\s)|\.netrc(?:$|\s)|\.pypirc(?:$|\s)|id_(?:rsa|dsa|ecdsa|ed25519)(?:$|\s)|.*(?:secret|credential|token|private-key|private_key).*|.*\.(?:pem|key|p12|pfx|log)(?:$|\s))/i;

@@ -14,7 +14,9 @@ import {
   createRegistry,
   createSessionState,
   currentStatus,
+  durableEventBody,
   finishAnalysisSuppressed,
+  isDurableLifecycleEvent,
   isUnsafeTarget,
   helpText,
   parseCommand,
@@ -27,6 +29,27 @@ import {
   truncateText,
   validateAnalyzerPayload,
 } from "../self-evolve-core.js";
+
+test("durable event admission accepts only scheduler lifecycle events", () => {
+  for (const type of ["session.idle", "session.status", "session.compacted"]) {
+    const event = { type, properties: { sessionID: "admitted" } };
+    assert.equal(isDurableLifecycleEvent(event), true);
+    assert.equal(isDurableLifecycleEvent({ event }), true);
+    assert.equal(durableEventBody({ event }), event);
+  }
+  for (const type of [
+    "message.part.delta",
+    "message.part.updated",
+    "message.updated",
+    "permission.asked",
+    "tool.execute.before",
+    "tool.execute.after",
+  ]) {
+    assert.equal(isDurableLifecycleEvent({ type }), false);
+  }
+  assert.equal(isDurableLifecycleEvent(null), false);
+  assert.equal(isDurableLifecycleEvent({}), false);
+});
 
 function validPayload(overrides = {}) {
   const proposal = {

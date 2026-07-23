@@ -74,7 +74,39 @@ function harness(t, config = {}) {
   const rolloutOutcomes = config.rolloutOutcomes ?? 10;
   for (let index = 0; index < rolloutOutcomes; index += 1) seedOutcome(store, index);
 
-  const calls = { events: [], cycles: [], applies: [], approvals: [], rollbacks: [], cancelled: [], workResults: [], reservations: [], recoveries: 0, synthesisRecoveries: 0, published: [] };
+  const calls = {
+    events: [],
+    cycles: [],
+    applies: [],
+    approvals: [],
+    rollbacks: [],
+    cancelled: [],
+    workResults: [],
+    reservations: [],
+    recoveries: 0,
+    synthesisRecoveries: 0,
+    published: [],
+    settingsReads: 0,
+    recordReads: 0,
+    recordWrites: 0,
+  };
+  const integrationStore = config.instrumentStore
+    ? {
+        ...store,
+        getSettings(...args) {
+          calls.settingsReads += 1;
+          return store.getSettings(...args);
+        },
+        readRecords(...args) {
+          calls.recordReads += 1;
+          return store.readRecords(...args);
+        },
+        appendRecord(...args) {
+          calls.recordWrites += 1;
+          return store.appendRecord(...args);
+        },
+      }
+    : store;
   const privacy = config.privacy?.(store, root) ?? {
     exportScope: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
     purgeScope: () => ({ ok: true, counts: {} }),
@@ -167,7 +199,7 @@ function harness(t, config = {}) {
 
   const ctx = { client: { tui: { publish(value) { calls.published.push(value); } } } };
   const integration = createIntegration({
-    store,
+    store: integrationStore,
     inventory: {},
     privacy,
     schemas,
@@ -243,6 +275,126 @@ test("manual mode has no passive scheduler activity or writes", async (t) => {
   assert.deepEqual(result, { scheduled: false, reason: "manual-mode" });
   assert.equal(h.calls.events.length, 0);
   assert.equal(h.store.exportAll().records.length, before);
+});
+
+test("stream delta bursts perform zero durable integration work in every mode", async (t) => {
+  for (const mode of schemas.Mode.values) {
+    await t.test(mode, async (t) => {
+      let mailboxCalls = 0;
+      let mailboxTimers = 0;
+      const h = harness(t, {
+        instrumentStore: true,
+        enqueueOnEvent: false,
+        integrationOptions: {
+          stateRoot: true,
+          __testConsumeDecisionRequests: async () => {
+            mailboxCalls += 1;
+            return { ok: true, processed: [] };
+          },
+          __testSetMailboxInterval: () => {
+            mailboxTimers += 1;
+            return { unref() {} };
+          },
+        },
+      });
+      if (mode !== "manual") {
+        const changed = h.integration.__testBridge.setMode(mode, mode === "yolo" ? { confirmed: true, allowlist: [h.root] } : {});
+        assert.equal(changed.ok, true);
+      }
+      const baseline = {
+        settingsReads: h.calls.settingsReads,
+        recordReads: h.calls.recordReads,
+        recordWrites: h.calls.recordWrites,
+        events: h.calls.events.length,
+        published: h.calls.published.length,
+        mailboxCalls,
+        mailboxTimers,
+      };
+      const variants = [
+        { field: "text", delta: "token" },
+        { field: "reasoning", delta: "thought" },
+        { field: "tool", delta: "{\"partial\":" },
+      ];
+      for (let index = 0; index < 3_000; index += 1) {
+        const result = await h.integration.handleEvent({
+          type: "message.part.delta",
+          properties: { sessionID: `delta-${index % 3}`, ...variants[index % variants.length] },
+        });
+        assert.deepEqual(result, { scheduled: false, reason: "irrelevant-event" });
+      }
+      assert.deepEqual({
+        settingsReads: h.calls.settingsReads,
+        recordReads: h.calls.recordReads,
+        recordWrites: h.calls.recordWrites,
+        events: h.calls.events.length,
+        published: h.calls.published.length,
+        mailboxCalls,
+        mailboxTimers,
+      }, baseline);
+    });
+  }
+});
+
+test("admitted event bursts reuse a bounded routing settings snapshot", async (t) => {
+  const h = harness(t, {
+    instrumentStore: true,
+    enqueueOnEvent: false,
+    integrationOptions: { __testRoutingSettingsTtlMs: 250 },
+  });
+  assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+  const baseline = h.calls.settingsReads;
+  for (let index = 0; index < 100; index += 1) {
+    const result = await h.integration.handleEvent({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "status-burst", status: { type: index % 2 ? "busy" : "retry" } },
+      },
+    });
+    assert.equal(result.scheduled, true);
+  }
+  assert.equal(h.calls.settingsReads - baseline, 1);
+
+  const current = h.store.getSettings();
+  h.store.setGlobalSettings(schemas.makeGlobalSettings({
+    ...current.global,
+    mode: "manual",
+    updatedAt: current.global.updatedAt + 1,
+  }));
+  assert.equal((await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "cached" } })).scheduled, true);
+  for (let index = 0; index < 251; index += 1) h.now();
+  assert.deepEqual(
+    await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "refreshed" } }),
+    { scheduled: false, reason: "manual-mode" },
+  );
+});
+
+test("mailbox processing is single-flight with at most one pending rerun", async (t) => {
+  let active = 0;
+  let maxActive = 0;
+  let passes = 0;
+  let releaseFirst;
+  const firstPass = new Promise((resolve) => { releaseFirst = resolve; });
+  const h = harness(t, {
+    integrationOptions: {
+      stateRoot: true,
+      __testConsumeDecisionRequests: async () => {
+        passes += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (passes === 1) await firstPass;
+        active -= 1;
+        return { ok: true, processed: [] };
+      },
+    },
+  });
+  const first = h.integration.processMailbox();
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = h.integration.processMailbox();
+  const third = h.integration.processMailbox();
+  releaseFirst();
+  await Promise.all([first, second, third]);
+  assert.equal(maxActive, 1);
+  assert.equal(passes, 2);
 });
 
 test("only scheduler-originated cycles receive the passive provider reservation API", async (t) => {

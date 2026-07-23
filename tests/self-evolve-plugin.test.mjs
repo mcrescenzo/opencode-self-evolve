@@ -1419,6 +1419,15 @@ test("duplicate passive event delivery reaches a shared integration once", async
   ]);
   assert.equal(typeof first.event, "function");
   assert.equal(typeof second.event, "function");
+  const deltaVariants = ["text", "reasoning", "tool"].flatMap((field) =>
+    Array.from({ length: 1_000 }, (_, index) => ({
+      type: "message.part.delta",
+      properties: { sessionID: `delta-${index % 4}`, field, delta: `${field}-${index}` },
+    })));
+  for (const delta of deltaVariants) {
+    await Promise.all([first.event(delta), second.event({ event: delta })]);
+  }
+  assert.equal(eventCalls, 0);
   const event = { type: "session.idle", properties: { sessionID: "same-event" } };
   await Promise.all([first.event(event), second.event(event)]);
   assert.equal(eventCalls, 1);

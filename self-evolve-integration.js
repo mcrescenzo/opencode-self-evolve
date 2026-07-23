@@ -6,6 +6,7 @@ import {
   consumeDecisionRequests,
   publishControlState,
 } from "./self-evolve-bridge.js";
+import { isDurableLifecycleEvent } from "./self-evolve-core.js";
 import { stateRootIdentity } from "./self-evolve-state-root.js";
 
 const RESTART_REMINDER = "OpenCode must be restarted for the new skill content to load in existing sessions; new sessions will pick it up automatically.";
@@ -23,6 +24,7 @@ const HIDDEN_ANALYZER_AGENTS = new Set([
 ]);
 const TERMINAL_SESSION_STATES = new Set(["aborted", "cancelled", "completed", "error", "failed", "idle"]);
 const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const ROUTING_SETTINGS_TTL_MS = 250;
 
 export const ROLLOUT_GATES = DEFAULT_ROLLOUT_GATES;
 
@@ -152,6 +154,7 @@ export function createIntegration({
   let terminalPurge = false;
   let mailboxTimer;
   let mailboxPolling = false;
+  let mailboxPending = false;
   let mailboxTask;
   let hostRecoveryTask;
   let hostRecoveryReport;
@@ -161,18 +164,36 @@ export function createIntegration({
   let controlProjectionKey;
   let controlProjection;
   let controlProjectionRefreshAt = 0;
+  let routingSettingsSnapshot;
+  let routingSettingsRefreshAt = 0;
   const setRetentionInterval = options.__testSetInterval ?? setInterval;
   const clearRetentionInterval = options.__testClearInterval ?? clearInterval;
   const retentionIntervalMs = options.__testRetentionIntervalMs ?? RETENTION_INTERVAL_MS;
   const retainStore = options.__testRunStoreRetention ?? ((timestamp) => store.retain(timestamp));
+  const setMailboxInterval = options.__testSetMailboxInterval ?? setInterval;
+  const clearMailboxInterval = options.__testClearMailboxInterval ?? clearInterval;
+  const consumeMailbox = options.__testConsumeDecisionRequests ?? consumeDecisionRequests;
+  const routingSettingsTtlMs = options.__testRoutingSettingsTtlMs ?? ROUTING_SETTINGS_TTL_MS;
 
-  function settings() {
+  function invalidateRoutingSettings() {
+    routingSettingsSnapshot = undefined;
+    routingSettingsRefreshAt = 0;
+  }
+
+  function settings({ routing = false } = {}) {
     if (terminalPurge || store.isTerminal?.()) return null;
+    const timestamp = routing ? now() : 0;
+    if (routing && routingSettingsSnapshot && timestamp < routingSettingsRefreshAt) return routingSettingsSnapshot;
     try {
       const value = store.getSettings();
       if (!value?.global || !value?.repo) throw new Error("corrupt-settings");
+      if (routing) {
+        routingSettingsSnapshot = value;
+        routingSettingsRefreshAt = timestamp + routingSettingsTtlMs;
+      }
       return value;
     } catch (error) {
+      invalidateRoutingSettings();
       corrupt = true;
       lastError = errorReason(error);
       return null;
@@ -205,8 +226,7 @@ export function createIntegration({
     };
   }
 
-  function resolveEffectiveMode(projectFingerprint) {
-    const current = settings();
+  function resolveEffectiveMode(projectFingerprint, current = settings()) {
     const mode = schemas.resolveMode(current?.global?.mode ?? "manual", current?.repo?.mode ?? "inherit", modeOverrides(current, projectFingerprint));
     return schemas.Mode?.values?.includes(mode) ? mode : "manual";
   }
@@ -369,8 +389,8 @@ export function createIntegration({
     Promise.resolve(method.call(ctx.client.tui, { type, properties })).catch((error) => { lastError = errorReason(error); });
   }
 
-  function syncSchedulerMode(projectFingerprint, reason = "settings-refresh") {
-    const mode = resolveEffectiveMode(projectFingerprint);
+  function syncSchedulerMode(projectFingerprint, reason = "settings-refresh", current) {
+    const mode = resolveEffectiveMode(projectFingerprint, current);
     schedulerInstance.setMode?.(mode, reason);
     return mode;
   }
@@ -625,6 +645,7 @@ export function createIntegration({
     }, { expectedGlobalUpdatedAt: request.settingsUpdatedAt });
     result = saved.ok ? { ok: true } : { ok: false, reason: saved.reason ?? "control-rejected" };
     if (saved.ok) {
+      invalidateRoutingSettings();
       for (const event of transitionEvents) store.appendRecord(schemas.wrapRecord("audit-event", event, event.timestamp));
       const effectiveMode = syncSchedulerMode(request.projectFingerprint, `control-${request.action}`);
       publish("self-evolve.settings", { action: request.action, effectiveMode });
@@ -700,35 +721,49 @@ export function createIntegration({
     return result;
   }
 
+  async function runMailboxPass() {
+    try {
+      issueBridgeNonces();
+      let controlStateError;
+      try { issueControlGrant(); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
+      const projectFingerprint = settings()?.repo?.projectFingerprint;
+      if (!projectFingerprint) return { ok: false, reason: "corrupt-settings", processed: [] };
+      const consumed = await consumeMailbox({
+        stateRoot: options.stateRoot,
+        projectFingerprint,
+        now,
+        validateAndDecide: validateMailboxDecision,
+        validateAndControl: validateMailboxControl,
+        maxRequests: options.mailboxMaxRequests,
+      });
+      try { issueControlGrant(); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
+      return controlStateError ? { ...consumed, controlStateError } : consumed;
+    } catch (error) {
+      lastError = errorReason(error);
+      return { ok: false, reason: lastError, processed: [] };
+    }
+  }
+
   async function processMailbox() {
-    if (!options.stateRoot || closed || terminalPurge || mailboxPolling) return { ok: false, reason: terminalPurge ? "restart-required-after-purge-all" : closed ? "integration-closed" : "mailbox-unavailable", processed: [] };
+    if (!options.stateRoot || closed || terminalPurge) return { ok: false, reason: terminalPurge ? "restart-required-after-purge-all" : closed ? "integration-closed" : "mailbox-unavailable", processed: [] };
+    if (mailboxPolling) {
+      mailboxPending = true;
+      return mailboxTask;
+    }
     mailboxPolling = true;
     mailboxTask = (async () => {
-      try {
-        issueBridgeNonces();
-        let controlStateError;
-        try { issueControlGrant(); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
-        const projectFingerprint = settings()?.repo?.projectFingerprint;
-        if (!projectFingerprint) return { ok: false, reason: "corrupt-settings", processed: [] };
-        const consumed = await consumeDecisionRequests({
-          stateRoot: options.stateRoot,
-          projectFingerprint,
-          now,
-          validateAndDecide: validateMailboxDecision,
-          validateAndControl: validateMailboxControl,
-          maxRequests: options.mailboxMaxRequests,
-        });
-        try { issueControlGrant(); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
-        return controlStateError ? { ...consumed, controlStateError } : consumed;
-      } catch (error) {
-        lastError = errorReason(error);
-        return { ok: false, reason: lastError, processed: [] };
-      }
+      let result;
+      do {
+        mailboxPending = false;
+        result = await runMailboxPass();
+      } while (mailboxPending && !closed && !terminalPurge);
+      return result;
     })();
     try {
       return await mailboxTask;
     } finally {
       mailboxPolling = false;
+      mailboxPending = false;
       mailboxTask = undefined;
     }
   }
@@ -736,7 +771,7 @@ export function createIntegration({
   function startMailboxPolling() {
     if (!options.stateRoot || mailboxTimer || closed || terminalPurge) return;
     const intervalMs = Math.min(60_000, Math.max(25, Number.isFinite(options.mailboxPollMs) ? options.mailboxPollMs : 500));
-    mailboxTimer = setInterval(() => { void processMailbox(); }, intervalMs);
+    mailboxTimer = setMailboxInterval(() => { void processMailbox(); }, intervalMs);
     mailboxTimer.unref?.();
   }
 
@@ -860,10 +895,15 @@ export function createIntegration({
 
   async function handleEvent(event) {
     if (terminalPurge) return { scheduled: false, reason: "restart-required-after-purge-all" };
-    void processMailbox();
-    const projectFingerprint = event?.properties?.projectFingerprint ?? settings()?.repo?.projectFingerprint;
-    const mode = syncSchedulerMode(projectFingerprint, "event-refresh");
-    if (mode === "manual") return { scheduled: false, reason: "manual-mode" };
+    if (!isDurableLifecycleEvent(event)) return { scheduled: false, reason: "irrelevant-event" };
+    const current = settings({ routing: true });
+    const body = event?.event && typeof event.event === "object" ? event.event : event;
+    const projectFingerprint = body?.properties?.projectFingerprint ?? current?.repo?.projectFingerprint;
+    const mode = syncSchedulerMode(projectFingerprint, "event-refresh", current);
+    if (mode === "manual") {
+      invalidateRoutingSettings();
+      return { scheduled: false, reason: "manual-mode" };
+    }
     await schedulerInstance.handleEvent(event);
     return { scheduled: true, mode };
   }
@@ -979,7 +1019,10 @@ export function createIntegration({
     } else {
       result = commandPolicy.execute(command, { projectFingerprint: input?.projectFingerprint ?? settings()?.repo?.projectFingerprint });
       if (result.terminalPurge) stopAfterPurgeAll();
-      else syncSchedulerMode(input?.projectFingerprint, `command-${command.verb}`);
+      else {
+        invalidateRoutingSettings();
+        syncSchedulerMode(input?.projectFingerprint, `command-${command.verb}`);
+      }
     }
     if (output && typeof output === "object") output.responseText = result.responseText;
     if (!terminalPurge) await processMailbox();
@@ -988,7 +1031,7 @@ export function createIntegration({
 
   function stopAfterPurgeAll() {
     terminalPurge = true;
-    clearInterval(mailboxTimer);
+    clearMailboxInterval(mailboxTimer);
     mailboxTimer = undefined;
     clearRetentionInterval(retentionTimer);
     retentionTimer = undefined;
@@ -1012,6 +1055,7 @@ export function createIntegration({
       return request.scope === "repo" ? { repo: transitioned.state.repo } : { global: transitioned.state.global };
     });
     if (!saved.ok) return { ok: false, reason: saved.reason };
+    invalidateRoutingSettings();
     for (const event of transitioned.events) store.appendRecord(schemas.wrapRecord("audit-event", event, event.timestamp));
     const effectiveMode = syncSchedulerMode(projectFingerprint, "mode-change");
     if (effectiveMode === "manual") {
@@ -1108,6 +1152,7 @@ export function createIntegration({
     });
     if (!saved.ok) return { ok: false, reason: saved.reason };
     runtimeKillSwitch = true;
+    invalidateRoutingSettings();
     for (const event of downgrade.events) store.appendRecord(schemas.wrapRecord("audit-event", event, event.timestamp));
     setModeForDowngrade("kill-switch");
     publish("self-evolve.settings", { action: "kill-switch", enabled: true });
@@ -1132,6 +1177,7 @@ export function createIntegration({
       return schemas.makeGlobalSettings({ ...global, killSwitchActive: false, updatedAt: now() });
     });
     if (!saved.ok) return { ok: false, reason: saved.reason };
+    invalidateRoutingSettings();
     const effectiveMode = syncSchedulerMode(projectFingerprint, "kill-switch-cleared");
     const auditEvent = appendAudit("kill-switch", { action: "off", reason: String(reason), storedMode: saved.settings.global.mode, effectiveMode });
     publish("self-evolve.settings", { action: "kill-switch", enabled: false, effectiveMode });
@@ -1208,7 +1254,7 @@ export function createIntegration({
     if (closed) return;
     closed = true;
     hostRecoveryController?.abort();
-    clearInterval(mailboxTimer);
+    clearMailboxInterval(mailboxTimer);
     mailboxTimer = undefined;
     clearRetentionInterval(retentionTimer);
     retentionTimer = undefined;
