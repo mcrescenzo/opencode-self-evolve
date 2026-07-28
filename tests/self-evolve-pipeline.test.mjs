@@ -151,6 +151,9 @@ function fixture(t, config = {}) {
     const applier = {
       applyProposal: async (args) => {
         calls.apply.push(args);
+        if (config.applyResult !== undefined) {
+          return typeof config.applyResult === "function" ? config.applyResult(args) : config.applyResult;
+        }
         return await realApplier.applyProposal(args);
       },
       rollbackApplied: (args) => realApplier.rollbackApplied(args),
@@ -404,6 +407,92 @@ test("real mocked synthesis and critic history alone crosses the yolo threshold"
   const duplicate = await integration.runEvolutionCycle({ sessionID: secondSessionID, projectFingerprint: PROJECT, scopeFingerprint: SCOPE, trigger: "replay", options: cycleOptions });
   assert.match(duplicate.responseText, /already processed/u);
   assert.equal(f.runtime.store.readRecords("audit-event").filter((record) => record.payload.details.action === "synthesis-outcome").length, 2);
+});
+
+test("a terminal yolo apply failure is durably failed closed before the cycle resolves", async (t) => {
+  const f = fixture(t, { applyResult: { ok: false, reason: "stale-hash" } });
+  const scheduler = { createScheduler: () => ({ setMode() {}, getCircuitBreaker: () => ({ open: false }), handleEvent() {}, recordWorkResult() {}, dispose() {} }) };
+  const integration = createIntegration({
+    store: f.runtime.store,
+    inventory: inventoryModule,
+    privacy: f.runtime.privacy,
+    schemas: schemasModule,
+    observation: observationModule,
+    synthesisModule,
+    applier: f.runtime.applier,
+    commands: commandModule,
+    pipeline: { createPipeline },
+    scheduler,
+    options: { ctx: f.ctx, rolloutGates: { yoloEnablementThreshold: { minSynthesesObserved: 1, minSuccessRate: 1 } } },
+    now: () => 2_100_150_000_000 + f.calls.prompt.length,
+  });
+  integration.__testBridge.setMode("yolo", { confirmed: true, allowlist: f.runtime.roots });
+  const cycleOptions = { inventoryRecords: f.runtime.records, targetSkill: f.runtime.records[0], currentContent: CURRENT };
+  let result;
+  for (let index = 1; index <= 3; index += 1) {
+    const sessionID = `terminal-yolo-${index}`;
+    f.messages.set(sessionID, commandMessages("/terminal-yolo"));
+    result = await integration.runEvolutionCycle({ sessionID, projectFingerprint: PROJECT, scopeFingerprint: SCOPE, trigger: "test", options: cycleOptions });
+  }
+
+  assert.equal(result.result, "failed-closed");
+  assert.equal(result.reason, "stale-hash");
+  assert.equal(result.proposal.state, "failed-closed");
+  assert.equal(f.calls.apply.length, 1);
+  assert.equal(fs.readFileSync(f.skillPath, "utf8"), CURRENT);
+  const proposal = f.runtime.store.readRecords("proposal").map((record) => record.payload).findLast((item) => item.id === result.proposal.id);
+  assert.equal(proposal.state, "failed-closed");
+  assert.equal(f.runtime.store.readRecords("decision").filter((record) => record.payload.proposalId === proposal.id && record.payload.newState === "failed-closed").length, 1);
+  assert.equal(f.runtime.store.readRecords("proposal-content").filter((record) => record.payload.proposalId === proposal.id).length, 0);
+  assert.equal(f.runtime.store.readRecords("audit-event").some((record) =>
+    record.payload.proposalId === proposal.id
+    && record.payload.kind === "apply"
+    && record.payload.details?.["readback-verified"] === true), false);
+
+  const beforeRecovery = f.runtime.store.readRecords("decision").filter((record) => record.payload.proposalId === proposal.id).length;
+  await integration.boot({ recoverHostSessions: false });
+  assert.equal(f.runtime.store.readRecords("decision").filter((record) => record.payload.proposalId === proposal.id).length, beforeRecovery);
+  assert.equal(f.calls.apply.length, 1, "boot recovery does not retry a terminal failed-closed application");
+  await integration.shutdown();
+});
+
+test("yolo lease contention remains a recoverable approved deferral", async (t) => {
+  const f = fixture(t, { applyResult: { ok: false, reason: "lease-busy", deferred: true } });
+  const scheduler = { createScheduler: () => ({ setMode() {}, getCircuitBreaker: () => ({ open: false }), handleEvent() {}, recordWorkResult() {}, dispose() {} }) };
+  const integration = createIntegration({
+    store: f.runtime.store,
+    inventory: inventoryModule,
+    privacy: f.runtime.privacy,
+    schemas: schemasModule,
+    observation: observationModule,
+    synthesisModule,
+    applier: f.runtime.applier,
+    commands: commandModule,
+    pipeline: { createPipeline },
+    scheduler,
+    options: { ctx: f.ctx, rolloutGates: { yoloEnablementThreshold: { minSynthesesObserved: 1, minSuccessRate: 1 } } },
+    now: () => 2_100_175_000_000 + f.calls.prompt.length,
+  });
+  integration.__testBridge.setMode("yolo", { confirmed: true, allowlist: f.runtime.roots });
+  const cycleOptions = { inventoryRecords: f.runtime.records, targetSkill: f.runtime.records[0], currentContent: CURRENT };
+  let result;
+  for (let index = 1; index <= 3; index += 1) {
+    const sessionID = `deferred-yolo-${index}`;
+    f.messages.set(sessionID, commandMessages("/deferred-yolo"));
+    result = await integration.runEvolutionCycle({ sessionID, projectFingerprint: PROJECT, scopeFingerprint: SCOPE, trigger: "test", options: cycleOptions });
+  }
+
+  assert.equal(result.result, "deferred");
+  assert.equal(result.deferred, true);
+  assert.equal(result.reason, "lease-busy");
+  assert.equal(result.proposal.state, "approved");
+  assert.equal(f.calls.apply.length, 1);
+  assert.equal(fs.readFileSync(f.skillPath, "utf8"), CURRENT);
+  const proposal = f.runtime.store.readRecords("proposal").map((record) => record.payload).findLast((item) => item.id === result.proposal.id);
+  assert.equal(proposal.state, "approved");
+  assert.equal(f.runtime.store.readRecords("decision").some((record) => record.payload.proposalId === proposal.id && record.payload.newState === "failed-closed"), false);
+  assert.ok(f.runtime.store.readRecords("proposal-content").some((record) => record.payload.proposalId === proposal.id));
+  await integration.shutdown();
 });
 
 test("proposal-content persistence failure records one failed outcome and grants no yolo authority", async (t) => {

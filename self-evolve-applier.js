@@ -78,8 +78,13 @@ function writeTemp(target, content, nonce) {
   let descriptor;
   try {
     descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, FILE_MODE);
-    fs.writeFileSync(descriptor, content);
-    fs.fsyncSync(descriptor);
+    try {
+      fs.writeFileSync(descriptor, content);
+      fs.fsyncSync(descriptor);
+    } catch (writeError) {
+      try { fs.rmSync(temporary, { force: true }); } catch {}
+      throw writeError;
+    }
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }

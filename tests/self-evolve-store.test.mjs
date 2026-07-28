@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { appendFileSync, chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,16 +47,23 @@ const TRANSACTION_CRASH_CHILD = fileURLToPath(new URL("./fixtures/decision-trans
 
 function runChild(root, project, operation, value) {
   return new Promise((resolve, reject) => {
-    const args = [CHILD, root, project, operation, ...(value === undefined ? [] : [String(value)])];
-    const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
+    const resultPath = path.join(root, `.store-child-result-${process.pid}-${randomUUID()}.json`);
+    const args = [CHILD, root, project, operation, resultPath, ...(value === undefined ? [] : [String(value)])];
+    const child = spawn(process.execPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
     child.on("close", (code) => {
       if (code !== 0) reject(new Error(`child-exit-${code}:${stderr}`));
-      else resolve(JSON.parse(stdout));
+      else {
+        try {
+          const result = JSON.parse(readFileSync(resultPath, "utf8"));
+          rmSync(resultPath, { force: true });
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      }
     });
   });
 }
@@ -198,6 +206,20 @@ test("duplicate envelope IDs are idempotent", () => {
   store.close();
 });
 
+test("append source reuse preserves the prior canonical bytes and atomic JSONL shape", () => {
+  const { store } = fixture();
+  const first = wrapRecord("observation", observation(1_000, H("1")), 1_000);
+  const second = wrapRecord("observation", observation(1_001, H("3")), 1_001);
+  assert.equal(store.appendRecord(first).ok, true);
+  const prior = store.readRecords("observation");
+  const expected = [...prior, second].map((record) => JSON.stringify(record)).join("\n") + "\n";
+
+  assert.equal(store.appendRecord(second).ok, true);
+
+  assert.equal(readFileSync(path.join(store.stateDir, "observations.jsonl"), "utf8"), expected);
+  store.close();
+});
+
 test("compare-and-swap appends a new version and rejects stale state", () => {
   const { store } = fixture();
   store.appendRecord(wrapRecord("proposal", proposal(), 1_000));
@@ -307,6 +329,25 @@ test("unreadable lease files are distinct from absent or corrupt leases", { skip
   store.close();
 });
 
+test("isLeaseHeld reclaims an expired pidless lease instead of leaving it on disk", () => {
+  const { store } = fixture(2_000);
+  const leaseFile = path.join(store.stateDir, "leases", "stale.lock");
+  writeFileSync(leaseFile, JSON.stringify({ actor: "ghost", acquiredAt: 1_000, expiresAt: 1_010, nonce: "ghost-nonce" }), { mode: 0o600 });
+  assert.equal(existsSync(leaseFile), true);
+  assert.equal(store.isLeaseHeld("stale", 5_000), false);
+  assert.equal(existsSync(leaseFile), false, "an expired reclaimable lease is removed by isLeaseHeld");
+  store.close();
+});
+
+test("acquireLease rejects an empty or over-long actor without writing a corrupt lease", () => {
+  const { store } = fixture(2_000);
+  assert.deepEqual(store.acquireLease("empty", { ttlMs: 100, actor: "" }), { ok: false, reason: "invalid-actor" });
+  assert.deepEqual(store.acquireLease("long", { ttlMs: 100, actor: "x".repeat(257) }), { ok: false, reason: "invalid-actor" });
+  assert.equal(store.getLeaseStatus("empty").state, "absent");
+  assert.equal(store.getLeaseStatus("long").state, "absent");
+  store.close();
+});
+
 test("retention removes old observations and preserves proposals, decisions, and audit", () => {
   const day = 86_400_000;
   const now = 40 * day;
@@ -322,6 +363,54 @@ test("retention removes old observations and preserves proposals, decisions, and
   assert.equal(store.readRecords("proposal").length, 1);
   assert.equal(store.readRecords("decision").length, 1);
   assert.equal(store.readRecords("audit-event").length, 1);
+  store.close();
+});
+
+test("retention unconditionally drains only session-status busy diagnostics", () => {
+  const day = 86_400_000;
+  const now = 40 * day;
+  const { store } = fixture(now);
+  const appendSchedulerAudit = (action, status, index) => {
+    const details = { action, sessionIDHash: H(String(index)), status, epoch: index };
+    const event = makeAuditEvent({
+      id: hashContent(`${action}:${status}:${index}`),
+      kind: "decision",
+      actor: "self-evolve-scheduler",
+      timestamp: now - day,
+      payloadHash: hashContent(JSON.stringify(details)),
+      details,
+    });
+    assert.equal(store.appendRecord(wrapRecord("audit-event", event, now - day)).ok, true);
+  };
+  for (let index = 1; index <= 3; index += 1) appendSchedulerAudit("session-status", "busy", index);
+  appendSchedulerAudit("session-status", "retry", 4);
+  appendSchedulerAudit("scheduler-budget", "busy", 5);
+
+  const removed = store.retain(now);
+  const remaining = store.readRecords("audit-event").map((record) => record.payload.details);
+  assert.equal(removed.audit, 3);
+  assert.deepEqual(remaining.map(({ action, status }) => ({ action, status })), [
+    { action: "session-status", status: "retry" },
+    { action: "scheduler-budget", status: "busy" },
+  ]);
+  store.close();
+});
+
+test("retention leaves record files untouched when no record is pruned", () => {
+  const day = 86_400_000;
+  const now = 40 * day;
+  const { store } = fixture(now);
+  store.appendRecord(auditEnvelope("applied", now - day));
+  const auditPath = path.join(store.stateDir, "audit.jsonl");
+  const before = statSync(auditPath);
+  const temporaryBefore = readdirSync(store.stateDir).filter((name) => name.endsWith(".tmp"));
+
+  assert.equal(store.retain(now).audit, 0);
+
+  const after = statSync(auditPath);
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.mtimeMs, before.mtimeMs);
+  assert.deepEqual(readdirSync(store.stateDir).filter((name) => name.endsWith(".tmp")), temporaryBefore);
   store.close();
 });
 

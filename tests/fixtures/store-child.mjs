@@ -11,14 +11,18 @@ import {
 } from "../../self-evolve-schemas.js";
 import { hashContent, openStore } from "../../self-evolve-store.js";
 
-const [root, projectFingerprint, operation, value = "child"] = process.argv.slice(2);
+const [root, projectFingerprint, operation, resultPath, value = "child"] = process.argv.slice(2);
 const now = 10_000;
+
+function writeResult(valueToWrite) {
+  writeFileSync(resultPath, `${JSON.stringify(valueToWrite)}\n`, { encoding: "utf8", mode: 0o600 });
+}
 
 if (operation === "crash-lock") {
   const lockPath = path.join(root, ".self-evolve-mutation.lock");
   writeFileSync(lockPath, JSON.stringify({ pid: process.pid, nonce: "crashed-child", acquiredAt: 0 }), { mode: 0o600, flag: "wx" });
   utimesSync(lockPath, new Date(0), new Date(0));
-  process.stdout.write(JSON.stringify({ ok: true, pid: process.pid }));
+  writeResult({ ok: true, pid: process.pid });
   process.exit(0);
 }
 
@@ -133,4 +137,4 @@ if (operation === "append") {
 }
 
 store.close();
-process.stdout.write(JSON.stringify(result));
+writeResult(result);

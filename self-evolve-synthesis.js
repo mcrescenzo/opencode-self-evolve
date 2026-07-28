@@ -200,6 +200,7 @@ export function parseSynthesizerOutput(rawJson, { cluster, targetSkill, inventor
     }
     if (typeof mapping.claim !== "string" || !mapping.claim.trim()) errors.push("empty-evidence-claim");
     if (!Array.isArray(mapping.observationIds) || mapping.observationIds.length === 0 || mapping.observationIds.some((id) => !observationIds.has(id))) errors.push("unknown-observation-id");
+    else if (new Set(mapping.observationIds).size !== mapping.observationIds.length) errors.push("duplicate-observation-id");
   }
 
   if (typeof result.proposedContent === "string") {

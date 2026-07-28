@@ -136,6 +136,34 @@ test("two concurrent applications are at most once", async (t) => {
   assert.equal(b.reason, "lease-busy");
 });
 
+test("a failed content write cleans up the exclusive temp file instead of leaking it", async (t) => {
+  const f = fixture(t);
+  const p = proposal(f);
+  const realOpen = fs.openSync;
+  const realWrite = fs.writeFileSync;
+  const tempFds = new Set();
+  fs.openSync = (target, ...args) => {
+    const fd = realOpen(target, ...args);
+    if (typeof target === "string" && target.includes(".self-evolve-tmp-")) tempFds.add(fd);
+    return fd;
+  };
+  fs.writeFileSync = (fdOrPath, ...args) => {
+    if (tempFds.has(fdOrPath)) throw new Error("injected-write-failure");
+    return realWrite(fdOrPath, ...args);
+  };
+  let result;
+  try {
+    result = await f.applier.applyProposal({ proposal: p, decision: decision(p), actor: "reviewer", mode: "auto", headless: false });
+  } finally {
+    fs.openSync = realOpen;
+    fs.writeFileSync = realWrite;
+  }
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /injected-write-failure/u);
+  const leaked = fs.readdirSync(path.dirname(f.target)).filter((name) => name.includes(".self-evolve-tmp-"));
+  assert.deepEqual(leaked, [], "no exclusive temp file leaks after a write failure");
+});
+
 test("stale target hash is rejected and audited", async (t) => {
   const f = fixture(t);
   const p = proposal(f);

@@ -314,9 +314,10 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   function releaseWorkLease(workItem) {
     const key = workItem?._leaseKey ?? leaseKey(workItem.projectFingerprint, workItem.sessionID);
     const nonce = workItem?.leaseNonce;
-    if (!nonce || !heldLeases.has(key)) return;
-    try { store.releaseLease(key, nonce); } catch (error) { log({ level: "warn", action: "release-lease", error: String(error?.message ?? error) }); }
-    heldLeases.delete(key);
+    if (!nonce || heldLeases.get(key) !== nonce) return;
+    let result;
+    try { result = store.releaseLease(key, nonce); } catch (error) { log({ level: "warn", action: "release-lease", error: String(error?.message ?? error) }); return; }
+    if (result?.ok || result?.reason === "lease-not-found") heldLeases.delete(key);
   }
 
   async function reserveEpisode(state) {
@@ -396,13 +397,15 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     audit("scheduler-budget", { budgetType: "synthesis", rootSessionIDHash: hashSessionLineage(state.rootSessionID) }, timestamp);
 
     queueMicrotask(() => {
-      try {
-        Promise.resolve(enqueueWork(workItem)).catch((error) => {
-          recordWorkResult(workItem, { ok: false, error: String(error?.message ?? error) });
+      void Promise.resolve()
+        .then(() => enqueueWork(workItem))
+        .then(
+          (result) => recordWorkResult(workItem, result),
+          (error) => recordWorkResult(workItem, { ok: false, error: String(error?.message ?? error) }),
+        )
+        .catch((error) => {
+          log({ level: "warn", action: "settle-work", error: String(error?.message ?? error) });
         });
-      } catch (error) {
-        recordWorkResult(workItem, { ok: false, error: String(error?.message ?? error) });
-      }
     });
   }
 
@@ -443,7 +446,9 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     }
     if (status !== "idle") {
       clearTimer(state);
-      audit("session-status", { sessionIDHash: hashSessionLineage(sessionID), status: String(status), epoch }, timestamp);
+      if (status !== "busy") {
+        audit("session-status", { sessionIDHash: hashSessionLineage(sessionID), status: String(status), epoch }, timestamp);
+      }
       return;
     }
     const observedAt = eventTimestamp(event);
@@ -508,17 +513,19 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   }
 
   function recordWorkResult(workItem, result = {}) {
+    const sessionID = workItem?.sessionID;
+    const owner = sessionID ? inFlight.get(sessionID) : undefined;
+    if (!owner) return { accepted: false, stale: false, duplicate: true };
+    if (owner.leaseNonce !== workItem.leaseNonce) return { accepted: false, stale: true, superseded: true };
+
     const timestamp = now();
-    const state = sessions.get(workItem?.sessionID);
-    const stale = !workItem
-      || timestamp - workItem.scheduledAt > workItemTtlMs
+    const state = sessions.get(sessionID);
+    const stale = timestamp - workItem.scheduledAt > workItemTtlMs
       || (state && workItem.epoch !== state.epoch);
-    releaseWorkLease(workItem ?? {});
-    if (workItem?.sessionID && inFlight.get(workItem.sessionID)?.leaseNonce === workItem.leaseNonce) {
-      inFlight.delete(workItem.sessionID);
-    }
+    releaseWorkLease(workItem);
+    inFlight.delete(sessionID);
     if (stale) {
-      audit("stale-work-result", { sessionIDHash: workItem?.sessionID ? hashSessionLineage(workItem.sessionID) : UNKNOWN_SESSION_LINEAGE_HASH }, timestamp);
+      audit("stale-work-result", { sessionIDHash: hashSessionLineage(sessionID) }, timestamp);
       return { accepted: false, stale: true };
     }
 

@@ -218,6 +218,12 @@ Two independent gates, both mandatory:
   3. The applier successfully acquires the per-target lease.
 - Unknown or unapproved scopes **downgrade** to a pending proposal in the
   review inbox (same as `auto`).
+- A pre-approval authority denial remains a pending review proposal. After the
+  internal yolo approval is durably committed, live-owner lease contention is
+  an explicit recoverable deferral and preserves the approved proposal. Every
+  other missing, malformed, or failed apply outcome transitions that proposal
+  to visible `failed-closed` before the cycle resolves; it must never be
+  reported as proposal-ready.
 - Yolo may operate headlessly, but the **next TUI session must surface the
   audit result and a rollback option**. Rollback is allowed only while the
   current on-disk hash still equals the plugin-applied hash recorded in the
@@ -366,7 +372,14 @@ One npm package exposes two target-only modules:
   lock, then idempotently commits the exact next proposal and decision records.
   It alone writes the decision, proposal,
   audit, skill mutation, and a bounded `0600` response keyed by request ID.
-  Request replay or duplicate consumers produce at most one transition/apply.
+  A completion audit binds the complete normalized request with a
+  domain-separated digest, its nonce hash, and the bounded semantic outcome.
+  If response publication or request removal fails after that completion, only
+  the identical envelope may reconstruct and republish the stored outcome,
+  without rerunning a transition, apply, settings mutation, or completion
+  audit. An altered same-ID envelope, a different ID reusing the nonce, or a
+  legacy completion without the digest fails closed. Request replay or
+  duplicate consumers therefore produce at most one transition/apply.
 - Decision protocol: `(proposalID, targetHash, proposedContentHash,
   decisionVersion, actor, timestamp, nonce, priorState, newState)` with
   compare-and-swap on `priorState`. The intent binds the prior proposal envelope
@@ -474,6 +487,17 @@ Redaction is **not** a secrecy guarantee. The plugin must disclose this in
   decision/control bridge TTL and the shorter operational TUI-report TTL are fixed safety bounds. Retention sweep runs at process startup and once per day
   while the process lives. Mailbox polling may remove already-expired bridge
   files sooner.
+- One narrow scheduler-diagnostic exception is independent of the durable
+  cutoff: audit events whose `details.action === "session-status"` and
+  `details.status === "busy"` are not written durably, and retention
+  unconditionally removes any backlog of those exact records. Section 3.3
+  already excludes diagnostic audit names from authority, and section 7's
+  security audit fields describe decision-protocol records rather than this
+  content-free busy heartbeat. This exception does not affect
+  `session-status`/`retry`, `session-compacted`, `late-session-cleanup`, or any
+  decision, apply, rollback, nonce, or CAS audit record; those retain the normal
+  three-times-`retentionDays` window and the security-load-bearing decision
+  protocol in section 5.2 is unchanged.
 - Record age uses the class's canonical event timestamp (for example,
   observation `createdAt`, receipt/cluster `lastSeenAt`, proposal
   `synthesizedAt`, decision/audit `timestamp`, rollback `rolledBackAt`, and
@@ -575,6 +599,12 @@ an overnight range wraps across midnight.
   - In-flight apply completes only if it has already acquired the lease and
     written the temp file; otherwise it aborts.
   - All downgrades append an audit event.
+- **Scheduled work settlement**: the scheduler owns normal fulfilled and
+  rejected settlement. It accepts at most one result for the current
+  `(sessionID, leaseNonce)` owner before releasing the episode lease, updating
+  backoff/breaker state, or scheduling a continuation. Early downgrade may
+  settle that owner; its later promise result is then a side-effect-free
+  duplicate. An older lease can never settle or release newer work.
 - **Corrupt state**: plugin refuses to start autonomous work; `/self-evolve
   status` reports the corruption; only `purge` commands are accepted until
   resolved.

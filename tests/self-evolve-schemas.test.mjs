@@ -292,6 +292,27 @@ test("new-skill proposal and decision schemas accept only the exact must-not-exi
   assert.throws(() => schemas.makeProposal({ ...item, skillTarget: { ...item.skillTarget, currentHash: "MUST-NOT-EXIST" } }), /invalid-sha256/u);
 });
 
+test("proposal content requires canonical base64 and a chunkIndex below chunkCount", () => {
+  const base = { proposalId: "proposal-1", contentHash: PROPOSED, contentEncoding: "base64", chunkIndex: 0, chunkCount: 1, content: Buffer.from("abc").toString("base64") };
+  assert.equal(schemas.makeProposalContent(base).content, "YWJj");
+  // Non-canonical base64 (wrong padding / length) is rejected even though the charset is valid.
+  assert.throws(() => schemas.makeProposalContent({ ...base, content: "A" }), /canonical base64/u);
+  assert.throws(() => schemas.makeProposalContent({ ...base, content: "YWJ" }), /canonical base64/u);
+  // chunkIndex must be strictly less than chunkCount.
+  assert.throws(() => schemas.makeProposalContent({ ...base, chunkIndex: 1, chunkCount: 1 }), /chunkIndex/u);
+  assert.throws(() => schemas.makeProposalContent({ ...base, chunkIndex: 2, chunkCount: 2 }), /chunkIndex/u);
+});
+
+test("global mode transition rejects a timestamp older than the current settings version", () => {
+  const prior = globalSettings({ updatedAt: 500 });
+  const fresh = schemas.transitionMode(prior, repoSettings(), { scope: "global", mode: "auto" }, 1_000, "operator");
+  assert.equal(fresh.ok, true);
+  assert.equal(fresh.state.global.updatedAt, 1_000);
+  const stale = schemas.transitionMode(prior, repoSettings(), { scope: "global", mode: "yolo" }, 200, "operator");
+  assert.equal(stale.ok, false);
+  assert.match(stale.error, /stale-timestamp/u);
+});
+
 test("every allowed proposal state transition succeeds and emits a decision audit", () => {
   const edges = {
     "critic-pending": ["pending", "failed-closed"],

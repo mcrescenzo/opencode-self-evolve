@@ -221,7 +221,12 @@ export function openStore(rootDir, {
   const decisionTransactionPath = path.join(stateDir, "decision-transaction.json");
   const bridgeProjectDir = path.join(baseDir, "bridge", projectFingerprint);
   const ownedLeases = new Map();
+  // Cache validity is the exact source bytes, never filesystem metadata. Every
+  // read still reads and compares the source, so writers in other processes are
+  // visible even when an inode, size, or millisecond mtime is reused.
+  const parsedFileCache = new Map();
   let exportInventory = null;
+  let legacyProposalContentAbsent = false;
   let closed = false;
   let terminal = false;
 
@@ -377,24 +382,56 @@ export function openStore(rootDir, {
     return parseJsonlSource(readFileSync(filePath, "utf8"), validator);
   }
 
+  function cacheParsedRecords(filePath, source, records) {
+    const cached = Object.freeze([...records]);
+    parsedFileCache.delete(filePath);
+    parsedFileCache.set(filePath, Object.freeze({ source, records: cached }));
+    while (parsedFileCache.size > 4) parsedFileCache.delete(parsedFileCache.keys().next().value);
+    return cached;
+  }
+
+  function readValidatedSource(filePath) {
+    if (!existsSync(filePath)) {
+      parsedFileCache.delete(filePath);
+      return { source: null, records: [], damaged: [] };
+    }
+    const source = readFileSync(filePath, "utf8");
+    const cached = parsedFileCache.get(filePath);
+    if (cached?.source === source) return { source, records: cached.records, damaged: [] };
+    const parsed = parseJsonlSource(source, assertRecord);
+    if (parsed.damaged.length === 0) parsed.records = cacheParsedRecords(filePath, source, parsed.records);
+    else parsedFileCache.delete(filePath);
+    return { source, ...parsed };
+  }
+
   function writeJsonl(filePath, records) {
     atomicWrite(filePath, records.map((record) => JSON.stringify(record)).join("\n") + (records.length ? "\n" : ""));
   }
 
   function readFileRecords(fileName, repair = true) {
     const filePath = path.join(stateDir, fileName);
-    const parsed = parseJsonl(filePath, assertRecord);
+    const parsed = readValidatedSource(filePath);
     if (!parsed.damaged.length || !repair) return parsed.records;
     if (!stateMutationLockHeld(root)) return withMutationLock(() => readFileRecords(fileName, true));
-    const current = parseJsonl(filePath, assertRecord);
+    const current = readValidatedSource(filePath);
     for (const item of current.damaged) quarantine(item.line, item.reason);
     writeJsonl(filePath, current.records);
+    parsedFileCache.delete(filePath);
     return current.records;
+  }
+
+  function readFileRecordsWithSource(fileName) {
+    const filePath = path.join(stateDir, fileName);
+    const parsed = readValidatedSource(filePath);
+    if (parsed.damaged.length) return { records: readFileRecords(fileName), source: null };
+    return { records: parsed.records, source: parsed.source ?? "" };
   }
 
   function writeRecords(fileName, records) {
     const source = records.map((record) => JSON.stringify(record)).join("\n") + (records.length ? "\n" : "");
-    atomicProjectWrite(path.join(stateDir, fileName), source);
+    const filePath = path.join(stateDir, fileName);
+    atomicProjectWrite(filePath, source);
+    cacheParsedRecords(filePath, source, records);
   }
 
   function compactProposalContentUnlocked(proposalIds) {
@@ -406,9 +443,13 @@ export function openStore(rootDir, {
   }
 
   function migrateLegacyProposalContentUnlocked() {
+    if (legacyProposalContentAbsent) return 0;
     const audit = readFileRecords(STORE_FILES["audit-event"]);
     const legacy = audit.filter((record) => record.kind === "audit-event" && record.payload?.details?.action === "proposal-content");
-    if (!legacy.length) return 0;
+    if (!legacy.length) {
+      legacyProposalContentAbsent = true;
+      return 0;
+    }
     const proposalRecords = readFileRecords(STORE_FILES.proposal);
     const latest = new Map();
     for (const record of proposalRecords) if (record.kind === "proposal") latest.set(record.payload.id, record.payload);
@@ -531,6 +572,7 @@ export function openStore(rootDir, {
     injectFault("legacy-migration-after-proposal-write");
     writeRecords(STORE_FILES["audit-event"], [...audit.filter((record) => !legacy.includes(record)), ...outcomes]);
     injectFault("legacy-migration-after-audit-write");
+    legacyProposalContentAbsent = true;
     return legacy.length;
   }
 
@@ -790,21 +832,26 @@ export function openStore(rootDir, {
       if (!["critic-pending", "pending", "approved", "applied"].includes(proposal.state)) return { ok: false, reason: "proposal-content-terminal" };
     }
     const fileName = fileForKind(clean.kind);
-    const records = readFileRecords(fileName);
+    const { records, source: currentSource } = readFileRecordsWithSource(fileName);
     if (records.some((record) => record.id === clean.id)) return { ok: true, duplicate: true, record: clean };
     if (clean.kind === "audit-event") {
       const existing = records.find((record) => record.kind === "audit-event" && record.payload.id === clean.payload.id);
       if (existing) return { ok: true, duplicate: true, record: existing };
     }
-    const next = [...records, clean];
-    const source = next.map((record) => JSON.stringify(record)).join("\n") + "\n";
-    const addedBytes = Buffer.byteLength(JSON.stringify(clean), "utf8") + 1;
+    const line = `${JSON.stringify(clean)}\n`;
+    const base = currentSource === null
+      ? records.map((record) => JSON.stringify(record)).join("\n") + (records.length ? "\n" : "")
+      : currentSource && !currentSource.endsWith("\n") ? `${currentSource}\n` : currentSource;
+    const source = base + line;
+    const addedBytes = Buffer.byteLength(source, "utf8") - Buffer.byteLength(currentSource ?? base, "utf8");
+    const filePath = path.join(stateDir, fileName);
     try {
-      assertProjectQuotaUnlocked(new Map([[path.resolve(path.join(stateDir, fileName)), source]]), { mandatoryAuditBytes: mandatoryAudit ? addedBytes : 0 });
+      assertProjectQuotaUnlocked(new Map([[path.resolve(filePath), source]]), { mandatoryAuditBytes: mandatoryAudit ? addedBytes : 0 });
     } catch (error) {
       return { ok: false, reason: reasonCode(error) };
     }
-    atomicWrite(path.join(stateDir, fileName), source);
+    atomicWrite(filePath, source);
+    cacheParsedRecords(filePath, source, [...records, clean]);
     return { ok: true, duplicate: false, record: clean };
   }
 
@@ -840,7 +887,9 @@ export function openStore(rootDir, {
         assertProjectQuotaUnlocked(changes, { mandatoryAuditBytes: auditBytes, quotaBytes });
         if (globalChanged) atomicWrite(globalSettingsPath, json(nextGlobal));
         if (repoChanged) atomicWrite(repoSettingsPath, json(nextRepo));
-        atomicWrite(path.join(stateDir, STORE_FILES["audit-event"]), auditSource);
+        const auditPath = path.join(stateDir, STORE_FILES["audit-event"]);
+        atomicWrite(auditPath, auditSource);
+        cacheParsedRecords(auditPath, auditSource, [...auditRecords, audit]);
         return { ok: true, changed: true, settings: { global: nextGlobal, repo: nextRepo }, auditEvent: audit.payload };
       });
     } catch (error) {
@@ -957,6 +1006,8 @@ export function openStore(rootDir, {
     try {
       return withMutationLock(() => {
       if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) return { ok: false, reason: "invalid-ttl" };
+      const cleanActor = String(actor ?? "");
+      if (!cleanActor || cleanActor.length > 256) return { ok: false, reason: "invalid-actor" };
       const filePath = leasePath(leaseKey);
       const acquiredAt = now();
       const nonce = randomBytes(24).toString("hex");
@@ -970,7 +1021,7 @@ export function openStore(rootDir, {
         repairedCorruptLease = true;
       }
       if (status.lease) removeLeaseUnlocked(leaseKey, status.lease);
-      const source = json({ pid: process.pid, actor: String(actor), acquiredAt, expiresAt: acquiredAt + ttlMs, nonce });
+      const source = json({ pid: process.pid, actor: cleanActor, acquiredAt, expiresAt: acquiredAt + ttlMs, nonce });
       assertProjectQuotaUnlocked(new Map([[path.resolve(filePath), source]]));
       writeFileSync(filePath, source, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
       ownedLeases.set(leaseKey, nonce);
@@ -1002,8 +1053,11 @@ export function openStore(rootDir, {
   function isLeaseHeld(leaseKey, nowMs = now()) {
     return withMutationLock(() => {
       const status = leaseStatusUnlocked(leaseKey, nowMs);
-      if (status.held || status.state !== "valid") return status.held;
-      removeLeaseUnlocked(leaseKey, status.lease);
+      if (status.held) return true;
+      if (status.reclaimable) {
+        removeLeaseUnlocked(leaseKey, status.lease);
+        return false;
+      }
       return false;
     });
   }
@@ -1172,7 +1226,16 @@ export function openStore(rootDir, {
             return keep;
           }
           const proposalId = record.kind === "proposal" ? record.payload.id : record.payload?.proposalId;
-           if (proposalId && activeProposalIds.has(proposalId) && ["proposal", "proposal-content", "decision", "audit-event"].includes(record.kind)) return true;
+          if (proposalId && activeProposalIds.has(proposalId) && ["proposal", "proposal-content", "decision", "audit-event"].includes(record.kind)) return true;
+          // Content-free busy diagnostics do not participate in authority or
+          // decision history and are drained independent of record age.
+          if (record.kind === "audit-event"
+              && record.payload.kind === "decision"
+              && record.payload.details?.action === "session-status"
+              && record.payload.details?.status === "busy") {
+            removed.audit += 1;
+            return false;
+          }
           const cutoff = observationKinds.has(record.kind) ? observationCutoff : durableCutoff;
           const keep = canonicalRecordTimestamp(record) >= cutoff;
           if (!keep) {
@@ -1181,7 +1244,7 @@ export function openStore(rootDir, {
           }
           return keep;
         });
-        writeRecords(fileName, kept);
+        if (kept.length !== records.length) writeRecords(fileName, kept);
       }
       writeJsonl(aggregatesPath, keptAggregates);
       for (const [indexPath, ids] of aggregateIndexes) {
@@ -1566,12 +1629,14 @@ export function openStore(rootDir, {
           if (contributed.size) compactAggregatesUnlocked((record) => !contributed.has(record.aggregateId));
           rmSync(stateDir, { recursive: true, force: true });
           rmSync(bridgeProjectDir, { recursive: true, force: true });
+          parsedFileCache.clear();
           initializeDirs();
           getSettingsUnlocked();
         } else {
           removed = before;
           rmSync(baseDir, { recursive: true, force: true });
           ownedLeases.clear();
+          parsedFileCache.clear();
           terminal = true;
           terminalRoots.add(root);
           return { ok: true, counts: countKinds(removed) };
@@ -1595,6 +1660,7 @@ export function openStore(rootDir, {
   }
 
   function close() {
+    parsedFileCache.clear();
     if (closed) return { ok: true, released: 0 };
     if (terminal || terminalRoots.has(root)) {
       ownedLeases.clear();

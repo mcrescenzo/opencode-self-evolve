@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,13 +16,10 @@ const RESERVATION_CHILD = fileURLToPath(new URL("./fixtures/passive-provider-res
 
 function runReservationChild(args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [RESERVATION_CHILD, ...args], { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
-    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-    child.on("error", reject);
-    child.on("close", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(`reservation-child-failed:${code}:${stderr}`)));
+    execFile(process.execPath, [RESERVATION_CHILD, ...args], { encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) reject(new Error(`reservation-child-failed:${error.code ?? "unknown"}:${stderr}`));
+      else resolve(JSON.parse(readFileSync(args.at(-1), "utf8")));
+    });
   });
 }
 
@@ -108,7 +105,10 @@ function fixture(t, options = {}) {
     privacy: {},
     budgets: { idleDebounceMs: 5, backoffBaseMs: 0, ...(options.budgets ?? {}) },
     now: () => clock.value,
-    enqueueWork: options.enqueueWork ?? ((item) => { work.push(item); }),
+    enqueueWork: options.enqueueWork ?? ((item) => {
+      work.push(item);
+      return new Promise(() => {});
+    }),
     log: (entry) => calls.logs.push(entry),
   });
   return { root, clock, records, leases, calls, settings, store, work, scheduler };
@@ -140,9 +140,11 @@ test("an older explicit epoch cannot replace newer idle work", async (t) => {
 });
 
 test("busy and retry transitions never trigger scheduling", async (t) => {
-  const { scheduler, work } = fixture(t);
+  const { scheduler, work, records } = fixture(t);
   await scheduler.handleEvent(status("transitions", "busy"));
+  assert.equal(actions(records, "session-status").filter((record) => record.payload.details.status === "busy").length, 0);
   await scheduler.handleEvent(status("transitions", "retry"));
+  assert.equal(actions(records, "session-status").filter((record) => record.payload.details.status === "retry").length, 1);
   await wait(15);
   assert.equal(work.length, 0);
   await scheduler.handleEvent(idle("transitions"));
@@ -313,8 +315,8 @@ test("concurrent process reservations cannot exceed the durable cap", async (t) 
   store.close();
 
   const results = await Promise.all([
-    runReservationChild([root, PROJECT, String(clock), "two"]),
-    runReservationChild([root, PROJECT, String(clock), "two"]),
+    runReservationChild([root, PROJECT, String(clock), "two-a", path.join(root, "result-a.json")]),
+    runReservationChild([root, PROJECT, String(clock), "two-b", path.join(root, "result-b.json")]),
   ]);
   const readback = openStore(root, { projectName: "passive-process", projectFingerprint: PROJECT, now: () => clock });
   const passive = readback.readRecords("audit-event").filter((record) =>
@@ -358,6 +360,74 @@ test("three failures in 24 hours trip the circuit breaker with backoff", async (
   assert.equal(scheduler.getCircuitBreaker().open, true);
   assert.equal(scheduler.getCircuitBreaker().reason, "three-failures-in-24h");
   scheduler.dispose();
+});
+
+test("the scheduler settles a fulfilled work promise exactly once", async (t) => {
+  let finish;
+  const work = [];
+  const { scheduler, calls, records } = fixture(t, {
+    enqueueWork(item) {
+      work.push(item);
+      return new Promise((resolve) => { finish = resolve; });
+    },
+  });
+  await scheduler.handleEvent(idle("fulfilled-once"));
+  await waitFor(() => work.length === 1, "fulfilled work");
+  finish({ ok: true });
+  await waitFor(() => calls.release.length === 1, "automatic fulfilled settlement");
+  const duplicate = scheduler.recordWorkResult(work[0], { ok: false, error: "late duplicate" });
+  assert.deepEqual(duplicate, { accepted: false, stale: false, duplicate: true });
+  assert.equal(calls.release.length, 1);
+  assert.equal(actions(records, "work-failure").length, 0);
+  scheduler.dispose();
+});
+
+test("a rejected work promise produces one failure settlement", async (t) => {
+  const work = [];
+  const { scheduler, calls, records } = fixture(t, {
+    enqueueWork(item) {
+      work.push(item);
+      return Promise.reject(new Error("pipeline-rejected"));
+    },
+  });
+  await scheduler.handleEvent(idle("rejected-once"));
+  await waitFor(() => actions(records, "work-failure").length === 1, "one rejected settlement");
+  await wait(10);
+  assert.equal(work.length, 1);
+  assert.equal(actions(records, "work-failure").length, 1);
+  assert.equal(calls.release.length, 1);
+  assert.deepEqual(scheduler.recordWorkResult(work[0], { ok: false }), { accepted: false, stale: false, duplicate: true });
+  assert.equal(actions(records, "work-failure").length, 1);
+  scheduler.dispose();
+});
+
+test("a late older-lease result cannot settle or release newer work", async (t) => {
+  const { scheduler, work, calls, records } = fixture(t);
+  await scheduler.handleEvent(idle("superseded"));
+  await waitFor(() => work.length === 1, "first lease");
+  assert.deepEqual(scheduler.recordWorkResult(work[0], { ok: true }), { accepted: true, stale: false });
+  await scheduler.handleEvent(idle("superseded"));
+  await waitFor(() => work.length === 2, "newer lease");
+  const releases = calls.release.length;
+  const stale = scheduler.recordWorkResult(work[0], { ok: false, error: "late old lease" });
+  assert.deepEqual(stale, { accepted: false, stale: true, superseded: true });
+  assert.equal(calls.release.length, releases);
+  assert.equal(actions(records, "work-failure").length, 0);
+  assert.deepEqual(scheduler.recordWorkResult(work[1], { ok: true }), { accepted: true, stale: false });
+  scheduler.dispose();
+});
+
+test("a failed work-lease release is retained so dispose can retry it", async (t) => {
+  const { scheduler, work, store } = fixture(t, { budgets: { idleDebounceMs: 0 } });
+  await scheduler.handleEvent(idle("release-fail"));
+  await waitFor(() => work.length === 1, "release-fail work");
+  const realRelease = store.releaseLease.bind(store);
+  store.releaseLease = () => ({ ok: false, reason: "lease-release-error" });
+  scheduler.recordWorkResult(work[0], { ok: true });
+  let disposeRetry = 0;
+  store.releaseLease = () => { disposeRetry += 1; return { ok: true }; };
+  scheduler.dispose();
+  assert.equal(disposeRetry, 1, "dispose retries a work-lease release that previously failed");
 });
 
 test("failure backoff uses stable root lineage, doubles, and survives restart", async (t) => {

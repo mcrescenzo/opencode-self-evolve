@@ -1,11 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
 import { createIntegration, ROLLOUT_GATES } from "../self-evolve-integration.js";
+import {
+  createControlRequest,
+  createDecisionRequest,
+  makeBridgeRequest,
+  makeControlRequest,
+  pollControlResponse,
+  pollDecisionResponse,
+  readControlState,
+  readProjectInbox,
+  submitControlRequest,
+  submitDecisionRequest,
+} from "../self-evolve-bridge.js";
 import { openStore } from "../self-evolve-store.js";
 import * as schemas from "../self-evolve-schemas.js";
 import * as commandModule from "../self-evolve-commands.js";
@@ -144,6 +156,7 @@ function harness(t, config = {}) {
         async runEvolutionCycle(args) {
           calls.cycles.push(args);
           if (config.deferredCycle) return config.deferredCycle.promise;
+          if (config.cycleError) throw new Error(config.cycleError);
           const item = config.cycleProposal ?? proposal(root);
           const fixture = {
             observations: [{ id: "observation-shared", incidentId: "incident-shared" }],
@@ -401,6 +414,24 @@ test("mailbox processing is single-flight with at most one pending rerun", async
   assert.equal(passes, 2);
 });
 
+test("an empty manual mailbox pass reads settings once and skips decision-nonce work", async (t) => {
+  const h = harness(t, {
+    instrumentStore: true,
+    integrationOptions: { stateRoot: true },
+  });
+  seedProposal(h.store, proposal(h.root));
+  const baselineReads = h.calls.settingsReads;
+
+  const result = await h.integration.processMailbox();
+
+  assert.equal(result.ok, true);
+  assert.equal(h.calls.settingsReads - baselineReads, 1);
+  const actions = h.store.readRecords("audit-event").map((record) => record.payload.details?.action);
+  assert.equal(actions.includes("bridge-nonce"), false);
+  assert.equal(actions.includes("headless-approval-nonce"), false);
+  assert.equal(actions.includes("control-nonce"), true);
+});
+
 test("only scheduler-originated cycles receive the passive provider reservation API", async (t) => {
   const h = harness(t);
   h.integration.__testBridge.setMode("auto");
@@ -628,6 +659,21 @@ test("in-flight downgrade cancels pending continuation and records downgrade", a
   assert.equal(h.calls.workResults.filter((entry) => entry.item.sessionID === "in-flight").length, 1);
 });
 
+test("integration leaves normal fulfillment and rejection settlement to the scheduler", async (t) => {
+  const fulfilled = harness(t);
+  fulfilled.integration.__testBridge.setMode("auto");
+  await fulfilled.integration.handleEvent({ type: "session.idle", properties: { sessionID: "scheduler-owned-success" } });
+  assert.equal(fulfilled.calls.workResults.length, 0, "integration does not settle fulfilled scheduler work");
+
+  const rejected = harness(t, { cycleError: "scheduler-owned-rejection" });
+  rejected.integration.__testBridge.setMode("auto");
+  await assert.rejects(
+    rejected.integration.handleEvent({ type: "session.idle", properties: { sessionID: "scheduler-owned-failure" } }),
+    /scheduler-owned-rejection/u,
+  );
+  assert.equal(rejected.calls.workResults.length, 0, "integration does not duplicate rejection settlement");
+});
+
 test("server-side TUI bridge works without a TUI process and rejects duplicate CAS", async (t) => {
   const h = harness(t);
   h.integration.__testBridge.setMode("auto");
@@ -638,6 +684,160 @@ test("server-side TUI bridge works without a TUI process and rejects duplicate C
   const duplicate = await h.integration.__testBridge.decide({ decision });
   assert.equal(first.ok, true);
   assert.deepEqual(duplicate, { ok: false, reason: "stale-prior-state" });
+});
+
+test("a committed decision outcome is republished after response publication fails", async (t) => {
+  let failPublication = false;
+  const h = harness(t, {
+    initialClock: Date.now(),
+    integrationOptions: {
+      stateRoot: true,
+      __testSetMailboxInterval: () => ({ unref() {} }),
+      __testClearMailboxInterval: () => {},
+      __testAfterRequestHandled() {
+        if (!failPublication) return;
+        failPublication = false;
+        throw new Error("injected-response-publication-failure");
+      },
+    },
+  });
+  h.integration.__testBridge.setMode("auto");
+  const item = proposal(h.root, { id: "decision-publication-retry" });
+  seedProposal(h.store, item, h.now());
+  await h.integration.boot({ recoverHostSessions: false });
+  const projected = readProjectInbox(h.root, FINGERPRINT, { now: h.now() }).find((entry) => entry.id === item.id);
+  assert.ok(projected?.decisionNonce);
+  const request = createDecisionRequest({
+    projectFingerprint: FINGERPRINT,
+    proposal: projected,
+    newState: "rejected",
+    timestamp: h.now(),
+    requestId: "decision-publication-retry",
+  });
+
+  failPublication = true;
+  submitDecisionRequest(h.root, request);
+  const failedPublication = await h.integration.processMailbox();
+  assert.equal(failedPublication.ok, false);
+  assert.equal(failedPublication.reason, "injected-response-publication-failure");
+  assert.equal(pollDecisionResponse(h.root, FINGERPRINT, request.requestId), null);
+  assert.equal(latestProposal(h.store, item.id).state, "rejected");
+
+  const completionEvents = () => h.store.readRecords("audit-event").filter((record) =>
+    record.payload.proposalId === item.id
+    && record.payload.details?.action === "bridge-request-complete"
+    && record.payload.details?.requestId === request.requestId);
+  const decisionTransitions = () => h.store.readRecords("decision").filter((record) =>
+    record.payload.proposalId === item.id && record.payload.newState === "rejected");
+  assert.equal(completionEvents().length, 1);
+  assert.match(completionEvents()[0].payload.details.requestDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(decisionTransitions().length, 1);
+
+  const retried = await h.integration.processMailbox();
+  assert.equal(retried.ok, true);
+  const response = pollDecisionResponse(h.root, FINGERPRINT, request.requestId);
+  assert.equal(response.ok, true);
+  assert.equal(response.recovered, true);
+  assert.equal(completionEvents().length, 1);
+  assert.equal(decisionTransitions().length, 1);
+
+  const responsePath = path.join(h.root, "self-evolve", "bridge", FINGERPRINT, "responses", `${request.requestId}.json`);
+  unlinkSync(responsePath);
+  const altered = makeBridgeRequest({ ...request, newState: "pending" }, { now: h.now(), projectFingerprint: FINGERPRINT });
+  submitDecisionRequest(h.root, altered);
+  await h.integration.processMailbox();
+  assert.deepEqual(
+    { ok: pollDecisionResponse(h.root, FINGERPRINT, request.requestId).ok, reason: pollDecisionResponse(h.root, FINGERPRINT, request.requestId).reason },
+    { ok: false, reason: "replayed-request" },
+  );
+
+  const differentId = makeBridgeRequest({ ...request, requestId: "decision-publication-new-id" }, { now: h.now(), projectFingerprint: FINGERPRINT });
+  submitDecisionRequest(h.root, differentId);
+  await h.integration.processMailbox();
+  assert.deepEqual(
+    { ok: pollDecisionResponse(h.root, FINGERPRINT, differentId.requestId).ok, reason: pollDecisionResponse(h.root, FINGERPRINT, differentId.requestId).reason },
+    { ok: false, reason: "replayed-decision" },
+  );
+  assert.equal(completionEvents().length, 1);
+  assert.equal(decisionTransitions().length, 1);
+  await h.integration.shutdown();
+});
+
+test("a committed control outcome is republished without repeating its settings mutation", async (t) => {
+  let failPublication = false;
+  const h = harness(t, {
+    initialClock: Date.now(),
+    integrationOptions: {
+      stateRoot: true,
+      __testSetMailboxInterval: () => ({ unref() {} }),
+      __testClearMailboxInterval: () => {},
+      __testAfterRequestHandled() {
+        if (!failPublication) return;
+        failPublication = false;
+        throw new Error("injected-control-publication-failure");
+      },
+    },
+  });
+  await h.integration.boot({ recoverHostSessions: false });
+  const controlState = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  const request = createControlRequest({
+    controlState,
+    action: "set-consent",
+    payload: { key: "sanitizedExcerpts", enabled: true },
+    timestamp: h.now(),
+    requestId: "control-publication-retry",
+  });
+
+  failPublication = true;
+  submitControlRequest(h.root, request);
+  const failedPublication = await h.integration.processMailbox();
+  assert.equal(failedPublication.ok, false);
+  assert.equal(failedPublication.reason, "injected-control-publication-failure");
+  assert.equal(pollControlResponse(h.root, FINGERPRINT, request.requestId), null);
+  const committedVersion = h.store.getSettings().global.updatedAt;
+  assert.equal(h.store.getSettings().global.consent.sanitizedExcerpts, true);
+
+  const completionEvents = () => h.store.readRecords("audit-event").filter((record) =>
+    record.payload.details?.action === "control-request-complete"
+    && record.payload.details?.requestId === request.requestId);
+  assert.equal(completionEvents().length, 1);
+  assert.match(completionEvents()[0].payload.details.requestDigest, /^[a-f0-9]{64}$/u);
+
+  const retried = await h.integration.processMailbox();
+  assert.equal(retried.ok, true);
+  const response = pollControlResponse(h.root, FINGERPRINT, request.requestId);
+  assert.equal(response.ok, true);
+  assert.deepEqual(Object.keys(response).sort(), ["ok", "processedAt", "projectFingerprint", "reason", "requestId", "schemaVersion", "status"].sort());
+  assert.equal(h.store.getSettings().global.updatedAt, committedVersion);
+  assert.equal(completionEvents().length, 1);
+
+  const responsePath = path.join(h.root, "self-evolve", "bridge", FINGERPRINT, "control-responses", `${request.requestId}.json`);
+  unlinkSync(responsePath);
+  const altered = makeControlRequest(
+    { ...request, payload: { key: "sanitizedExcerpts", enabled: false } },
+    { now: h.now(), projectFingerprint: FINGERPRINT },
+  );
+  submitControlRequest(h.root, altered);
+  await h.integration.processMailbox();
+  assert.deepEqual(
+    { ok: pollControlResponse(h.root, FINGERPRINT, request.requestId).ok, reason: pollControlResponse(h.root, FINGERPRINT, request.requestId).reason },
+    { ok: false, reason: "replayed-request" },
+  );
+
+  const differentId = makeControlRequest(
+    { ...request, requestId: "control-publication-new-id" },
+    { now: h.now(), projectFingerprint: FINGERPRINT },
+  );
+  submitControlRequest(h.root, differentId);
+  await h.integration.processMailbox();
+  assert.deepEqual(
+    { ok: pollControlResponse(h.root, FINGERPRINT, differentId.requestId).ok, reason: pollControlResponse(h.root, FINGERPRINT, differentId.requestId).reason },
+    { ok: false, reason: "replayed-control" },
+  );
+  assert.equal(h.store.getSettings().global.updatedAt, committedVersion);
+  assert.equal(h.store.getSettings().global.consent.sanitizedExcerpts, true);
+  assert.equal(completionEvents().length, 1);
+  await h.integration.shutdown();
 });
 
 test("apply and rollback each produce audited state and rollback CAS", async (t) => {
@@ -890,6 +1090,14 @@ test("mode changes publish a TUI event and consent remains command-policy manage
   const consent = h.integration.__testBridge.setConsent("sanitizedExcerpts", true);
   assert.equal(consent.ok, true);
   assert.equal(h.integration.__testBridge.getConsent().sanitizedExcerpts, true);
+});
+
+test("a synchronous TUI publish failure does not reject the settings mutation", async (t) => {
+  const h = harness(t);
+  h.ctx.client.tui.publish = () => { throw new Error("tui-unavailable"); };
+  const result = h.integration.__testBridge.setMode("auto");
+  assert.equal(result.ok, true, "the mode change succeeds even when TUI publish throws synchronously");
+  await h.integration.shutdown();
 });
 
 test("host session recovery is bounded, selective, and idempotent", async (t) => {

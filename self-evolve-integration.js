@@ -4,6 +4,7 @@ import {
   BRIDGE_TTL_MS,
   cleanupBridge,
   consumeDecisionRequests,
+  pendingRequestCounts,
   publishControlState,
 } from "./self-evolve-bridge.js";
 import { isDurableLifecycleEvent } from "./self-evolve-core.js";
@@ -31,6 +32,14 @@ export const ROLLOUT_GATES = DEFAULT_ROLLOUT_GATES;
 
 function sha256(value) {
   return createHash("sha256").update(String(value)).digest("hex");
+}
+
+function mailboxRequestDigest(type, request) {
+  return sha256(`self-evolve-${type}-request-completion-v1\n${JSON.stringify(request)}`);
+}
+
+function completionReason(result, fallback) {
+  return result?.ok === true ? "accepted" : String(result?.reason ?? fallback).slice(0, 256);
 }
 
 function errorReason(error) {
@@ -107,7 +116,6 @@ export function createIntegration({
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
   const rolloutGates = frozenRolloutGates(options.rolloutGates ?? options.settings?.rolloutGates);
   const inFlight = new Map();
-  const downgraded = new Set();
   let runtimeKillSwitch = process.env.SELF_EVOLVE_KILL === "1" || process.env.SELF_EVOLVE_KILL === "true";
   let corrupt = false;
   let lastError;
@@ -167,9 +175,11 @@ export function createIntegration({
 
   function circuitBreakerOpen() {
     try {
-      return applier.circuitBreakerOpen?.() === true
-        || schedulerInstance?.getCircuitBreaker?.().open === true
-        || store.readRecords?.("circuit-breaker").at(-1)?.payload?.open === true;
+      const applierOpen = applier.circuitBreakerOpen?.();
+      const schedulerBreaker = schedulerInstance?.getCircuitBreaker?.();
+      if (applierOpen === true || schedulerBreaker?.open === true) return true;
+      if (typeof applierOpen === "boolean" && typeof schedulerBreaker?.open === "boolean") return false;
+      return store.readRecords?.("circuit-breaker").at(-1)?.payload?.open === true;
     } catch {
       return true;
     }
@@ -255,15 +265,34 @@ export function createIntegration({
       let decision = args.decision;
       if (args.mode === "yolo" && proposal?.state === "pending" && currentProposal(proposal.id)) {
         const preliminary = evaluateAuthority({ ...args, proposal, decision });
-        if (!preliminary.allowed) return { ok: false, reason: preliminary.reason };
+        if (!preliminary.allowed) return { ok: false, reason: preliminary.reason, disposition: "pending-review" };
         decision = makeDecision(proposal, "approved", "self-evolve-applier");
         const changed = casDecision(proposal, decision);
-        if (!changed.ok) return { ok: false, reason: changed.reason };
+        if (!changed.ok) return { ok: false, reason: changed.reason, disposition: "terminal-failure" };
         proposal = { ...changed.proposal, ...(proposal.proposedContent === undefined ? {} : { proposedContent: proposal.proposedContent }) };
       }
       const authority = evaluateAuthority({ ...args, proposal, decision });
-      if (!authority.allowed) return { ok: false, reason: authority.reason };
-      return applier.applyProposal({ ...args, proposal, decision });
+      if (!authority.allowed) {
+        return {
+          ok: false,
+          reason: authority.reason,
+          disposition: proposal?.state === "pending" ? "pending-review" : "terminal-failure",
+        };
+      }
+      let result;
+      try {
+        result = await applier.applyProposal({ ...args, proposal, decision });
+      } catch (error) {
+        return { ok: false, reason: errorReason(error), disposition: "terminal-failure" };
+      }
+      if (result?.ok === true) return { ...result, disposition: "applied" };
+      if (result?.deferred === true) return { ...result, disposition: "deferred" };
+      return {
+        ...(result && typeof result === "object" ? result : {}),
+        ok: false,
+        reason: result?.reason ?? "apply-failed",
+        disposition: "terminal-failure",
+      };
     },
   });
 
@@ -297,9 +326,8 @@ export function createIntegration({
     const key = `${workItem.sessionID}:${workItem.leaseNonce ?? workItem.epoch ?? now()}`;
     const item = { ...workItem, key, mode: resolveEffectiveMode(workItem.projectFingerprint), stage: "pipeline", startedAt: now() };
     inFlight.set(key, item);
-    let result;
     try {
-      result = await runEvolutionCycle({
+      return await runEvolutionCycle({
         ...workItem,
         ctx,
         trigger: workItem.trigger ?? "scheduler",
@@ -311,13 +339,8 @@ export function createIntegration({
           }),
         },
       });
-      return result;
-    } catch (error) {
-      result = { ok: false, error: errorReason(error) };
-      throw error;
     } finally {
       inFlight.delete(key);
-      if (!downgraded.delete(key)) schedulerInstance.recordWorkResult?.(workItem, result);
     }
   }
 
@@ -351,7 +374,11 @@ export function createIntegration({
   function publish(type, properties = {}) {
     const method = ctx?.client?.tui?.publish;
     if (typeof method !== "function") return;
-    Promise.resolve(method.call(ctx.client.tui, { type, properties })).catch((error) => { lastError = errorReason(error); });
+    try {
+      Promise.resolve(method.call(ctx.client.tui, { type, properties })).catch((error) => { lastError = errorReason(error); });
+    } catch (error) {
+      lastError = errorReason(error);
+    }
   }
 
   function syncSchedulerMode(projectFingerprint, reason = "settings-refresh", current) {
@@ -452,9 +479,8 @@ export function createIntegration({
       && event.details?.nonceHash === nonceHash);
   }
 
-  function issueControlGrant() {
+  function issueControlGrant(current = settings()) {
     if (!options.stateRoot) return null;
-    const current = settings();
     if (!current) return null;
     const version = settingsVersion(current);
     const timestamp = now();
@@ -490,7 +516,7 @@ export function createIntegration({
       stateRootIdentity: stateRootIdentity(options.stateRoot),
       nonce: grant.nonce,
       mode: current.global.mode,
-      effectiveMode: resolveEffectiveMode(current.repo.projectFingerprint),
+      effectiveMode: resolveEffectiveMode(current.repo.projectFingerprint, current),
       allowedSkillRoots: current.global.allowedSkillRoots,
       consent: current.global.consent,
       repoExcluded: current.repo.excluded,
@@ -536,8 +562,9 @@ export function createIntegration({
       action: "bridge-request-complete",
       requestId: request.requestId,
       nonceHash: sha256(request.nonce),
+      requestDigest: mailboxRequestDigest("decision", request),
       accepted: result.ok === true,
-      reason: result.ok === true ? "accepted" : String(result.reason ?? "decision-rejected"),
+      reason: completionReason(result, "decision-rejected"),
       recovered,
     }, request.proposalId, "self-evolve-integration");
   }
@@ -547,17 +574,51 @@ export function createIntegration({
       action: "control-request-complete",
       requestId: request.requestId,
       nonceHash: sha256(request.nonce),
+      requestDigest: mailboxRequestDigest("control", request),
       controlAction: request.action,
       accepted: result.ok === true,
-      reason: result.ok === true ? "accepted" : String(result.reason ?? "control-rejected"),
+      reason: completionReason(result, "control-rejected"),
     }, undefined, "self-evolve-integration");
   }
 
+  function recoverBridgeCompletion(request, completion) {
+    const details = completion?.details;
+    if (details?.nonceHash !== sha256(request.nonce)
+      || details?.requestDigest !== mailboxRequestDigest("decision", request)) {
+      return { ok: false, reason: "replayed-request" };
+    }
+    return details.accepted === true
+      ? { ok: true, recovered: true }
+      : { ok: false, reason: String(details.reason ?? "decision-rejected").slice(0, 256), recovered: true };
+  }
+
+  function recoverControlCompletion(request, completion) {
+    const details = completion?.details;
+    if (details?.nonceHash !== sha256(request.nonce)
+      || details?.requestDigest !== mailboxRequestDigest("control", request)) {
+      return { ok: false, reason: "replayed-request" };
+    }
+    return details.accepted === true
+      ? { ok: true }
+      : { ok: false, reason: String(details.reason ?? "control-rejected").slice(0, 256) };
+  }
+
+  function finishBridgeRequest(request, result, recovered = false) {
+    recordBridgeCompletion(request, result, recovered);
+    return recovered ? { ...result, recovered: true } : result;
+  }
+
+  function finishControlRequest(request, result) {
+    recordControlCompletion(request, result);
+    return result;
+  }
+
   function validateMailboxControl(request) {
-    if (completedControlRequest(request)) return { ok: false, reason: "replayed-request" };
+    const completed = completedControlRequest(request);
+    if (completed) return recoverControlCompletion(request, completed);
     if (completedControlNonce(request.nonce)) return { ok: false, reason: "replayed-control" };
     const fresh = settings();
-    if (!fresh) return { ok: false, reason: "corrupt-settings" };
+    if (!fresh) return finishControlRequest(request, { ok: false, reason: "corrupt-settings" });
     const grant = latestControlGrant()?.details;
     const version = settingsVersion(fresh);
     let result;
@@ -572,8 +633,7 @@ export function createIntegration({
       || grant.expiresAt <= now()) result = { ok: false, reason: "invalid-or-expired-nonce" };
     else if (request.settingsUpdatedAt !== fresh.global.updatedAt || request.settingsVersion !== version) result = { ok: false, reason: "stale-settings-version" };
     if (result) {
-      recordControlCompletion(request, result);
-      return result;
+      return finishControlRequest(request, result);
     }
 
     let transitionEvents = [];
@@ -615,12 +675,12 @@ export function createIntegration({
       const effectiveMode = syncSchedulerMode(request.projectFingerprint, `control-${request.action}`);
       publish("self-evolve.settings", { action: request.action, effectiveMode });
     }
-    recordControlCompletion(request, result);
-    return result;
+    return finishControlRequest(request, result);
   }
 
   async function validateMailboxDecision(request) {
-    if (completedBridgeRequest(request)) return { ok: false, reason: "replayed-request" };
+    const completed = completedBridgeRequest(request);
+    if (completed) return recoverBridgeCompletion(request, completed);
     if (completedBridgeNonce(request)) return { ok: false, reason: "replayed-decision" };
     const stored = matchingStoredDecision(request);
     if (stored) {
@@ -629,8 +689,7 @@ export function createIntegration({
         const applied = await runApprovalFlow({ proposalId: proposal.id, actor: request.actor, projectFingerprint: proposal.projectFingerprint });
         if (applied.result !== "applied") {
           const result = { ok: false, reason: applied.reason ?? "apply-recovery-failed" };
-          recordBridgeCompletion(request, result, true);
-          return { ...result, recovered: true };
+          return finishBridgeRequest(request, result, true);
         }
         markApplied(proposal.id);
       }
@@ -638,16 +697,16 @@ export function createIntegration({
       const expectedState = request.newState === "approved" ? "applied" : request.newState;
       if (recoveredProposal?.state !== expectedState) {
         const result = { ok: false, reason: "incomplete-decision-recovery" };
-        recordBridgeCompletion(request, result, true);
-        return { ...result, recovered: true };
+        return finishBridgeRequest(request, result, true);
       }
-      recordBridgeCompletion(request, { ok: true }, true);
-      return { ok: true, recovered: true };
+      return finishBridgeRequest(request, { ok: true }, true);
     }
     const current = settings();
     const proposal = currentProposal(request.proposalId);
-    if (!current || !proposal) return { ok: false, reason: "record-not-found" };
-    if (request.projectFingerprint !== current.repo.projectFingerprint || proposal.projectFingerprint !== current.repo.projectFingerprint) return { ok: false, reason: "cross-project-request" };
+    if (!current || !proposal) return finishBridgeRequest(request, { ok: false, reason: "record-not-found" });
+    if (request.projectFingerprint !== current.repo.projectFingerprint || proposal.projectFingerprint !== current.repo.projectFingerprint) {
+      return finishBridgeRequest(request, { ok: false, reason: "cross-project-request" });
+    }
     const grant = latestBridgeGrant(proposal.id)?.details;
     if (!grant
       || grant.action !== "bridge-nonce"
@@ -659,14 +718,20 @@ export function createIntegration({
       || grant.priorState !== request.priorState
       || grant.actor !== request.actor
       || grant.nonce !== request.nonce
-      || grant.expiresAt <= now()) return { ok: false, reason: "invalid-or-expired-nonce" };
-    if (proposal.skillTarget.currentHash !== request.targetHash || proposal.proposedContentHash !== request.proposedContentHash) return { ok: false, reason: "hash-binding-mismatch" };
-    if (proposal.decisionVersion + 1 !== request.decisionVersion) return { ok: false, reason: "stale-decision-version" };
-    if (proposal.state !== request.priorState) return { ok: false, reason: "stale-prior-state" };
+      || grant.expiresAt <= now()) return finishBridgeRequest(request, { ok: false, reason: "invalid-or-expired-nonce" });
+    if (proposal.skillTarget.currentHash !== request.targetHash || proposal.proposedContentHash !== request.proposedContentHash) {
+      return finishBridgeRequest(request, { ok: false, reason: "hash-binding-mismatch" });
+    }
+    if (proposal.decisionVersion + 1 !== request.decisionVersion) {
+      return finishBridgeRequest(request, { ok: false, reason: "stale-decision-version" });
+    }
+    if (proposal.state !== request.priorState) return finishBridgeRequest(request, { ok: false, reason: "stale-prior-state" });
     const transitionAllowed = (request.priorState === "pending" && ["approved", "rejected", "pending"].includes(request.newState))
       || (request.priorState === "applied" && request.newState === "rolled-back");
-    if (!transitionAllowed) return { ok: false, reason: "invalid-transition" };
-    if (request.newState === "approved" && resolveEffectiveMode(request.projectFingerprint) === "manual") return { ok: false, reason: "manual-advisory-only" };
+    if (!transitionAllowed) return finishBridgeRequest(request, { ok: false, reason: "invalid-transition" });
+    if (request.newState === "approved" && resolveEffectiveMode(request.projectFingerprint) === "manual") {
+      return finishBridgeRequest(request, { ok: false, reason: "manual-advisory-only" });
+    }
     const result = await decide({
       proposalId: proposal.id,
       actor: request.actor,
@@ -682,17 +747,23 @@ export function createIntegration({
         newState: request.newState,
       }),
     });
-    recordBridgeCompletion(request, result);
-    return result;
+    return finishBridgeRequest(request, result);
   }
 
   async function runMailboxPass() {
     try {
-      issueBridgeNonces();
-      let controlStateError;
-      try { issueControlGrant(); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
-      const projectFingerprint = settings()?.repo?.projectFingerprint;
+      const current = settings();
+      const projectFingerprint = current?.repo?.projectFingerprint;
       if (!projectFingerprint) return { ok: false, reason: "corrupt-settings", processed: [] };
+      const pending = options.stateRoot
+        ? pendingRequestCounts(options.stateRoot, projectFingerprint)
+        : { decisions: 0, controls: 0 };
+      const effective = resolveEffectiveMode(projectFingerprint, current);
+      // Manual mode still consumes controls and decisions. It only skips
+      // proactive decision-nonce work when no decision request is waiting.
+      if (pending.decisions > 0 || effective !== "manual") issueBridgeNonces();
+      let controlStateError;
+      try { issueControlGrant(current); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
       const consumed = await consumeMailbox({
         stateRoot: options.stateRoot,
         projectFingerprint,
@@ -700,8 +771,11 @@ export function createIntegration({
         validateAndDecide: validateMailboxDecision,
         validateAndControl: validateMailboxControl,
         maxRequests: options.mailboxMaxRequests,
+        __testAfterRequestHandled: options.__testAfterRequestHandled,
       });
-      try { issueControlGrant(); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
+      if (consumed.controls?.length || consumed.processed?.length) {
+        try { issueControlGrant(); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
+      }
       return controlStateError ? { ...consumed, controlStateError } : consumed;
     } catch (error) {
       lastError = errorReason(error);
@@ -1028,7 +1102,6 @@ export function createIntegration({
       for (const item of inFlight.values()) {
         schedulerInstance.cancelPending?.(item.sessionID);
         schedulerInstance.recordWorkResult?.(item, { result: "downgrade", downgrade: true });
-        downgraded.add(item.key);
       }
     }
     publish("self-evolve.settings", { action: "mode", mode, effectiveMode });
@@ -1133,7 +1206,6 @@ export function createIntegration({
     for (const item of inFlight.values()) {
       schedulerInstance.cancelPending?.(item.sessionID);
       schedulerInstance.recordWorkResult?.(item, { result: "downgrade", downgrade: true });
-      downgraded.add(item.key);
     }
   }
 

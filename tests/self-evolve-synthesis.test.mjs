@@ -406,6 +406,13 @@ test("invalid evidence references, hash claims, and token or byte estimates are 
   }
 });
 
+test("duplicate observation ids in one evidence mapping are rejected (uniqueItems)", () => {
+  const output = synthesisOutput({ evidenceMapping: [{ claim: "Repeated duplicates.", observationIds: [OBSERVATION_ID, OBSERVATION_ID] }] });
+  const result = parseSynthesizerOutput(output, { cluster: cluster(), targetSkill: target(), inventory: [target()], expectedCurrentHash: H(CURRENT) });
+  assert.equal(result.ok, false);
+  assert.equal(result.errors.includes("duplicate-observation-id"), true);
+});
+
 test("critic malformed output fails closed and records proposal-scoped backoff", async () => {
   const synthesized = await synthesize();
   const sdk = fakeContext("bad");

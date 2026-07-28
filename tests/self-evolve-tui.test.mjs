@@ -446,6 +446,30 @@ test("safe-idle gating defers dialogs until idle has lasted 1500ms", async () =>
   await h.dispose();
 });
 
+test("showing a proposal records last-shown so an unchanged proposal is not re-shown", async () => {
+  const h = harness({ kv: enabledKv(), proposals: [proposal()], clock: 1_000, status: "busy" });
+  const drain = () => new Promise((resolve) => setTimeout(resolve, 5));
+  try {
+    await SelfEvolveTuiPlugin(h.api, { idleDebounceMs: 0, mailboxPollMs: 5_000 });
+    await drain();
+    h.setStatus({ type: "idle", since: 1_000 });
+    h.setClock(3_000);
+    h.event("session.idle");
+    await drain();
+    assert.ok(actionDialog(h), "the pending proposal is shown once safely idle");
+    const recorded = h.kv.get("self-evolve:last-shown-at");
+    assert.equal(typeof recorded?.["proposal-1"], "number", "last-shown is recorded for the displayed proposal");
+    const shown = h.selects.length;
+    // A later refresh for the same unchanged proposal must not re-display it.
+    h.setClock(9_000);
+    h.event("session.idle");
+    await drain();
+    assert.equal(h.selects.length, shown, "an unchanged proposal is not re-shown on the next refresh");
+  } finally {
+    await h.dispose();
+  }
+});
+
 test("safeIdlePredicate resets its debounce when a session becomes busy", () => {
   const h = harness({ clock: 2_000, status: { type: "idle", since: 0 } });
   const idle = safeIdlePredicate(h.api, 1_500);

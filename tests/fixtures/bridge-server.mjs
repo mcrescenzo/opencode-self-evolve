@@ -6,7 +6,7 @@ import { openStore } from "../../self-evolve-store.js";
 import * as schemas from "../../self-evolve-schemas.js";
 import * as commands from "../../self-evolve-commands.js";
 
-const [stateRoot, projectFingerprint, skillRoot] = process.argv.slice(2);
+const [stateRoot, projectFingerprint, skillRoot, readyFile] = process.argv.slice(2);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const store = openStore(stateRoot, { projectFingerprint, projectName: "bridge-process" });
 const current = store.getSettings();
@@ -76,7 +76,7 @@ const integration = createIntegration({
 });
 
 await integration.boot({ hostVersion: "1.18.3" });
-process.stdout.write("READY\n");
+fs.writeFileSync(readyFile, "ready\n", { encoding: "utf8", flag: "wx" });
 
 let stopping = false;
 async function stop() {

@@ -7,7 +7,7 @@ import {
   submitControlRequest,
 } from "../../self-evolve-bridge.js";
 
-const [stateRoot, projectFingerprint, operation, value, requestFile] = process.argv.slice(2);
+const [stateRoot, projectFingerprint, operation, value, requestFile, resultFile] = process.argv.slice(2);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function stateAfter(nonce) {
@@ -69,4 +69,4 @@ for (let attempt = 0; attempt < 300; attempt += 1) {
 }
 if (!response) throw new Error("control-response-timeout");
 const next = response.ok ? await stateAfter(state.nonce) : readControlState(stateRoot, projectFingerprint);
-process.stdout.write(`${JSON.stringify({ state, request, response, next })}\n`);
+fs.writeFileSync(resultFile, JSON.stringify({ state, request, response, next }), { encoding: "utf8", flag: "wx" });

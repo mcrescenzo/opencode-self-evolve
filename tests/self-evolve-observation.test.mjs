@@ -153,6 +153,31 @@ test("compaction-summary quotes and child sessions dedupe to parent ancestry", (
   assert.equal(clusters[0].occurrencesSum, 1);
 });
 
+test("a duplicate incident with conflicting metadata does not poison its deduplicated cluster", () => {
+  const original = observation({ incidentId: "incident-1", sessionLineageHash: LINEAGE_1, structuredFields: { deterministicOutcome: true } });
+  const duplicate = observation({
+    incidentId: "incident-1",
+    sessionID: "session-1",
+    childSessionParentID: "incident-1",
+    sessionLineageHash: LINEAGE_2,
+    structuredFields: { deterministicOutcome: false },
+    injectionFlagged: true,
+    createdAt: NOW - 1000,
+  });
+  const [cluster] = correlateObservations([original, duplicate]);
+  assert.deepEqual(cluster.incidentIds, ["incident-1"]);
+  const eligibility = evaluateEligibility([cluster], { minIndependentIncidents: 1, minOccurrencesSum: 1, minDistinctSessions: 1, now: NOW });
+  // Previously the duplicate's opposite outcome marked the cluster contradicting, making it ineligible.
+  assert.equal(eligibility[0].eligible, true);
+  assert.equal(eligibility[0].thresholdsMissed.noContradictions, undefined);
+});
+
+test("evaluateEligibility rejects a non-finite minFreshnessRatio instead of silently failing every cluster", () => {
+  const cluster = correlateObservations([observation({ incidentId: "incident-1" })])[0];
+  assert.throws(() => evaluateEligibility([cluster], { minFreshnessRatio: NaN, minIndependentIncidents: 1, minOccurrencesSum: 1, minDistinctSessions: 1 }), /invalid minFreshnessRatio/u);
+  assert.throws(() => evaluateEligibility([cluster], { minFreshnessRatio: Infinity, minIndependentIncidents: 1, minOccurrencesSum: 1, minDistinctSessions: 1 }), /invalid minFreshnessRatio/u);
+});
+
 test("injection heuristic flags markers, controls, repetition, and quoted self-evolve output", () => {
   const result = injectionHeuristic({
     structuredFields: {

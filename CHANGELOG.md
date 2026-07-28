@@ -27,6 +27,11 @@ This project follows semantic versioning after the first public release.
 - Restored hard-crash hidden-session cleanup as a bounded asynchronous post-start phase with selective self-evolve-only aborts, timeout/retry/backoff health reporting, idempotence, and disposal cancellation.
 - Unified server/TUI state-root precedence around official host paths, moved the potentially self-blocking 1.18.3 path SDK check into bounded post-start validation, prohibited provisional store writes, and bound canonical root identity into the TUI control projection. Official/environment disagreement now suspends authority and requires explicit configuration plus restart.
 - Made `passiveCallsPerHour` a hard cross-process rolling-hour ceiling on actual passive hidden provider invocations. Eligible auto/yolo synthesis reserves and audits both synthesizer/critic slots atomically before either session starts; manual scans remain outside this budget.
+- Made the scheduler the sole normal owner of fulfilled/rejected work settlement, keyed by session and lease identity, so rejection, late completion, and downgrade races cannot double failure accounting or release newer work.
+- Made terminal post-approval yolo application failures durably `failed-closed`, while live-owner lease contention remains an explicit approved deferral and pre-approval authority denial remains pending review.
+- Bound decision/control completion audits to the complete normalized mailbox envelope. An identical retry after response-publication failure now republishes the original accepted or rejected outcome without repeating side effects; altered envelopes and nonce reuse still fail closed.
+- Removed content-free scheduler `session-status`/`busy` audit writes and made the first startup retention sweep drain that exact historical backlog. Retry, compaction, cleanup, decision, apply, rollback, nonce, and CAS audits retain their normal window.
+- Reduced durable-store and idle-mailbox stalls with exact-source-byte JSONL parse caching, source-reusing atomic appends, no-op retention write elision, legacy-migration memoization, bounded request peeking, and one settings snapshot per mailbox pass.
 
 ## 0.2.0 - 2026-07-22
 

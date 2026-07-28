@@ -16,24 +16,37 @@ const CLIENT = path.join(HERE, "fixtures", "bridge-tui-client.mjs");
 const CONTROL_CLIENT = path.join(HERE, "fixtures", "bridge-control-client.mjs");
 const FLOOD_CLIENT = path.join(HERE, "fixtures", "bridge-flood-client.mjs");
 const PROJECT = "e".repeat(64);
+let resultOrdinal = 0;
+
+function resultFile(stateRoot, label) {
+  resultOrdinal += 1;
+  return path.join(stateRoot, `.${label}-${process.pid}-${resultOrdinal}.json`);
+}
 
 async function startServer(stateRoot, skillRoot) {
-  const child = spawn(process.execPath, [SERVER, stateRoot, PROJECT, skillRoot], { stdio: ["ignore", "pipe", "pipe"] });
+  const readyFile = resultFile(stateRoot, "bridge-server-ready");
+  const child = spawn(process.execPath, [SERVER, stateRoot, PROJECT, skillRoot, readyFile], { stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   await new Promise((resolve, reject) => {
-    let output = "";
-    const timeout = setTimeout(() => reject(new Error(`server-ready-timeout: ${stderr}`)), 5_000);
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      output += chunk;
-      if (output.includes("READY\n")) {
-        clearTimeout(timeout);
+    const started = Date.now();
+    const poll = setInterval(() => {
+      if (fs.existsSync(readyFile)) {
+        clearInterval(poll);
+        fs.rmSync(readyFile, { force: true });
         resolve();
+      } else if (Date.now() - started >= 5_000) {
+        clearInterval(poll);
+        child.kill("SIGTERM");
+        reject(new Error(`server-ready-timeout: ${stderr}`));
       }
+    }, 10);
+    poll.unref?.();
+    child.once("exit", (code) => {
+      clearInterval(poll);
+      reject(new Error(`server-exited-${code}: ${stderr}`));
     });
-    child.once("exit", (code) => reject(new Error(`server-exited-${code}: ${stderr}`)));
   });
   return child;
 }
@@ -45,15 +58,20 @@ async function stopServer(child) {
 }
 
 async function client(stateRoot, action, proposalId, replayFile) {
-  const args = [CLIENT, stateRoot, PROJECT, action, proposalId];
-  if (replayFile) args.push(replayFile);
-  const { stdout } = await execFileAsync(process.execPath, args, { timeout: 10_000 });
-  return JSON.parse(stdout.trim());
+  const output = resultFile(stateRoot, "bridge-client");
+  const args = [CLIENT, stateRoot, PROJECT, action, proposalId, replayFile ?? "", output];
+  await execFileAsync(process.execPath, args, { timeout: 10_000 });
+  const result = JSON.parse(fs.readFileSync(output, "utf8"));
+  fs.rmSync(output, { force: true });
+  return result;
 }
 
 async function controlClient(stateRoot, operation, value = "", extra = "") {
-  const { stdout } = await execFileAsync(process.execPath, [CONTROL_CLIENT, stateRoot, PROJECT, operation, value, extra], { timeout: 10_000 });
-  return JSON.parse(stdout.trim());
+  const output = resultFile(stateRoot, "control-client");
+  await execFileAsync(process.execPath, [CONTROL_CLIENT, stateRoot, PROJECT, operation, value, extra, output], { timeout: 10_000 });
+  const result = JSON.parse(fs.readFileSync(output, "utf8"));
+  fs.rmSync(output, { force: true });
+  return result;
 }
 
 test("production filesystem path works across processes, restart, replay, and cleanup", async (t) => {
@@ -186,8 +204,9 @@ test("concurrent mailbox publishers cannot exceed the shared project file cap", 
   t.after(() => store.close());
 
   const results = await Promise.all(Array.from({ length: 4 }, async (_, index) => {
-    const { stdout } = await execFileAsync(process.execPath, [FLOOD_CLIENT, root, PROJECT, `worker-${index}`, "40"], { timeout: 10_000 });
-    return JSON.parse(stdout.trim());
+    const output = resultFile(root, `flood-client-${index}`);
+    await execFileAsync(process.execPath, [FLOOD_CLIENT, root, PROJECT, `worker-${index}`, "40", output], { timeout: 10_000 });
+    return JSON.parse(fs.readFileSync(output, "utf8"));
   }));
   const requestDir = path.join(root, "self-evolve", "bridge", PROJECT, "requests");
   const published = fs.readdirSync(requestDir).filter((name) => name.endsWith(".json")).length;

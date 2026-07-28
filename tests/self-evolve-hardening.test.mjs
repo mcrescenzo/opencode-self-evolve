@@ -355,17 +355,34 @@ test("11 bounded cost and concurrency: ten idle events stay under six calls and 
   const settings = store.getSettings();
   store.setGlobalSettings(schemas.makeGlobalSettings({ ...settings.global, mode: "auto", consent: { passiveCalls: true, durableObservations: true }, updatedAt: NOW }));
   const work = [];
+  const settle = [];
   let active = 0;
   let maxActive = 0;
-  const scheduler = createScheduler({ store, privacy: {}, budgets: { idleDebounceMs: 1, backoffBaseMs: 0 }, now: () => NOW, enqueueWork(item) { active += 1; maxActive = Math.max(maxActive, active); work.push(item); } });
+  const scheduler = createScheduler({
+    store,
+    privacy: {},
+    budgets: { idleDebounceMs: 1, backoffBaseMs: 0 },
+    now: () => NOW,
+    enqueueWork(item) {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      work.push(item);
+      return new Promise((resolve) => {
+        settle.push((result) => {
+          active -= 1;
+          resolve(result);
+        });
+      });
+    },
+  });
   t.after(() => { scheduler.dispose(); store.close(); });
   for (let index = 0; index < 10; index += 1) {
     const sessionID = `session-${index % 3}`;
     await scheduler.handleEvent({ type: "session.idle", properties: { sessionID, parentID: "shared-root-session", scopeFingerprint: SCOPE } });
     if (index < 3) {
       await waitFor(() => work.length === index + 1, `work ${index + 1}`);
-      active -= 1;
-      scheduler.recordWorkResult(work[index], { ok: false, error: "provider failure", clusterID: "shared-failure" });
+      settle[index]({ ok: false, error: "provider failure", clusterID: "shared-failure" });
+      await new Promise((resolve) => setImmediate(resolve));
     }
   }
   await new Promise((resolve) => setTimeout(resolve, 15));

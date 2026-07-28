@@ -20,8 +20,8 @@ const DEFAULT_EXCERPT_LENGTH = 240;
 const FINGERPRINT = /^[a-f0-9]{64}$/;
 const CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u;
 const CONTROL_GLOBAL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu;
-const ABSOLUTE_PATH = /(?:^|[\s"'(<])(?:\/(?:[^\s/]+\/)+[^\s"')>]*|[A-Za-z]:\\(?:[^\s\\]+\\)+[^\s"')>]*)/u;
-const ABSOLUTE_PATH_GLOBAL = /(?:^|[\s"'(<])(?:\/(?:[^\s/]+\/)+[^\s"')>]*|[A-Za-z]:\\(?:[^\s\\]+\\)+[^\s"')>]*)/gu;
+const ABSOLUTE_PATH = /(?:^|[\s"'(<])(?:\/[^\s"'()<>]+|[A-Za-z]:\\[^\s"'()<>]+)/u;
+const ABSOLUTE_PATH_GLOBAL = /(?:^|[\s"'(<])(?:\/[^\s"'()<>]+|[A-Za-z]:\\[^\s"'()<>]+)/gu;
 const PROVIDER_TOKEN_PATTERNS = [
   /\bAKIA[0-9A-Z]{16}\b/g,
   /\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[oprsu]_[A-Za-z0-9]{20,})\b/g,

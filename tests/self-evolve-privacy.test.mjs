@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,26 +37,28 @@ const NOW = 120 * DAY;
 const CHILD = fileURLToPath(new URL("./fixtures/store-child.mjs", import.meta.url));
 
 function runAggregateChild(root, fingerprint, incidentId) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CHILD, root, fingerprint, "aggregate", incidentId], { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
-    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-    child.on("error", reject);
-    child.on("close", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(`child-exit-${code}:${stderr}`)));
-  });
+  return runStoreChild(root, fingerprint, "aggregate", incidentId);
 }
 
 function runStoreChild(root, fingerprint, operation, value) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CHILD, root, fingerprint, operation, String(value)], { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
+    const resultPath = path.join(root, `.privacy-child-result-${process.pid}-${randomUUID()}.json`);
+    const child = spawn(process.execPath, [CHILD, root, fingerprint, operation, resultPath, String(value)], { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
-    child.on("close", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(`child-exit-${code}:${stderr}`)));
+    child.on("close", (code) => {
+      if (code !== 0) reject(new Error(`child-exit-${code}:${stderr}`));
+      else {
+        try {
+          const result = JSON.parse(readFileSync(resultPath, "utf8"));
+          rmSync(resultPath, { force: true });
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      }
+    });
   });
 }
 
@@ -250,10 +253,21 @@ test("excerpt scrub applies bounded heuristic redaction", () => {
   store.close();
 });
 
+test("single-component absolute paths are redacted and rejected, not only multi-segment paths", () => {
+  const { store, guard } = fixture();
+  const scrubbed = guard.scrubExcerpt({ text: "see /secret and C:\\boot for details" });
+  assert.equal(scrubbed.ok, true);
+  assert.equal(scrubbed.redacted.includes("/secret"), false);
+  assert.equal(scrubbed.redacted.includes("C:\\boot"), false);
+  assert.match(scrubbed.redacted, /<path>/);
+  const claim = assertSafeGlobalClaim({ note: "root path is /etc here" });
+  assert.equal(claim.ok, false);
+  store.close();
+});
+
 test("an already-created guard observes same-process consent revocation immediately", () => {
   const { store, guard } = fixture({ excerpts: true, aggregate: true });
-  assert.equal(guard.scrubExcerpt({ text: "before revocation" }).ok, true);
-  assert.equal(store.updateGlobalSettings((global) => makeGlobalSettings({
+  assert.equal(guard.scrubExcerpt({ text: "before revocation" }).ok, true);  assert.equal(store.updateGlobalSettings((global) => makeGlobalSettings({
     ...global,
     consent: { ...global.consent, sanitizedExcerpts: false },
     updatedAt: global.updatedAt + 1,

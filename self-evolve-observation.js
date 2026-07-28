@@ -238,13 +238,13 @@ export function correlateObservations(observations) {
         };
         groups.set(key, group);
       }
+      if (group.incidents.has(root)) continue;
       if (group.lastCreatedAt !== null && observation.createdAt < group.lastCreatedAt) group.outOfOrder = true;
       group.lastCreatedAt = observation.createdAt;
       const polarity = observation.structuredFields.deterministicOutcome;
       if (typeof polarity === "boolean" && typeof group.lastPolarity === "boolean" && polarity !== group.lastPolarity) group.contradiction = true;
       if (typeof polarity === "boolean") group.lastPolarity = polarity;
       group.injectionFlagged ||= observation.injectionFlagged;
-      if (group.incidents.has(root)) continue;
       const recorded = recordIncident(group.cluster, observation, Math.max(group.cluster.lastSeenAt, observation.createdAt));
       if (!recorded.ok) throw new TypeError(recorded.error);
       group.cluster = recorded.state;
@@ -280,7 +280,7 @@ export function evaluateEligibility(clusters, thresholds = {}) {
   const retentionMs = thresholds.retentionMs ?? DEFAULT_RETENTION_MS;
   const scope = thresholds.scope ?? "repository";
   if (!Number.isInteger(minDistinctSessions) || minDistinctSessions < 1) throw new TypeError("invalid minDistinctSessions");
-  if (typeof minFreshnessRatio !== "number" || minFreshnessRatio < 0 || minFreshnessRatio > 1) throw new TypeError("invalid minFreshnessRatio");
+  if (!Number.isFinite(minFreshnessRatio) || minFreshnessRatio < 0 || minFreshnessRatio > 1) throw new TypeError("invalid minFreshnessRatio");
   if (!Number.isSafeInteger(retentionMs) || retentionMs < 0) throw new TypeError("invalid retentionMs");
   if (!["repository", "global"].includes(scope)) throw new TypeError("invalid scope");
 

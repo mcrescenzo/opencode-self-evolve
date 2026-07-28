@@ -6,7 +6,7 @@ import {
   submitDecisionRequest,
 } from "../../self-evolve-bridge.js";
 
-const [stateRoot, projectFingerprint, action, proposalId, replayFile] = process.argv.slice(2);
+const [stateRoot, projectFingerprint, action, proposalId, replayFile, resultFile] = process.argv.slice(2);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let request;
@@ -35,4 +35,4 @@ for (let attempt = 0; attempt < 300; attempt += 1) {
 }
 if (!response) throw new Error("mailbox-response-timeout");
 const responsePath = `${stateRoot}/self-evolve/bridge/${projectFingerprint}/responses/${request.requestId}.json`;
-process.stdout.write(`${JSON.stringify({ request, response, requestMode, responseMode: fs.statSync(responsePath).mode & 0o777, inbox: readProjectInbox(stateRoot, projectFingerprint).map((item) => ({ id: item.id, state: item.state })) })}\n`);
+fs.writeFileSync(resultFile, JSON.stringify({ request, response, requestMode, responseMode: fs.statSync(responsePath).mode & 0o777, inbox: readProjectInbox(stateRoot, projectFingerprint).map((item) => ({ id: item.id, state: item.state })) }), { encoding: "utf8", flag: "wx" });

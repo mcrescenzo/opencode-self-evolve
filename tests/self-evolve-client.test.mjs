@@ -96,3 +96,13 @@ test("cleanup falls back to interrupt only when abort is unavailable", async () 
   await cleanupSession(ctx, "hidden");
   assert.deepEqual(calls, [{ path: { id: "hidden" }, query: { directory: "/workspace/project" } }]);
 });
+
+test("readSessionMessages treats a non-positive or invalid limit as zero and never returns the whole transcript", async () => {
+  const ctx = context({
+    async messages() { return { data: { messages: [{ id: "one" }, { id: "two" }, { id: "three" }] } }; },
+  });
+  assert.deepEqual(await readSessionMessages(ctx, "root", 0), []);
+  assert.deepEqual(await readSessionMessages(ctx, "root", -2), []);
+  assert.deepEqual(await readSessionMessages(ctx, "root", 1.7), []);
+  assert.deepEqual(await readSessionMessages(ctx, "root", 2), [{ id: "two" }, { id: "three" }]);
+});

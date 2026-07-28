@@ -1,6 +1,7 @@
 import { createDecisionRequest, submitDecisionRequest } from "../../self-evolve-bridge.js";
+import { writeFileSync } from "node:fs";
 
-const [stateRoot, projectFingerprint, prefix, rawCount] = process.argv.slice(2);
+const [stateRoot, projectFingerprint, prefix, rawCount, resultFile] = process.argv.slice(2);
 const count = Number(rawCount);
 const proposal = {
   id: `proposal-${prefix}`,
@@ -29,4 +30,4 @@ for (let index = 0; index < count; index += 1) {
     rejected += 1;
   }
 }
-process.stdout.write(`${JSON.stringify({ published, rejected })}\n`);
+writeFileSync(resultFile, JSON.stringify({ published, rejected }), { encoding: "utf8", flag: "wx" });

@@ -329,6 +329,13 @@ function sanitizeAnalyzerText(value, max = 1200) {
   );
 }
 
+// Target path/surface/symbol fields must shed ANSI and C0/C1 control characters
+// (terminal/control-sequence injection) without applying markdown sanitization,
+// which would strip legitimate filename punctuation such as underscores.
+function sanitizeTargetField(value, max) {
+  return normalizedString(String(value ?? "").replace(ANSI_CONTROL_RE, "").replace(CONTROL_CHAR_RE, " "), max);
+}
+
 function substantiveTokens(value) {
   return (String(value || "").toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) || [])
     .filter((token) => !QUALITY_STOP_WORDS.has(token));
@@ -394,9 +401,9 @@ export function validateAnalyzerPayload(payload, state, context = {}) {
   if (!proposal.target || typeof proposal.target !== "object" || Array.isArray(proposal.target) || !allowedKeys(proposal.target, ["path", "surface", "symbol"])) {
     return { ok: false, failure: false, reason: "Proposal target is malformed." };
   }
-  const targetPath = normalizedString(proposal.target.path, 500);
-  const targetSurface = normalizedString(proposal.target.surface, 300);
-  const targetSymbol = normalizedString(proposal.target.symbol, 200);
+  const targetPath = sanitizeTargetField(proposal.target.path, 500);
+  const targetSurface = sanitizeTargetField(proposal.target.surface, 300);
+  const targetSymbol = sanitizeTargetField(proposal.target.symbol, 200);
   if ((!targetPath && !targetSurface) || VAGUE_TARGET_RE.test(targetPath || targetSurface)) {
     return { ok: false, failure: false, reason: "Proposal target is too vague." };
   }
@@ -424,8 +431,8 @@ export function validateAnalyzerPayload(payload, state, context = {}) {
   if (!["low", "medium", "high"].includes(proposal.risk) || !nonEmptyString(proposal.riskMitigation, 12)) {
     return { ok: false, failure: false, reason: "Proposal lacks risk or mitigation." };
   }
-  if (!Number.isFinite(proposal.confidence) || proposal.confidence < opts.minConfidence) {
-    return { ok: false, failure: false, reason: "Proposal confidence is below threshold." };
+  if (!Number.isFinite(proposal.confidence) || proposal.confidence < 0 || proposal.confidence > 1 || proposal.confidence < opts.minConfidence) {
+    return { ok: false, failure: false, reason: "Proposal confidence is outside the valid range or below threshold." };
   }
   if (SENSITIVE_ACTION_RE.test(proposal.suggestedAction)) {
     return { ok: false, failure: false, reason: "Proposal suggested action asks to expose sensitive file contents." };
@@ -634,8 +641,8 @@ export function redactText(text) {
   value = value.replace(/\b(Authorization\s*:\s*)[^\r\n]+/gi, "$1[redacted]");
   value = value.replace(/\b((?:Set-)?Cookie\s*:\s*)[^\r\n]+/gi, "$1[redacted]");
   value = value.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [redacted]");
-  value = value.replace(/\b([A-Z0-9_]*(?:DATABASE_URL|DB_URL|REDIS_URL|MONGO(?:DB)?_URI|POSTGRES(?:QL)?_URL)[A-Z0-9_]*)\s*[:=]\s*[\"']?[^\"'\s,;]{8,}/gi, "$1=[redacted]");
-  value = value.replace(/\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*)\s*[:=]\s*[\"']?[^\"'\s,;]{8,}/gi, "$1=[redacted]");
+  value = value.replace(/\b([A-Z0-9_]*(?:DATABASE_URL|DB_URL|REDIS_URL|MONGO(?:DB)?_URI|POSTGRES(?:QL)?_URL)[A-Z0-9_]*)\s*[:=]\s*(?:"[^"]{8,}"|'[^']{8,}'|[^"'\s,;]{8,})/gi, "$1=[redacted]");
+  value = value.replace(/\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*)\s*[:=]\s*(?:"[^"]{8,}"|'[^']{8,}'|[^"'\s,;]{8,})/gi, "$1=[redacted]");
   value = value.replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^\s/:@]+):([^\s/@]+)@/gi, "$1[redacted]@");
   value = value.replace(COMMON_PROVIDER_TOKEN_RE, "[redacted: token]");
   value = value.replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b/g, "[redacted: token]");

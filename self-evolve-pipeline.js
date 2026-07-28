@@ -16,9 +16,10 @@ function messageRole(message) {
 }
 
 function selfEvolveOutput(message) {
+  const agent = message?.agent ?? message?.info?.agent;
   const parts = message?.parts ?? message?.info?.parts ?? [];
-  return message?.agent === "self-evolve-synthesizer"
-    || message?.agent === "self-evolve-critic"
+  return agent === "self-evolve-synthesizer"
+    || agent === "self-evolve-critic"
     || (Array.isArray(parts) && parts.some((part) => part?.metadata?.source === "self-evolve-plugin"));
 }
 
@@ -518,7 +519,35 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         persistSynthesisOutcome(synthesized, "accepted", undefined, options.faultInjection);
         if (mode === "yolo") {
           const applied = await applier.applyProposal({ proposal: { ...proposal, proposedContent: content }, mode, actor: "self-evolve-applier" });
-          if (applied?.ok) return { result: "applied", proposal, observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: `Self-evolve applied proposal ${proposal.id}; appliedHash ${applied.appliedHash}; auditId ${applied.auditId}.` };
+          if (applied?.ok === true && applied.disposition === "applied") {
+            return { result: "applied", proposal, observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: `Self-evolve applied proposal ${proposal.id}; appliedHash ${applied.appliedHash}; auditId ${applied.auditId}.` };
+          }
+          const latest = currentProposal(store, proposal.id) ?? proposal;
+          if (applied?.disposition === "deferred" && applied.deferred === true) {
+            return {
+              result: "deferred",
+              deferred: true,
+              reason: applied.reason ?? "apply-deferred",
+              proposal: latest,
+              observations,
+              eligibility,
+              auditEvents: auditSince(store, auditStart),
+              responseText: `Self-evolve deferred automatic application of proposal ${proposal.id}: ${applied.reason ?? "apply-deferred"}.`,
+            };
+          }
+          if (applied?.disposition !== "pending-review" || latest.state !== "pending") {
+            const reason = String(applied?.reason ?? "invalid-automatic-apply-outcome").slice(0, 400);
+            const failed = failProposalClosed(latest, reason);
+            return {
+              result: "failed-closed",
+              reason,
+              proposal: failed,
+              observations,
+              eligibility,
+              auditEvents: auditSince(store, auditStart),
+              responseText: `Self-evolve automatic application of proposal ${proposal.id} failed closed: ${reason}. No verified skill-file change was accepted.`,
+            };
+          }
         }
         return {
           result: mode === "manual" ? "proposal-pending" : "proposal-ready",

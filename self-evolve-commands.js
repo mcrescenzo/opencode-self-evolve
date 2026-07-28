@@ -305,6 +305,7 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     let consent;
     const saved = store.updateGlobalSettings((global) => {
       if (key === "crossRepoAggregation" && value && !global.consent.sanitizedExcerpts) throw new Error("sanitized-excerpts-consent-required");
+      if (key === "sanitizedExcerpts" && !value && global.consent.crossRepoAggregation) throw new Error("cross-repository-aggregation-requires-excerpts");
       wasEnabled = global.consent[key];
       consent = makeConsentState({ ...global.consent, [key]: value });
       return makeGlobalSettings({ ...global, consent, updatedAt: now() });

@@ -191,16 +191,18 @@ export async function readSessionMessages(ctx, sessionID, limit, options = {}) {
   const session = ctx?.client?.session;
   const method = session?.messages;
   if (typeof method !== "function") throw new Error("OpenCode session.messages is unavailable.");
+  const boundedLimit = Number.isSafeInteger(limit) && limit > 0 ? limit : 0;
   const result = await invokeCompatible([
-    () => method.call(session, { path: { id: sessionID }, query: { directory: ctx.directory, limit } }),
-    () => method.call(session, { path: { sessionID }, query: { directory: ctx.directory, limit } }),
-    () => method.call(session, { sessionID, directory: ctx.directory, limit }),
+    () => method.call(session, { path: { id: sessionID }, query: { directory: ctx.directory, limit: boundedLimit } }),
+    () => method.call(session, { path: { sessionID }, query: { directory: ctx.directory, limit: boundedLimit } }),
+    () => method.call(session, { sessionID, directory: ctx.directory, limit: boundedLimit }),
   ], {
     timeoutMs: options.timeoutMs,
     signal: options.signal,
     label: options.label ?? "OpenCode session.messages",
   });
-  return sessionMessages(result).slice(-limit);
+  const messages = sessionMessages(result);
+  return boundedLimit > 0 ? messages.slice(-boundedLimit) : [];
 }
 
 export async function cleanupSession(ctx, sessionID, options = {}) {

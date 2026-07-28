@@ -84,6 +84,14 @@ test("request envelopes are exact, bounded, hash-bound, and reject stale or cros
   assert.throws(() => makeBridgeRequest({ ...request, targetHash: "wrong" }), /invalid-target-hash/u);
 });
 
+test("a new-skill decision request accepts the must-not-exist target hash sentinel", () => {
+  const newSkill = proposal({ skillTarget: { canonicalRoot: "/skills", relativePath: "fresh/SKILL.md", currentHash: "must-not-exist" } });
+  const request = createDecisionRequest({ projectFingerprint: PROJECT, proposal: newSkill, newState: "approved", timestamp: Date.now() });
+  assert.equal(request.targetHash, "must-not-exist");
+  // A genuinely malformed target hash is still rejected.
+  assert.throws(() => createDecisionRequest({ projectFingerprint: PROJECT, proposal: proposal({ skillTarget: { canonicalRoot: "/skills", relativePath: "x/SKILL.md", currentHash: "nope" } }), newState: "approved", timestamp: Date.now() }), /invalid-target-hash/u);
+});
+
 test("TUI host-health runtime report is exact, root-bound, short-lived, and securely published", (t) => {
   const root = fixture(t);
   const issuedAt = Date.now();
@@ -241,6 +249,51 @@ test("request publication and responses are restrictive, atomic, replay-safe fil
   const responsePath = path.join(root, "self-evolve", "bridge", PROJECT, "responses", `${request.requestId}.json`);
   assert.equal(fs.statSync(responsePath).mode & 0o777, 0o600);
   assert.equal("proposedContent" in response, false);
+});
+
+test("a post-handler publication fault leaves the request queued for outcome-safe retry", async (t) => {
+  const root = fixture(t);
+  const request = createDecisionRequest({
+    projectFingerprint: PROJECT,
+    proposal: proposal(),
+    newState: "rejected",
+    timestamp: Date.now(),
+    requestId: "post-handler-fault",
+  });
+  const submitted = submitDecisionRequest(root, request);
+  let handled = 0;
+  let failOnce = true;
+  await assert.rejects(
+    consumeDecisionRequests({
+      stateRoot: root,
+      projectFingerprint: PROJECT,
+      validateAndDecide: async () => {
+        handled += 1;
+        return { ok: true };
+      },
+      __testAfterRequestHandled() {
+        if (!failOnce) return;
+        failOnce = false;
+        throw new Error("publication-fault");
+      },
+    }),
+    /publication-fault/u,
+  );
+  assert.equal(fs.existsSync(submitted.path), true);
+  assert.equal(pollDecisionResponse(root, PROJECT, request.requestId), null);
+
+  const retried = await consumeDecisionRequests({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    validateAndDecide: async () => {
+      handled += 1;
+      return { ok: true, recovered: true };
+    },
+  });
+  assert.equal(retried.processed.length, 1);
+  assert.equal(retried.processed[0].recovered, true);
+  assert.equal(handled, 2, "the transport retries; integration supplies semantic idempotency");
+  assert.equal(fs.existsSync(submitted.path), false);
 });
 
 test("consumer rejects malformed and stale requests and cleanup removes expired envelopes", async (t) => {

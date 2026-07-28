@@ -524,12 +524,16 @@ export function makeProposalContent(data) {
   exactKeys(data, ProposalContent.fields, "ProposalContent");
   const content = asString(data.content, { max: 512 });
   if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(content)) fail("malformed-payload", "content must be base64");
+  if (Buffer.from(content, "base64").toString("base64") !== content) fail("malformed-payload", "content must be canonical base64");
+  const chunkIndex = asInt(data.chunkIndex, { min: 0, max: 1_000_000 });
+  const chunkCount = asInt(data.chunkCount, { min: 1, max: 1_000_000 });
+  if (chunkIndex >= chunkCount) fail("malformed-payload", "chunkIndex must be less than chunkCount");
   return deepFreeze({
     proposalId: idString(data.proposalId),
     contentHash: asSha256Hex(data.contentHash),
     contentEncoding: asEnum(data.contentEncoding, ["base64"]),
-    chunkIndex: asInt(data.chunkIndex, { min: 0, max: 1_000_000 }),
-    chunkCount: asInt(data.chunkCount, { min: 1, max: 1_000_000 }),
+    chunkIndex,
+    chunkCount,
     content,
   });
 }
@@ -761,6 +765,7 @@ export function transitionMode(currentGlobal, currentRepo, requested, now, actor
     const mode = scope === "repo" ? asEnum(request.mode, REPO_MODES) : asMode(request.mode);
     const timestamp = asTimestamp(now);
     const cleanActor = asNonEmptyString(actor, { max: MAX.actor });
+    if (scope === "global" && Number.isFinite(global.updatedAt) && timestamp < global.updatedAt) fail("stale-timestamp", "mode transition timestamp is older than the current settings version");
     const nextGlobal = scope === "global" ? makeGlobalSettings({ ...global, mode, updatedAt: timestamp }) : global;
     const nextRepo = scope === "repo" ? makeRepoSettings({ ...repo, mode }) : repo;
     const suppliedOverrides = request.overrides ?? {};

@@ -689,6 +689,46 @@ test("validateAnalyzerPayload rejects a target whose surface is only stop-words"
   assert.match(result.reason, /lacks a concrete term/i);
 });
 
+test("target fields shed ANSI/control sequences while preserving filename punctuation", () => {
+  const state = createSessionState("sanitize-target", {}, 0);
+  const payload = validPayload({
+    proposal: {
+      summary: "The transcript discussed id_rsa handling; secret files must not be targets.",
+      evidence: ["The session mentioned id_rsa and credential handling in a repo-local context."],
+      target: { path: "config/id_rsa\u001b[31m", surface: "repo-local file", symbol: "" },
+      placement: "repo-local",
+      suggestedAction: "Document id_rsa handling without touching the private key file.",
+    },
+  });
+  const result = validateAnalyzerPayload(payload, state, { targetRoot: "/repo" });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /secret|runtime|dependency|ignored/i);
+  // The underscore survives (it is a legitimate filename char needed by isUnsafeTarget).
+  assert.equal(result.proposal, undefined);
+});
+
+test("confidence outside the documented [0, 1] range is rejected rather than clamped", () => {
+  const state = createSessionState("confidence-range", {}, 0);
+  const above = validateAnalyzerPayload(validPayload({ proposal: { confidence: 2 } }), state, { targetRoot: "/repo" });
+  assert.equal(above.ok, false);
+  assert.match(above.reason, /confidence/i);
+  const below = validateAnalyzerPayload(validPayload({ proposal: { confidence: -0.5 } }), state, { targetRoot: "/repo" });
+  assert.equal(below.ok, false);
+  assert.match(below.reason, /confidence/i);
+  // A valid in-range confidence is still accepted.
+  const ok = validateAnalyzerPayload(validPayload({ proposal: { confidence: 0.9 } }), state, { targetRoot: "/repo" });
+  assert.equal(ok.ok, true);
+});
+
+test("redactText fully redacts quoted secrets that contain spaces", () => {
+  const quoted = 'PASSWORD="correct horse battery staple"\nAPI_KEY=\'sk live token value here\'';
+  const redacted = redactText(quoted);
+  assert.equal(redacted.includes("correct horse battery staple"), false);
+  assert.equal(redacted.includes("sk live token value here"), false);
+  assert.match(redacted, /PASSWORD=\[redacted\]/);
+  assert.match(redacted, /API_KEY=\[redacted\]/);
+});
+
 
 test("parseAnalyzerOutput extracts JSON wrapped in prose via brace extraction", () => {
   const wrapped = 'Here is my analysis:\n{"proposal":null,"reason":"No safe actionable proposal."}\nDone.';

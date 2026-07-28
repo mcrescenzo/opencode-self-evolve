@@ -674,7 +674,9 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       if (typeof api.attention?.notify === "function") {
         await api.attention.notify({ title: "Self-evolve", message: "A proposal is ready for review", notification: true, sound: false });
       }
+      if (disposed || api.lifecycle.signal.aborted) return { ok: false, reason: "disposed" };
       showProposal(proposal);
+      api.kv.set(LAST_SHOWN_KEY, { ...lastShownAt(), [proposal.id]: nowFor(api) });
       return { ok: true };
     } catch (error) {
       if (!api.lifecycle.signal.aborted) dialogError(api, error instanceof Error ? error.message : String(error));

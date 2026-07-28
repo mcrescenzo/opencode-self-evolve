@@ -413,7 +413,7 @@ export function makeBridgeRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_T
     requestId: validId(value.requestId, "request-id"),
     projectFingerprint: validHash(value.projectFingerprint, "project-fingerprint"),
     proposalId: validId(value.proposalId, "proposal-id"),
-    targetHash: validHash(value.targetHash, "target-hash"),
+    targetHash: value.targetHash === "must-not-exist" ? "must-not-exist" : validHash(value.targetHash, "target-hash"),
     proposedContentHash: validHash(value.proposedContentHash, "proposed-content-hash"),
     decisionVersion: value.decisionVersion,
     priorState: value.priorState,
@@ -898,7 +898,15 @@ function requestFiles(paths, directory) {
     .sort((left, right) => left.requestId.localeCompare(right.requestId));
 }
 
-async function consumeType({ paths, projectFingerprint, now, maxRequests, type, handler, beforeRead }) {
+export function pendingRequestCounts(stateRoot, projectFingerprint) {
+  const paths = bridgePaths(stateRoot, projectFingerprint, { create: true });
+  return {
+    decisions: requestFiles(paths, paths.requests).length,
+    controls: requestFiles(paths, paths.controlRequests).length,
+  };
+}
+
+async function consumeType({ paths, projectFingerprint, now, maxRequests, type, handler, beforeRead, afterHandled }) {
   const directory = type === "control" ? paths.controlRequests : paths.requests;
   const responseDirectory = type === "control" ? paths.controlResponses : paths.responses;
   const processed = [];
@@ -919,6 +927,7 @@ async function consumeType({ paths, projectFingerprint, now, maxRequests, type, 
     } catch (error) {
       result = { ok: false, reason: reason(error) };
     }
+    await afterHandled?.({ type, request, result, filePath: item.filePath, requestId: item.requestId });
     const common = {
       schemaVersion: SCHEMA_VERSION,
       requestId: item.requestId,
@@ -947,7 +956,7 @@ async function consumeType({ paths, projectFingerprint, now, maxRequests, type, 
   return processed;
 }
 
-export async function consumeDecisionRequests({ stateRoot, projectFingerprint, now = () => Date.now(), validateAndDecide, validateAndControl, maxRequests = 32, lockTtlMs = 10_000, __testBeforeRequestRead } = {}) {
+export async function consumeDecisionRequests({ stateRoot, projectFingerprint, now = () => Date.now(), validateAndDecide, validateAndControl, maxRequests = 32, lockTtlMs = 10_000, __testBeforeRequestRead, __testAfterRequestHandled } = {}) {
   if (typeof validateAndDecide !== "function" && typeof validateAndControl !== "function") throw new TypeError("bridge-handler-required");
   const timestamp = now();
   const paths = bridgePaths(stateRoot, projectFingerprint, { create: true });
@@ -957,8 +966,8 @@ export async function consumeDecisionRequests({ stateRoot, projectFingerprint, n
   const lock = withStateMutationLock(paths.boundary, () => acquireConsumerLock(paths, timestamp, lockTtlMs));
   if (!lock) return { ok: false, reason: "bridge-lease-busy", processed: [], controls: [] };
   try {
-    const processed = await consumeType({ paths, projectFingerprint, now, maxRequests, type: "decision", handler: validateAndDecide, beforeRead: __testBeforeRequestRead });
-    const controls = await consumeType({ paths, projectFingerprint, now, maxRequests, type: "control", handler: validateAndControl, beforeRead: __testBeforeRequestRead });
+    const processed = await consumeType({ paths, projectFingerprint, now, maxRequests, type: "decision", handler: validateAndDecide, beforeRead: __testBeforeRequestRead, afterHandled: __testAfterRequestHandled });
+    const controls = await consumeType({ paths, projectFingerprint, now, maxRequests, type: "control", handler: validateAndControl, beforeRead: __testBeforeRequestRead, afterHandled: __testAfterRequestHandled });
     return { ok: true, processed, controls };
   } finally {
     withStateMutationLock(paths.boundary, () => releaseConsumerLock(paths, lock.nonce));

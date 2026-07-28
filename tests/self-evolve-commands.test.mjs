@@ -254,6 +254,19 @@ test("all consent keys toggle with first-enable disclosures and cross-repo requi
   assert.equal(policy.getConsent().crossRepoAggregation, false);
 });
 
+test("disabling sanitized excerpts while cross-repo aggregation is enabled is rejected", (t) => {
+  const { policy } = fixture(t);
+  policy.execute(command("consent excerpts on"), { projectFingerprint: FINGERPRINT });
+  const enabled = policy.execute(command("consent cross-repo on"), { projectFingerprint: FINGERPRINT });
+  assert.match(enabled.responseText, /Disclosure:/);
+  assert.equal(policy.getConsent().crossRepoAggregation, true);
+  const blocked = policy.execute(command("consent excerpts off"), { projectFingerprint: FINGERPRINT });
+  assert.match(blocked.responseText, /cross-repository-aggregation-requires-excerpts/u);
+  // The privacy invariant survives: excerpts remain on and aggregation stays consistent.
+  assert.equal(policy.getConsent().sanitizedExcerpts, true);
+  assert.equal(policy.getConsent().crossRepoAggregation, true);
+});
+
 test("newer settings fail closed to manual and refuse writes with a health message", (t) => {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-commands-corrupt-"));
   const stateDir = path.join(root, "self-evolve", FINGERPRINT);
