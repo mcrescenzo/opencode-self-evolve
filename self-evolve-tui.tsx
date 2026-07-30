@@ -17,6 +17,7 @@ const CARD_ID = "self-evolve-sidebar-card"
 const REVIEW_DIALOG_ID = "self-evolve-review-dialog"
 const CONTROL_CENTER_COMMAND = "self-evolve.control-center"
 const CONTROL_CENTER_ROUTE = "self-evolve.control-center.route"
+const CONTROL_CENTER_MODE = "self-evolve-control-center"
 const CONTROL_CENTER_VIEW_ID = "self-evolve-control-center"
 const activeApis = new WeakSet<object>()
 
@@ -274,9 +275,8 @@ function ControlCenter(props: {
   )
   const model = () => buildControlCenterModel(props.snapshot())
   let popMode = () => {}
-  const close = () => props.api.route.navigate(props.prior.name, props.prior.params)
   onMount(() => {
-    popMode = props.api.mode.push("self-evolve-control-center")
+    popMode = props.api.mode.push(CONTROL_CENTER_MODE)
     const ids = (props.snapshot().projection?.index?.reviews ?? []).slice(0, 2).map((review) => review.proposalId)
     void props.store.selectDetails(ids)
   })
@@ -328,12 +328,6 @@ function ControlCenter(props: {
       flexDirection="column"
       paddingLeft={2}
       paddingRight={2}
-      onKeyDown={(event: KeyEvent) => {
-        if (event.name === "escape") {
-          event.preventDefault()
-          close()
-        }
-      }}
     >
       <text fg={props.api.theme.current.text}><b>Self-evolve control center</b></text>
       <box flexDirection="row" gap={1}>
@@ -491,6 +485,10 @@ const tui: TuiPlugin = async (api, options, meta) => {
     )
   }
   let priorRoute: { name: string; params?: Record<string, unknown> } = { name: "home" }
+  const closeControlCenter = () => {
+    if (api.route.current.name !== CONTROL_CENTER_ROUTE) return
+    api.route.navigate(priorRoute.name, priorRoute.params)
+  }
   const openControlCenter = () => {
     if (api.route.current.name !== CONTROL_CENTER_ROUTE) {
       priorRoute = {
@@ -504,7 +502,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     name: CONTROL_CENTER_ROUTE,
     render: () => <ControlCenter api={api} store={projectStore!} snapshot={snapshot} prior={priorRoute} />,
   }])
-  const unregisterKeymap = api.keymap.registerLayer({
+  const unregisterPaletteKeymap = api.keymap.registerLayer({
     commands: [{
       name: CONTROL_CENTER_COMMAND,
       title: "Self-evolve control center",
@@ -513,12 +511,21 @@ const tui: TuiPlugin = async (api, options, meta) => {
       run: openControlCenter,
     }],
   })
+  const unregisterControlCenterKeymap = api.keymap.registerLayer({
+    mode: CONTROL_CENTER_MODE,
+    bindings: [{
+      key: "escape",
+      cmd: closeControlCenter,
+      desc: "Close self-evolve control center",
+    }],
+  })
   api.lifecycle.onDispose(() => {
     if (api.route.current.name === CONTROL_CENTER_ROUTE) {
       api.route.navigate(priorRoute.name, priorRoute.params)
     }
     unregisterRoute?.()
-    if (typeof unregisterKeymap === "function") unregisterKeymap()
+    if (typeof unregisterPaletteKeymap === "function") unregisterPaletteKeymap()
+    if (typeof unregisterControlCenterKeymap === "function") unregisterControlCenterKeymap()
   })
   api.slots.register({
     order: 275,

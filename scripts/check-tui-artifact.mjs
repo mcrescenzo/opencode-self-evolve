@@ -57,9 +57,12 @@ export function assertApprovedTuiPackageContract(packageJSON, source) {
     'api.ui.dialog.replace',
     'api.ui.dialog.setSize("xlarge")',
     'api.route.register',
-    'api.mode.push("self-evolve-control-center")',
+    'api.mode.push(CONTROL_CENTER_MODE)',
     'name: CONTROL_CENTER_COMMAND',
     'namespace: "palette"',
+    'mode: CONTROL_CENTER_MODE',
+    'key: "escape"',
+    'cmd: closeControlCenter',
   ]) {
     if (!source.includes(required)) fail(`raw TUI artifact is missing native surface contract: ${required}`);
   }
