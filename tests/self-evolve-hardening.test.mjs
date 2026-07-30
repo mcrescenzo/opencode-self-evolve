@@ -470,11 +470,18 @@ test("15 provider and TUI hangs are bounded and fail closed without disabling ma
     now: () => NOW,
     route: { current: { params: { sessionID: "manual" } } },
     kv: { get: (key, fallback) => kv.has(key) ? kv.get(key) : fallback, set: (key, value) => kv.set(key, value) },
-    ui: { DialogConfirm() {}, DialogSelect() {}, DialogAlert(value) { alerts.push(value); }, toast() {} },
+    ui: {
+      DialogConfirm() {},
+      DialogSelect() {},
+      DialogAlert(value) { alerts.push(value); },
+      toast() {},
+      dialog: { replace(render) { return render(); }, clear() {}, setSize() {} },
+    },
     event: { on: () => () => {} },
     lifecycle: { signal: controller.signal, onDispose(fn) { disposers.push(fn); } },
     state: { session: { status: () => ({ type: "idle", since: 0 }) } },
     client: {},
+    __testAutoReview: true,
     __testMailboxClient: { getInbox: async () => await new Promise(() => {}) },
   };
   await SelfEvolveTuiPlugin(api, { selfEvolve: { projectFingerprint: PROJECT_A, serverTimeoutMs: 5, idleDebounceMs: 0 } });

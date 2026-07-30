@@ -6,7 +6,7 @@
 - This repository is the standalone source for `@mcrescenzo/opencode-self-evolve`. It may be checked out directly or nested inside a larger OpenCode config tree; do not assume any parent checkout is a git repository.
 - Public package users register the plugin in `opencode.json` as `@mcrescenzo/opencode-self-evolve`. Local development checkouts may register a file path to `self-evolve.js`.
 - Legacy manual state is session-local and in-memory. Durable v0.2 autonomy state is restricted to the OpenCode state root; never add external-tracker writes, network publication, Git mutation, implementation/shell agents, or external-system mutation.
-- Use plain Node ESM and no new npm dependencies. Run `npm test`, `npm run check`, and `npm run pack:check` from this directory; run `npm run smoke:live` when a local OpenCode binary is available.
+- Use plain Node ESM for server and shared modules and add no ordinary runtime dependencies. The target-exclusive raw TSX `./tui` entry may declare only these optional peer dependencies: `@opencode-ai/plugin ~1.18.3`, `@opentui/core >=0.4.3 <0.5.0`, `@opentui/keymap >=0.4.3 <0.5.0`, `@opentui/solid >=0.4.3 <0.5.0`, and `solid-js 1.9.12`; they must remain unreachable from the package root. Any other dependency or range change requires maintainer approval. Run `npm test`, `npm run check`, and `npm run pack:check` from this directory; run `npm run smoke:live` when a local OpenCode binary is available.
 - Tests import pure helpers from `self-evolve-core.js` and `SelfEvolvePlugin.__test`; keep `self-evolve.js` exporting only the plugin function so OpenCode does not boot test helpers as plugins.
 - Runtime directories such as `.opencode/`, `.remember/`, `.beads/`, `.claude/`, `node_modules/`, logs, and live `.env` files are not package fixtures and must not be published. Local tracker state may exist during development, but it is not part of the public release surface.
 - After changing this plugin or OpenCode registration/config, restart OpenCode; running sessions keep already-loaded plugins, commands, agents, and instructions.
@@ -35,7 +35,13 @@ These are deliberate decisions, not accidents. Preserve them across refactors.
 - `self-evolve-integration.js`: mode/authority coordination, boot recovery, TUI bridge, and shutdown.
 - `self-evolve-lock.js`: shared synchronous cross-process mutation lock used by stores and mailbox publishers.
 - `self-evolve-state-root.js`: shared canonical state-root precedence, bounded host validation, and root identity.
-- `self-evolve-tui.js`: native safe-idle review, consent, audit, and rollback UI.
+- `self-evolve-ui-protocol.js`: strict bounded projection, grant, operation, and compatibility schemas shared by both targets.
+- `self-evolve-projection.js`: server-authored project projection and target-derived operation grants.
+- `self-evolve-export.js`: private short-lived native export artifact writer and metadata reader.
+- `self-evolve-tui.tsx`: raw target-exclusive public TUI entry; `self-evolve-tui.js` owns target-exclusive host registration and lifecycle wiring.
+- `self-evolve-tui-store.js`: target-exclusive project-scoped reactive projection store and lifecycle owner.
+- **TUI authority invariant.** The TUI is a read-only projection consumer and can publish only strict create-exclusive decision, control, and operation envelopes. The server freshly revalidates root/project identity, projection/grant generation, domain versions, nonce, consent, and authority immediately before any effect. Native purge-all is accepted-terminal: publish the terminal response and stop authority before deleting its mailbox subtree.
+- **Native UX invariant.** Normal Release A interaction is the conditional sidebar card, mounted native review dialog, and `self-evolve.control-center` palette route. Keep outcomes mounted, do not reintroduce proposal/status/settings toasts, attention notifications, polling-triggered dialogs, or slash-dependent normal workflows. Slash commands remain headless and recovery compatibility.
 - **Dual-target invariant.** The server entry is exported only from `.` and must not import `./tui`, `@opencode-ai/plugin/tui`, or `@opentui/*`. The TUI entry is exported only from `./tui`. Shared pure helpers import from neither target.
 - **Single-export invariant.** `self-evolve.js` still exports only `default SelfEvolvePlugin`; test seams remain properties on that function.
 - **Module-level registry invariant.** Keep the single module-scoped `const registry`; never reassign or duplicate it when adding autonomy wiring.

@@ -246,7 +246,6 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       passiveCallsRemainingThisHour: Math.max(0, fresh.passiveCallsPerHour - budgetCount(events, "passive", timestamp - HOUR_MS)),
       synthesesRemainingToday: Math.max(0, fresh.synthesisPerDay - budgetCount(events, "synthesis", timestamp - DAY_MS)),
       withinQuietPeriod: isQuiet(timestamp, quietHours),
-      notificationsRemainingThisHour: Math.max(0, fresh.notificationsPerHour - budgetCount(events, "notification", timestamp - HOUR_MS)),
     });
   }
 
@@ -529,11 +528,6 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       return { accepted: false, stale: true };
     }
 
-    if (Number.isSafeInteger(result.notifications) && result.notifications > 0) {
-      for (let index = 0; index < result.notifications; index += 1) {
-        audit("scheduler-budget", { budgetType: "notification", rootSessionIDHash: hashSessionLineage(state?.rootSessionID ?? workItem.sessionID) }, timestamp);
-      }
-    }
     if (normalizeResultFailure(result)) {
       const failureKey = schedulingFailureKey(state?.rootSessionID ?? workItem.sessionID);
       const priorFailures = persistedFailures(failureKey, timestamp);

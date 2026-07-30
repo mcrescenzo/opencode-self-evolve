@@ -47,7 +47,7 @@ quality gates.
 | Durable structured observations                 | Only when `/self-evolve` invoked  | Automatic at idle boundaries          | Automatic at idle boundaries                      |
 | Correlation + eligibility                       | On invocation                     | Automatic                             | Automatic                                         |
 | Synthesis + deterministic validation + critic   | On invocation                     | Automatic                             | Automatic                                         |
-| Notify on eligible proposal                      | Toast on invocation               | Native TUI dialog at safe idle        | Native TUI dialog at safe idle                    |
+| Surface eligible proposal                       | Durable headless result            | Conditional sidebar review card       | Conditional sidebar audit/review card             |
 | Apply a skill change                             | **Never** (advisory only)         | Explicit per-change TUI or deterministic headless approval | Automatically, **only** in allowlisted scopes |
 | Apply in non-allowlisted scope                   | n/a                               | Downgrade to pending proposal         | Downgrade to pending proposal                     |
 | Headless apply                                   | n/a                               | Explicit deterministic one-use approval command only | Permitted in explicit allowlist after release gates pass |
@@ -62,10 +62,9 @@ newer-than-known state.
 | Read session messages via SDK                      | ✓        | ✓      | ✓      | Server plugin          |
 | Write structured observation to state root         | invoke  | ✓      | ✓      | Server plugin          |
 | Spawn hidden deny-all-tools analyzer session       | invoke  | ✓      | ✓      | Server plugin          |
-| `client.tui.showToast` (toast)                     | ✓        | ✓      | ✓      | Server plugin          |
-| Optional supported TUI refresh event               | ✓        | ✓      | ✓      | Server plugin          |
-| `api.ui.DialogConfirm` / `DialogSelect` (consent)  | -        | ✓      | ✓      | TUI plugin             |
-| `api.attention.notify` (system notification)       | -        | ✓      | ✓      | TUI plugin             |
+| Persistent projection refresh event                | ✓        | ✓      | ✓      | Server plugin          |
+| Conditional native sidebar and mounted routes      | -        | ✓      | ✓      | TUI plugin             |
+| Toast, attention notification, automatic dialog    | -        | -      | -      | Prohibited normal UX   |
 | Read+write OpenCode skill files in allowlist       | -        | approved | ✓    | Server applier only    |
 | Read+write OpenCode skill files outside allowlist  | -        | -      | -      | Never                  |
 | Spawn implementation/shell/Git agent               | -        | -      | -      | Never                  |
@@ -163,9 +162,12 @@ Two independent gates, both mandatory:
 
 ### 2.6 Notify / Apply
 
-- **Notify**: native TUI dialog at safe idle boundary (`api.ui.DialogConfirm`
-   or `api.ui.DialogSelect`); fall back to durable command-accessible inbox for
-   headless operation. **Never** inject a turn into the working session, never
+- **Surface**: a conditional privacy-safe sidebar card opens the mounted native
+  review route by click or focused Enter. A permanent palette-only control
+  center remains available when the card is absent. Background work only
+  changes persistent projection state; it never emits a toast or attention
+  notification and never opens a dialog automatically. The durable
+  command-accessible inbox remains the headless fallback. **Never** inject a turn into the working session, never
    call `client.session.promptAsync`, never call `client.tui.appendPrompt`,
    never add a synthetic proposal message to the task transcript, never invoke
    the working agent's question tool.
@@ -297,7 +299,7 @@ One npm package exposes two target-only modules:
   only. Imports only from `@opencode-ai/plugin` (the `.` target) and Node
   built-ins. **Must not statically import `./tui` or `@opencode-ai/plugin/tui`**
   — those peers are not installed in headless contexts.
-- **TUI entry** (`self-evolve-tui.js` reached via `package.json`
+- **TUI entry** (`self-evolve-tui.tsx` reached via `package.json`
   `exports["./tui"]`): uses the supported `@opencode-ai/plugin/tui` contract
   and the package's own pure-ESM helpers without requiring an OpenTUI runtime
   import. It default-exports one `TuiPluginModule` with stable ID
@@ -342,8 +344,8 @@ One npm package exposes two target-only modules:
 - Server plugin is the **sole writer** of observation/proposal/audit records.
 - TUI plugin is **read-only** with respect to global settings and every project
   record. It must not append decisions, proposals, audits, or skill content.
-  Its only replaceable write is the bounded runtime report above; decision and
-  control writes remain create-exclusive requests.
+  Its only replaceable write is the bounded runtime report above; decision,
+  control, and operation writes remain create-exclusive requests.
 - Cross-process decisions use a filesystem request/response mailbox at
   `<state-root>/self-evolve/bridge/<projectFingerprint>/`, with `requests/` and
   `responses/` children. There is no arbitrary client extension, undocumented
@@ -353,8 +355,8 @@ One npm package exposes two target-only modules:
   hash, proposed-content hash, expected decision version and prior state,
   requested state, actor, creation time, and server-issued one-use nonce.
   Unknown fields or an invalid binding reject the whole request. Apart from
-  decision/control requests and its one runtime-report generation, the TUI may
-  write no other file under the state root.
+  decision/control/operation requests and its one runtime-report generation,
+  the TUI may write no other file under the state root.
 - Durable controls use a separate `control-requests/` and `control-responses/`
   namespace, not decision fields. The TUI reads a strict server-authored
   `control-state.json` projection and may request only: global manual/auto/yolo
@@ -365,6 +367,13 @@ One npm package exposes two target-only modules:
   stale settings, replay, and cross-project requests fail closed. Yolo requires
   a non-empty exact allowlist and two native confirmations; allowlist changes
   require elevated confirmation. Cross-repository consent requires excerpts.
+- Native actions use separate `operation-requests/` and `operation-responses/`
+  namespaces. The closed actions are exact-duration snooze, rollback,
+  pause/resume, kill switch, scoped purge, sensitive export, accepted-terminal
+  purge-all, and bounded bootstrap retry. Each envelope binds the canonical
+  root/project, target-derived projection/grant generation, relevant domain
+  versions, exact subject, capability, expiry, and one-use nonce. The server
+  freshly revalidates every binding immediately before the effect.
 - The server consumes requests under a project mailbox lease, re-reads global
   and repository settings, validates the complete binding, and performs the
   decision transition through the store-owned decision transaction. The store
@@ -387,23 +396,30 @@ One npm package exposes two target-only modules:
   side; malformed, newer, or conflicting intents are quarantined and fail boot
   closed. A decision record is one-use (nonce is burned by the transaction).
 
-### 5.3 Notification flow
+### 5.3 Native projection and review flow
 
-- Server detects eligible proposal -> writes pending review record -> may
-  publish a supported refresh event when that capability is available.
-- TUI polls the durable inbox and mailbox responses at safe idle boundaries;
-  refresh events are optional latency hints, never the consistency mechanism.
-- TUI renders `api.ui.DialogConfirm`/`DialogSelect` at safe idle boundary.
-- TUI writes one authenticated, hash-bound request envelope; the server writes
-  the bounded response. The TUI never mutates a decision record directly.
+- Server detects an eligible proposal, persists it, issues bounded
+  capability-specific grants, and atomically publishes a versioned project
+  index plus hash-bound review details.
+- One project-scoped reactive TUI store performs bounded full rereads. Filesystem
+  watches and host events are latency hints, never consistency authority.
+- The sidebar card is absent in healthy empty state and appears only for setup,
+  review, audit, failure, or in-flight operation state. User activation opens a
+  mounted review surface; background refresh never opens it.
+- Apply and Reject retain the exact legacy Decision tuple. Other native actions
+  use closed operation schemas bound to project, root, generation, projection
+  hash, capability, expiry, subject/version fields, and one-use nonce.
+- The TUI writes one authenticated request envelope; the server freshly
+  revalidates domain state, performs the mutation, audits it, and writes the
+  bounded response. The TUI never mutates durable records directly.
 - Headless: the durable inbox holds pending proposals. The deterministic
   approval command invokes server integration directly with the complete
   one-use approval tuple; it does not emulate a TUI request.
 - Neither path injects a prompt or message into a working session.
-- The native palette/slash command is `self-evolve.settings` /
-  `/self-evolve-settings`; it uses supported keymap registration and native
-  select/confirm/prompt dialogs. Excerpt and cross-repository dialogs state that
-  redaction is not a secrecy guarantee.
+- The permanent palette command is `self-evolve.control-center`. It has
+  `namespace: "palette"` and no slash metadata or aliases. Its namespaced route
+  covers Overview, Reviews, Settings, Safety, Evidence, Health/Budgets,
+  Maintenance, and Help and restores the exact prior host route.
 
 ## 6. Repository identity
 
@@ -484,7 +500,7 @@ Redaction is **not** a secrecy guarantee. The plugin must disclose this in
   aggregate `expiresAt` assigned when a claim is created; the proposal/audit
   window is three times that value. Existing aggregate claims always expire by
   their stored `expiresAt` and are not rewritten by later settings changes. The
-  decision/control bridge TTL and the shorter operational TUI-report TTL are fixed safety bounds. Retention sweep runs at process startup and once per day
+  decision/control/operation bridge TTL and the shorter operational TUI-report TTL are fixed safety bounds. Retention sweep runs at process startup and once per day
   while the process lives. Mailbox polling may remove already-expired bridge
   files sooner.
 - One narrow scheduler-diagnostic exception is independent of the durable
@@ -538,12 +554,20 @@ Redaction is **not** a secrecy guarantee. The plugin must disclose this in
   - `/self-evolve purge proposals` — all critic-pending and pending proposal
     versions and their content chunks (closed records retained for audit).
   - `/self-evolve purge project` — all records, rollback snapshots, bridge
-    files, local aggregation index, and indexed global aggregate contributions
-    for this project fingerprint. Global settings remain.
+    files, native export artifacts, local aggregation index, and indexed global
+    aggregate contributions for this project fingerprint. Global settings remain.
   - `/self-evolve purge --all` — entire `self-evolve/` state subtree, including
     global settings, global aggregates, all project partitions, and bridge data.
-- Export operations produce a JSON archive of the same scope.
-- `export all` is state-root-wide rather than an alias for the current project. Its bounded JSON schema contains global settings and aggregate claims, every project partition with settings/records/indexes, decision requests/responses, control requests/responses, the current control-state projection, active proposal-content chunks, and rollback snapshots required for restoration. Every bridge class carries an explicit sensitive-metadata classification and per-file byte count; decision/control requests and control state are limited to 8 KiB, responses to 4 KiB. Strict envelope, filename, and project binding validation rejects unrelated fields. Snapshot bodies are Base64 and explicitly classified `sensitive-skill-snapshot`; the archive is sensitive. Terminal/purged proposal content, locks, temporary files, raw quarantine corruption, unrelated OpenCode state, transcripts, and raw messages are excluded; symlinks, hard links, or file replacement in the exported subtree fail closed.
+- Native purge-all validates exact confirmation, publishes an authenticated
+  `accepted-terminal` acknowledgement, stops all integration work, and then
+  removes the subtree. The TUI never treats disappearance alone as confirmed
+  success and instructs restart and health verification.
+- Native export operations stream a private `0600` artifact under the state
+  root and report path, size, SHA-256, and expiry. One job runs per project;
+  temporary bytes have a separate bounded quota; startup/expiry cleanup and
+  every purge remove artifacts; nothing is opened automatically.
+- Headless export operations produce a JSON archive of the same scope.
+- `export all` is state-root-wide rather than an alias for the current project. Its bounded JSON schema contains global settings and aggregate claims, every project partition with settings/records/indexes, decision requests/responses, control requests/responses, operation requests/responses, the current control-state projection, active proposal-content chunks, and rollback snapshots required for restoration. Every bridge class carries an explicit sensitive-metadata classification and per-file byte count; requests and control state are limited to 8 KiB, responses to 4 KiB. Strict envelope, filename, and project binding validation rejects unrelated fields. Snapshot bodies are Base64 and explicitly classified `sensitive-skill-snapshot`; the archive is sensitive. Terminal/purged proposal content, locks, temporary files, raw quarantine corruption, unrelated OpenCode state, transcripts, and raw messages are excluded; symlinks, hard links, or file replacement in the exported subtree fail closed.
 - Purge-all is terminal for the current store/integration instance. Before returning it stops scheduler, mailbox, and retention timers; subsequent commands/events return `restart-required-after-purge-all`; shutdown must not recreate state. Only a fresh OpenCode process may initialize the subtree again. Project purge remains non-terminal and reinitializes only that project.
 
 ## 9. Budgets and concurrency
@@ -557,12 +581,11 @@ Redaction is **not** a secrecy guarantee. The plugin must disclose this in
 | Concurrent syntheses globally                   | 1                              |
 | Idle debounce (ms)                              | 1500                           |
 | Storage quota per project (MiB)                 | 8                              |
-| Notifications per process per hour              | 3                              |
 
 Exceeding any budget fails closed (no write, no call). Budgets are
 configurable; defaults are conservative.
 
-The storage budget is one total cap for each project-associated partition, including repository settings, all record files, indexes, snapshots, leases, quarantine artifacts, and bridge files. Current usage and pending replacement bytes are evaluated while the shared cross-process mutation lock is held, without following symlinks. TUI decision and control publishers share at most 64 pending request files and a conservative mailbox sub-budget of the smaller of 512 KiB or one eighth of the project quota; pending requests reserve their maximum 4 KiB response and admission also reserves one absent control-state projection. Growing request publications preserve up to 64 KiB (or one eighth of a smaller quota) for later store mutations. A bounded mandatory settings audit envelope of at most 4 KiB may cross an already exhausted cap so a safety control outcome remains durable; ordinary records and recursive failure audits receive no bypass.
+The storage budget is one total cap for each project-associated partition, including repository settings, all record files, indexes, snapshots, leases, quarantine artifacts, and bridge files. Current usage and pending replacement bytes are evaluated while the shared cross-process mutation lock is held, without following symlinks. TUI decision, control, and operation publishers share at most 64 pending request files and a conservative mailbox sub-budget of the smaller of 512 KiB or one eighth of the project quota; pending requests reserve their maximum 4 KiB response and admission also reserves one absent control-state projection. Growing request publications preserve up to 64 KiB (or one eighth of a smaller quota) for later store mutations. A bounded mandatory settings audit envelope of at most 4 KiB may cross an already exhausted cap so a safety control outcome remains durable; ordinary records and recursive failure audits receive no bypass. The legacy `notificationsPerHour` setting is retained only for durable-state compatibility and has no Release A scheduling or UI effect.
 
 Quiet hours use local wall-clock time and the canonical shape
 `{ "from": "22:00", "to": "07:00" }`. Equal endpoints disable that period;
@@ -611,6 +634,26 @@ an overnight range wraps across midnight.
 
 ## 11. Migration (v0.1.2 -> v0.2.x)
 
+### 11.1 Sidebar-first Release A
+
+- Release A is additive. The normal interactive surface is the conditional
+  sidebar card plus palette-only control center; no normal interaction depends
+  on slash input, toast, attention, or an automatically opened dialog.
+- Existing `/self-evolve` verbs, durable inbox, exact headless approval tuple,
+  emergency controls, bootstrap recovery, manual scan, export, and purge remain
+  supported for one compatibility release and for server-only operation.
+- Projection and operation protocols negotiate independently at version 1.
+  New-TUI/old-server and old-TUI/new-server pairs remain legacy/read-only and
+  gain no new write authority.
+- Manual Scan now remains headless because the exact 1.18.3 native API does not
+  provide a safe binding from a palette route to one exact source session.
+- Disable the native target by removing it from `tui.json` and restarting while
+  retaining the server entry. Roll back by installing the prior package,
+  restoring the prior registrations and state-root backup, and restarting.
+  State roots are never copied, merged, or migrated automatically.
+- Slash retirement is outside Release A. It requires a complete two-release
+  compatibility window and a separate maintainer-approved disposition.
+
 - v0.1.2 has no durable state, so migration is essentially configuration-only.
 - On first start, v0.2.x:
   - creates `<state-root>/self-evolve/` with `0700` perms,
@@ -625,7 +668,7 @@ an overnight range wraps across midnight.
   `durableAutonomy: false` compatibility option. Startup `mode` is not durable
   authority and does not override an existing preference; commands own later
   mode changes, and restart reshapes passive hooks from persisted effective mode.
-- The package supports the verified OpenCode 1.18 patch line `>=1.18.3 <1.19.0`. `@opencode-ai/plugin` is an optional `~1.18.3` peer contract and a development-only contract dependency; runtime entries do not import it.
+- The package supports the OpenCode 1.18 patch line `>=1.18.3 <1.19.0`. Its raw `./tui` target alone may reach the approved optional peers: `@opencode-ai/plugin ~1.18.3`, `@opentui/core`, `@opentui/keymap`, and `@opentui/solid` in `>=0.4.3 <0.5.0`, plus `solid-js 1.9.12`. The package root and shared server graph import none of them; headless consumers may omit all optional peers.
   After the factory returns, production startup derives the running OpenCode
   version from bounded official health: `client.global.health()` when present,
   followed only after a recognized SDK transport/capability error by exact-origin GET

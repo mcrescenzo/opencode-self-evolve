@@ -220,6 +220,7 @@ export function openStore(rootDir, {
   const aggregateIndexPath = path.join(stateDir, "aggregate-contributions.json");
   const decisionTransactionPath = path.join(stateDir, "decision-transaction.json");
   const bridgeProjectDir = path.join(baseDir, "bridge", projectFingerprint);
+  const exportProjectDir = path.join(baseDir, "exports", projectFingerprint);
   const ownedLeases = new Map();
   // Cache validity is the exact source bytes, never filesystem metadata. Every
   // read still reads and compares the source, so writers in other processes are
@@ -799,6 +800,50 @@ export function openStore(rootDir, {
 
   function getSettings() {
     return withMutationLock(getSettingsUnlocked);
+  }
+
+  function readProjectionSnapshot() {
+    return withMutationLock(() => {
+      if (existsSync(decisionTransactionPath)) throw new Error("projection-snapshot-recovery-pending");
+      let global;
+      let repo;
+      try {
+        global = makeGlobalSettings(JSON.parse(readFileSync(globalSettingsPath, "utf8")));
+        repo = makeRepoSettings(JSON.parse(readFileSync(repoSettingsPath, "utf8")));
+      } catch {
+        throw new Error("projection-snapshot-corrupt-settings");
+      }
+      const settings = { global, repo };
+      const records = [];
+      for (const fileName of [...new Set(Object.values(STORE_FILES))].sort()) {
+        const read = readValidatedSource(path.join(stateDir, fileName));
+        if (read.damaged.length) throw new Error("projection-snapshot-corrupt-records");
+        records.push(...read.records);
+      }
+      if (records.some((record) => record.kind === "audit-event" && record.payload?.details?.action === "proposal-content")) {
+        throw new Error("projection-snapshot-recovery-pending");
+      }
+      // Projection grants bind the generation they authorize. Excluding only
+      // their issuance records from the generation avoids a circular hash;
+      // every underlying authority record and every operation outcome remains
+      // generation-bearing.
+      const generationRecords = records.filter((record) => !(
+        record.kind === "audit-event"
+        && record.payload?.details?.action === "ui-operation-nonce"
+      ));
+      const generation = hashContent(JSON.stringify([
+        "self-evolve-projection-store-snapshot-v1",
+        settings.global,
+        settings.repo,
+        generationRecords,
+      ]));
+      return Object.freeze({
+        projectFingerprint,
+        generation,
+        settings: Object.freeze({ global: settings.global, repo: settings.repo }),
+        records: Object.freeze([...records]),
+      });
+    });
   }
 
   function allRecords() {
@@ -1614,6 +1659,7 @@ export function openStore(rootDir, {
         if (!new Set(["observations", "proposals", "project", "all"]).has(scope)) return { ok: false, reason: "invalid-scope" };
         const before = allRecords();
         let removed = [];
+        rmSync(exportProjectDir, { recursive: true, force: true });
         if (scope === "observations") {
           const records = readFileRecords(STORE_FILES.observation);
           removed = records.filter((record) => record.kind === "observation");
@@ -1720,6 +1766,7 @@ export function openStore(rootDir, {
     updateRepoSettings,
     setGlobalSettings: (settings) => setSettings("global", settings),
     setRepoSettings: (settings) => setSettings("repo", settings),
+    readProjectionSnapshot,
     appendRecord,
     readRecords,
     getRecord,

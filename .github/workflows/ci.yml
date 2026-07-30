@@ -47,3 +47,25 @@ jobs:
 
       - name: Package dry run
         run: npm pack --dry-run --json --ignore-scripts
+
+  packed-tui-compatibility:
+    name: Packed TUI floor, adjacent, and latest supported
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install package dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Test aligned packed TUI consumers
+        run: npm run test:tui-matrix

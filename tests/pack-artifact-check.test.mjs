@@ -6,7 +6,9 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { assertApprovedTuiPackageContract } from "../scripts/check-tui-artifact.mjs";
 import { assertNoForbiddenImports, assertServerEntryContract, assertSpawnSucceeded } from "../scripts/pack-artifact-check.mjs";
+import { parseExact118Version, resolveLatestCommon18 } from "../scripts/packed-tui-consumer-matrix.mjs";
 import { createIntegration } from "../self-evolve-integration.js";
 import * as schemas from "../self-evolve-schemas.js";
 
@@ -24,7 +26,7 @@ function runPackCheck(root = repoRoot) {
 test("pack artifact check passes for the release package", () => {
   const result = runPackCheck();
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout, /server and TUI targets imported from a fresh consumer/u);
+  assert.match(result.stdout, /raw TUI target validated and server target imported from a fresh peerless consumer/u);
 });
 
 test("pack artifact check rejects a forbidden package files entry", (t) => {
@@ -54,6 +56,35 @@ test("pack scanner rejects named server exports and TUI imports", () => {
   assert.doesNotThrow(() => assertServerEntryContract("export default function Plugin() {}\n"));
   assert.throws(() => assertServerEntryContract("export const helper = 1; export default function Plugin() {}\n"), /no named exports/u);
   assert.throws(() => assertServerEntryContract('import "@opencode-ai/plugin/tui"; export default function Plugin() {}\n'), /prohibited TUI/u);
+});
+
+test("approved raw TUI package contract is exact and rejects dependency drift", () => {
+  const packageJSON = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+  const source = readFileSync(path.join(repoRoot, "self-evolve-tui.tsx"), "utf8");
+  assert.equal(assertApprovedTuiPackageContract(packageJSON, source), true);
+  assert.throws(
+    () => assertApprovedTuiPackageContract({ ...packageJSON, dependencies: { solid: "latest" } }, source),
+    /ordinary runtime dependencies are prohibited/u,
+  );
+  assert.throws(
+    () => assertApprovedTuiPackageContract({
+      ...packageJSON,
+      peerDependencies: { ...packageJSON.peerDependencies, "solid-js": "^1.9.12" },
+    }, source),
+    /optional peer contract does not match maintainer approval/u,
+  );
+});
+
+test("TUI matrix resolver selects only the latest exact common stable 1.18.x patch", () => {
+  assert.deepEqual(parseExact118Version("1.18.12"), { version: "1.18.12", patch: 12 });
+  for (const invalid of ["1.18.03", "1.18.4-beta.1", "1.19.0", "v1.18.4", "1.18"]) {
+    assert.equal(parseExact118Version(invalid), null);
+  }
+  assert.equal(
+    resolveLatestCommon18(["1.18.3", "1.18.4", "1.18.9", "1.19.0"], ["1.18.3", "1.18.4", "1.18.8", "1.18.9"]),
+    "1.18.9",
+  );
+  assert.throws(() => resolveLatestCommon18(["1.18.2", "1.19.0"], ["1.18.2"]), /no-common-stable/u);
 });
 
 test("pack command diagnostics distinguish spawn, signal, and exit failures", () => {

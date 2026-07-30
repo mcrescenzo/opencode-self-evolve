@@ -115,6 +115,11 @@ function harness({ kv, proposals = [], clock = 2_000, status = { type: "idle", s
       DialogPrompt(props) { prompts.push(props); return props; },
       DialogAlert(props) { alerts.push(props); return props; },
       toast(input) { toasts.push(input); },
+      dialog: {
+        replace(render) { return render(); },
+        clear() {},
+        setSize() {},
+      },
     },
     attention: { async notify(input) { notifications.push(input); return { ok: true, notification: true, sound: false }; } },
     keymap: { registerLayer(layer) { keymapLayers.push(layer); return () => {}; } },
@@ -143,6 +148,7 @@ function harness({ kv, proposals = [], clock = 2_000, status = { type: "idle", s
       tui: { async appendPrompt() { appendPrompt.calls += 1; } },
     },
     __testMailboxClient: bridge,
+    __testAutoReview: true,
   };
   return {
     api,
@@ -181,6 +187,45 @@ test("default export is a TUI-only plugin module", () => {
   assert.deepEqual(Object.keys(tuiModule), ["id", "tui"]);
   assert.equal(tuiModule.id, "mcrescenzo.self-evolve");
   assert.equal(tuiModule.tui, SelfEvolveTuiPlugin);
+});
+
+test("production TUI acquires and refreshes the project-scoped projection store", async () => {
+  const h = harness({ kv: enabledKv() });
+  const calls = [];
+  const projectStore = {
+    refresh() {
+      calls.push("refresh");
+      return Promise.resolve({ phase: "legacy" });
+    },
+  };
+  await SelfEvolveTuiPlugin(h.api, {
+    __testTuiStoreFactory(input) {
+      calls.push(input);
+      return projectStore;
+    },
+  });
+  assert.equal(calls[0].api, h.api);
+  assert.equal(calls[0].config.stateRoot, "/state");
+  assert.equal(calls[0].config.worktree, "/worktree");
+  assert.match(calls[0].config.projectFingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(calls[1], "refresh");
+  await h.dispose();
+});
+
+test("production background refresh never emits toast, attention, or auto-dialog UI", async () => {
+  const h = harness({ proposals: [proposal()] });
+  h.api.__testAutoReview = false;
+  await SelfEvolveTuiPlugin(h.api);
+  h.event("self-evolve.proposal");
+  h.event("session.idle");
+  h.event("session.status");
+  await flush();
+  assert.equal(h.confirms.length, 0);
+  assert.equal(h.selects.length, 0);
+  assert.equal(h.alerts.length, 0);
+  assert.equal(h.toasts.length, 0);
+  assert.equal(h.notifications.length, 0);
+  await h.dispose();
 });
 
 test("TUI publishes current api.app.version as a root-bound host-health runtime report", async (t) => {
@@ -598,7 +643,8 @@ test("registered native settings command creates strict filesystem controls with
   await SelfEvolveTuiPlugin(h.api, { selfEvolve: { stateRoot: root, idleDebounceMs: 0, mailboxPollMs: 25, serverTimeoutMs: 1 } });
   const command = h.keymapLayers.flatMap((layer) => layer.commands ?? []).find((item) => item.name === "self-evolve.settings");
   assert.equal(command.namespace, "palette");
-  assert.equal(command.slashName, "self-evolve-settings");
+  assert.equal("slashName" in command, false);
+  assert.equal("slashAliases" in command, false);
 
   async function settingsDialog() {
     command.run();

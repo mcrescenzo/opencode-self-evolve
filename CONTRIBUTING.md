@@ -2,10 +2,12 @@
 
 This plugin is intentionally conservative:
 
-- Manual `/self-evolve` commands are the only analysis trigger.
+- Manual analysis remains command-driven; validated `auto` and `yolo` modes admit only the documented idle/status/compaction scheduler events.
 - The analyzer must remain hidden, isolated, and tool-denied.
-- The plugin must not edit files, write to external issue trackers or memory systems, publish, push, or mutate external systems without explicit user approval.
-- Session state stays in memory only.
+- Durable state must remain inside the validated OpenCode state root. Never add external-tracker writes, network publication, Git mutation, implementation/shell agents, or arbitrary external-system mutation.
+- The transactional applier is the only skill-file writer and must preserve consent, allowlist, hash, lease, evidence, audit, and rollback gates.
+- Keep the server root headless-safe and the raw TSX TUI target-exclusive. The normal Release A UX is the sidebar card, native review dialog, and `self-evolve.control-center` palette command; slash commands remain a documented headless/compatibility fallback.
+- Legacy compatibility state remains session-local and in-memory. Durable autonomy state never enters the legacy registry.
 
 Run the validation commands before proposing changes:
 
@@ -13,13 +15,16 @@ Run the validation commands before proposing changes:
 npm test
 npm run check
 npm run pack:check
+npm run test:tui-matrix
 npm run smoke:live
 ```
 
 See [docs/internals.md](docs/internals.md) for what each of these checks verifies and how the
-plugin's hooks and analyzer contract work.
+plugin's hooks, native projection protocol, and analyzer contract work. The packed TUI matrix
+requires registry access; exact-host interactive evidence is a separate operator gate and must
+not be inferred from deterministic tests.
 
-Avoid adding runtime dependencies unless there is a strong reason and the safety tradeoff is documented.
+Do not add ordinary runtime dependencies. The only approved optional peers are the exact target-exclusive TUI contract recorded in `AGENTS.md`; any other package or range requires maintainer approval.
 
 ## Repository Surface
 

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertApprovedTuiPackageContract } from "./check-tui-artifact.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const defaultRepoRoot = path.resolve(path.dirname(scriptPath), "..");
@@ -123,6 +124,10 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
       assertNoForbiddenImports(file, readFileSync(path.join(extractDir, "package", file), "utf8"));
     }
     assertServerEntryContract(readFileSync(path.join(extractDir, "package", "self-evolve.js"), "utf8"));
+    assertApprovedTuiPackageContract(
+      packageJSON,
+      readFileSync(path.join(extractDir, "package", "self-evolve-tui.tsx"), "utf8"),
+    );
 
     const consumerDir = path.join(tempRoot, "consumer");
     mkdirSync(consumerDir);
@@ -133,17 +138,18 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
     }
     const opentuiScope = path.join(consumerDir, "node_modules", "@opentui");
     if (existsSync(opentuiScope)) fail("Headless consumer unexpectedly installed @opentui peers");
+    if (existsSync(path.join(consumerDir, "node_modules", "solid-js"))) {
+      fail("Headless consumer unexpectedly installed the optional solid-js peer");
+    }
 
     const smoke = [
       `const server = await import(${JSON.stringify(packageJSON.name)});`,
       `if (typeof server.default !== "function") throw new Error("server default export is not a Plugin factory");`,
       `if (Object.keys(server).join(",") !== "default") throw new Error("server target exposes named exports");`,
-      `const tui = await import(${JSON.stringify(`${packageJSON.name}/tui`)});`,
-      `if (!tui.default || tui.default.id !== "mcrescenzo.self-evolve" || typeof tui.default.tui !== "function") throw new Error("TUI default export does not have TuiPluginModule shape");`,
     ].join("\n");
     run(process.execPath, ["--input-type=module", "--eval", smoke], { cwd: consumerDir });
 
-    console.log(`Pack artifact check passed: ${files.size} exact files; server and TUI targets imported from a fresh consumer.`);
+    console.log(`Pack artifact check passed: ${files.size} exact files; raw TUI target validated and server target imported from a fresh peerless consumer.`);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }

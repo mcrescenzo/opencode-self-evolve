@@ -19,6 +19,7 @@ import {
   stateRootIdentity,
   validateProjectedStateRoot,
 } from "./self-evolve-state-root.js";
+import { acquireProjectTuiStore } from "./self-evolve-tui-store.js";
 
 /** @typedef {import("@opencode-ai/plugin/tui").TuiPlugin} TuiPlugin */
 /** @typedef {import("@opencode-ai/plugin/tui").TuiPluginApi} TuiPluginApi */
@@ -219,8 +220,29 @@ function resultFailure(result) {
   return null;
 }
 
+function replaceDialog(api, render) {
+  if (typeof api.ui?.dialog?.replace !== "function") throw new Error("native-dialog-stack-unavailable");
+  api.ui.dialog.replace(render);
+}
+
+function showAlert(api, props) {
+  replaceDialog(api, () => api.ui.DialogAlert(props));
+}
+
+function showConfirm(api, props) {
+  replaceDialog(api, () => api.ui.DialogConfirm(props));
+}
+
+function showPrompt(api, props) {
+  replaceDialog(api, () => api.ui.DialogPrompt(props));
+}
+
+function showSelect(api, props) {
+  replaceDialog(api, () => api.ui.DialogSelect(props));
+}
+
 function dialogError(api, message) {
-  api.ui.DialogAlert({
+  showAlert(api, {
     title: "Self-evolve error",
     message: `${message}. See /self-evolve health for details.`,
   });
@@ -236,9 +258,11 @@ export function parseAllowlistInput(value) {
 /** @type {TuiPlugin} */
 export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const config = options?.selfEvolve ?? options ?? {};
+  const nativeSurface = config.__nativeSidebar === true;
   const debounceMs = Number.isFinite(config.idleDebounceMs) ? config.idleDebounceMs : DEFAULT_BUDGETS.idleDebounceMs;
-  const budget = Number.isFinite(config.notificationsPerHour) ? config.notificationsPerHour : DEFAULT_BUDGETS.notificationsPerHour;
-  const eventType = config.eventType ?? "self-evolve.proposal";
+  const testAutoReview = config.__testAutoReview === true || api.__testAutoReview === true;
+  const testNotificationBudget = Number.isFinite(config.notificationsPerHour) ? config.notificationsPerHour : DEFAULT_BUDGETS.notificationsPerHour;
+  const testEventType = config.eventType ?? "self-evolve.proposal";
   const serverTimeoutMs = Math.min(MAX_SERVER_WAIT_MS, Math.max(1, Number.isFinite(config.serverTimeoutMs) ? config.serverTimeoutMs : MAX_SERVER_WAIT_MS));
   const pollMs = Math.min(5_000, Math.max(25, Number.isFinite(config.mailboxPollMs) ? config.mailboxPollMs : 250));
   let stateRoot;
@@ -265,6 +289,22 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     return;
   }
   const projectFingerprint = identity.projectFingerprint;
+  let projectStore;
+  try {
+    const storeFactory = options?.__testTuiStoreFactory ?? acquireProjectTuiStore;
+    projectStore = storeFactory({
+      api,
+      config: {
+        ...config,
+        stateRoot,
+        projectFingerprint,
+        worktree: identity.worktreePath,
+      },
+      clientFactory: options?.__testTuiStoreClientFactory,
+    });
+  } catch (error) {
+    console.warn(`self-evolve native projection store disabled: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const tuiHostVersion = typeof api.app?.version === "string" ? api.app.version.trim() : "";
   let hostHealthTimer;
   let hostHealthNonce;
@@ -305,7 +345,10 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       });
     } catch {}
   };
-  if (typeof api.ui?.DialogConfirm !== "function" || typeof api.ui?.DialogSelect !== "function") {
+  void projectStore?.refresh();
+  if (typeof api.ui?.dialog?.replace !== "function"
+      || typeof api.ui?.DialogConfirm !== "function"
+      || typeof api.ui?.DialogSelect !== "function") {
     console.warn("self-evolve TUI dialogs disabled: native dialog capabilities are unavailable; host health remains published and proposals remain in the durable inbox");
     api.lifecycle.signal.addEventListener("abort", stopHostHealth, { once: true });
     api.lifecycle.onDispose(() => {
@@ -332,7 +375,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     pollControl: (requestId) => pollControlResponse(stateRoot, projectFingerprint, requestId),
   } : null);
   const idle = safeIdlePredicate(api, debounceMs);
-  const limiter = notificationRateLimiter(api, budget);
+  const testLimiter = testAutoReview ? notificationRateLimiter(api, testNotificationBudget) : null;
   const inFlight = new Set();
   const unsubscribers = [];
   let disposed = false;
@@ -414,7 +457,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         if (!response) {
           remaining.push(pending);
         } else if (!response.ok) {
-          api.ui.DialogAlert({ title: "Self-evolve decision rejected", message: `${response.reason}. The durable inbox will be refreshed.` });
+          showAlert(api, { title: "Self-evolve decision rejected", message: `${response.reason}. The durable inbox will be refreshed.` });
         }
       } catch {
         remaining.push(pending);
@@ -424,7 +467,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   }
 
   function busyDialog(proposal, body) {
-    api.ui.DialogSelect({
+    showSelect(api, {
       title: `Applying decision: ${proposal.skillTarget?.relativePath ?? proposal.id}`,
       options: [{ title: "Working...", value: "busy", description: body, disabled: true }],
       skipFilter: true,
@@ -446,7 +489,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       savePendingRequests([...pendingRequests(), { requestId: request.requestId, proposalId: fresh.id, submittedAt: nowFor(api) }]);
       const result = await pollResponse(request.requestId);
       if (!result) {
-        api.ui.DialogAlert({ title: "Self-evolve decision queued", message: "The server has not responded yet. The request remains queued and will be checked at the next safe idle refresh." });
+        showAlert(api, { title: "Self-evolve decision queued", message: "The server has not responded yet. The request remains queued and will be checked at the next safe idle refresh." });
         queueRefresh();
         return { ok: false, reason: "decision-response-pending" };
       }
@@ -454,7 +497,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       const failure = resultFailure(result);
       if (failure) {
         if (/stale|nonce|replay|hash|version/.test(failure)) {
-          api.ui.DialogAlert({ title: "Proposal changed", message: `${failure}. The durable inbox will be refreshed.` });
+          showAlert(api, { title: "Proposal changed", message: `${failure}. The durable inbox will be refreshed.` });
           queueRefresh();
           return { ok: false, reason: failure };
         }
@@ -488,15 +531,14 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       savePendingRequests([...pendingRequests(), { kind: "control", requestId: request.requestId, submittedAt: nowFor(api) }]);
       const response = await pollResponse(request.requestId, serverTimeoutMs, "control");
       if (!response) {
-        api.ui.DialogAlert({ title: "Self-evolve control queued", message: "The server has not responded yet. The bounded request remains queued." });
+        showAlert(api, { title: "Self-evolve control queued", message: "The server has not responded yet. The bounded request remains queued." });
         return { ok: false, reason: "control-response-pending" };
       }
       savePendingRequests(pendingRequests().filter((item) => item.requestId !== request.requestId));
       if (!response.ok) {
-        api.ui.DialogAlert({ title: "Self-evolve control rejected", message: `${response.reason}. Reopen settings to refresh server state.` });
+        showAlert(api, { title: "Self-evolve control rejected", message: `${response.reason}. Reopen settings to refresh server state.` });
         return { ok: false, reason: response.reason };
       }
-      api.ui.toast({ variant: "success", message: "Self-evolve settings updated" });
       return { ok: true };
     } catch (error) {
       dialogError(api, error instanceof Error ? error.message : String(error));
@@ -506,10 +548,10 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
 
   function confirmYolo(allowlist) {
     const visible = allowlist.map((root) => `- ${root}`).join("\n");
-    api.ui.DialogConfirm({
+    showConfirm(api, {
       title: "Yolo risk confirmation 1 of 2",
       message: `Yolo may apply validated skill changes without per-change approval, only under this exact allowlist:\n${visible}`,
-      onConfirm: () => api.ui.DialogConfirm({
+      onConfirm: () => showConfirm(api, {
         title: "Yolo risk confirmation 2 of 2",
         message: `Confirm unattended skill writes to exactly:\n${visible}`,
         onConfirm: () => { void submitControl("set-mode", { mode: "yolo", allowlist, confirmation: "ENABLE YOLO" }); },
@@ -518,7 +560,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   }
 
   function promptYoloAllowlist(state) {
-    api.ui.DialogPrompt({
+    showPrompt(api, {
       title: "Yolo allowlist",
       placeholder: "/canonical/skill/root (one per line)",
       value: state.allowedSkillRoots.join("\n"),
@@ -540,17 +582,17 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     }));
     const onSelect = (option) => {
       if (option.value === "yolo") return promptYoloAllowlist(state);
-      api.ui.DialogConfirm({
+      showConfirm(api, {
         title: `Set self-evolve mode to ${option.value}?`,
         message: option.value === "auto" ? "Auto may make passive provider calls only when the separate consent controls permit it." : "Manual disables passive work.",
         onConfirm: () => { void submitControl("set-mode", { mode: option.value }); },
       });
     };
-    api.ui.DialogSelect({ title: `Self-evolve mode (current: ${state.mode})`, options, onSelect, skipFilter: true });
+    showSelect(api, { title: `Self-evolve mode (current: ${state.mode})`, options, onSelect, skipFilter: true });
   }
 
   function showAllowlistFlow(state) {
-    api.ui.DialogPrompt({
+    showPrompt(api, {
       title: "Edit canonical skill-root allowlist",
       description: () => "This changes the only roots eligible for yolo writes. Review every path before confirming.",
       placeholder: "/canonical/skill/root (one per line)",
@@ -559,7 +601,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         try {
           const allowlist = parseAllowlistInput(value);
           const visible = allowlist.length ? allowlist.map((root) => `- ${root}`).join("\n") : "(empty)";
-          api.ui.DialogConfirm({
+          showConfirm(api, {
             title: "Elevated allowlist confirmation",
             message: `Replace the yolo allowlist with exactly:\n${visible}`,
             onConfirm: () => { void submitControl("update-allowlist", { allowlist, confirmation: "UPDATE ALLOWLIST" }); },
@@ -572,13 +614,13 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   function showConsentFlow(state, key) {
     const enabled = !state.consent[key];
     if (key === "crossRepoAggregation" && enabled && !state.consent.sanitizedExcerpts) {
-      api.ui.DialogAlert({ title: "Excerpt consent required", message: "Enable sanitized excerpts before cross-repository aggregation. Redaction reduces exposure; it does not guarantee secrecy." });
+      showAlert(api, { title: "Excerpt consent required", message: "Enable sanitized excerpts before cross-repository aggregation. Redaction reduces exposure; it does not guarantee secrecy." });
       return;
     }
     const disclosure = key === "sanitizedExcerpts" || key === "crossRepoAggregation"
       ? "Redaction reduces exposure but is not a secrecy guarantee. Review exports and retention policy accordingly."
       : "This setting is independent and defaults to off.";
-    api.ui.DialogConfirm({
+    showConfirm(api, {
       title: `${enabled ? "Enable" : "Disable"} ${CONSENT_LABELS[key]}?`,
       message: disclosure,
       onConfirm: () => { void submitControl("set-consent", { key, enabled }); },
@@ -597,14 +639,14 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       const onSelect = (option) => {
         if (option.value === "mode") showModeFlow(state);
         else if (option.value === "allowlist") showAllowlistFlow(state);
-        else if (option.value === "repo-excluded") api.ui.DialogConfirm({
+        else if (option.value === "repo-excluded") showConfirm(api, {
           title: state.repoExcluded ? "Include this repository?" : "Exclude this repository?",
           message: state.repoExcluded ? "Self-evolve may operate here subject to mode and consent." : "This repository will be excluded from self-evolve observation and application.",
           onConfirm: () => { void submitControl("set-repo-excluded", { excluded: !state.repoExcluded }); },
         });
         else if (option.value.startsWith("consent:")) showConsentFlow(state, option.value.slice("consent:".length));
       };
-      api.ui.DialogSelect({ title: "Self-evolve durable settings", options, onSelect, skipFilter: true });
+      showSelect(api, { title: "Self-evolve durable settings", options, onSelect, skipFilter: true });
     } catch (error) { dialogError(api, error instanceof Error ? error.message : String(error)); }
   }
 
@@ -648,8 +690,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       void submitChoice(proposal, option.value, body);
     };
     for (const option of optionsForDialog) option.onSelect = () => onSelect(option);
-    api.ui.toast({ variant: "info", message: "New self-evolve proposal ready for review" });
-    api.ui.DialogSelect({ title: digest.title, options: optionsForDialog, onSelect, skipFilter: true });
+    showSelect(api, { title: digest.title, options: optionsForDialog, onSelect, skipFilter: true });
   }
 
   async function refreshInbox() {
@@ -668,12 +709,9 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         now: nowFor(api),
       }));
       if (!proposal) return { ok: false, reason: "inbox-empty" };
-      const allowance = limiter.canNotify(`proposal:${proposal.id}`);
-      if (!allowance.ok) return { ok: false, reason: allowance.reason };
-      limiter.record(`proposal:${proposal.id}`);
-      if (typeof api.attention?.notify === "function") {
-        await api.attention.notify({ title: "Self-evolve", message: "A proposal is ready for review", notification: true, sound: false });
-      }
+      const allowance = testLimiter?.canNotify(`proposal:${proposal.id}`);
+      if (allowance && !allowance.ok) return { ok: false, reason: allowance.reason };
+      testLimiter?.record(`proposal:${proposal.id}`);
       if (disposed || api.lifecycle.signal.aborted) return { ok: false, reason: "disposed" };
       showProposal(proposal);
       api.kv.set(LAST_SHOWN_KEY, { ...lastShownAt(), [proposal.id]: nowFor(api) });
@@ -722,10 +760,10 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     scheduleRefresh(0);
   }
 
-  if (api.kv.get(FIRST_USE_KEY) === undefined) {
-    api.ui.DialogConfirm({
+  if (testAutoReview && api.kv.get(FIRST_USE_KEY) === undefined) {
+    showConfirm(api, {
       title: "Enable self-evolve proposal dialogs?",
-      message: "Self-evolve can analyze bounded structured evidence and show native proposal reviews. It never injects messages into your working session. Allow future proposal dialogs?",
+      message: "Test-only compatibility review opt-in.",
       onConfirm: () => {
         api.kv.set(FIRST_USE_KEY, true);
         queueRefresh();
@@ -734,7 +772,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     });
   }
 
-  if (typeof api.keymap?.registerLayer === "function" && typeof api.ui?.DialogPrompt === "function") {
+  if (!nativeSurface && typeof api.keymap?.registerLayer === "function" && typeof api.ui?.DialogPrompt === "function") {
     api.keymap.registerLayer({
       mode: "base",
       commands: [{
@@ -742,7 +780,6 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         title: "Self-evolve settings",
         category: "Self-evolve",
         namespace: "palette",
-        slashName: "self-evolve-settings",
         run: () => { void openSettings(); },
       }],
     });
@@ -750,10 +787,12 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     console.warn("self-evolve settings command disabled: native keymap or prompt capabilities are unavailable");
   }
 
-  unsubscribers.push(api.event.on(eventType, queueRefresh));
-  unsubscribers.push(api.event.on("session.idle", queueRefresh));
-  unsubscribers.push(api.event.on("session.status", queueRefresh));
-  pollTimer = setInterval(queueRefresh, Math.max(pollMs, debounceMs || pollMs));
+  if (testAutoReview) {
+    unsubscribers.push(api.event.on(testEventType, queueRefresh));
+    unsubscribers.push(api.event.on("session.idle", queueRefresh));
+    unsubscribers.push(api.event.on("session.status", queueRefresh));
+    pollTimer = setInterval(queueRefresh, Math.max(pollMs, debounceMs || pollMs));
+  }
 
   const abort = () => {
     disposed = true;
@@ -771,7 +810,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
   });
 
-  if (dialogsEnabled()) queueRefresh();
+  if (testAutoReview && dialogsEnabled()) queueRefresh();
 }
 
 export default { id: "mcrescenzo.self-evolve", tui: SelfEvolveTuiPlugin };

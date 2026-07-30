@@ -9,18 +9,28 @@ import { createIntegration, ROLLOUT_GATES } from "../self-evolve-integration.js"
 import {
   createControlRequest,
   createDecisionRequest,
+  createUiOperationRequest,
   makeBridgeRequest,
   makeControlRequest,
   pollControlResponse,
   pollDecisionResponse,
+  pollUiOperationResponse,
   readControlState,
   readProjectInbox,
+  readUiProjection,
   submitControlRequest,
   submitDecisionRequest,
+  submitUiOperationRequest,
 } from "../self-evolve-bridge.js";
+import * as inventoryModule from "../self-evolve-inventory.js";
 import { openStore } from "../self-evolve-store.js";
 import * as schemas from "../self-evolve-schemas.js";
 import * as commandModule from "../self-evolve-commands.js";
+import {
+  UI_CAPABILITIES,
+  UI_OPERATION_PROTOCOL_VERSION,
+  UI_PROJECTION_VERSION,
+} from "../self-evolve-ui-protocol.js";
 
 const FINGERPRINT = "a".repeat(64);
 const CURRENT_HASH = "b".repeat(64);
@@ -217,7 +227,7 @@ function harness(t, config = {}) {
   const ctx = { client: { tui: { publish(value) { calls.published.push(value); } } } };
   const integration = createIntegration({
     store: integrationStore,
-    inventory: {},
+    inventory: config.inventory ?? {},
     privacy,
     schemas,
     observation: {},
@@ -430,6 +440,156 @@ test("an empty manual mailbox pass reads settings once and skips decision-nonce 
   assert.equal(actions.includes("bridge-nonce"), false);
   assert.equal(actions.includes("headless-approval-nonce"), false);
   assert.equal(actions.includes("control-nonce"), true);
+});
+
+test("the production integration publishes a negotiated server-authored UI projection", async (t) => {
+  const h = harness(t, {
+    inventory: inventoryModule,
+    integrationOptions: { stateRoot: true },
+  });
+
+  const pass = await h.integration.processMailbox();
+  assert.equal(pass.ok, true);
+  assert.equal(pass.uiProjectionError, undefined);
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  assert.equal(projected.mode, "native");
+  assert.equal(projected.index.projectFingerprint, FINGERPRINT);
+  assert.equal(projected.index.status.effectiveMode, "manual");
+  assert.deepEqual(projected.index.reviews, []);
+});
+
+test("native operation mailbox version-binds pause and recovers one exact response", async (t) => {
+  const h = harness(t, {
+    inventory: inventoryModule,
+    integrationOptions: { stateRoot: true },
+  });
+  const initialPass = await h.integration.processMailbox();
+  assert.equal(initialPass.uiProjectionError, undefined, JSON.stringify(initialPass));
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  const grant = projected.index.allowedActions.find((action) => action.action === "set-paused");
+  assert.ok(grant, JSON.stringify({
+    actions: projected.index.allowedActions,
+    grants: h.store.readRecords("audit-event").map((record) => record.payload.details).filter((details) => details?.action === "ui-operation-nonce"),
+    generation: projected.index.generation,
+    currentGeneration: h.store.readProjectionSnapshot().generation,
+  }));
+  const control = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant,
+    payload: { paused: true, settingsVersion: control.settingsVersion },
+    timestamp: h.now(),
+    requestId: "native-pause-request",
+  });
+  assert.equal(submitUiOperationRequest(h.root, request).ok, true);
+  const consumed = await h.integration.processMailbox();
+  assert.equal(consumed.operations.length, 1);
+  const response = pollUiOperationResponse(h.root, request, { now: h.now() });
+  assert.equal(response.ok, true);
+  assert.equal(h.store.getSettings().global.paused, true);
+  const statuses = h.store.readRecords("audit-event")
+    .map((record) => record.payload.details)
+    .filter((details) => details?.requestId === request.requestId && details?.action === "ui-operation-status")
+    .map((details) => details.status);
+  assert.deepEqual(statuses, ["queued", "running", "completed"]);
+  assert.throws(() => submitUiOperationRequest(h.root, request), /operation-response-already-exists/u);
+});
+
+test("native operation mailbox rejects a stale projection without settings mutation", async (t) => {
+  const h = harness(t, {
+    inventory: inventoryModule,
+    integrationOptions: { stateRoot: true },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  const grant = projected.index.allowedActions.find((action) => action.action === "set-kill-switch");
+  assert.ok(grant, JSON.stringify(projected.index.allowedActions));
+  const control = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant,
+    payload: { enabled: true, settingsVersion: control.settingsVersion },
+    timestamp: h.now(),
+  });
+  assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+  submitUiOperationRequest(h.root, request);
+  await h.integration.processMailbox();
+  const response = pollUiOperationResponse(h.root, request, { now: h.now() });
+  assert.equal(response.ok, false);
+  assert.match(response.reason, /stale|unavailable/u);
+  assert.equal(h.store.getSettings().global.killSwitchActive, false);
+});
+
+test("native purge-all acknowledges accepted-terminal before bounded destructive work", async (t) => {
+  let purgeCallback;
+  const h = harness(t, {
+    inventory: inventoryModule,
+    privacy: (store) => ({
+      exportScope: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
+      exportAll: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
+      purgeScope({ scope }) {
+        return store.purge({ scope });
+      },
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: {
+      stateRoot: true,
+      __testSetTerminalPurgeTimeout(callback) {
+        purgeCallback = callback;
+        return { unref() {} };
+      },
+    },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  const grant = projected.index.allowedActions.find((action) => action.action === "purge-all");
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant,
+    payload: { confirmation: "PURGE ALL SELF-EVOLVE DATA" },
+    timestamp: h.now(),
+  });
+  submitUiOperationRequest(h.root, request);
+  const consumed = await h.integration.processMailbox();
+  assert.equal(consumed.operations[0].status, "accepted-terminal");
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).status, "accepted-terminal");
+  assert.equal(existsSync(path.join(h.root, "self-evolve")), true);
+  purgeCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(existsSync(path.join(h.root, "self-evolve")), false);
+  assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: {} }), {
+    scheduled: false,
+    reason: "restart-required-after-purge-all",
+  });
+  await h.integration.shutdown();
 });
 
 test("only scheduler-originated cycles receive the passive provider reservation API", async (t) => {

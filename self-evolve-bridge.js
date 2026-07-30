@@ -12,6 +12,7 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -27,6 +28,19 @@ import {
 } from "./self-evolve-schemas.js";
 import { withStateMutationLock } from "./self-evolve-lock.js";
 import { stateRootIdentity as computeStateRootIdentity } from "./self-evolve-state-root.js";
+import {
+  UI_CAPABILITIES,
+  UI_OPERATION_PROTOCOL_VERSION,
+  UI_PROJECTION_VERSION,
+  UI_PROTOCOL_LIMITS,
+  hashUiProtocol,
+  makeUiOperationRequest,
+  makeUiOperationResponse,
+  makeUiProjectionIndex,
+  makeUiProtocolOffer,
+  makeUiReviewDetail,
+  negotiateUiProtocol,
+} from "./self-evolve-ui-protocol.js";
 
 export const BRIDGE_TTL_MS = 24 * 60 * 60 * 1000;
 export const TUI_HOST_HEALTH_TTL_MS = 60 * 1000;
@@ -68,6 +82,7 @@ const MAX_SETTINGS_BYTES = 64 * 1024;
 const MAX_MAILBOX_BYTES = 512 * 1024;
 const MAX_MAILBOX_FILES = 64;
 const MAX_STORE_RESERVE_BYTES = 64 * 1024;
+const MAX_UI_PROJECTION_FILES = 2 + UI_PROTOCOL_LIMITS.reviewIndexEntries;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const HOST_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/u;
@@ -173,13 +188,57 @@ function bridgePaths(stateRoot, projectFingerprint, { create = false } = {}) {
   const responses = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "responses"], { create });
   const controlRequests = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "control-requests"], { create });
   const controlResponses = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "control-responses"], { create });
-  if (![requests, responses, controlRequests, controlResponses].every(Boolean)) return null;
+  const operationRequests = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "operation-requests"], { create });
+  const operationResponses = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "operation-responses"], { create });
+  if (![requests, responses, controlRequests, controlResponses, operationRequests, operationResponses].every(Boolean)) return null;
   return {
     boundary, fingerprint, root, requests, responses, controlRequests, controlResponses,
+    operationRequests, operationResponses,
     lock: path.join(root, "consumer.lock"),
     controlState: path.join(root, "control-state.json"),
     tuiHostHealth: path.join(root, "tui-host-health.json"),
   };
+}
+
+function uiProjectionPaths(paths, { create = false, generation } = {}) {
+  const root = walkDirectories(paths.boundary, [
+    "self-evolve", "bridge", paths.fingerprint, "ui-projections",
+  ], { create });
+  if (!root) return null;
+  const generations = walkDirectories(paths.boundary, [
+    "self-evolve", "bridge", paths.fingerprint, "ui-projections", "generations",
+  ], { create });
+  if (!generations) return null;
+  let generationRoot = null;
+  let details = null;
+  if (generation !== undefined) {
+    const cleanGeneration = validHash(generation, "projection-generation");
+    generationRoot = walkDirectories(paths.boundary, [
+      "self-evolve", "bridge", paths.fingerprint, "ui-projections", "generations", cleanGeneration,
+    ], { create });
+    if (generationRoot) {
+      details = walkDirectories(paths.boundary, [
+        "self-evolve", "bridge", paths.fingerprint, "ui-projections", "generations", cleanGeneration, "details",
+      ], { create });
+    }
+    if (!generationRoot || !details) return null;
+  }
+  return {
+    root,
+    generations,
+    generationRoot,
+    details,
+    offer: path.join(root, "protocol-offer.json"),
+    index: path.join(root, "index.json"),
+  };
+}
+
+function projectionDetailPath(projectionPathsValue, proposalId) {
+  if (!projectionPathsValue?.details) throw new Error("ui-projection-generation-unavailable");
+  const id = String(proposalId ?? "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(id)) throw new TypeError("invalid-proposal-id");
+  const fileName = createHash("sha256").update(`self-evolve-ui-detail-path-v1\n${id}`).digest("hex");
+  return path.join(projectionPathsValue.details, `${fileName}.json`);
 }
 
 function revalidateDirectory(boundary, directory) {
@@ -259,6 +318,76 @@ function secureReadTuiHostHealth(paths, { effectiveUid } = {}) {
   return read;
 }
 
+function assertPrivateProjectionAncestors(paths, directory, uid = effectiveUserId()) {
+  const relative = path.relative(paths.boundary, directory);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("ui-projection-path-escape-rejected");
+  }
+  let current = paths.boundary;
+  const boundary = lstatSync(current);
+  if (!boundary.isDirectory() || boundary.isSymbolicLink() || boundary.uid !== uid) throw new Error("ui-projection-owner-rejected");
+  if ((boundary.mode & 0o022) !== 0 || realpathSync(current) !== current) throw new Error("ui-projection-boundary-permissions-rejected");
+  for (const component of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    const stat = lstatSync(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("ui-projection-ancestor-rejected");
+    if (stat.uid !== uid) throw new Error("ui-projection-owner-rejected");
+    const projectionRelative = path.relative(path.join(paths.root, "ui-projections"), current);
+    const privateProjectionDirectory = projectionRelative === ""
+      || (!projectionRelative.startsWith(`..${path.sep}`) && projectionRelative !== ".." && !path.isAbsolute(projectionRelative));
+    if ((stat.mode & (privateProjectionDirectory ? 0o077 : 0o022)) !== 0) {
+      throw new Error(privateProjectionDirectory
+        ? "ui-projection-private-directory-permissions-rejected"
+        : "ui-projection-ancestor-permissions-rejected");
+    }
+    if (realpathSync(current) !== current) throw new Error("ui-projection-ancestor-rejected");
+  }
+}
+
+function assertUiProjectionBoundary(boundary, uid = effectiveUserId()) {
+  const stat = lstatSync(boundary);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid) throw new Error("ui-projection-owner-rejected");
+  if ((stat.mode & 0o022) !== 0 || realpathSync(boundary) !== boundary) {
+    throw new Error("ui-projection-boundary-permissions-rejected");
+  }
+}
+
+function secureProjectionRead(paths, filePath, maxBytes, label, { effectiveUid } = {}) {
+  const uid = effectiveUserId(effectiveUid);
+  assertPrivateProjectionAncestors(paths, path.dirname(filePath), uid);
+  const read = secureRead(paths, filePath, maxBytes, label);
+  if (!read) return null;
+  if (read.stat.uid !== uid) throw new Error(`${label}-owner-rejected`);
+  if ((read.stat.mode & 0o777) !== FILE_MODE) throw new Error(`${label}-mode-rejected`);
+  assertPrivateProjectionAncestors(paths, path.dirname(filePath), uid);
+  return read;
+}
+
+function assertPrivateProjectionTree(paths, projectionRoot, uid = effectiveUserId()) {
+  const root = lstatOptional(projectionRoot);
+  if (!root) return;
+  assertPrivateProjectionAncestors(paths, projectionRoot, uid);
+  const visit = (directory) => {
+    assertPrivateProjectionAncestors(paths, directory, uid);
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const filePath = path.join(directory, entry.name);
+      const stat = lstatSync(filePath);
+      if (stat.isSymbolicLink()) throw new Error("ui-projection-symlink-rejected");
+      if (stat.uid !== uid) throw new Error("ui-projection-owner-rejected");
+      if (entry.isDirectory()) {
+        if ((stat.mode & 0o077) !== 0 || realpathSync(filePath) !== filePath) throw new Error("ui-projection-private-directory-permissions-rejected");
+        visit(filePath);
+      } else if (entry.isFile()) {
+        if (stat.nlink !== 1) throw new Error("ui-projection-hardlink-rejected");
+        if ((stat.mode & 0o777) !== FILE_MODE) throw new Error("ui-projection-mode-rejected");
+      } else {
+        throw new Error("ui-projection-path-rejected");
+      }
+    }
+  };
+  visit(projectionRoot);
+}
+
 function safeTreeUsage(paths, directory) {
   const root = lstatOptional(directory);
   if (!root) return { bytes: 0, files: [] };
@@ -300,7 +429,7 @@ function quotaBytesFor(paths) {
 }
 
 function pendingRequestCount(paths, files) {
-  const requestRoots = new Set([paths.requests, paths.controlRequests]);
+  const requestRoots = new Set([paths.requests, paths.controlRequests, paths.operationRequests]);
   return files.filter((file) => requestRoots.has(path.dirname(file.filePath)) && file.filePath.endsWith(".json")).length;
 }
 
@@ -316,7 +445,11 @@ function assertMailboxPublication(paths, target, source, { request = false, remo
   const sourceBytes = Buffer.byteLength(source, "utf8");
   const existingBytes = existing?.size ?? 0;
   const removedBytes = removed?.size ?? 0;
-  const removingPending = removed && (path.dirname(removePath) === paths.requests || path.dirname(removePath) === paths.controlRequests) ? 1 : 0;
+  const removingPending = removed && [
+    paths.requests,
+    paths.controlRequests,
+    paths.operationRequests,
+  ].includes(path.dirname(removePath)) ? 1 : 0;
   const pending = pendingRequestCount(paths, bridgeUsage.files) - removingPending + (request && !existing ? 1 : 0);
   const controlStateReserve = pending > 0 && !lstatOptional(paths.controlState) ? MAX_CONTROL_STATE_BYTES : 0;
   const projectedProjectBytes = stateUsage.bytes + bridgeUsage.bytes - existingBytes - removedBytes + sourceBytes + controlStateReserve;
@@ -334,6 +467,30 @@ function assertMailboxPublication(paths, target, source, { request = false, remo
   return { projectedProjectBytes, projectedMailboxBytes, projectedRequestCount: pending, quotaBytes, mailboxQuotaBytes };
 }
 
+function assertUiProjectionPublication(paths, plannedFiles) {
+  if (!(plannedFiles instanceof Map) || plannedFiles.size < 2 || plannedFiles.size > MAX_UI_PROJECTION_FILES) {
+    throw new Error("ui-projection-file-count-exceeded");
+  }
+  const quotaBytes = quotaBytesFor(paths);
+  const stateUsage = safeTreeUsage(paths, path.join(paths.boundary, "self-evolve", paths.fingerprint));
+  const bridgeUsage = safeTreeUsage(paths, paths.root);
+  let replacedBytes = 0;
+  let sourceBytes = 0;
+  for (const [filePath, source] of plannedFiles) {
+    assertInside(paths.root, filePath);
+    if (typeof source !== "string") throw new TypeError("ui-projection-source-required");
+    const existing = lstatOptional(filePath);
+    if (existing) {
+      assertRegularSingleLink(existing, "ui-projection-publication");
+      replacedBytes += existing.size;
+    }
+    sourceBytes += Buffer.byteLength(source, "utf8");
+  }
+  const projectedProjectBytes = stateUsage.bytes + bridgeUsage.bytes - replacedBytes + sourceBytes;
+  if (projectedProjectBytes > quotaBytes && sourceBytes > replacedBytes) throw new Error("ui-projection-byte-quota-exceeded");
+  return { projectedProjectBytes, quotaBytes };
+}
+
 function secureUnlink(paths, filePath, expected, { allowSymlink = false, expectedLinks = 1 } = {}) {
   const parent = path.dirname(filePath);
   revalidateDirectory(paths.boundary, parent);
@@ -348,6 +505,39 @@ function secureUnlink(paths, filePath, expected, { allowSymlink = false, expecte
   revalidateDirectory(paths.boundary, parent);
   unlinkSync(filePath);
   return true;
+}
+
+function removePrivateProjectionTree(paths, directory) {
+  assertInside(paths.root, directory);
+  const stat = lstatOptional(directory);
+  if (!stat) return 0;
+  if (stat.isSymbolicLink()) {
+    secureUnlink(paths, directory, stat, { allowSymlink: true });
+    return 1;
+  }
+  if (stat.isFile()) {
+    assertRegularSingleLink(stat, "ui-projection-cleanup");
+    return secureUnlink(paths, directory, stat) ? 1 : 0;
+  }
+  if (!stat.isDirectory() || realpathSync(directory) !== directory) throw new Error("ui-projection-path-rejected");
+  let removed = 0;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const filePath = path.join(directory, entry.name);
+    const child = lstatSync(filePath);
+    if (entry.isDirectory() && !entry.isSymbolicLink()) {
+      removed += removePrivateProjectionTree(paths, filePath);
+      continue;
+    }
+    if (child.isSymbolicLink()) {
+      if (secureUnlink(paths, filePath, child, { allowSymlink: true })) removed += 1;
+      continue;
+    }
+    assertRegularSingleLink(child, "ui-projection-cleanup");
+    if (secureUnlink(paths, filePath, child)) removed += 1;
+  }
+  revalidateDirectory(paths.boundary, path.dirname(directory));
+  rmdirSync(directory);
+  return removed;
 }
 
 function atomicWrite(paths, filePath, source, { exclusive = false } = {}) {
@@ -616,6 +806,22 @@ export function validateBridgeExportMetadata(type, value, { projectFingerprint, 
     clean = makeControlResponse(value);
   } else if (type === "control-state") {
     clean = makeControlState(value, { now: value?.issuedAt, projectFingerprint });
+  } else if (type === "operation-request") {
+    clean = validateOperationRequestEnvelope(value, {
+      now: value?.issuedAt,
+      projectFingerprint,
+    });
+  } else if (type === "operation-response") {
+    clean = makeUiOperationResponse(value, {
+      projectFingerprint,
+      stateRootIdentity: value?.stateRootIdentity,
+      requestId: value?.requestId,
+      action: value?.action,
+      requestHash: value?.requestHash,
+      requestIssuedAt: Math.min(value?.processedAt ?? 0, value?.processedAt ?? 0),
+      requestExpiresAt: (value?.processedAt ?? 0) + UI_PROTOCOL_LIMITS.operationTtlMs,
+      now: value?.processedAt,
+    });
   } else {
     throw new TypeError("unknown-bridge-export-class");
   }
@@ -667,6 +873,84 @@ export function submitControlRequest(stateRoot, request) {
   });
 }
 
+function operationRequestContext(value, nowValue = Date.now()) {
+  return {
+    projectFingerprint: value?.projectFingerprint,
+    stateRootIdentity: value?.stateRootIdentity,
+    generation: value?.generation,
+    projectionHash: value?.projectionHash,
+    now: nowValue,
+    supportedCapabilities: UI_CAPABILITIES,
+    grant: {
+      action: value?.action,
+      capability: value?.capability,
+      nonce: value?.nonce,
+      expiresAt: value?.expiresAt,
+    },
+  };
+}
+
+function validateOperationRequestEnvelope(value, { now = Date.now(), projectFingerprint } = {}) {
+  const clean = makeUiOperationRequest(value, operationRequestContext(value, now));
+  if (projectFingerprint && clean.projectFingerprint !== projectFingerprint) throw new TypeError("cross-project-request");
+  return clean;
+}
+
+export function createUiOperationRequest({
+  projection,
+  grant,
+  action = grant?.action,
+  payload,
+  timestamp = Date.now(),
+  requestId = randomBytes(16).toString("hex"),
+} = {}) {
+  const expiresAt = Math.min(timestamp + UI_PROTOCOL_LIMITS.operationTtlMs, grant?.expiresAt ?? 0);
+  const body = {
+    operationProtocolVersion: UI_OPERATION_PROTOCOL_VERSION,
+    requestId,
+    projectFingerprint: projection?.projectFingerprint,
+    stateRootIdentity: projection?.stateRootIdentity,
+    generation: projection?.generation,
+    projectionHash: projection?.projectionHash,
+    action,
+    capability: grant?.capability,
+    actor: BRIDGE_ACTOR,
+    issuedAt: timestamp,
+    expiresAt,
+    nonce: grant?.nonce,
+    payload,
+  };
+  const request = { ...body, operationHash: hashUiProtocol("operation-request", body) };
+  return makeUiOperationRequest(request, {
+    projectFingerprint: projection?.projectFingerprint,
+    stateRootIdentity: projection?.stateRootIdentity,
+    generation: projection?.generation,
+    projectionHash: projection?.projectionHash,
+    now: timestamp,
+    supportedCapabilities: projection?.capabilities ?? UI_CAPABILITIES,
+    grant,
+  });
+}
+
+export function submitUiOperationRequest(stateRoot, request) {
+  const clean = validateOperationRequestEnvelope(request, {
+    now: request?.issuedAt,
+    projectFingerprint: request?.projectFingerprint,
+  });
+  const source = boundedJson(clean, UI_PROTOCOL_LIMITS.operationBytes, "operation-request");
+  const boundary = stateBoundary(stateRoot);
+  return withStateMutationLock(boundary, () => {
+    const paths = bridgePaths(boundary, clean.projectFingerprint, { create: true });
+    const target = path.join(paths.operationRequests, `${clean.requestId}.json`);
+    if (lstatOptional(path.join(paths.operationResponses, `${clean.requestId}.json`))) {
+      throw new Error("operation-response-already-exists");
+    }
+    assertMailboxPublication(paths, target, source, { request: true });
+    atomicWrite(paths, target, source, { exclusive: true });
+    return { ok: true, requestId: clean.requestId, path: target };
+  });
+}
+
 function pollResponse(stateRoot, projectFingerprint, requestId, type) {
   const paths = bridgePaths(stateRoot, projectFingerprint);
   if (!paths) return null;
@@ -690,6 +974,28 @@ export function pollControlResponse(stateRoot, projectFingerprint, requestId) {
   return pollResponse(stateRoot, projectFingerprint, requestId, "control");
 }
 
+export function pollUiOperationResponse(stateRoot, request, { now = Date.now() } = {}) {
+  const cleanRequest = validateOperationRequestEnvelope(request, {
+    now: Math.min(now, request?.expiresAt - 1),
+    projectFingerprint: request?.projectFingerprint,
+  });
+  const paths = bridgePaths(stateRoot, cleanRequest.projectFingerprint);
+  if (!paths) return null;
+  const filePath = path.join(paths.operationResponses, `${cleanRequest.requestId}.json`);
+  const read = secureRead(paths, filePath, UI_PROTOCOL_LIMITS.responseBytes, "operation-response");
+  if (!read) return null;
+  return makeUiOperationResponse(JSON.parse(read.source), {
+    projectFingerprint: cleanRequest.projectFingerprint,
+    stateRootIdentity: cleanRequest.stateRootIdentity,
+    requestId: cleanRequest.requestId,
+    action: cleanRequest.action,
+    requestHash: cleanRequest.operationHash,
+    requestIssuedAt: cleanRequest.issuedAt,
+    requestExpiresAt: cleanRequest.expiresAt,
+    now,
+  });
+}
+
 export function publishControlState(stateRoot, value) {
   const clean = makeControlState(value, { now: value.issuedAt, projectFingerprint: value.projectFingerprint });
   const source = boundedJson(clean, MAX_CONTROL_STATE_BYTES, "control-state");
@@ -708,6 +1014,275 @@ export function readControlState(stateRoot, projectFingerprint, { now = Date.now
   const read = secureRead(paths, paths.controlState, MAX_CONTROL_STATE_BYTES, "control-state");
   if (!read) return null;
   return makeControlState(JSON.parse(read.source), { now, projectFingerprint });
+}
+
+function validateUiProjectionBundle({
+  index: indexValue,
+  details: detailValues,
+  offer: offerValue,
+  projectFingerprint,
+  stateRootIdentity,
+  now,
+}) {
+  const offer = makeUiProtocolOffer(offerValue ?? {
+    projectionVersions: [UI_PROJECTION_VERSION],
+    operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+    capabilities: UI_CAPABILITIES,
+  });
+  if (!offer.projectionVersions.includes(UI_PROJECTION_VERSION)) throw new Error("ui-projection-version-not-offered");
+  const index = makeUiProjectionIndex(indexValue, {
+    projectFingerprint,
+    stateRootIdentity,
+    generation: indexValue?.generation,
+    now,
+    supportedCapabilities: offer.capabilities,
+  });
+  if (index.capabilities.some((capability) => !offer.capabilities.includes(capability))) {
+    throw new Error("ui-projection-capability-not-offered");
+  }
+  if (!Array.isArray(detailValues) || detailValues.length !== index.reviews.length) {
+    throw new Error("ui-projection-detail-set-incomplete");
+  }
+  const reviews = new Map(index.reviews.map((review) => [review.proposalId, review]));
+  const seen = new Set();
+  const details = detailValues.map((value) => {
+    const review = reviews.get(value?.proposalId);
+    if (!review || seen.has(value.proposalId)) throw new Error("ui-projection-detail-set-mismatch");
+    const detail = makeUiReviewDetail(value, {
+      projectFingerprint,
+      stateRootIdentity,
+      generation: index.generation,
+      detailRevision: review.detailRevision,
+      detailHash: review.detailHash,
+      now,
+      supportedCapabilities: index.capabilities,
+    });
+    if (detail.summary.state !== review.state || detail.summary.target.relativePath !== review.target) {
+      throw new Error("ui-projection-detail-index-mismatch");
+    }
+    if (detail.issuedAt < index.issuedAt || detail.expiresAt > index.expiresAt) {
+      throw new Error("ui-projection-detail-lifetime-mismatch");
+    }
+    seen.add(detail.proposalId);
+    return detail;
+  }).sort((left, right) => left.proposalId.localeCompare(right.proposalId));
+  if (seen.size !== reviews.size) throw new Error("ui-projection-detail-set-incomplete");
+  return Object.freeze({ offer, index, details: Object.freeze(details) });
+}
+
+function cleanupStaleUiGenerationsUnlocked(paths, activeGeneration) {
+  const projection = uiProjectionPaths(paths);
+  if (!projection) return 0;
+  assertPrivateProjectionTree(paths, projection.root);
+  let removed = 0;
+  for (const entry of readdirSync(projection.generations, { withFileTypes: true })) {
+    const entryPath = path.join(projection.generations, entry.name);
+    if (entry.name === activeGeneration) continue;
+    if (!entry.isDirectory() || entry.isSymbolicLink() || !HASH_PATTERN.test(entry.name)) {
+      removed += removePrivateProjectionTree(paths, entryPath);
+      continue;
+    }
+    removed += removePrivateProjectionTree(paths, entryPath);
+  }
+  return removed;
+}
+
+function cleanupUiProjectionTempsUnlocked(paths, directory) {
+  const root = lstatOptional(directory);
+  if (!root) return 0;
+  assertPrivateProjectionTree(paths, directory);
+  let removed = 0;
+  const visit = (current) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const filePath = path.join(current, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        visit(filePath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(".tmp")) continue;
+      const stat = lstatSync(filePath);
+      if (secureUnlink(paths, filePath, stat)) removed += 1;
+    }
+  };
+  visit(directory);
+  return removed;
+}
+
+export function publishUiProjection(stateRoot, {
+  index,
+  details,
+  offer,
+  now = Date.now(),
+  __testFaultInjection,
+} = {}) {
+  const boundary = stateBoundary(stateRoot);
+  assertUiProjectionBoundary(boundary);
+  const projectFingerprint = validHash(index?.projectFingerprint, "project-fingerprint");
+  const expectedRootIdentity = computeStateRootIdentity(boundary);
+  const clean = validateUiProjectionBundle({
+    index,
+    details,
+    offer,
+    projectFingerprint,
+    stateRootIdentity: expectedRootIdentity,
+    now,
+  });
+  return withStateMutationLock(boundary, () => {
+    const paths = bridgePaths(boundary, projectFingerprint, { create: true });
+    assertPrivateProjectionAncestors(paths, paths.root);
+    const projection = uiProjectionPaths(paths, { create: true, generation: clean.index.generation });
+    assertPrivateProjectionTree(paths, projection.root);
+    let removed = cleanupUiProjectionTempsUnlocked(paths, projection.root);
+    const offerSource = boundedJson(clean.offer, MAX_REQUEST_BYTES, "ui-protocol-offer");
+    const indexSource = boundedJson(clean.index, UI_PROTOCOL_LIMITS.indexBytes, "ui-projection-index");
+    const detailSources = new Map(clean.details.map((detail) => [
+      projectionDetailPath(projection, detail.proposalId),
+      boundedJson(detail, UI_PROTOCOL_LIMITS.detailBytes, "ui-review-detail"),
+    ]));
+    const planned = new Map([
+      [projection.offer, offerSource],
+      [projection.index, indexSource],
+      ...detailSources,
+    ]);
+    assertUiProjectionPublication(paths, planned);
+    for (const [filePath, source] of detailSources) atomicWrite(paths, filePath, source);
+    __testFaultInjection?.("ui-projection-after-details", { generation: clean.index.generation });
+    atomicWrite(paths, projection.offer, offerSource);
+    __testFaultInjection?.("ui-projection-before-index", { generation: clean.index.generation });
+    atomicWrite(paths, projection.index, indexSource);
+    __testFaultInjection?.("ui-projection-after-index", { generation: clean.index.generation });
+    removed += cleanupStaleUiGenerationsUnlocked(paths, clean.index.generation);
+    return Object.freeze({
+      offer: clean.offer,
+      index: clean.index,
+      details: clean.details,
+      staleFilesRemoved: removed,
+    });
+  });
+}
+
+export function readUiProtocolOffer(stateRoot, projectFingerprint, { __testEffectiveUid } = {}) {
+  const paths = bridgePaths(stateRoot, projectFingerprint);
+  if (!paths) return null;
+  const projection = uiProjectionPaths(paths);
+  if (!projection) return null;
+  const read = secureProjectionRead(paths, projection.offer, MAX_REQUEST_BYTES, "ui-protocol-offer", {
+    effectiveUid: __testEffectiveUid,
+  });
+  return read ? makeUiProtocolOffer(JSON.parse(read.source)) : null;
+}
+
+export function readUiProjection(stateRoot, projectFingerprint, {
+  now = Date.now(),
+  stateRootIdentity,
+  clientOffer,
+  detailProposalIds = [],
+  __testEffectiveUid,
+  __testAfterIndexRead,
+  __testAfterDetailsRead,
+} = {}) {
+  const fingerprint = validHash(projectFingerprint, "project-fingerprint");
+  const boundary = stateBoundary(stateRoot);
+  const expectedRootIdentity = stateRootIdentity ?? computeStateRootIdentity(boundary);
+  const paths = bridgePaths(boundary, fingerprint);
+  const legacy = (reasonValue) => Object.freeze({
+    ...negotiateUiProtocol(null, clientOffer),
+    reason: reasonValue,
+    index: null,
+    details: Object.freeze([]),
+    effectiveIndexActions: Object.freeze([]),
+    effectiveDetailActions: Object.freeze({}),
+  });
+  if (!paths) return legacy("server-bridge-unavailable");
+  const projection = uiProjectionPaths(paths);
+  if (!projection) return legacy("server-offer-unavailable");
+  const offerRead = secureProjectionRead(paths, projection.offer, MAX_REQUEST_BYTES, "ui-protocol-offer", {
+    effectiveUid: __testEffectiveUid,
+  });
+  if (!offerRead) return legacy("server-offer-unavailable");
+  const serverOffer = makeUiProtocolOffer(JSON.parse(offerRead.source));
+  const negotiation = negotiateUiProtocol(serverOffer, clientOffer);
+  if (negotiation.mode === "legacy") {
+    return Object.freeze({
+      ...negotiation,
+      index: null,
+      details: Object.freeze([]),
+      effectiveIndexActions: Object.freeze([]),
+      effectiveDetailActions: Object.freeze({}),
+    });
+  }
+  const indexRead = secureProjectionRead(paths, projection.index, UI_PROTOCOL_LIMITS.indexBytes, "ui-projection-index", {
+    effectiveUid: __testEffectiveUid,
+  });
+  if (!indexRead) throw new Error("ui-projection-index-unavailable");
+  const indexValue = JSON.parse(indexRead.source);
+  const index = makeUiProjectionIndex(indexValue, {
+    projectFingerprint: fingerprint,
+    stateRootIdentity: expectedRootIdentity,
+    generation: indexValue?.generation,
+    now,
+    supportedCapabilities: serverOffer.capabilities,
+  });
+  __testAfterIndexRead?.({ index });
+  if (!Array.isArray(detailProposalIds)
+      || detailProposalIds.length > UI_PROTOCOL_LIMITS.residentDetails
+      || new Set(detailProposalIds).size !== detailProposalIds.length) {
+    throw new TypeError("resident-details-out-of-bounds");
+  }
+  const reviews = new Map(index.reviews.map((review) => [review.proposalId, review]));
+  const generationPaths = uiProjectionPaths(paths, { generation: index.generation });
+  if (!generationPaths) throw new Error("ui-projection-generation-unavailable");
+  const details = detailProposalIds.map((proposalId) => {
+    const review = reviews.get(proposalId);
+    if (!review) throw new Error("ui-projection-detail-unlisted");
+    const detailPath = projectionDetailPath(generationPaths, proposalId);
+    const read = secureProjectionRead(paths, detailPath, UI_PROTOCOL_LIMITS.detailBytes, "ui-review-detail", {
+      effectiveUid: __testEffectiveUid,
+    });
+    if (!read) throw new Error("ui-projection-detail-unavailable");
+    const detail = makeUiReviewDetail(JSON.parse(read.source), {
+      projectFingerprint: fingerprint,
+      stateRootIdentity: expectedRootIdentity,
+      generation: index.generation,
+      detailRevision: review.detailRevision,
+      detailHash: review.detailHash,
+      now,
+      supportedCapabilities: index.capabilities,
+    });
+    if (detail.summary.state !== review.state || detail.summary.target.relativePath !== review.target) {
+      throw new Error("ui-projection-detail-index-mismatch");
+    }
+    return detail;
+  });
+  __testAfterDetailsRead?.({ index, details });
+  const indexReadback = secureProjectionRead(paths, projection.index, UI_PROTOCOL_LIMITS.indexBytes, "ui-projection-index", {
+    effectiveUid: __testEffectiveUid,
+  });
+  if (!indexReadback
+      || !sameInode(indexRead.stat, indexReadback.stat)
+      || indexRead.source !== indexReadback.source) {
+    throw new Error("ui-projection-index-replaced");
+  }
+  const offerReadback = secureProjectionRead(paths, projection.offer, MAX_REQUEST_BYTES, "ui-protocol-offer", {
+    effectiveUid: __testEffectiveUid,
+  });
+  if (!offerReadback
+      || !sameInode(offerRead.stat, offerReadback.stat)
+      || offerRead.source !== offerReadback.source) {
+    throw new Error("ui-protocol-offer-replaced");
+  }
+  const effectiveCapabilities = new Set(negotiation.capabilities);
+  const effectiveDetailActions = Object.fromEntries(details.map((detail) => [
+    detail.proposalId,
+    Object.freeze(detail.allowedActions.filter((action) => effectiveCapabilities.has(action.capability))),
+  ]));
+  return Object.freeze({
+    ...negotiation,
+    index,
+    details: Object.freeze(details),
+    effectiveIndexActions: Object.freeze(index.allowedActions.filter((action) => effectiveCapabilities.has(action.capability))),
+    effectiveDetailActions: Object.freeze(effectiveDetailActions),
+  });
 }
 
 export function publishTuiHostHealth(stateRoot, {
@@ -847,6 +1422,51 @@ export function readProjectInbox(stateRoot, projectFingerprint, { now = Date.now
   });
 }
 
+export function readBoundedInspection(stateRoot, projectFingerprint, { limit = 32 } = {}) {
+  const fingerprint = validHash(projectFingerprint, "project-fingerprint");
+  if (!Number.isSafeInteger(limit) || limit < 0 || limit > 64) throw new TypeError("inspection-limit-out-of-bounds");
+  const boundary = stateBoundary(stateRoot);
+  const stateDir = walkDirectories(boundary, ["self-evolve", fingerprint]);
+  if (!stateDir) return Object.freeze({
+    observations: Object.freeze([]),
+    eligibility: Object.freeze([]),
+    overflow: Object.freeze({ observations: 0, eligibility: 0 }),
+  });
+  const paths = { boundary };
+  const records = [
+    ...readJsonl(paths, path.join(stateDir, "observations.jsonl")),
+    ...readJsonl(paths, path.join(stateDir, "proposals.jsonl")),
+  ].map(assertRecord);
+  const observations = records
+    .filter((record) => record.kind === "observation" && record.payload.projectFingerprint === fingerprint)
+    .map((record) => ({
+      occurredAt: record.payload.createdAt,
+      redacted: record.payload.redacted,
+      injectionFlagged: record.payload.injectionFlagged,
+      summary: Object.entries(record.payload.structuredFields)
+        .map(([key, value]) => `${key}=${String(value)}`)
+        .join(", ")
+        .slice(0, 2_048) || "Sanitized observation with no structured summary fields.",
+    }))
+    .sort((left, right) => right.occurredAt - left.occurredAt);
+  const eligibility = records
+    .filter((record) => record.kind === "eligibility-explanation")
+    .map((record) => ({
+      eligible: record.payload.eligible,
+      reasons: record.payload.reasons,
+      met: record.payload.thresholdsMet,
+      missed: record.payload.thresholdsMissed,
+    }));
+  return Object.freeze({
+    observations: Object.freeze(observations.slice(0, limit).map(Object.freeze)),
+    eligibility: Object.freeze(eligibility.slice(-limit).reverse().map(Object.freeze)),
+    overflow: Object.freeze({
+      observations: Math.max(0, observations.length - limit),
+      eligibility: Math.max(0, eligibility.length - limit),
+    }),
+  });
+}
+
 function acquireConsumerLock(paths, now, ttlMs) {
   const lease = { pid: process.pid, acquiredAt: now, expiresAt: now + ttlMs, nonce: randomBytes(16).toString("hex") };
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -903,6 +1523,7 @@ export function pendingRequestCounts(stateRoot, projectFingerprint) {
   return {
     decisions: requestFiles(paths, paths.requests).length,
     controls: requestFiles(paths, paths.controlRequests).length,
+    operations: requestFiles(paths, paths.operationRequests).length,
   };
 }
 
@@ -956,19 +1577,133 @@ async function consumeType({ paths, projectFingerprint, now, maxRequests, type, 
   return processed;
 }
 
-export async function consumeDecisionRequests({ stateRoot, projectFingerprint, now = () => Date.now(), validateAndDecide, validateAndControl, maxRequests = 32, lockTtlMs = 10_000, __testBeforeRequestRead, __testAfterRequestHandled } = {}) {
-  if (typeof validateAndDecide !== "function" && typeof validateAndControl !== "function") throw new TypeError("bridge-handler-required");
+async function consumeOperationType({
+  paths,
+  projectFingerprint,
+  now,
+  maxRequests,
+  handler,
+  beforeRead,
+  afterHandled,
+}) {
+  const processed = [];
+  if (typeof handler !== "function") return processed;
+  for (const item of requestFiles(paths, paths.operationRequests).slice(0, maxRequests)) {
+    let read;
+    let request;
+    let result;
+    try {
+      beforeRead?.({ type: "operation", filePath: item.filePath, requestId: item.requestId });
+      read = secureRead(paths, item.filePath, UI_PROTOCOL_LIMITS.operationBytes, "operation-request");
+      if (!read) continue;
+      const value = JSON.parse(read.source);
+      request = validateOperationRequestEnvelope(value, { now: now(), projectFingerprint });
+      if (request.requestId !== item.requestId) throw new Error("request-id-path-mismatch");
+      result = await handler(request);
+    } catch (error) {
+      result = { ok: false, reason: reason(error) };
+    }
+    await afterHandled?.({
+      type: "operation",
+      request,
+      result,
+      filePath: item.filePath,
+      requestId: item.requestId,
+    });
+    let response;
+    if (request) {
+      const processedAt = Math.max(request.issuedAt, Math.min(now(), request.expiresAt - 1));
+      const status = result?.ok === true
+        ? result?.terminal === true ? "accepted-terminal" : "accepted"
+        : "rejected";
+      const body = {
+        operationProtocolVersion: UI_OPERATION_PROTOCOL_VERSION,
+        requestId: request.requestId,
+        projectFingerprint,
+        stateRootIdentity: request.stateRootIdentity,
+        action: request.action,
+        requestHash: request.operationHash,
+        ok: result?.ok === true,
+        status,
+        processedAt,
+        reason: result?.ok === true ? null : String(result?.reason ?? "operation-rejected").slice(0, UI_PROTOCOL_LIMITS.reasonBytes),
+      };
+      response = makeUiOperationResponse({
+        ...body,
+        responseHash: hashUiProtocol("operation-response", body),
+      }, {
+        projectFingerprint,
+        stateRootIdentity: request.stateRootIdentity,
+        requestId: request.requestId,
+        action: request.action,
+        requestHash: request.operationHash,
+        requestIssuedAt: request.issuedAt,
+        requestExpiresAt: request.expiresAt,
+        now: processedAt,
+      });
+    }
+    withStateMutationLock(paths.boundary, () => {
+      const current = lstatOptional(item.filePath);
+      if (current && (!read || !sameInode(current, read.stat))) throw new Error("operation-request-replaced");
+      if (response) {
+        const responsePath = path.join(paths.operationResponses, `${item.requestId}.json`);
+        const source = boundedJson(response, UI_PROTOCOL_LIMITS.responseBytes, "operation-response");
+        if (!lstatOptional(responsePath)) {
+          assertMailboxPublication(paths, responsePath, source, {
+            removePath: current ? item.filePath : undefined,
+          });
+          atomicWrite(paths, responsePath, source, { exclusive: true });
+        }
+      }
+      if (current) secureUnlink(paths, item.filePath, read?.stat);
+    });
+    if (response) processed.push(response);
+    if (result?.ok === true && typeof result.afterResponse === "function") {
+      try { result.afterResponse(); } catch {}
+    }
+  }
+  return processed;
+}
+
+export async function consumeDecisionRequests({
+  stateRoot,
+  projectFingerprint,
+  now = () => Date.now(),
+  validateAndDecide,
+  validateAndControl,
+  validateAndOperate,
+  maxRequests = 32,
+  lockTtlMs = 10_000,
+  __testBeforeRequestRead,
+  __testAfterRequestHandled,
+} = {}) {
+  if (typeof validateAndDecide !== "function"
+      && typeof validateAndControl !== "function"
+      && typeof validateAndOperate !== "function") {
+    throw new TypeError("bridge-handler-required");
+  }
   const timestamp = now();
   const paths = bridgePaths(stateRoot, projectFingerprint, { create: true });
-  if (requestFiles(paths, paths.requests).length === 0 && requestFiles(paths, paths.controlRequests).length === 0) {
-    return { ok: true, processed: [], controls: [] };
+  if (requestFiles(paths, paths.requests).length === 0
+      && requestFiles(paths, paths.controlRequests).length === 0
+      && requestFiles(paths, paths.operationRequests).length === 0) {
+    return { ok: true, processed: [], controls: [], operations: [] };
   }
   const lock = withStateMutationLock(paths.boundary, () => acquireConsumerLock(paths, timestamp, lockTtlMs));
-  if (!lock) return { ok: false, reason: "bridge-lease-busy", processed: [], controls: [] };
+  if (!lock) return { ok: false, reason: "bridge-lease-busy", processed: [], controls: [], operations: [] };
   try {
     const processed = await consumeType({ paths, projectFingerprint, now, maxRequests, type: "decision", handler: validateAndDecide, beforeRead: __testBeforeRequestRead, afterHandled: __testAfterRequestHandled });
     const controls = await consumeType({ paths, projectFingerprint, now, maxRequests, type: "control", handler: validateAndControl, beforeRead: __testBeforeRequestRead, afterHandled: __testAfterRequestHandled });
-    return { ok: true, processed, controls };
+    const operations = await consumeOperationType({
+      paths,
+      projectFingerprint,
+      now,
+      maxRequests,
+      handler: validateAndOperate,
+      beforeRead: __testBeforeRequestRead,
+      afterHandled: __testAfterRequestHandled,
+    });
+    return { ok: true, processed, controls, operations };
   } finally {
     withStateMutationLock(paths.boundary, () => releaseConsumerLock(paths, lock.nonce));
   }
@@ -997,8 +1732,27 @@ function cleanupDirectory(paths, directory, type, projectFingerprint, now) {
         ? makeBridgeRequest(value, { now, maxAgeMs: BRIDGE_TTL_MS, projectFingerprint })
         : type === "control-request"
           ? makeControlRequest(value, { now, maxAgeMs: BRIDGE_TTL_MS, projectFingerprint })
-          : type === "decision-response" ? makeBridgeResponse(value) : makeControlResponse(value);
-      const timestamp = type.endsWith("request") ? clean.timestamp : clean.processedAt;
+          : type === "operation-request"
+            ? validateOperationRequestEnvelope(value, { now, projectFingerprint })
+            : type === "decision-response"
+              ? makeBridgeResponse(value)
+              : type === "control-response"
+                ? makeControlResponse(value)
+                : makeUiOperationResponse(value, {
+                  projectFingerprint,
+                  stateRootIdentity: value?.stateRootIdentity,
+                  requestId: value?.requestId,
+                  action: value?.action,
+                  requestHash: value?.requestHash,
+                  requestIssuedAt: value?.processedAt,
+                  requestExpiresAt: (value?.processedAt ?? 0) + UI_PROTOCOL_LIMITS.operationTtlMs,
+                  now,
+                });
+      const timestamp = type === "decision-request" || type === "control-request"
+        ? clean.timestamp
+        : type === "operation-request"
+          ? clean.issuedAt
+          : clean.processedAt;
       if (timestamp > now + 30_000 || timestamp + BRIDGE_TTL_MS <= now) throw new Error("expired-or-future-envelope");
       if (entry.name !== `${clean.requestId}.json`) throw new Error("request-id-path-mismatch");
     } catch {
@@ -1007,6 +1761,54 @@ function cleanupDirectory(paths, directory, type, projectFingerprint, now) {
     }
   }
   return removed;
+}
+
+function cleanupUiProjectionUnlocked(paths, projectFingerprint, now) {
+  const projection = uiProjectionPaths(paths);
+  if (!projection) return 0;
+  try {
+    assertPrivateProjectionTree(paths, projection.root);
+    const offerRead = secureProjectionRead(paths, projection.offer, MAX_REQUEST_BYTES, "ui-protocol-offer");
+    const indexRead = secureProjectionRead(paths, projection.index, UI_PROTOCOL_LIMITS.indexBytes, "ui-projection-index");
+    if (!offerRead || !indexRead) throw new Error("ui-projection-incomplete");
+    const offer = makeUiProtocolOffer(JSON.parse(offerRead.source));
+    const indexValue = JSON.parse(indexRead.source);
+    const index = makeUiProjectionIndex(indexValue, {
+      projectFingerprint,
+      stateRootIdentity: computeStateRootIdentity(paths.boundary),
+      generation: indexValue?.generation,
+      now,
+      supportedCapabilities: offer.capabilities,
+    });
+    const generation = uiProjectionPaths(paths, { generation: index.generation });
+    if (!generation) throw new Error("ui-projection-generation-unavailable");
+    for (const review of index.reviews) {
+      const detailRead = secureProjectionRead(
+        paths,
+        projectionDetailPath(generation, review.proposalId),
+        UI_PROTOCOL_LIMITS.detailBytes,
+        "ui-review-detail",
+      );
+      if (!detailRead) throw new Error("ui-projection-detail-unavailable");
+      const detail = makeUiReviewDetail(JSON.parse(detailRead.source), {
+        projectFingerprint,
+        stateRootIdentity: index.stateRootIdentity,
+        generation: index.generation,
+        detailRevision: review.detailRevision,
+        detailHash: review.detailHash,
+        now,
+        supportedCapabilities: index.capabilities,
+      });
+      if (detail.summary.state !== review.state || detail.summary.target.relativePath !== review.target) {
+        throw new Error("ui-projection-detail-index-mismatch");
+      }
+    }
+    return cleanupUiProjectionTempsUnlocked(paths, projection.root)
+      + cleanupStaleUiGenerationsUnlocked(paths, index.generation);
+  } catch (error) {
+    if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(reason(error))) throw error;
+    return removePrivateProjectionTree(paths, projection.root);
+  }
 }
 
 export function cleanupBridge(stateRoot, projectFingerprint, { now = Date.now(), lockTtlMs = 10_000 } = {}) {
@@ -1020,6 +1822,8 @@ export function cleanupBridge(stateRoot, projectFingerprint, { now = Date.now(),
       removed += cleanupDirectory(paths, paths.responses, "decision-response", projectFingerprint, now);
       removed += cleanupDirectory(paths, paths.controlRequests, "control-request", projectFingerprint, now);
       removed += cleanupDirectory(paths, paths.controlResponses, "control-response", projectFingerprint, now);
+      removed += cleanupDirectory(paths, paths.operationRequests, "operation-request", projectFingerprint, now);
+      removed += cleanupDirectory(paths, paths.operationResponses, "operation-response", projectFingerprint, now);
       try {
         const read = secureRead(paths, paths.controlState, MAX_CONTROL_STATE_BYTES, "control-state");
         if (read) makeControlState(JSON.parse(read.source), { now, projectFingerprint });
@@ -1041,6 +1845,7 @@ export function cleanupBridge(stateRoot, projectFingerprint, { now = Date.now(),
         const health = lstatOptional(paths.tuiHostHealth);
         if (health?.isFile() && health.nlink === 1 && secureUnlink(paths, paths.tuiHostHealth, health)) removed += 1;
       }
+      removed += cleanupUiProjectionUnlocked(paths, projectFingerprint, now);
     });
     return { ok: true, removed };
   } finally {

@@ -1,0 +1,448 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { buildUiProjection } from "../self-evolve-projection.js";
+import {
+  makeAuditEvent,
+  makeEligibilityExplanation,
+  makeEvidenceCluster,
+  makeGlobalSettings,
+  makeProposal,
+  makeProposalContent,
+  wrapRecord,
+} from "../self-evolve-schemas.js";
+import { hashContent, openStore } from "../self-evolve-store.js";
+
+const PROJECT = "a".repeat(64);
+const ROOT_IDENTITY = "b".repeat(64);
+const NOW = 1_000_000;
+const CURRENT = "---\nname: demo\n---\n# Current\n";
+const PROPOSED = "---\nname: demo\n---\n# Proposed\n";
+const CURRENT_HASH = hashContent(CURRENT);
+const PROPOSED_HASH = hashContent(PROPOSED);
+
+function hash(value) {
+  return createHash("sha256").update(String(value)).digest("hex");
+}
+
+function fixture(t, { mode = "auto" } = {}) {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-projection-"));
+  const skillRoot = path.join(root, "skills");
+  const skillPath = path.join(skillRoot, "demo", "SKILL.md");
+  mkdirSync(path.dirname(skillPath), { recursive: true });
+  writeFileSync(skillPath, CURRENT);
+  const store = openStore(root, { projectName: "projection", projectFingerprint: PROJECT, now: () => NOW });
+  const current = store.getSettings();
+  assert.equal(store.setGlobalSettings(makeGlobalSettings({
+    ...current.global,
+    mode,
+    allowedSkillRoots: [skillRoot],
+    updatedAt: NOW,
+  })).mode, mode);
+  t.after(() => {
+    try { store.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  });
+  const targetReader = (proposal) => {
+    const target = path.join(proposal.skillTarget.canonicalRoot, proposal.skillTarget.relativePath);
+    if (!existsSync(target)) return { exists: false, content: null, hash: null };
+    const content = readFileSync(target);
+    return { exists: true, content, hash: hashContent(content) };
+  };
+  const inventory = () => {
+    const content = readFileSync(skillPath);
+    return [{
+      canonicalRoot: skillRoot,
+      relativePath: "demo/SKILL.md",
+      exists: true,
+      currentHash: hashContent(content),
+    }];
+  };
+  return { root, skillRoot, skillPath, store, targetReader, inventory };
+}
+
+function proposal(skillRoot, overrides = {}) {
+  return makeProposal({
+    id: overrides.id ?? "proposal-1",
+    projectFingerprint: overrides.projectFingerprint ?? PROJECT,
+    clusterId: overrides.clusterId ?? hash(`cluster:${overrides.id ?? "proposal-1"}`),
+    skillTarget: {
+      canonicalRoot: skillRoot,
+      relativePath: overrides.relativePath ?? "demo/SKILL.md",
+      currentHash: overrides.currentHash ?? CURRENT_HASH,
+    },
+    proposedContentHash: overrides.proposedContentHash ?? PROPOSED_HASH,
+    rationaleText: overrides.rationaleText ?? "Repeated deterministic evidence supports this bounded skill update.",
+    synthesizedAt: overrides.synthesizedAt ?? NOW - 5_000,
+    synthesizerModelId: "fixture/no-provider",
+    criticScore: overrides.criticScore ?? 0.95,
+    criticPassed: overrides.criticPassed ?? true,
+    validDeterministic: overrides.validDeterministic ?? true,
+    state: overrides.state ?? "pending",
+    injectionFlagged: overrides.injectionFlagged ?? false,
+    decisionVersion: overrides.decisionVersion ?? 0,
+    burnedNonceHashes: overrides.burnedNonceHashes ?? [],
+  });
+}
+
+function append(store, kind, payload, createdAt = NOW - 4_000) {
+  const result = store.appendRecord(wrapRecord(kind, payload, createdAt));
+  assert.equal(result.ok, true, `${kind}: ${result.reason}`);
+}
+
+function seedContent(store, item, content = PROPOSED, createdAt = NOW - 3_900) {
+  append(store, "proposal-content", makeProposalContent({
+    proposalId: item.id,
+    contentHash: item.proposedContentHash,
+    contentEncoding: "base64",
+    chunkIndex: 0,
+    chunkCount: 1,
+    content: Buffer.from(content).toString("base64"),
+  }), createdAt);
+}
+
+function audit(kind, proposalId, details, timestamp = NOW - 3_000) {
+  return makeAuditEvent({
+    id: hash(JSON.stringify([kind, proposalId, details, timestamp])),
+    kind,
+    ...(proposalId ? { proposalId } : {}),
+    actor: "self-evolve-integration",
+    timestamp,
+    payloadHash: hash(JSON.stringify(details)),
+    details,
+  });
+}
+
+function seedLegacyGrant(store, item, expiresAt = NOW + 30_000) {
+  append(store, "audit-event", audit("decision", item.id, {
+    action: "bridge-nonce",
+    projectFingerprint: item.projectFingerprint,
+    subjectId: item.id,
+    targetHash: item.skillTarget.currentHash,
+    proposedContentHash: item.proposedContentHash,
+    decisionVersion: item.decisionVersion + 1,
+    priorState: item.state,
+    actor: "self-evolve-tui",
+    nonce: hash(`legacy:${item.id}`),
+    expiresAt,
+  }));
+}
+
+function seedEvidence(store, item) {
+  append(store, "evidence-cluster", makeEvidenceCluster({
+    id: item.clusterId,
+    receiptType: "repeated-command",
+    projectFingerprint: PROJECT,
+    incidentIds: ["incident-1", "incident-2", "incident-3"],
+    scopeFingerprint: hash("scope"),
+    occurrencesSum: 4,
+    firstSeenAt: NOW - 20_000,
+    lastSeenAt: NOW - 2_000,
+  }));
+  append(store, "eligibility-explanation", makeEligibilityExplanation({
+    clusterId: item.clusterId,
+    eligible: true,
+    reasons: ["all-thresholds-met"],
+    thresholdsMet: {
+      minIndependentIncidents: "3 (actual 3)",
+      minOccurrencesSum: "3 (actual 4)",
+    },
+    thresholdsMissed: {},
+  }));
+}
+
+function build(f, options = {}) {
+  return buildUiProjection(f.store.readProjectionSnapshot(), {
+    stateRootIdentity: ROOT_IDENTITY,
+    now: NOW,
+    targetReader: f.targetReader,
+    inventory: f.inventory(),
+    ...options,
+  });
+}
+
+function treeSnapshot(root) {
+  const output = [];
+  const visit = (directory) => {
+    for (const name of readdirSync(directory).sort()) {
+      const filePath = path.join(directory, name);
+      const relative = path.relative(root, filePath);
+      const stat = statSync(filePath);
+      if (stat.isDirectory()) visit(filePath);
+      else output.push([relative, stat.mode & 0o777, hash(readFileSync(filePath))]);
+    }
+  };
+  visit(root);
+  return output;
+}
+
+test("pending projections render bounded diff, evidence, eligibility, budgets, and fresh legacy actions", (t) => {
+  const f = fixture(t);
+  const item = proposal(f.skillRoot);
+  append(f.store, "proposal", item);
+  seedContent(f.store, item);
+  seedEvidence(f.store, item);
+  seedLegacyGrant(f.store, item);
+
+  const result = build(f, { detailProposalIds: [item.id] });
+  assert.equal(result.index.status.state, "ready");
+  assert.equal(result.index.status.storedMode, "auto");
+  assert.equal(result.index.status.effectiveMode, "auto");
+  assert.equal(result.index.reviews.length, 1);
+  assert.equal(result.details.length, 1);
+  assert.equal(result.publicationDetails.length, 1);
+  assert.equal(result.publicationDetails[0].detailHash, result.index.reviews[0].detailHash);
+  const detail = result.details[0];
+  assert.equal(detail.detailHash, result.index.reviews[0].detailHash);
+  assert.equal(detail.revision, result.index.reviews[0].detailRevision);
+  assert.equal(detail.summary.tokenImpact.estimatedTokens, Math.ceil(Buffer.byteLength(PROPOSED) / 4));
+  assert.equal(detail.summary.tokenImpact.budgetTokens, 8_000);
+  assert.equal(detail.summary.eligibility.eligible, true);
+  assert.deepEqual(detail.summary.eligibility.checks.map((check) => check.name), [
+    "minIndependentIncidents",
+    "minOccurrencesSum",
+  ]);
+  assert.deepEqual(detail.evidence.map((entry) => entry.kind), ["repeated-command"]);
+  assert.equal(detail.evidence.every((entry) => entry.redacted), true);
+  assert.equal(detail.diff.kind, "unified");
+  assert.match(detail.diff.lines.join("\n"), /-# Current[\s\S]*\+# Proposed/u);
+  assert.deepEqual(detail.allowedActions.map((action) => action.action), ["apply-proposal", "reject-proposal"]);
+  assert.equal(result.index.generation, result.generation);
+  assert.equal(result.unavailableDetailIds.length, 0);
+});
+
+test("manual and yolo pending projections remain reviewable without inferring Apply authority", (t) => {
+  for (const mode of ["manual", "yolo"]) {
+    const f = fixture(t, { mode });
+    const item = proposal(f.skillRoot, { id: `proposal-${mode}` });
+    append(f.store, "proposal", item);
+    seedContent(f.store, item);
+    seedLegacyGrant(f.store, item);
+    const result = build(f, { detailProposalIds: [item.id] });
+    assert.equal(result.details[0].summary.effectiveMode, mode);
+    assert.deepEqual(result.details[0].allowedActions.map((action) => action.action), ["reject-proposal"]);
+  }
+});
+
+test("applied audit projections expose verified rollback eligibility and local acknowledgement only", (t) => {
+  const f = fixture(t);
+  writeFileSync(f.skillPath, PROPOSED);
+  const item = proposal(f.skillRoot, { state: "applied", decisionVersion: 2 });
+  append(f.store, "proposal", item);
+  seedContent(f.store, item);
+  append(f.store, "audit-event", audit("apply", item.id, {
+    state: "readback-verified",
+    appliedHash: PROPOSED_HASH,
+    "readback-verified": true,
+  }));
+  const result = build(f, { detailProposalIds: [item.id] });
+  const detail = result.details[0];
+  assert.deepEqual(detail.summary.rollback, { eligible: true, reason: null, appliedHash: PROPOSED_HASH });
+  assert.deepEqual(detail.allowedActions.map((action) => action.action), ["acknowledge-audit"]);
+  assert.match(detail.audit[0].summary, /readback was verified/u);
+  assert.doesNotMatch(JSON.stringify(detail), new RegExp(f.skillRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+});
+
+test("missing content, failed-closed state, target drift, and private material fail closed without state changes", (t) => {
+  const f = fixture(t);
+  const failed = proposal(f.skillRoot, {
+    id: "failed",
+    state: "failed-closed",
+    proposedContentHash: hash("missing"),
+    rationaleText: "private ses_super_secret_session should never render",
+  });
+  append(f.store, "proposal", failed);
+  const drifted = proposal(f.skillRoot, { id: "drifted", relativePath: "demo/SKILL.md" });
+  append(f.store, "proposal", drifted);
+  seedContent(f.store, drifted, PROPOSED);
+  writeFileSync(f.skillPath, `${CURRENT}drift\n`);
+  const beforeRecords = f.store.readRecords("proposal").map((record) => record.id);
+  const beforeTree = treeSnapshot(f.root);
+  const result = build(f, { detailProposalIds: [failed.id, drifted.id] });
+  const afterTree = treeSnapshot(f.root);
+  assert.deepEqual(f.store.readRecords("proposal").map((record) => record.id), beforeRecords);
+  assert.deepEqual(afterTree, beforeTree);
+  for (const detail of result.details) {
+    assert.equal(detail.summary.risk, "critical");
+    assert.equal(detail.diff.kind, "unavailable");
+    assert.deepEqual(detail.allowedActions, []);
+  }
+  assert.doesNotMatch(JSON.stringify(result), /ses_super_secret_session/u);
+  assert.equal(result.index.reviews.every((review) => review.attention === "critical"), true);
+});
+
+test("schema-valid proposal chunks with inconsistent decoded content are never rendered or actionable", (t) => {
+  const f = fixture(t);
+  const item = proposal(f.skillRoot, { id: "inconsistent-content" });
+  append(f.store, "proposal", item);
+  seedContent(f.store, item, "different bytes with a falsely claimed hash");
+  seedLegacyGrant(f.store, item);
+  const result = build(f, { detailProposalIds: [item.id] });
+  const detail = result.details[0];
+  assert.equal(detail.summary.risk, "critical");
+  assert.equal(detail.diff.kind, "unavailable");
+  assert.deepEqual(detail.allowedActions, []);
+  assert.doesNotMatch(JSON.stringify(result), /different bytes/u);
+});
+
+test("corrupt, terminal, startup, and unavailable health states are explicit and suppress global actions", (t) => {
+  const f = fixture(t);
+  for (const state of ["corrupt", "terminal", "startup-pending", "unavailable"]) {
+    const result = build(f, { health: { state, reason: `${state}-fixture` } });
+    assert.equal(result.index.status.state, state);
+    assert.equal(result.index.status.reason, `${state}-fixture`);
+    assert.deepEqual(result.index.allowedActions, []);
+  }
+});
+
+test("operation grants bind the exact project, root, and target-derived generation without circular store hashes", (t) => {
+  const f = fixture(t);
+  const item = proposal(f.skillRoot);
+  append(f.store, "proposal", item);
+  seedContent(f.store, item);
+  const firstSnapshot = f.store.readProjectionSnapshot();
+  const first = buildUiProjection(firstSnapshot, {
+    stateRootIdentity: ROOT_IDENTITY,
+    now: NOW,
+    targetReader: f.targetReader,
+    inventory: f.inventory(),
+  });
+  append(f.store, "audit-event", audit("decision", item.id, {
+    action: "ui-operation-nonce",
+    projectFingerprint: PROJECT,
+    stateRootIdentity: ROOT_IDENTITY,
+    generation: first.generation,
+    subjectId: item.id,
+    uiAction: "snooze-proposal",
+    capability: "operation-snooze-v1",
+    nonce: hash("snooze"),
+    expiresAt: NOW + 30_000,
+  }));
+  const secondSnapshot = f.store.readProjectionSnapshot();
+  assert.equal(secondSnapshot.generation, firstSnapshot.generation);
+  const second = buildUiProjection(secondSnapshot, {
+    stateRootIdentity: ROOT_IDENTITY,
+    now: NOW,
+    targetReader: f.targetReader,
+    inventory: f.inventory(),
+    detailProposalIds: [item.id],
+  });
+  assert.equal(second.generation, first.generation);
+  assert.deepEqual(second.details[0].allowedActions.map((action) => action.action), ["snooze-proposal"]);
+
+  append(f.store, "audit-event", audit("decision", null, {
+    action: "ui-operation-nonce",
+    projectFingerprint: PROJECT,
+    stateRootIdentity: ROOT_IDENTITY,
+    generation: second.generation,
+    uiAction: "set-paused",
+    capability: "operation-pause-v1",
+    nonce: hash("pause"),
+    expiresAt: NOW + 30_000,
+  }, NOW - 2_000));
+  const third = build(f);
+  assert.deepEqual(third.index.allowedActions.map((action) => action.action), ["set-paused"]);
+});
+
+test("index bounds are deterministic, report exact overflow, and filter cross-project records", (t) => {
+  const f = fixture(t);
+  const targetValues = new Map();
+  const inventory = [];
+  const currentSettings = f.store.getSettings();
+  assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
+    ...currentSettings.global,
+    allowedSkillRoots: ["/skills"],
+    updatedAt: NOW + 1,
+  })).allowedSkillRoots[0], "/skills");
+  for (let index = 0; index < 65; index += 1) {
+    const id = `proposal-${String(index).padStart(2, "0")}`;
+    const current = `current-${index}`;
+    const proposed = `proposed-${index}`;
+    const item = proposal("/skills", {
+      id,
+      relativePath: `${id}/SKILL.md`,
+      currentHash: hashContent(current),
+      proposedContentHash: hashContent(proposed),
+      synthesizedAt: NOW - index,
+    });
+    append(f.store, "proposal", item, NOW - index);
+    seedContent(f.store, item, proposed, NOW - index);
+    targetValues.set(id, { exists: true, content: current, hash: hashContent(current) });
+    inventory.push({
+      canonicalRoot: "/skills",
+      relativePath: `${id}/SKILL.md`,
+      exists: true,
+      currentHash: hashContent(current),
+    });
+  }
+  const foreign = proposal("/skills", {
+    id: "foreign",
+    projectFingerprint: "f".repeat(64),
+    relativePath: "foreign/SKILL.md",
+    currentHash: hashContent("foreign"),
+    proposedContentHash: hashContent("foreign-proposed"),
+  });
+  append(f.store, "proposal", foreign);
+  const snapshot = f.store.readProjectionSnapshot();
+  const result = buildUiProjection(snapshot, {
+    stateRootIdentity: ROOT_IDENTITY,
+    now: NOW,
+    targetReader: (item) => targetValues.get(item.id),
+    inventory,
+  });
+  assert.equal(result.index.reviews.length, 64);
+  assert.equal(result.publicationDetails.length, 64);
+  assert.deepEqual(
+    result.publicationDetails.map((detail) => detail.proposalId),
+    result.index.reviews.map((review) => review.proposalId),
+  );
+  assert.equal(result.index.overflow.reviews.truncated, true);
+  assert.equal(result.index.overflow.reviews.omittedCount, 1);
+  assert.equal(result.index.overflow.reviews.omittedBytes > 0, true);
+  assert.equal(result.index.reviews.some((review) => review.proposalId === "foreign"), false);
+});
+
+test("target changes during construction abort the entire generation", (t) => {
+  const f = fixture(t);
+  const item = proposal(f.skillRoot);
+  append(f.store, "proposal", item);
+  seedContent(f.store, item);
+  let reads = 0;
+  assert.throws(() => buildUiProjection(f.store.readProjectionSnapshot(), {
+    stateRootIdentity: ROOT_IDENTITY,
+    now: NOW,
+    targetReader: () => {
+      reads += 1;
+      const content = reads === 1 ? CURRENT : `${CURRENT}changed\n`;
+      return { exists: true, content, hash: hashContent(content) };
+    },
+    inventory: f.inventory(),
+  }), /target-content-changed-during-projection/u);
+});
+
+test("store projection snapshots are immutable, generation-stable for reads, and change with authority state", (t) => {
+  const f = fixture(t);
+  const first = f.store.readProjectionSnapshot();
+  const second = f.store.readProjectionSnapshot();
+  assert.equal(first.generation, second.generation);
+  assert.equal(Object.isFrozen(first), true);
+  assert.equal(Object.isFrozen(first.records), true);
+  const item = proposal(f.skillRoot);
+  append(f.store, "proposal", item);
+  const third = f.store.readProjectionSnapshot();
+  assert.notEqual(third.generation, first.generation);
+  assert.equal(third.records.some((record) => record.kind === "proposal" && record.payload.id === item.id), true);
+});
