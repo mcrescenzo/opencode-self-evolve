@@ -27,11 +27,17 @@ Native review and the embedded-host version relay are separate TUI-plugin behavi
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["@mcrescenzo/opencode-self-evolve"]
+  "plugin": ["@mcrescenzo/opencode-self-evolve/tui"]
 }
 ```
 
-For this repository's local checkout, use `"plugin": ["./plugins/self-evolve/self-evolve-tui.tsx"]` in the config root's `tui.json`. The raw TSX entry is loaded directly by OpenCode’s Bun TUI runtime; the package has no install-time build. If advanced identity options such as `stateRoot` or `remoteUrl` are supplied to the server wrapper, pass the same values in the supported TUI plugin-options tuple so both targets derive one partition. The TUI module ID is `mcrescenzo.self-evolve`. Restart OpenCode after changing either registration file.
+The supported native target is `self-evolve-tui.tsx`, exported by the package as `./tui`. For this repository's local checkout, use `"plugin": ["./plugins/self-evolve/self-evolve-tui.tsx"]` in the config root's `tui.json`. The raw TSX entry is loaded directly by OpenCode’s Bun TUI runtime; the package has no install-time build. `self-evolve-tui.js` is a target-exclusive compatibility fallback used by the native wrapper, not the supported standalone registration. If an external `tui.json` still names `./plugins/self-evolve/self-evolve-tui.js`, replace it with `./plugins/self-evolve/self-evolve-tui.tsx` (or use `@mcrescenzo/opencode-self-evolve/tui` for an installed package) and restart OpenCode. This package does not edit external configuration.
+
+If advanced identity options such as `stateRoot` or `remoteUrl` are supplied to the server wrapper, pass the same values in the supported TUI plugin-options tuple so both targets derive one partition. The stable module ID is `mcrescenzo.self-evolve`; the hidden agents are `mcrescenzo.self-evolve.analyzer`, `mcrescenzo.self-evolve.synthesizer`, and `mcrescenzo.self-evolve.critic`, while the palette entry is `mcrescenzo.self-evolve.control-center`. Restart OpenCode after changing either registration file.
+
+Mixed versions fail closed without gaining authority: a new TUI with an old server remains legacy/read-only and submits no new writes, while an old TUI with a new server remains legacy/read-only through the retained legacy protocols and also gains no new write authority. The sidebar and control center require the aligned native target and server; headless commands and the durable inbox remain available according to the server version.
+
+TUI bookkeeping uses package-owned `mcrescenzo.self-evolve:*` KV keys. On the first read of each canonical key, one bounded compatibility read may migrate a valid raw value from its former `self-evolve:*` key. Invalid canonical values and corrupt or oversized legacy values are preserved and ignored rather than overwritten; legacy keys are never written. This fallback is a one-release migration window and keeps old/new peers able to read the same raw value.
 
 The `./tui` export alone may reach the optional TUI peer contract: `@opencode-ai/plugin ~1.18.3`, `@opentui/core`, `@opentui/keymap`, and `@opentui/solid` in `>=0.4.3 <0.5.0`, plus `solid-js 1.9.12`. A server-only host may omit them all. The package root remains plain Node ESM and imports neither the raw TSX entry nor any TUI peer.
 

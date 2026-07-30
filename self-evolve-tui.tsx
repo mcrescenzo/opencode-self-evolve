@@ -3,7 +3,11 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js"
 import type { KeyEvent, Renderable } from "@opentui/core"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import legacyModule from "./self-evolve-tui.js"
+// The legacy helper module is JSDoc-typed (allowJs) as a default-only module at
+// typecheck time; its named package-owned exports are present at runtime because
+// Bun transpiles this raw TUI target. Suppress the resolver limitation here.
+// @ts-ignore
+import legacyModule, { TUI_IDENTITIES, claimTuiSurfaceOwnership } from "./self-evolve-tui.js"
 import {
   acquireProjectTuiStore,
   buildControlCenterModel,
@@ -15,10 +19,10 @@ import {
 
 const CARD_ID = "self-evolve-sidebar-card"
 const REVIEW_DIALOG_ID = "self-evolve-review-dialog"
-const CONTROL_CENTER_COMMAND = "self-evolve.control-center"
-const CONTROL_CENTER_ROUTE = "self-evolve.control-center.route"
-const CONTROL_CENTER_MODE = "self-evolve-control-center"
-const CONTROL_CENTER_VIEW_ID = "self-evolve-control-center"
+const CONTROL_CENTER_COMMAND = TUI_IDENTITIES.command
+const CONTROL_CENTER_ROUTE = TUI_IDENTITIES.route
+const CONTROL_CENTER_MODE = TUI_IDENTITIES.mode
+const CONTROL_CENTER_VIEW_ID = TUI_IDENTITIES.view
 const activeApis = new WeakSet<object>()
 
 type ProjectStore = ReturnType<typeof acquireProjectTuiStore>
@@ -442,9 +446,17 @@ function ControlCenter(props: {
 
 const tui: TuiPlugin = async (api, options, meta) => {
   if (activeApis.has(api)) return
+  const surfaceOwnership = claimTuiSurfaceOwnership(api)
+  if (!surfaceOwnership.owned) {
+    console.warn(`self-evolve TUI registration skipped: ${surfaceOwnership.reason}`.slice(0, 240))
+    return
+  }
+  if (surfaceOwnership.duplicate) return
   activeApis.add(api)
+  let releaseWithNativeCleanup = false
   api.lifecycle.onDispose(() => {
     activeApis.delete(api)
+    if (!releaseWithNativeCleanup) surfaceOwnership.release?.()
   })
   let projectStore: ProjectStore | undefined
   const compatibilityOptions = {
@@ -457,6 +469,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
   }
   await legacyModule.tui(api, compatibilityOptions, meta)
   if (!projectStore) return
+  releaseWithNativeCleanup = true
   const [snapshot, setSnapshot] = createSignal(projectStore.getSnapshot())
   const unsubscribe = projectStore.subscribe(setSnapshot)
   api.lifecycle.onDispose(unsubscribe)
@@ -503,6 +516,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     render: () => <ControlCenter api={api} store={projectStore!} snapshot={snapshot} prior={priorRoute} />,
   }])
   const unregisterPaletteKeymap = api.keymap.registerLayer({
+    id: TUI_IDENTITIES.paletteLayer,
     commands: [{
       name: CONTROL_CENTER_COMMAND,
       title: "Self-evolve control center",
@@ -512,6 +526,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     }],
   })
   const unregisterControlCenterKeymap = api.keymap.registerLayer({
+    id: TUI_IDENTITIES.modeLayer,
     mode: CONTROL_CENTER_MODE,
     bindings: [{
       key: "escape",
@@ -520,12 +535,15 @@ const tui: TuiPlugin = async (api, options, meta) => {
     }],
   })
   api.lifecycle.onDispose(() => {
-    if (api.route.current.name === CONTROL_CENTER_ROUTE) {
+    if (surfaceOwnership.owns?.() && api.route.current.name === CONTROL_CENTER_ROUTE) {
       api.route.navigate(priorRoute.name, priorRoute.params)
     }
-    unregisterRoute?.()
-    if (typeof unregisterPaletteKeymap === "function") unregisterPaletteKeymap()
-    if (typeof unregisterControlCenterKeymap === "function") unregisterControlCenterKeymap()
+    if (surfaceOwnership.owns?.()) {
+      unregisterRoute?.()
+      if (typeof unregisterPaletteKeymap === "function") unregisterPaletteKeymap()
+      if (typeof unregisterControlCenterKeymap === "function") unregisterControlCenterKeymap()
+    }
+    surfaceOwnership.release?.()
   })
   api.slots.register({
     order: 275,

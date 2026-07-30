@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 
 import { createApplier } from "../self-evolve-applier.js";
 import { createCommandPolicy } from "../self-evolve-commands.js";
@@ -13,10 +14,26 @@ import { createPipeline } from "../self-evolve-pipeline.js";
 import { createPrivacyGuard } from "../self-evolve-privacy.js";
 import { createScheduler } from "../self-evolve-scheduler.js";
 import * as schemas from "../self-evolve-schemas.js";
-import { openStore } from "../self-evolve-store.js";
+import { openStore, resolveProjectIdentity } from "../self-evolve-store.js";
 import * as synthesis from "../self-evolve-synthesis.js";
 import SelfEvolvePlugin from "../self-evolve.js";
 import { SelfEvolveTuiPlugin } from "../self-evolve-tui.js";
+
+// A genuinely-dead OS pid (child exited once spawnSync returns) so the entrypoint's
+// real process-liveness check classifies the seeded self-evolve owner as dead.
+function deadOwnerPid() {
+  return spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid;
+}
+// Pre-seed durable dead-owner records so recovery (self-evolve-3r4) proves it aborts
+// only sessions this package provably owned by a now-dead process.
+function seedActiveHostOwners(root, stateRoot, sessions) {
+  const { projectFingerprint } = resolveProjectIdentity({ worktreePath: root, directory: root });
+  const store = openStore(stateRoot, { projectFingerprint, now: () => NOW });
+  for (const { id, agent } of sessions) {
+    assert.equal(store.acquireHostOwner(id, { agent, projectFingerprint, rootIdentity: store.rootIdentity, generation: 0, pid: deadOwnerPid() }).ok, true);
+  }
+  store.close();
+}
 
 const H = (value) => inventory.hashSkillContent(value);
 const PROJECT_A = H("hardening-project-a");
@@ -518,6 +535,14 @@ test("17 durable entrypoint asynchronously aborts only active self-evolve orphan
     { id: "critic-terminal", agent: "self-evolve-critic", state: "completed" },
     { id: "ordinary-active", agent: "build", state: "running" },
   ];
+  // Only the three active hidden-analyzer sessions carry a dead self-evolve owner
+  // record; the terminal session and the unrelated agent are not candidates, and a
+  // foreign/unknown same-name session (no record) is never aborted.
+  seedActiveHostOwners(root, path.join(root, "state"), [
+    { id: "analyzer-active", agent: "self-evolve-analyzer" },
+    { id: "synth-active", agent: "self-evolve-synthesizer" },
+    { id: "critic-active", agent: "self-evolve-critic" },
+  ]);
   const ctx = {
     directory: root,
     worktree: root,

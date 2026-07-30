@@ -24,6 +24,19 @@ import {
 } from "../self-evolve-bridge.js";
 import * as inventoryModule from "../self-evolve-inventory.js";
 import { openStore } from "../self-evolve-store.js";
+import { spawnSync } from "node:child_process";
+
+// A genuinely-dead OS pid (the child has exited by the time spawnSync returns),
+// so recovery's real process-liveness check classifies the seeded owner as dead.
+function deadOwnerPid() {
+  return spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid;
+}
+function seedDeadHostOwner(root, sessionId, agent) {
+  const store = openStore(root, { projectName: "fixture", projectFingerprint: FINGERPRINT, now: () => 100 });
+  const seeded = store.acquireHostOwner(sessionId, { agent, projectFingerprint: FINGERPRINT, rootIdentity: store.rootIdentity, generation: 0, pid: deadOwnerPid() });
+  store.close();
+  return seeded;
+}
 import * as schemas from "../self-evolve-schemas.js";
 import * as commandModule from "../self-evolve-commands.js";
 import {
@@ -1276,6 +1289,10 @@ test("host session recovery is bounded, selective, and idempotent", async (t) =>
     },
     abort: async (args) => { aborted.push(args?.path?.id ?? args?.path?.sessionID ?? args?.sessionID); return { data: {} }; },
   };
+  // Recovery (self-evolve-3r4) aborts only a session with a provably DEAD self-evolve
+  // owner record matching this project/root. "terminal"/"other" are not candidates;
+  // a same-name session without an owner record is foreign/unknown and never aborted.
+  assert.equal(seedDeadHostOwner(h.root, "active", "self-evolve-analyzer").ok, true);
   const [first, concurrent] = await Promise.all([
     h.integration.recoverHostSessions({ timeoutMs: 20, retries: 1, backoffMs: 1 }),
     h.integration.recoverHostSessions({ timeoutMs: 20, retries: 1, backoffMs: 1 }),

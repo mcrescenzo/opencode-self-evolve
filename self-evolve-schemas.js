@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 
-export const SCHEMA_VERSION = "0.2.0";
+export const SCHEMA_VERSION = "0.2.1";
 export const UNKNOWN_SESSION_LINEAGE_HASH = createHash("sha256").update("self-evolve-session-lineage-v1\nunknown").digest("hex");
+export const UNKNOWN_ROOT_LINEAGE_HASH = createHash("sha256").update("self-evolve-root-lineage-v1\nunknown").digest("hex");
 
 const MAX = Object.freeze({
   string: 1024,
@@ -29,6 +30,7 @@ const RECEIPT_TYPES = Object.freeze([
   "repeated-clarification",
 ]);
 const AGGREGATE_CLAIM_TYPES = Object.freeze(["global-skill-candidate"]);
+export const ORIGIN_KINDS = Object.freeze(["user", "delegated", "hidden", "plugin-created", "anonymous", "unknown"]);
 const PROPOSAL_STATES = Object.freeze([
   "critic-pending",
   "pending",
@@ -259,7 +261,7 @@ export const RepoSettings = deepFreeze({
 });
 export const EpisodeCursor = deepFreeze({ fields: ["sessionIDHash", "lastIdleAt", "lastObservedMessageHash", "leaseNonce"] });
 export const Receipt = deepFreeze({ fields: ["receiptType", "signatureHash", "occurrences", "firstSeenAt", "lastSeenAt", "projectFingerprint", "scopeFingerprint"] });
-export const Observation = deepFreeze({ fields: ["id", "projectFingerprint", "receiptIds", "structuredFields", "incidentId", "sessionLineageHash", "createdAt", "injectionFlagged", "redacted"] });
+export const Observation = deepFreeze({ fields: ["id", "projectFingerprint", "receiptIds", "structuredFields", "incidentId", "sessionLineageHash", "rootLineageHash", "originKind", "createdAt", "injectionFlagged", "redacted"] });
 export const EvidenceCluster = deepFreeze({ fields: ["id", "receiptType", "projectFingerprint", "incidentIds", "scopeFingerprint", "occurrencesSum", "firstSeenAt", "lastSeenAt"] });
 export const EligibilityExplanation = deepFreeze({ fields: ["clusterId", "eligible", "reasons", "thresholdsMet", "thresholdsMissed"] });
 export const Proposal = deepFreeze({
@@ -448,7 +450,8 @@ function structuredObservationFields(value) {
 }
 
 export function makeObservation(data) {
-  exactKeys(data, Observation.fields, "Observation", Observation.fields.filter((field) => field !== "sessionLineageHash"));
+  const optionalLegacyFields = new Set(["sessionLineageHash", "rootLineageHash", "originKind"]);
+  exactKeys(data, Observation.fields, "Observation", Observation.fields.filter((field) => !optionalLegacyFields.has(field)));
   return deepFreeze({
     id: asSha256Hex(data.id),
     projectFingerprint: asFingerprint(data.projectFingerprint),
@@ -456,6 +459,8 @@ export function makeObservation(data) {
     structuredFields: structuredObservationFields(data.structuredFields),
     incidentId: nonceString(data.incidentId),
     sessionLineageHash: asSha256Hex(data.sessionLineageHash ?? UNKNOWN_SESSION_LINEAGE_HASH),
+    rootLineageHash: asSha256Hex(data.rootLineageHash ?? UNKNOWN_ROOT_LINEAGE_HASH),
+    originKind: asEnum(data.originKind ?? "unknown", ORIGIN_KINDS),
     createdAt: asTimestamp(data.createdAt),
     injectionFlagged: asBoolean(data.injectionFlagged, "injectionFlagged"),
     redacted: asBoolean(data.redacted, "redacted"),

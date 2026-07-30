@@ -12,6 +12,7 @@ import {
   reserveAnalysis,
   resolveOptions,
   SELF_EVOLVE_ANALYZER_AGENT,
+  SELF_EVOLVE_MODULE_ID,
   SELF_EVOLVE_SOURCE,
 } from "./self-evolve-core.js";
 import {
@@ -19,6 +20,7 @@ import {
   ANALYZER_TOOLS,
   buildAnalyzerPrompt,
 } from "./analyzer-prompt.js";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
@@ -53,6 +55,7 @@ import {
 // Existing session objects remain shared by session ID.
 const registry = createRegistry();
 const legacyOwners = new Set();
+const sharedCommandOwnership = { current: null };
 
 // Durable late-start recovery is coordinated separately from the legacy
 // session registry. OpenCode may keep hooks from more than one factory
@@ -61,6 +64,168 @@ const legacyOwners = new Set();
 const lateDurableRecoveryRegistry = new Map();
 const durableHostObjectIDs = new WeakMap();
 let nextDurableHostObjectID = 1;
+
+const EVENT_DELIVERY_DEDUP_TTL_MS = 60_000;
+const EVENT_DELIVERY_DEDUP_MAX_ENTRIES = 256;
+const EVENT_DELIVERY_MAX_PENDING = 256;
+const EVENT_DELIVERY_DIAGNOSTIC_MAX_CHARS = 240;
+const EVENT_DELIVERY_SNAPSHOT_MAX_DEPTH = 4;
+const EVENT_DELIVERY_SNAPSHOT_MAX_ITEMS = 32;
+const EVENT_DELIVERY_SNAPSHOT_MAX_STRING = 160;
+
+function safeEventPath(value, path) {
+  try {
+    let current = value;
+    for (const key of path) {
+      if (current === null || (typeof current !== "object" && typeof current !== "function")) return undefined;
+      current = current[key];
+    }
+    return current;
+  } catch {
+    return undefined;
+  }
+}
+
+function semanticEventBody(input) {
+  const nested = safeEventPath(input, ["event"]);
+  return nested && typeof nested === "object" ? nested : input;
+}
+
+function boundedSemanticScalar(value) {
+  if (typeof value === "string") {
+    const clean = value.trim();
+    return clean ? clean.slice(0, EVENT_DELIVERY_SNAPSHOT_MAX_STRING) : null;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) return String(value);
+  return null;
+}
+
+function firstSemanticScalar(event, paths) {
+  for (const path of paths) {
+    const value = boundedSemanticScalar(safeEventPath(event, path));
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function boundedEventSnapshot(value, depth = 0, seen = new Set()) {
+  if (value === null) return null;
+  if (typeof value === "string") return value.slice(0, EVENT_DELIVERY_SNAPSHOT_MAX_STRING);
+  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+  if (typeof value === "boolean") return value;
+  if (typeof value === "bigint") return String(value);
+  if (value === undefined) return "[undefined]";
+  if (typeof value !== "object") return `[${typeof value}]`;
+  if (depth >= EVENT_DELIVERY_SNAPSHOT_MAX_DEPTH) return "[depth]";
+  if (seen.has(value)) return "[circular]";
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.slice(0, EVENT_DELIVERY_SNAPSHOT_MAX_ITEMS)
+        .map((item) => boundedEventSnapshot(item, depth + 1, seen));
+    }
+    let keys;
+    try {
+      keys = Object.keys(value).sort().slice(0, EVENT_DELIVERY_SNAPSHOT_MAX_ITEMS);
+    } catch {
+      return "[unavailable]";
+    }
+    const snapshot = {};
+    for (const key of keys) {
+      let item;
+      try {
+        item = value[key];
+      } catch {
+        item = "[unavailable]";
+      }
+      snapshot[key.slice(0, EVENT_DELIVERY_SNAPSHOT_MAX_STRING)] = boundedEventSnapshot(item, depth + 1, seen);
+    }
+    return snapshot;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function semanticEventDedupKey(input) {
+  const event = semanticEventBody(input);
+  const type = firstSemanticScalar(event, [["type"]]);
+  const eventID = firstSemanticScalar(event, [
+    ["properties", "eventID"], ["properties", "eventId"], ["properties", "event_id"],
+    ["eventID"], ["eventId"], ["event_id"], ["id"], ["properties", "id"],
+  ]);
+  const sessionID = firstSemanticScalar(event, [
+    ["properties", "sessionID"], ["properties", "sessionId"], ["properties", "session", "id"],
+    ["sessionID"], ["sessionId"], ["session", "id"],
+  ]);
+  const rootID = firstSemanticScalar(event, [
+    ["properties", "rootID"], ["properties", "rootId"], ["properties", "parentID"], ["properties", "parentId"],
+    ["properties", "session", "rootID"], ["properties", "session", "rootId"],
+    ["properties", "session", "parentID"], ["properties", "session", "parentId"],
+    ["rootID"], ["rootId"], ["parentID"], ["parentId"], ["session", "rootID"], ["session", "parentID"],
+  ]);
+  const epoch = firstSemanticScalar(event, [["properties", "epoch"], ["epoch"]]);
+  const generation = firstSemanticScalar(event, [
+    ["properties", "generation"], ["properties", "eventGeneration"], ["generation"], ["eventGeneration"],
+  ]);
+  const projectFingerprint = firstSemanticScalar(event, [
+    ["properties", "projectFingerprint"], ["projectFingerprint"],
+  ]);
+  if (eventID !== null) {
+    return `id:${JSON.stringify([type, eventID, sessionID, rootID, epoch, generation, projectFingerprint])}`;
+  }
+  if (type !== null && sessionID !== null && (epoch !== null || generation !== null)) {
+    return `composite:${JSON.stringify([type, sessionID, rootID, epoch, generation, projectFingerprint])}`;
+  }
+  const conservative = JSON.stringify({
+    type,
+    sessionID,
+    rootID,
+    epoch,
+    generation,
+    projectFingerprint,
+    event: boundedEventSnapshot(event),
+  });
+  return `fallback:${createHash("sha256").update(conservative).digest("hex").slice(0, 24)}`;
+}
+
+function createSemanticEventDeduper({
+  ttlMs = EVENT_DELIVERY_DEDUP_TTL_MS,
+  maxEntries = EVENT_DELIVERY_DEDUP_MAX_ENTRIES,
+} = {}) {
+  const boundedTTL = Number.isSafeInteger(ttlMs) && ttlMs > 0 ? ttlMs : EVENT_DELIVERY_DEDUP_TTL_MS;
+  const boundedMax = Number.isSafeInteger(maxEntries) && maxEntries > 0 ? maxEntries : EVENT_DELIVERY_DEDUP_MAX_ENTRIES;
+  const entries = new Map();
+  return {
+    accept(key, timestamp = Date.now()) {
+      if (typeof key !== "string" || !key) return true;
+      const currentTime = Number.isFinite(timestamp) ? timestamp : Date.now();
+      for (const [candidate, seenAt] of entries) {
+        if (currentTime - seenAt < boundedTTL) break;
+        entries.delete(candidate);
+      }
+      const seenAt = entries.get(key);
+      if (seenAt !== undefined && currentTime - seenAt < boundedTTL) return false;
+      if (seenAt !== undefined) entries.delete(key);
+      while (entries.size >= boundedMax) entries.delete(entries.keys().next().value);
+      entries.set(key, currentTime);
+      return true;
+    },
+    get size() {
+      return entries.size;
+    },
+  };
+}
+
+function eventDeliveryDiagnostic(log, action, error) {
+  if (typeof log !== "function") return;
+  let detail = action;
+  try {
+    detail = errorMessage(error, action).slice(0, EVENT_DELIVERY_DIAGNOSTIC_MAX_CHARS);
+  } catch {}
+  try {
+    void Promise.resolve(log({ level: "warn", action, error: detail })).catch(() => {});
+  } catch {}
+}
 
 function now(options) {
   return typeof options?.now === "function" ? options.now() : Date.now();
@@ -172,6 +337,135 @@ function analyzerPermissionRules() {
 
 function analyzerPermissionConfig() {
   return Object.fromEntries(analyzerPermissionNames().map((permission) => [permission, "deny"]));
+}
+
+const ANALYZER_DESCRIPTION = "Hidden session-local self-evolve analyzer that returns strict JSON proposals from bounded redacted transcript evidence.";
+const AGENT_METADATA_KEY = "metadata";
+const SELF_EVOLVE_COMMAND = "self-evolve";
+const SELF_EVOLVE_COMMAND_DESCRIPTION = "Inspect or control durable self-evolve behavior";
+const SELF_EVOLVE_COMMAND_TEMPLATE = `The registered self-evolve server plugin handles /self-evolve through command.execute.before and replaces this template with deterministic command output.
+
+Arguments: $ARGUMENTS
+
+Common forms:
+- status | health | budget | scan
+- manual | auto | yolo confirm --allowlist <absolute-root>
+- inbox | review [id] | approve <id> ... | reject <id> | snooze <id> [duration] | undo <id>
+- pause | resume | exclude | include | repo <manual|auto|yolo|inherit>
+- consent <passive|observations|excerpts|cross-repo> <on|off>
+- inspect observations [N] | inspect eligibility [clusterId]
+- export [observations|proposals|project|all] | purge <observations|proposals|project|all>
+- kill-switch <on|off>
+
+Use /self-evolve help for exact syntax and safety disclosures.`;
+
+function agentDefinitionFingerprint(definition) {
+  const permission = Object.fromEntries(Object.entries(definition?.permission ?? {}).sort(([left], [right]) => left.localeCompare(right)));
+  return createHash("sha256").update(JSON.stringify({
+    description: String(definition?.description ?? ""),
+    prompt: String(definition?.prompt ?? ""),
+    permission,
+  })).digest("hex");
+}
+
+function analyzerAgentDefinition(model) {
+  const definition = {
+    description: ANALYZER_DESCRIPTION,
+    mode: "primary",
+    hidden: true,
+    model,
+    temperature: 0,
+    steps: 1,
+    prompt: ANALYZER_SYSTEM_PROMPT,
+    permission: analyzerPermissionConfig(),
+  };
+  const definitionFingerprint = agentDefinitionFingerprint(definition);
+  return {
+    ...definition,
+    [AGENT_METADATA_KEY]: Object.freeze({ owner: SELF_EVOLVE_MODULE_ID, definitionFingerprint }),
+  };
+}
+
+function equivalentAnalyzerDefinition(existing, expected) {
+  if (!existing || typeof existing !== "object" || Array.isArray(existing)) return false;
+  const expectedFingerprint = expected[AGENT_METADATA_KEY].definitionFingerprint;
+  const metadata = existing[AGENT_METADATA_KEY];
+  if (metadata?.owner === SELF_EVOLVE_MODULE_ID
+      && metadata?.definitionFingerprint === expectedFingerprint
+      && agentDefinitionFingerprint(existing) === expectedFingerprint) return true;
+  return agentDefinitionFingerprint(existing) === expectedFingerprint
+    && existing.mode === expected.mode
+    && existing.hidden === expected.hidden
+    && existing.temperature === expected.temperature
+    && existing.steps === expected.steps;
+}
+
+function registerAnalyzerAgent(cfg) {
+  cfg.agent = cfg.agent ?? {};
+  const expected = analyzerAgentDefinition(cfg.model);
+  const existing = cfg.agent[SELF_EVOLVE_ANALYZER_AGENT];
+  if (existing === undefined) {
+    cfg.agent[SELF_EVOLVE_ANALYZER_AGENT] = expected;
+    return { registered: true, equivalent: false };
+  }
+  if (equivalentAnalyzerDefinition(existing, expected)) return { registered: false, equivalent: true };
+  console.warn(`self-evolve agent registration skipped: foreign definition owns ${SELF_EVOLVE_ANALYZER_AGENT}`.slice(0, 240));
+  return { registered: false, equivalent: false, reason: "foreign-agent-definition" };
+}
+
+function commandDefinitionFingerprint(definition) {
+  return createHash("sha256").update(JSON.stringify({
+    description: String(definition?.description ?? ""),
+    template: String(definition?.template ?? ""),
+    agent: definition?.agent === undefined ? null : String(definition.agent),
+    model: definition?.model === undefined ? null : String(definition.model),
+    subtask: definition?.subtask === undefined ? null : definition.subtask,
+  })).digest("hex");
+}
+
+function selfEvolveCommandDefinition() {
+  const definition = {
+    description: SELF_EVOLVE_COMMAND_DESCRIPTION,
+    template: SELF_EVOLVE_COMMAND_TEMPLATE,
+  };
+  const definitionFingerprint = commandDefinitionFingerprint(definition);
+  return {
+    ...definition,
+    [AGENT_METADATA_KEY]: Object.freeze({ owner: SELF_EVOLVE_MODULE_ID, definitionFingerprint }),
+  };
+}
+
+function equivalentSelfEvolveCommandDefinition(existing, expected = selfEvolveCommandDefinition()) {
+  if (!existing || typeof existing !== "object" || Array.isArray(existing)) return false;
+  const expectedFingerprint = expected[AGENT_METADATA_KEY].definitionFingerprint;
+  const actualFingerprint = commandDefinitionFingerprint(existing);
+  const metadata = existing[AGENT_METADATA_KEY];
+  if (metadata?.owner === SELF_EVOLVE_MODULE_ID
+      && metadata?.definitionFingerprint === expectedFingerprint
+      && actualFingerprint === expectedFingerprint) return true;
+  return actualFingerprint === expectedFingerprint;
+}
+
+function registerSelfEvolveCommand(cfg) {
+  cfg.command = cfg.command && typeof cfg.command === "object" && !Array.isArray(cfg.command) ? cfg.command : {};
+  const expected = selfEvolveCommandDefinition();
+  const existing = cfg.command[SELF_EVOLVE_COMMAND];
+  if (existing === undefined) {
+    cfg.command[SELF_EVOLVE_COMMAND] = expected;
+    return { registered: true, equivalent: false, owned: true, definitionFingerprint: expected.metadata.definitionFingerprint };
+  }
+  if (equivalentSelfEvolveCommandDefinition(existing, expected)) {
+    return { registered: false, equivalent: true, owned: true, definitionFingerprint: expected.metadata.definitionFingerprint };
+  }
+  console.warn("self-evolve command registration skipped: foreign definition owns self-evolve".slice(0, 240));
+  return { registered: false, equivalent: false, owned: false, reason: "foreign-command-definition", definitionFingerprint: expected.metadata.definitionFingerprint };
+}
+
+function ownsSelfEvolveCommand(cfg, definitionFingerprint) {
+  if (!cfg || typeof definitionFingerprint !== "string") return false;
+  const expected = selfEvolveCommandDefinition();
+  return expected.metadata.definitionFingerprint === definitionFingerprint
+    && equivalentSelfEvolveCommandDefinition(cfg.command?.[SELF_EVOLVE_COMMAND], expected);
 }
 
 async function withTimeout(task, timeoutMs, label) {
@@ -762,6 +1056,7 @@ async function createDurablePipeline(ctx, options, selectedStateRoot, compatibil
 async function SelfEvolvePlugin(ctx, options = {}) {
   const instancePluginOptions = resolveOptions(options);
   let configuredModel = null;
+  let commandOwnership = null;
   const durableEnabled = instancePluginOptions.durableAutonomy !== false;
   const legacyOwnerToken = {};
   if (!durableEnabled) legacyOwners.add(legacyOwnerToken);
@@ -776,6 +1071,9 @@ async function SelfEvolvePlugin(ctx, options = {}) {
   let lateRecoveryCoordination = null;
   let usesSharedLateRuntime = false;
   let disposed = false;
+  const eventDispatches = createSemanticEventDeduper();
+  const eventDeliveryDiagnostics = createSemanticEventDeduper();
+  let pendingEventDeliveries = 0;
   let durableUnavailableReason;
   let runningHostCompatibility = hostCompatibility("unknown", false, "host-health-unavailable");
   let initialSelection;
@@ -818,7 +1116,7 @@ async function SelfEvolvePlugin(ctx, options = {}) {
         compatibility: null,
         unavailableReason: undefined,
         commandDispatches: new WeakMap(),
-        eventDispatches: new WeakMap(),
+        eventDispatches: createSemanticEventDeduper(),
         lateRecoveryAttempted: false,
       };
       lateDurableRecoveryRegistry.set(coordinationKey, lateRecoveryCoordination);
@@ -1004,21 +1302,26 @@ async function SelfEvolvePlugin(ctx, options = {}) {
   const hooks = {
     config: async (cfg) => {
       configuredModel = cfg.model;
-      cfg.agent = cfg.agent ?? {};
-      cfg.agent[SELF_EVOLVE_ANALYZER_AGENT] = {
-        description: "Hidden session-local self-evolve analyzer that returns strict JSON proposals from bounded redacted transcript evidence.",
-        mode: "primary",
-        hidden: true,
-        model: cfg.model,
-        temperature: 0,
-        steps: 1,
-        prompt: ANALYZER_SYSTEM_PROMPT,
-        permission: analyzerPermissionConfig(),
-      };
+      registerAnalyzerAgent(cfg);
+      commandOwnership = { cfg, owned: false, definitionFingerprint: null };
+      const registration = registerSelfEvolveCommand(cfg);
+      commandOwnership.owned = registration.owned === true;
+      commandOwnership.definitionFingerprint = registration.definitionFingerprint ?? null;
     },
 
     "command.execute.before": async (input, output) => {
       if (input.command !== "self-evolve") return;
+      // Defer only when THIS instance positively knows a foreign definition owns the
+      // command (registered and not owned), or our owned definition was replaced by a
+      // foreign one since registration. When the config hook never ran (ownership
+      // unknown), proceed as before so a standalone/legacy install still works.
+      if (commandOwnership?.owned === false) return;
+      if (commandOwnership?.owned === true
+          && commandOwnership.definitionFingerprint
+          && !ownsSelfEvolveCommand(commandOwnership.cfg, commandOwnership.definitionFingerprint)) {
+        commandOwnership.owned = false;
+        return;
+      }
       if (lateRecoveryCoordination && input && typeof input === "object") {
         const priorDispatch = lateRecoveryCoordination.commandDispatches.get(input);
         if (priorDispatch) {
@@ -1092,22 +1395,46 @@ async function SelfEvolvePlugin(ctx, options = {}) {
   };
 
   if (durableEnabled && startupMode !== "manual") {
-    hooks.event = async (input) => {
-      if (!isDurableLifecycleEvent(input)) return;
-      const integration = settledRuntime?.integration;
-      if (!integration) return;
-      if (lateRecoveryCoordination && input && typeof input === "object") {
-        const priorDispatch = lateRecoveryCoordination.eventDispatches.get(input);
-        if (priorDispatch) {
-          await priorDispatch;
+    hooks.event = (input) => {
+      try {
+        if (!isDurableLifecycleEvent(input)) return;
+        const timestamp = now(instancePluginOptions);
+        const key = semanticEventDedupKey(input);
+        if (pendingEventDeliveries >= EVENT_DELIVERY_MAX_PENDING) {
+          if (eventDeliveryDiagnostics.accept("saturated", timestamp)) {
+            eventDeliveryDiagnostic(instancePluginOptions.log, "event-delivery-saturated", "pending queue limit reached");
+          }
           return;
         }
-        const dispatch = Promise.resolve(integration?.handleEvent?.(input));
-        lateRecoveryCoordination.eventDispatches.set(input, dispatch);
-        await dispatch;
-        return;
+        if (!eventDispatches.accept(key, timestamp)) return;
+        pendingEventDeliveries += 1;
+        try {
+          queueMicrotask(() => {
+            void Promise.resolve()
+              .then(async () => {
+                if (disposed) return;
+                const integration = settledRuntime?.integration;
+                if (!integration) return;
+                if (lateRecoveryCoordination && !lateRecoveryCoordination.eventDispatches.accept(key, timestamp)) return;
+                await integration.handleEvent?.(input);
+              })
+              .catch((error) => {
+                eventDeliveryDiagnostic(instancePluginOptions.log, "event-delivery-failed", error);
+              })
+              .finally(() => {
+                pendingEventDeliveries = Math.max(0, pendingEventDeliveries - 1);
+              })
+              .catch((error) => {
+                eventDeliveryDiagnostic(instancePluginOptions.log, "event-delivery-settlement-failed", error);
+              });
+          });
+        } catch (error) {
+          pendingEventDeliveries = Math.max(0, pendingEventDeliveries - 1);
+          throw error;
+        }
+      } catch (error) {
+        eventDeliveryDiagnostic(instancePluginOptions.log, "event-delivery-malformed", error);
       }
-      await integration?.handleEvent?.(input);
     };
   }
 
@@ -1138,6 +1465,19 @@ SelfEvolvePlugin.__test = {
     return registry;
   },
   analyzerPermissionNames,
+  agentDefinitionFingerprint,
+  analyzerAgentDefinition,
+  equivalentAnalyzerDefinition,
+  registerAnalyzerAgent,
+  commandDefinitionFingerprint,
+  selfEvolveCommandDefinition,
+  equivalentSelfEvolveCommandDefinition,
+  registerSelfEvolveCommand,
+  ownsSelfEvolveCommand,
+  createSemanticEventDeduper,
+  EVENT_DELIVERY_DEDUP_MAX_ENTRIES,
+  EVENT_DELIVERY_DEDUP_TTL_MS,
+  EVENT_DELIVERY_MAX_PENDING,
   handleCommand,
   humanizeScanReason,
   proposalNotification,
@@ -1145,10 +1485,14 @@ SelfEvolvePlugin.__test = {
   resolveStateRoot,
   runAnalysis,
   scanText,
+  semanticEventDedupKey,
   showProposalToast,
   __resetRegistryForTests: () => {
     registry.clear();
     legacyOwners.clear();
+  },
+  __resetCommandOwnershipForTests: () => {
+    sharedCommandOwnership.current = null;
   },
 };
 

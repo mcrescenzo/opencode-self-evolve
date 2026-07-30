@@ -1,4 +1,5 @@
 import path from "node:path";
+import { partIsExcludedFromEvidence } from "./self-evolve-observation.js";
 
 export const DEFAULT_OPTIONS = Object.freeze({
   minIntervalMs: 10 * 60 * 1000,
@@ -28,8 +29,24 @@ export const STATUSES = Object.freeze({
 });
 
 export const PLACEMENTS = Object.freeze(["global", "repo-local", "plugin-local", "unknown"]);
-export const SELF_EVOLVE_SOURCE = "self-evolve-plugin";
-export const SELF_EVOLVE_ANALYZER_AGENT = "self-evolve-analyzer";
+export const SELF_EVOLVE_MODULE_ID = "mcrescenzo.self-evolve";
+export const SELF_EVOLVE_SOURCE = SELF_EVOLVE_MODULE_ID;
+export const SELF_EVOLVE_ANALYZER_AGENT = `${SELF_EVOLVE_MODULE_ID}.analyzer`;
+export const SELF_EVOLVE_SYNTHESIZER_AGENT = `${SELF_EVOLVE_MODULE_ID}.synthesizer`;
+export const SELF_EVOLVE_CRITIC_AGENT = `${SELF_EVOLVE_MODULE_ID}.critic`;
+export const LEGACY_SELF_EVOLVE_SOURCE = "self-evolve-plugin";
+export const LEGACY_SELF_EVOLVE_AGENTS = Object.freeze({
+  analyzer: "self-evolve-analyzer",
+  synthesizer: "self-evolve-synthesizer",
+  critic: "self-evolve-critic",
+});
+const SELF_EVOLVE_AGENTS = new Set([
+  SELF_EVOLVE_ANALYZER_AGENT,
+  SELF_EVOLVE_SYNTHESIZER_AGENT,
+  SELF_EVOLVE_CRITIC_AGENT,
+  ...Object.values(LEGACY_SELF_EVOLVE_AGENTS),
+]);
+const SELF_EVOLVE_SOURCES = new Set([SELF_EVOLVE_SOURCE, LEGACY_SELF_EVOLVE_SOURCE]);
 export const PRIVACY_DISCLOSURE = "Privacy: a manual scan sends a bounded, redacted recent-session transcript to the configured model provider for analysis.";
 const DURABLE_LIFECYCLE_EVENT_TYPES = new Set([
   "session.compacted",
@@ -682,7 +699,7 @@ export function truncateTail(text, maxChars, label = "content") {
 
 function partListText(parts) {
   if (!Array.isArray(parts)) return "";
-  return parts.map(partText).filter(Boolean).join("\n");
+  return parts.filter((part) => !partIsExcludedFromEvidence(part)).map(partText).filter(Boolean).join("\n");
 }
 
 function partText(part) {
@@ -699,8 +716,9 @@ function partText(part) {
 export function messageText(message) {
   if (!message) return "";
   if (typeof message === "string") return message;
-  return partListText(message.parts ?? message.info?.parts ?? message.message?.parts) ||
-    String(message.text ?? message.content ?? message.info?.text ?? "");
+  const parts = message.parts ?? message.info?.parts ?? message.message?.parts;
+  if (Array.isArray(parts) && parts.length > 0) return partListText(parts);
+  return String(message.text ?? message.content ?? message.info?.text ?? "");
 }
 
 function messageID(message, index) {
@@ -716,9 +734,15 @@ function messageAgent(message) {
 }
 
 function isSelfEvolveMessage(message) {
-  if (messageAgent(message) === SELF_EVOLVE_ANALYZER_AGENT) return true;
-  const parts = message?.parts ?? message?.info?.parts ?? [];
-  return Array.isArray(parts) && parts.some((part) => part?.metadata?.source === SELF_EVOLVE_SOURCE);
+  if (SELF_EVOLVE_AGENTS.has(messageAgent(message))) return true;
+  const parts = message?.parts ?? message?.info?.parts ?? message?.message?.parts ?? [];
+  return Array.isArray(parts) && parts.some((part) => SELF_EVOLVE_SOURCES.has(part?.metadata?.source));
+}
+
+function isExcludedEvidenceMessage(message) {
+  if (partIsExcludedFromEvidence(message)) return true;
+  const parts = message?.parts ?? message?.info?.parts ?? message?.message?.parts;
+  return Array.isArray(parts) && parts.length > 0 && parts.every(partIsExcludedFromEvidence);
 }
 
 export function buildTranscript(messages, options = {}) {
@@ -728,7 +752,7 @@ export function buildTranscript(messages, options = {}) {
   const unique = [];
   input.forEach((message, index) => {
     const id = messageID(message, index);
-    if (seen.has(id) || isSelfEvolveMessage(message)) return;
+    if (seen.has(id) || isSelfEvolveMessage(message) || isExcludedEvidenceMessage(message)) return;
     seen.add(id);
     unique.push(message);
   });

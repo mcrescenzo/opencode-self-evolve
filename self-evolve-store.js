@@ -3,6 +3,7 @@ import {
   constants,
   existsSync,
   fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -18,6 +19,12 @@ import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { BRIDGE_CONTROL_STATE_RESERVE_BYTES, BRIDGE_RESPONSE_RESERVE_BYTES, validateBridgeExportMetadata } from "./self-evolve-bridge.js";
 import { stateMutationLockHeld, withStateMutationLock } from "./self-evolve-lock.js";
+import {
+  LEGACY_SELF_EVOLVE_AGENTS,
+  SELF_EVOLVE_ANALYZER_AGENT,
+  SELF_EVOLVE_CRITIC_AGENT,
+  SELF_EVOLVE_SYNTHESIZER_AGENT,
+} from "./self-evolve-core.js";
 import {
   SCHEMA_VERSION,
   assertRecord,
@@ -37,12 +44,19 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 const DEFAULT_STALE_LOCK_MS = 30_000;
+export const HOST_OWNER_TTL_MS = 15 * 60 * 1000;
 const DAY_MS = 86_400_000;
 const MANDATORY_AUDIT_MAX_BYTES = 4 * 1024;
 const DECISION_TRANSACTION_VERSION = 2;
 const MAX_EXPORT_BYTES = 64 * 1024 * 1024;
 const EXPORT_NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) && constants.O_NOFOLLOW !== 0 ? constants.O_NOFOLLOW : null;
 const ACTIVE_PROPOSAL_STATES = new Set(["critic-pending", "pending", "approved", "applied"]);
+const HIDDEN_HOST_OWNER_AGENTS = new Set([
+  SELF_EVOLVE_ANALYZER_AGENT,
+  SELF_EVOLVE_SYNTHESIZER_AGENT,
+  SELF_EVOLVE_CRITIC_AGENT,
+  ...Object.values(LEGACY_SELF_EVOLVE_AGENTS),
+]);
 const STORE_FILES = Object.freeze({
   observation: "observations.jsonl",
   proposal: "proposals.jsonl",
@@ -201,16 +215,19 @@ export function openStore(rootDir, {
   lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS,
   staleLockMs = DEFAULT_STALE_LOCK_MS,
   faultInjection,
+  processIsAlive: hostProcessIsAlive = processIsAlive,
 } = {}) {
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
   if (!/^[a-f0-9]{64}$/.test(String(projectFingerprint))) throw new TypeError("invalid-project-fingerprint");
   if (!Number.isSafeInteger(lockTimeoutMs) || lockTimeoutMs < 1) throw new TypeError("invalid-lock-timeout");
   if (!Number.isSafeInteger(staleLockMs) || staleLockMs < 1) throw new TypeError("invalid-stale-lock-window");
+  if (typeof hostProcessIsAlive !== "function") throw new TypeError("process-is-alive-must-be-function");
   const root = path.resolve(String(rootDir));
   const baseDir = path.join(root, "self-evolve");
   const globalDir = path.join(baseDir, "global");
   const stateDir = path.join(baseDir, projectFingerprint);
   const leasesDir = path.join(stateDir, "leases");
+  const hostOwnersDir = path.join(stateDir, "host-owners");
   const quarantineDir = path.join(stateDir, "quarantine");
   const globalQuarantineDir = path.join(globalDir, "quarantine");
   const snapshotsDir = path.join(stateDir, "snapshots");
@@ -222,6 +239,7 @@ export function openStore(rootDir, {
   const bridgeProjectDir = path.join(baseDir, "bridge", projectFingerprint);
   const exportProjectDir = path.join(baseDir, "exports", projectFingerprint);
   const ownedLeases = new Map();
+  const ownedHostOwners = new Map();
   // Cache validity is the exact source bytes, never filesystem metadata. Every
   // read still reads and compares the source, so writers in other processes are
   // visible even when an inode, size, or millisecond mtime is reused.
@@ -246,6 +264,7 @@ export function openStore(rootDir, {
     ensureDir(globalDir);
     ensureDir(stateDir);
     ensureDir(leasesDir);
+    ensureDir(hostOwnersDir);
     ensureDir(quarantineDir);
     ensureDir(globalQuarantineDir);
     ensureDir(snapshotsDir);
@@ -1142,6 +1161,200 @@ export function openStore(rootDir, {
     });
   }
 
+  function hostOwnerKey(sessionId) {
+    const value = String(sessionId ?? "");
+    if (!value || value.length > 512 || Buffer.byteLength(value, "utf8") > 1024 || value.includes("\0")) throw new TypeError("invalid-host-session-id");
+    return hashContent(`self-evolve-host-owner-v1\n${value}`);
+  }
+
+  function hostOwnerPath(sessionId) {
+    return path.join(hostOwnersDir, `${hostOwnerKey(sessionId)}.json`);
+  }
+
+  function validHostOwner(value, sessionId) {
+    const keys = ["schema", "sessionId", "agent", "pid", "generation", "projectFingerprint", "rootIdentity", "nonce", "acquiredAt", "expiresAt"];
+    return value && typeof value === "object" && !Array.isArray(value)
+      && Object.keys(value).sort().join(",") === [...keys].sort().join(",")
+      && value.schema === "self-evolve.host-owner.v1"
+      && value.sessionId === sessionId
+      && typeof value.sessionId === "string" && value.sessionId.length > 0 && value.sessionId.length <= 512
+      && Buffer.byteLength(value.sessionId, "utf8") <= 1024 && !value.sessionId.includes("\0")
+      && HIDDEN_HOST_OWNER_AGENTS.has(value.agent)
+      && Number.isSafeInteger(value.pid) && value.pid > 0
+      && Number.isSafeInteger(value.generation) && value.generation >= 0
+      && /^[a-f0-9]{64}$/.test(value.projectFingerprint)
+      && /^[a-f0-9]{64}$/.test(value.rootIdentity)
+      && /^(?:[a-f0-9]{2}){24,64}$/.test(value.nonce)
+      && Number.isSafeInteger(value.acquiredAt) && value.acquiredAt >= 0
+      && Number.isSafeInteger(value.expiresAt) && value.expiresAt > value.acquiredAt;
+  }
+
+  function readHostOwnerState(sessionId) {
+    let source;
+    try {
+      source = readFileSync(hostOwnerPath(sessionId), "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") return { state: "absent" };
+      return { state: "error", reason: "host-owner-read-error", code: String(error?.code ?? "UNKNOWN") };
+    }
+    let owner;
+    try {
+      owner = JSON.parse(source);
+    } catch {
+      return { state: "corrupt", reason: "host-owner-invalid-json", source };
+    }
+    if (!validHostOwner(owner, sessionId)) return { state: "malformed", reason: "host-owner-invalid-shape", source };
+    return { state: "valid", owner, source };
+  }
+
+  function removeHostOwnerUnlocked(sessionId, owner) {
+    try { unlinkSync(hostOwnerPath(sessionId)); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    const key = hostOwnerKey(sessionId);
+    if (!owner?.nonce || ownedHostOwners.get(key)?.nonce === owner.nonce) ownedHostOwners.delete(key);
+  }
+
+  function quarantineHostOwnerUnlocked(sessionId, read) {
+    const key = hostOwnerKey(sessionId);
+    quarantineDeterministic(read.source, read.reason, `host-owner-${key}`);
+    removeHostOwnerUnlocked(sessionId);
+  }
+
+  function hostOwnerStatusUnlocked(sessionId, { projectFingerprint: expectedProject, rootIdentity: expectedRoot, now: nowMs = now() } = {}) {
+    if (!/^[a-f0-9]{64}$/.test(String(expectedProject)) || !/^[a-f0-9]{64}$/.test(String(expectedRoot)) || !Number.isSafeInteger(nowMs) || nowMs < 0) {
+      return { classification: "malformed", reason: "invalid-host-owner-status-context" };
+    }
+    const read = readHostOwnerState(sessionId);
+    if (read.state === "absent") return { classification: "unknown", reason: "host-owner-not-found" };
+    if (read.state === "error") return { classification: "unknown", reason: read.reason, code: read.code };
+    if (read.state === "corrupt" || read.state === "malformed") {
+      quarantineHostOwnerUnlocked(sessionId, read);
+      return { classification: read.state, reason: read.reason };
+    }
+    const owner = read.owner;
+    if (owner.projectFingerprint !== expectedProject || owner.rootIdentity !== expectedRoot) {
+      return { classification: "foreign", reason: "host-owner-scope-mismatch", owner };
+    }
+    if (hostProcessIsAlive(owner.pid)) return { classification: "live-owner", reason: "host-owner-process-live", owner };
+    return { classification: "abortable", reason: "host-owner-process-dead", owner, nonce: owner.nonce };
+  }
+
+  function acquireHostOwner(sessionId, { agent, projectFingerprint: ownerProject, rootIdentity, generation, ttlMs = HOST_OWNER_TTL_MS, pid = process.pid } = {}) {
+    try {
+      return withMutationLock(() => {
+        hostOwnerKey(sessionId);
+        if (!HIDDEN_HOST_OWNER_AGENTS.has(agent)) return { ok: false, reason: "invalid-host-owner-agent" };
+        if (ownerProject !== projectFingerprint) return { ok: false, reason: "invalid-host-owner-project" };
+        if (rootIdentity !== hashContent(JSON.stringify(["self-evolve-state-root-v1", root]))) return { ok: false, reason: "invalid-host-owner-root" };
+        if (!Number.isSafeInteger(generation) || generation < 0) return { ok: false, reason: "invalid-host-owner-generation" };
+        if (!Number.isSafeInteger(pid) || pid <= 0) return { ok: false, reason: "invalid-host-owner-pid" };
+        if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) return { ok: false, reason: "invalid-host-owner-ttl" };
+        const acquiredAt = now();
+        const expiresAt = acquiredAt + ttlMs;
+        if (!Number.isSafeInteger(acquiredAt) || acquiredAt < 0 || !Number.isSafeInteger(expiresAt)) return { ok: false, reason: "invalid-host-owner-time" };
+        const existing = readHostOwnerState(sessionId);
+        if (existing.state === "error") return { ok: false, reason: existing.reason, code: existing.code };
+        if (existing.state === "valid") return { ok: false, reason: "host-owner-busy" };
+        if (existing.state === "corrupt" || existing.state === "malformed") quarantineHostOwnerUnlocked(sessionId, existing);
+        const nonce = randomBytes(24).toString("hex");
+        const owner = { schema: "self-evolve.host-owner.v1", sessionId: String(sessionId), agent, pid, generation, projectFingerprint: ownerProject, rootIdentity, nonce, acquiredAt, expiresAt };
+        const source = json(owner);
+        const filePath = hostOwnerPath(sessionId);
+        assertProjectQuotaUnlocked(new Map([[path.resolve(filePath), source]]));
+        let descriptor;
+        try {
+          descriptor = openSync(filePath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, FILE_MODE);
+          writeFileSync(descriptor, source, { encoding: "utf8" });
+          fsyncSync(descriptor);
+        } catch (error) {
+          if (descriptor !== undefined) try { unlinkSync(filePath); } catch {}
+          throw error;
+        } finally {
+          if (descriptor !== undefined) closeSync(descriptor);
+        }
+        ownedHostOwners.set(hostOwnerKey(sessionId), { sessionId: String(sessionId), nonce, pid: process.pid, generation });
+        return { ok: true, nonce, expiresAt };
+      });
+    } catch (error) {
+      return { ok: false, reason: "host-owner-acquire-error", code: String(error?.code ?? reasonCode(error)) };
+    }
+  }
+
+  function releaseHostOwner(sessionId, nonce) {
+    try {
+      return withMutationLock(() => {
+        const read = readHostOwnerState(sessionId);
+        if (read.state === "absent") return { ok: true, absent: true };
+        if (read.state === "error") return { ok: false, reason: read.reason, code: read.code };
+        if (read.state !== "valid") {
+          quarantineHostOwnerUnlocked(sessionId, read);
+          return { ok: false, reason: read.state === "corrupt" ? "host-owner-corrupt" : "host-owner-malformed" };
+        }
+        if (read.owner.nonce !== nonce) return { ok: false, reason: "nonce-mismatch" };
+        removeHostOwnerUnlocked(sessionId, read.owner);
+        return { ok: true };
+      });
+    } catch (error) {
+      return { ok: false, reason: "host-owner-release-error", code: String(error?.code ?? reasonCode(error)) };
+    }
+  }
+
+  function hostOwnerStatus(sessionId, options) {
+    try { return withMutationLock(() => hostOwnerStatusUnlocked(sessionId, options)); }
+    catch (error) { return { classification: "unknown", reason: "host-owner-status-error", code: String(error?.code ?? reasonCode(error)) }; }
+  }
+
+  function releaseOwnedHostOwners({ pid, generation } = {}) {
+    if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(generation) || generation < 0) return { ok: false, released: 0, reason: "invalid-host-owner-release-context" };
+    try {
+      return withMutationLock(() => {
+        let released = 0;
+        const failures = [];
+        for (const owned of [...ownedHostOwners.values()]) {
+          if (owned.pid !== pid || owned.generation !== generation) continue;
+          const read = readHostOwnerState(owned.sessionId);
+          if (read.state === "absent") { ownedHostOwners.delete(hostOwnerKey(owned.sessionId)); continue; }
+          if (read.state !== "valid") { failures.push({ sessionKey: hostOwnerKey(owned.sessionId), reason: `host-owner-${read.state}` }); continue; }
+          if (read.owner.pid !== pid || read.owner.generation !== generation || read.owner.nonce !== owned.nonce) continue;
+          removeHostOwnerUnlocked(owned.sessionId, read.owner);
+          released += 1;
+        }
+        return failures.length ? { ok: false, released, failures } : { ok: true, released };
+      });
+    } catch (error) {
+      return { ok: false, released: 0, reason: "host-owner-release-error", code: String(error?.code ?? reasonCode(error)) };
+    }
+  }
+
+  function cleanupExpiredHostOwners({ now: nowMs = now() } = {}) {
+    if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new TypeError("invalid-retention-time");
+    return withMutationLock(() => {
+      let removed = 0;
+      let quarantined = 0;
+      for (const entry of readdirSync(hostOwnersDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) continue;
+        let source;
+        try { source = readFileSync(path.join(hostOwnersDir, entry.name), "utf8"); } catch { continue; }
+        let owner;
+        try { owner = JSON.parse(source); } catch {
+          quarantineDeterministic(source, "host-owner-invalid-json", `host-owner-${entry.name.slice(0, 64)}`);
+          unlinkSync(path.join(hostOwnersDir, entry.name));
+          quarantined += 1;
+          continue;
+        }
+        if (!validHostOwner(owner, owner?.sessionId) || hostOwnerKey(owner.sessionId) !== entry.name.slice(0, 64)) {
+          quarantineDeterministic(source, "host-owner-invalid-shape", `host-owner-${entry.name.slice(0, 64)}`);
+          unlinkSync(path.join(hostOwnersDir, entry.name));
+          quarantined += 1;
+          continue;
+        }
+        if (owner.expiresAt > nowMs || hostProcessIsAlive(owner.pid)) continue;
+        removeHostOwnerUnlocked(owner.sessionId, owner);
+        removed += 1;
+      }
+      return { hostOwners: removed, quarantinedHostOwners: quarantined };
+    });
+  }
+
   function runCas(kind, id, expectedPriorState, mutateFn) {
     try {
       return withMutationLock(() => {
@@ -1682,6 +1895,7 @@ export function openStore(rootDir, {
           removed = before;
           rmSync(baseDir, { recursive: true, force: true });
           ownedLeases.clear();
+          ownedHostOwners.clear();
           parsedFileCache.clear();
           terminal = true;
           terminalRoots.add(root);
@@ -1710,6 +1924,7 @@ export function openStore(rootDir, {
     if (closed) return { ok: true, released: 0 };
     if (terminal || terminalRoots.has(root)) {
       ownedLeases.clear();
+      ownedHostOwners.clear();
       closed = true;
       return { ok: true, released: 0 };
     }
@@ -1775,6 +1990,11 @@ export function openStore(rootDir, {
     isLeaseHeld,
     getLeaseStatus,
     cleanupExpiredLeases,
+    acquireHostOwner,
+    releaseHostOwner,
+    hostOwnerStatus,
+    releaseOwnedHostOwners,
+    cleanupExpiredHostOwners,
     runCas,
     commitDecision,
     recoverDecisionTransaction: () => withMutationLock(recoverDecisionTransactionUnlocked),
@@ -1804,5 +2024,7 @@ export function openStore(rootDir, {
     }),
     get snapshotRoot() { return snapshotsDir; },
     get stateDir() { return stateDir; },
+    get projectFingerprint() { return projectFingerprint; },
+    get rootIdentity() { return hashContent(JSON.stringify(["self-evolve-state-root-v1", root])); },
   });
 }

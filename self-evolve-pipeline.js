@@ -1,14 +1,19 @@
 import { readSessionMessages } from "./self-evolve-client.js";
+import { partIsExcludedFromEvidence } from "./self-evolve-observation.js";
 
 const DEFAULT_MESSAGE_LIMIT = 120;
 const CONTENT_CHUNK_SIZE = 400;
 
-function messageText(message) {
-  const parts = message?.parts ?? message?.info?.parts ?? message?.message?.parts ?? [];
+function messageParts(message) {
+  const parts = message?.parts ?? message?.info?.parts ?? message?.message?.parts;
+  return Array.isArray(parts) ? parts : null;
+}
+
+function messageText(message, parts = messageParts(message)) {
   const text = Array.isArray(parts)
     ? parts.map((part) => part?.text ?? part?.content ?? "").filter(Boolean).join("\n")
     : "";
-  return text || String(message?.text ?? message?.content ?? message?.info?.text ?? "");
+  return parts?.length ? text : String(message?.text ?? message?.content ?? message?.info?.text ?? "");
 }
 
 function messageRole(message) {
@@ -17,7 +22,7 @@ function messageRole(message) {
 
 function selfEvolveOutput(message) {
   const agent = message?.agent ?? message?.info?.agent;
-  const parts = message?.parts ?? message?.info?.parts ?? [];
+  const parts = messageParts(message) ?? [];
   return agent === "self-evolve-synthesizer"
     || agent === "self-evolve-critic"
     || (Array.isArray(parts) && parts.some((part) => part?.metadata?.source === "self-evolve-plugin"));
@@ -25,8 +30,12 @@ function selfEvolveOutput(message) {
 
 function metadataMessages(messages, privacy) {
   return messages.flatMap((message) => {
+    if (partIsExcludedFromEvidence(message)) return [];
+    const parts = messageParts(message);
+    const evidenceParts = parts?.filter((part) => !partIsExcludedFromEvidence(part)) ?? null;
+    if (parts?.length && evidenceParts.length === 0) return [];
     const role = messageRole(message);
-    const text = messageText(message).trim();
+    const text = messageText(message, evidenceParts).trim();
     const command = role === "user" ? text.match(/^\s*(\/[A-Za-z0-9][A-Za-z0-9_-]*)\b/u)?.[1] : null;
     const excerpt = text && privacy?.scrubExcerpt ? privacy.scrubExcerpt({ text }) : null;
     const contentScan = text && privacy?.scanForForbiddenContent ? privacy.scanForForbiddenContent(text) : null;
@@ -37,7 +46,7 @@ function metadataMessages(messages, privacy) {
       injectionFlagged: contentScan?.issues?.some((issue) => issue === "prompt-injection-marker" || issue === "authority-escalation") === true,
       isSelfEvolveOutput: selfEvolveOutput(message),
     };
-    const toolParts = (message?.parts ?? message?.info?.parts ?? []).filter((part) =>
+    const toolParts = (evidenceParts ?? []).filter((part) =>
       part?.type === "tool" && (part?.state?.status === "error" || part?.state?.error));
     return [base, ...toolParts.map((part) => ({
       role: "tool",
@@ -102,6 +111,35 @@ function proposalText(proposal, mode) {
 function noEligibleText(eligibility) {
   const reasons = [...new Set(eligibility.flatMap((item) => item.reasons ?? []))];
   return `Self-evolve recorded bounded observations but no evidence cluster is eligible. ${reasons.length ? `Unmet gates: ${reasons.join(", ")}. ` : ""}No files were applied.`;
+}
+
+function episodeLineage({ sessionID, projectFingerprint, rootSessionID, rootSessionIDHash, originKind, options, schemas, observation }) {
+  const suppliedRootSessionID = rootSessionID ?? options.rootSessionID;
+  const suppliedRootSessionIDHash = rootSessionIDHash ?? options.rootSessionIDHash;
+  const suppliedOriginKind = originKind ?? options.originKind;
+  if (suppliedOriginKind === "unknown" || suppliedRootSessionIDHash === schemas.UNKNOWN_ROOT_LINEAGE_HASH) {
+    return { resolved: false, rootLineageHash: schemas.UNKNOWN_ROOT_LINEAGE_HASH, originKind: "unknown", reason: "scheduler-root-unresolved" };
+  }
+  if (typeof suppliedRootSessionID === "string" && suppliedRootSessionID
+    && suppliedRootSessionIDHash === observation.hashRootLineage(suppliedRootSessionID)
+    && schemas.ORIGIN_KINDS.includes(suppliedOriginKind)
+    && suppliedOriginKind !== "unknown"
+    && ((suppliedOriginKind === "delegated") === (suppliedRootSessionID !== sessionID))) {
+    return {
+      resolved: true,
+      rootSessionID: suppliedRootSessionID,
+      rootLineageHash: suppliedRootSessionIDHash,
+      originKind: suppliedOriginKind,
+    };
+  }
+  return observation.resolveRootLineage({
+    sessionID,
+    projectFingerprint,
+    sessions: options.sessionAncestry ?? [{ sessionID, projectFingerprint }],
+    preferredRootSessionID: suppliedRootSessionID,
+    preferredRootSessionIDHash: suppliedRootSessionIDHash,
+    maxDepth: options.rootLineageMaxDepth ?? observation.ROOT_LINEAGE_MAX_DEPTH,
+  });
 }
 
 export function createPipeline({ store, inventory, privacy, synthesis, applier, commands, schemas, observation, now = () => Date.now() }) {
@@ -321,12 +359,13 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     return recovered;
   }
 
-  async function runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger, mode, options = {} }) {
+  async function runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger, mode, rootSessionID, rootSessionIDHash, originKind, options = {} }) {
     const auditStart = store.readRecords("audit-event").length;
     const observations = [];
     let eligibility = [];
     try {
       const sessionIDHash = observation.hashSessionLineage(sessionID);
+      const lineage = episodeLineage({ sessionID, projectFingerprint, rootSessionID, rootSessionIDHash, originKind, options, schemas, observation });
       const cursorRecord = latestCursor(store, sessionIDHash);
       const cursor = cursorRecord?.payload ?? schemas.makeEpisodeCursor({ sessionIDHash });
       const limit = Math.min(256, Number.isSafeInteger(options.messageLimit) && options.messageLimit > 0 ? options.messageLimit : DEFAULT_MESSAGE_LIMIT);
@@ -403,6 +442,8 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
           structuredFields: receiptFields(receipt),
           incidentId,
           sessionLineageHash: sessionIDHash,
+          rootLineageHash: lineage.rootLineageHash,
+          originKind: lineage.originKind,
           createdAt: timestamp,
           injectionFlagged,
           redacted: true,

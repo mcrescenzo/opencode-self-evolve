@@ -420,7 +420,7 @@ One npm package exposes two target-only modules:
   approval command invokes server integration directly with the complete
   one-use approval tuple; it does not emulate a TUI request.
 - Neither path injects a prompt or message into a working session.
-- The permanent palette command is `self-evolve.control-center`. It has
+- The permanent palette command is `mcrescenzo.self-evolve.control-center`. It has
   `namespace: "palette"` and no slash metadata or aliases. Its namespaced route
   covers Overview, Reviews, Settings, Safety, Evidence, Health/Budgets,
   Maintenance, and Help and restores the exact prior host route.

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   DEFAULT_BUDGETS,
   Mode,
+  UNKNOWN_ROOT_LINEAGE_HASH,
   UNKNOWN_SESSION_LINEAGE_HASH,
   beginEpisode,
   canStartEpisode,
@@ -13,7 +14,7 @@ import {
   trip,
   wrapRecord,
 } from "./self-evolve-schemas.js";
-import { hashSessionLineage } from "./self-evolve-observation.js";
+import { hashSessionLineage, resolveRootLineage } from "./self-evolve-observation.js";
 
 const ACTOR = "self-evolve-scheduler";
 const DEFAULT_LEASE_TTL_MS = 10 * 60 * 1000;
@@ -47,6 +48,36 @@ function eventParentID(event) {
     ?? event?.parentID
     ?? event?.session?.parentID
     ?? null;
+}
+
+function eventProjectFingerprint(event) {
+  return event?.properties?.projectFingerprint
+    ?? event?.properties?.session?.projectFingerprint
+    ?? event?.projectFingerprint
+    ?? event?.session?.projectFingerprint
+    ?? null;
+}
+
+function eventHidden(event) {
+  return event?.properties?.hidden
+    ?? event?.properties?.session?.hidden
+    ?? event?.hidden
+    ?? event?.session?.hidden;
+}
+
+function eventAgent(event) {
+  return event?.properties?.agent
+    ?? event?.properties?.session?.agent
+    ?? event?.agent
+    ?? event?.session?.agent;
+}
+
+function eventCreatedBy(event) {
+  return event?.properties?.session?.createdBy ?? event?.session?.createdBy;
+}
+
+function eventAnonymous(event) {
+  return event?.properties?.session?.anonymous ?? event?.session?.anonymous;
 }
 
 function eventEpoch(event) {
@@ -390,7 +421,9 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       scheduledAt: timestamp,
       trigger: cachedMode,
       epoch: state.epoch,
-      rootSessionIDHash: hashSessionLineage(state.rootSessionID),
+      ...(state.canonicalRootSessionID ? { rootSessionID: state.canonicalRootSessionID } : {}),
+      rootSessionIDHash: state.rootLineageHash ?? UNKNOWN_ROOT_LINEAGE_HASH,
+      originKind: state.originKind ?? "unknown",
     });
     inFlight.set(state.sessionID, workItem);
     audit("scheduler-budget", { budgetType: "synthesis", rootSessionIDHash: hashSessionLineage(state.rootSessionID) }, timestamp);
@@ -428,7 +461,29 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     const epoch = suppliedEpoch ?? latestEpoch + 1;
     const state = prior ?? { sessionID, timer: null, pendingAfterFlight: false };
     state.touchedAt = timestamp;
-    state.rootSessionID = eventParentID(event) ?? prior?.rootSessionID ?? sessionID;
+    const parentID = eventParentID(event);
+    const projectFingerprint = eventProjectFingerprint(event) ?? currentProject();
+    const hidden = eventHidden(event);
+    const agent = eventAgent(event);
+    const createdBy = eventCreatedBy(event);
+    const anonymous = eventAnonymous(event);
+    state.reused ||= (parentID !== null && prior?.parentID !== undefined && prior.parentID !== null && prior.parentID !== parentID)
+      || (projectFingerprint !== null && prior?.projectFingerprint !== undefined && prior.projectFingerprint !== projectFingerprint)
+      || (hidden !== undefined && prior?.hidden !== undefined && prior.hidden !== hidden)
+      || (agent !== undefined && prior?.agent !== undefined && prior.agent !== agent)
+      || (createdBy !== undefined && prior?.createdBy !== undefined && prior.createdBy !== createdBy)
+      || (anonymous !== undefined && prior?.anonymous !== undefined && prior.anonymous !== anonymous);
+    state.parentID = parentID !== null ? parentID : prior?.parentID ?? null;
+    state.projectFingerprint = projectFingerprint ?? prior?.projectFingerprint;
+    state.hidden = hidden ?? prior?.hidden;
+    state.agent = agent ?? prior?.agent;
+    state.createdBy = createdBy ?? prior?.createdBy;
+    state.anonymous = anonymous ?? prior?.anonymous;
+    const root = resolveRootLineage({ sessionID, projectFingerprint: state.projectFingerprint, sessions: [...sessions.values(), state] });
+    state.canonicalRootSessionID = root.resolved ? root.rootSessionID : null;
+    state.rootLineageHash = root.rootLineageHash;
+    state.originKind = root.originKind;
+    state.rootSessionID = root.resolved ? root.rootSessionID : eventParentID(event) ?? prior?.rootSessionID ?? sessionID;
     state.scopeFingerprint = event?.properties?.scopeFingerprint ?? prior?.scopeFingerprint ?? currentProject();
     sessions.set(sessionID, state);
 

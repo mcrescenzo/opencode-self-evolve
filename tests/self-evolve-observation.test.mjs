@@ -22,6 +22,11 @@ const NOW = 40 * DAY;
 const LINEAGE_1 = hashSignature("lineage-1");
 const LINEAGE_2 = hashSignature("lineage-2");
 const LINEAGE_3 = hashSignature("lineage-3");
+// Canonical root lineage hashes (buw.2): evidence independence is measured by
+// distinct trustworthy USER roots, not per-child session lineage.
+const ROOT_1 = hashSignature("root-1");
+const ROOT_2 = hashSignature("root-2");
+const ROOT_3 = hashSignature("root-3");
 
 function episode(messages, overrides = {}) {
   return {
@@ -51,6 +56,8 @@ function observation(overrides = {}) {
     },
     incidentId: "incident-1",
     sessionLineageHash: LINEAGE_1,
+    rootLineageHash: ROOT_1,
+    originKind: "user",
     createdAt: NOW,
     injectionFlagged: false,
     redacted: true,
@@ -211,9 +218,9 @@ test("model-only assistant assertions do not create deterministic receipts or ca
 
 test("three independent episodes across distinct sessions accumulate to eligibility", () => {
   const clusters = correlateObservations([
-    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, createdAt: NOW - 2 }),
-    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, createdAt: NOW - 1 }),
-    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, createdAt: NOW }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, rootLineageHash: ROOT_1, createdAt: NOW - 2 }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, rootLineageHash: ROOT_2, createdAt: NOW - 1 }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, rootLineageHash: ROOT_3, createdAt: NOW }),
   ]);
   const [result] = evaluateEligibility(clusters, { now: NOW });
   assert.equal(result.eligible, true);
@@ -222,22 +229,24 @@ test("three independent episodes across distinct sessions accumulate to eligibil
   assert.deepEqual(result.reasons, ["all-thresholds-met"]);
 });
 
-test("missing legacy lineage collapses to one unknown session", () => {
+test("missing legacy root lineage contributes no independent roots", () => {
   const values = [1, 2, 3].map((index) => {
     const value = observation({ incidentId: `legacy-${index}`, createdAt: NOW - 3 + index });
     delete value.sessionLineageHash;
+    delete value.rootLineageHash;
+    delete value.originKind;
     return value;
   });
   const [result] = evaluateEligibility(correlateObservations(values), { now: NOW });
   assert.equal(result.eligible, false);
-  assert.match(result.thresholdsMissed.minDistinctSessions, /actual 1/);
+  assert.match(result.thresholdsMissed.minDistinctSessions, /actual 0/);
 });
 
 test("adjacent polarity contradiction blocks eligibility with an inspectable explanation", () => {
   const clusters = correlateObservations([
-    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, createdAt: NOW - 2 }),
-    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, createdAt: NOW - 1, structuredFields: { deterministicOutcome: false } }),
-    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, createdAt: NOW }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, rootLineageHash: ROOT_1, createdAt: NOW - 2 }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, rootLineageHash: ROOT_2, createdAt: NOW - 1, structuredFields: { deterministicOutcome: false } }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, rootLineageHash: ROOT_3, createdAt: NOW }),
   ]);
   const [result] = evaluateEligibility(clusters, { now: NOW });
   assert.equal(result.eligible, false);
@@ -247,9 +256,9 @@ test("adjacent polarity contradiction blocks eligibility with an inspectable exp
 
 test("stale evidence below the freshness ratio blocks eligibility", () => {
   const clusters = correlateObservations([
-    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, createdAt: NOW - 40 * DAY }),
-    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, createdAt: NOW - 39 * DAY }),
-    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, createdAt: NOW }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, rootLineageHash: ROOT_1, createdAt: NOW - 40 * DAY }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, rootLineageHash: ROOT_2, createdAt: NOW - 39 * DAY }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, rootLineageHash: ROOT_3, createdAt: NOW }),
   ]);
   const [result] = evaluateEligibility(clusters, { now: NOW, retentionMs: 30 * DAY });
   assert.equal(result.eligible, false);
@@ -259,9 +268,9 @@ test("stale evidence below the freshness ratio blocks eligibility", () => {
 
 test("repository scope is the default and global scope requires explicit designation", () => {
   const clusters = correlateObservations([
-    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1 }),
-    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2 }),
-    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3 }),
+    observation({ incidentId: "episode-1", sessionLineageHash: LINEAGE_1, rootLineageHash: ROOT_1 }),
+    observation({ incidentId: "episode-2", sessionLineageHash: LINEAGE_2, rootLineageHash: ROOT_2 }),
+    observation({ incidentId: "episode-3", sessionLineageHash: LINEAGE_3, rootLineageHash: ROOT_3 }),
   ]);
   assert.equal(evaluateEligibility(clusters, { now: NOW })[0].eligible, true);
   const implicitGlobal = evaluateEligibility(clusters, { now: NOW, scope: "global" })[0];

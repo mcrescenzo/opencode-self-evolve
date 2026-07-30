@@ -1961,6 +1961,9 @@ test("deferred health grants no integration authority before resolution and disp
   resolveHealth({ data: { healthy: true, version: "1.18.3" } });
   await waitForDurableStartup(hooks, "pending-authority");
   await hooks.event({ type: "session.idle", properties: { sessionID: "ready" } });
+  // The event hook is fire-and-forget (OpenCode does not await it); flush the
+  // queued delivery before asserting the integration observed exactly one event.
+  await tick();
   assert.equal(calls.events, 1);
   await hooks.dispose();
 

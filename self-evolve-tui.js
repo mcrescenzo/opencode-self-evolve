@@ -25,11 +25,38 @@ import { acquireProjectTuiStore } from "./self-evolve-tui-store.js";
 /** @typedef {import("@opencode-ai/plugin/tui").TuiPluginApi} TuiPluginApi */
 
 const PREVIEW_LINE_LIMIT = 50;
-const NOTIFICATION_KEY = "self-evolve:notification-history";
-const FIRST_USE_KEY = "self-evolve:first-use-seen";
-const DISMISSED_KEY = "self-evolve:dismissed-ids";
-const LAST_SHOWN_KEY = "self-evolve:last-shown-at";
-const PENDING_REQUESTS_KEY = "self-evolve:pending-request-ids";
+export const SELF_EVOLVE_MODULE_ID = "mcrescenzo.self-evolve";
+export const TUI_IDENTITIES = Object.freeze({
+  command: `${SELF_EVOLVE_MODULE_ID}.control-center`,
+  route: `${SELF_EVOLVE_MODULE_ID}.control-center.route`,
+  mode: `${SELF_EVOLVE_MODULE_ID}.control-center`,
+  view: `${SELF_EVOLVE_MODULE_ID}.control-center`,
+  paletteLayer: `${SELF_EVOLVE_MODULE_ID}.control-center.palette`,
+  modeLayer: `${SELF_EVOLVE_MODULE_ID}.control-center.mode`,
+});
+export const TUI_KV_KEYS = Object.freeze({
+  notificationHistory: `${SELF_EVOLVE_MODULE_ID}:notification-history`,
+  firstUse: `${SELF_EVOLVE_MODULE_ID}:first-use-seen`,
+  dismissed: `${SELF_EVOLVE_MODULE_ID}:dismissed-ids`,
+  lastShown: `${SELF_EVOLVE_MODULE_ID}:last-shown-at`,
+  pendingRequests: `${SELF_EVOLVE_MODULE_ID}:pending-request-ids`,
+});
+export const TUI_LEGACY_KV_KEYS = Object.freeze({
+  notificationHistory: "self-evolve:notification-history",
+  firstUse: "self-evolve:first-use-seen",
+  dismissed: "self-evolve:dismissed-ids",
+  lastShown: "self-evolve:last-shown-at",
+  pendingRequests: "self-evolve:pending-request-ids",
+});
+const NOTIFICATION_KEY = TUI_KV_KEYS.notificationHistory;
+const FIRST_USE_KEY = TUI_KV_KEYS.firstUse;
+const DISMISSED_KEY = TUI_KV_KEYS.dismissed;
+const LAST_SHOWN_KEY = TUI_KV_KEYS.lastShown;
+const PENDING_REQUESTS_KEY = TUI_KV_KEYS.pendingRequests;
+const TUI_SURFACE_REGISTRY = Symbol.for("mcrescenzo.self-evolve.tui.surface-registry");
+const TUI_SURFACE_FINGERPRINT = "mcrescenzo.self-evolve.control-center.v1";
+const TUI_KV_MAX_BYTES = 32 * 1024;
+const ownedKvCache = new WeakMap();
 const ACTOR = BRIDGE_ACTOR;
 const MAX_SERVER_WAIT_MS = 5_000;
 const HOST_HEALTH_REFRESH_MS = 15_000;
@@ -41,6 +68,125 @@ const CONSENT_LABELS = Object.freeze({
   sanitizedExcerpts: "Sanitized excerpts",
   crossRepoAggregation: "Cross-repository aggregation",
 });
+
+function boundedJsonValue(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8") <= TUI_KV_MAX_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+function boundedString(value, max = 512) {
+  return typeof value === "string" && value.length > 0 && value.length <= max && Buffer.byteLength(value, "utf8") <= max * 2;
+}
+
+function validNotificationHistory(value) {
+  return Array.isArray(value) && value.length <= REVIEW_BOOKKEEPING_CAP
+    && value.every((entry) => entry && typeof entry === "object" && !Array.isArray(entry)
+      && Number.isFinite(entry.at) && boundedString(entry.reason, 160));
+}
+
+function validDismissed(value) {
+  return Array.isArray(value) && value.length <= REVIEW_BOOKKEEPING_CAP && value.every((id) => boundedString(id));
+}
+
+function validLastShown(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length <= REVIEW_BOOKKEEPING_CAP
+    && Object.entries(value).every(([id, timestamp]) => boundedString(id) && Number.isFinite(timestamp));
+}
+
+function validPendingRequests(value) {
+  return Array.isArray(value) && value.length <= 32 && value.every((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) || !boundedString(entry.requestId)) return false;
+    if (entry.kind !== undefined && !["control", "decision"].includes(entry.kind)) return false;
+    if (entry.proposalId !== undefined && !boundedString(entry.proposalId)) return false;
+    return Number.isFinite(entry.submittedAt);
+  });
+}
+
+const TUI_KV_DEFINITIONS = new Map([
+  [TUI_KV_KEYS.notificationHistory, { legacy: TUI_LEGACY_KV_KEYS.notificationHistory, valid: validNotificationHistory }],
+  [TUI_KV_KEYS.firstUse, { legacy: TUI_LEGACY_KV_KEYS.firstUse, valid: (value) => typeof value === "boolean" }],
+  [TUI_KV_KEYS.dismissed, { legacy: TUI_LEGACY_KV_KEYS.dismissed, valid: validDismissed }],
+  [TUI_KV_KEYS.lastShown, { legacy: TUI_LEGACY_KV_KEYS.lastShown, valid: validLastShown }],
+  [TUI_KV_KEYS.pendingRequests, { legacy: TUI_LEGACY_KV_KEYS.pendingRequests, valid: validPendingRequests }],
+]);
+
+// Raw values at package-qualified canonical keys with a one-release read-once
+// legacy fallback. Canonical values are stored UNWRAPPED so old/new TUI+server
+// combinations degrade gracefully (an older peer reading the canonical key sees
+// the raw value, not an envelope). Foreign protection: a value at the canonical
+// key that does not satisfy our validator is left untouched (never clobbered).
+export function createOwnedKv(rawKv) {
+  if (!rawKv || typeof rawKv.get !== "function" || typeof rawKv.set !== "function") throw new TypeError("tui-kv-unavailable");
+  const cached = ownedKvCache.get(rawKv);
+  if (cached) return cached;
+  const migrated = new Set();
+
+  function readOwned(key, fallback) {
+    const definition = TUI_KV_DEFINITIONS.get(key);
+    if (!definition) return { value: fallback, foreign: true };
+    const canonical = rawKv.get(key);
+    if (canonical !== undefined) {
+      if (definition.valid(canonical) && boundedJsonValue(canonical)) return { value: canonical, foreign: false };
+      return { value: fallback, foreign: true };
+    }
+    if (!migrated.has(key)) {
+      migrated.add(key);
+      const legacy = rawKv.get(definition.legacy);
+      if (legacy !== undefined && definition.valid(legacy) && boundedJsonValue(legacy)) {
+        rawKv.set(key, legacy);
+        return { value: legacy, foreign: false };
+      }
+    }
+    return { value: fallback, foreign: false };
+  }
+
+  const ownedKv = Object.freeze({
+    get(key, fallback) { return readOwned(key, fallback).value; },
+    set(key, value) {
+      const definition = TUI_KV_DEFINITIONS.get(key);
+      if (!definition || !definition.valid(value) || !boundedJsonValue(value)) return false;
+      const canonical = rawKv.get(key);
+      if (canonical !== undefined && !(definition.valid(canonical) && boundedJsonValue(canonical))) return false;
+      rawKv.set(key, value);
+      return true;
+    },
+  });
+  ownedKvCache.set(rawKv, ownedKv);
+  return ownedKv;
+}
+
+export function claimTuiSurfaceOwnership(api) {
+  if (!api || (typeof api !== "object" && typeof api !== "function")) return { owned: false, duplicate: false, reason: "invalid-tui-api" };
+  let registry = api[TUI_SURFACE_REGISTRY];
+  if (!(registry instanceof Map)) {
+    registry = new Map();
+    try { Object.defineProperty(api, TUI_SURFACE_REGISTRY, { configurable: false, enumerable: false, value: registry }); }
+    catch { return { owned: false, duplicate: false, reason: "surface-registry-unavailable" }; }
+  }
+  const ids = [...new Set(Object.values(TUI_IDENTITIES))];
+  const claims = ids.map((id) => registry.get(id));
+  if (claims.some((claim) => claim && (claim.owner !== SELF_EVOLVE_MODULE_ID || claim.fingerprint !== TUI_SURFACE_FINGERPRINT))) {
+    return { owned: false, duplicate: false, reason: "foreign-tui-surface" };
+  }
+  const duplicate = claims.every((claim) => claim?.owner === SELF_EVOLVE_MODULE_ID && claim?.fingerprint === TUI_SURFACE_FINGERPRINT);
+  const token = Object.freeze({ owner: SELF_EVOLVE_MODULE_ID, fingerprint: TUI_SURFACE_FINGERPRINT });
+  if (!duplicate) for (const id of ids) registry.set(id, token);
+  return {
+    owned: true,
+    duplicate,
+    owns() {
+      return ids.every((id) => registry.get(id) === token);
+    },
+    release() {
+      if (duplicate) return;
+      for (const id of ids) if (registry.get(id) === token) registry.delete(id);
+    },
+  };
+}
 
 function nowFor(api) {
   return typeof api.now === "function" ? api.now() : Date.now();
@@ -157,9 +303,10 @@ export function pruneReviewBookkeeping({ proposals = [], dismissedIds = [], last
 
 export function notificationRateLimiter(api, budgetPerHour) {
   const budget = Math.max(0, Math.trunc(budgetPerHour));
+  const kv = createOwnedKv(api.kv);
   const recent = () => {
     const cutoff = nowFor(api) - 3_600_000;
-    const stored = api.kv.get(NOTIFICATION_KEY, []);
+    const stored = kv.get(NOTIFICATION_KEY, []);
     return Array.isArray(stored) ? stored.filter((entry) => Number.isFinite(entry?.at) && entry.at > cutoff) : [];
   };
   return {
@@ -172,7 +319,7 @@ export function notificationRateLimiter(api, budgetPerHour) {
     record(reason) {
       const history = recent();
       history.push({ at: nowFor(api), reason: String(reason ?? "proposal") });
-      api.kv.set(NOTIFICATION_KEY, history);
+      kv.set(NOTIFICATION_KEY, history);
       return { ok: true, remaining: Math.max(0, budget - history.length) };
     },
   };
@@ -258,6 +405,7 @@ export function parseAllowlistInput(value) {
 /** @type {TuiPlugin} */
 export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const config = options?.selfEvolve ?? options ?? {};
+  const kv = createOwnedKv(api.kv);
   const nativeSurface = config.__nativeSidebar === true;
   const debounceMs = Number.isFinite(config.idleDebounceMs) ? config.idleDebounceMs : DEFAULT_BUDGETS.idleDebounceMs;
   const testAutoReview = config.__testAutoReview === true || api.__testAutoReview === true;
@@ -386,14 +534,14 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   let pollTimer;
 
   const dismissedIds = () => {
-    const value = api.kv.get(DISMISSED_KEY, []);
+    const value = kv.get(DISMISSED_KEY, []);
     return Array.isArray(value) ? value : [];
   };
   const lastShownAt = () => {
-    const value = api.kv.get(LAST_SHOWN_KEY, {});
+    const value = kv.get(LAST_SHOWN_KEY, {});
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
   };
-  const dialogsEnabled = () => api.kv.get(FIRST_USE_KEY) === true;
+  const dialogsEnabled = () => kv.get(FIRST_USE_KEY) === true;
 
   function saveReviewBookkeeping(proposals) {
     const pruned = pruneReviewBookkeeping({
@@ -402,8 +550,8 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       lastShownAt: lastShownAt(),
       now: nowFor(api),
     });
-    api.kv.set(DISMISSED_KEY, pruned.dismissedIds);
-    api.kv.set(LAST_SHOWN_KEY, pruned.lastShownAt);
+    kv.set(DISMISSED_KEY, pruned.dismissedIds);
+    kv.set(LAST_SHOWN_KEY, pruned.lastShownAt);
     return pruned;
   }
 
@@ -430,12 +578,12 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   }
 
   function pendingRequests() {
-    const value = api.kv.get(PENDING_REQUESTS_KEY, []);
+    const value = kv.get(PENDING_REQUESTS_KEY, []);
     return Array.isArray(value) ? value.filter((item) => item && typeof item.requestId === "string") : [];
   }
 
   function savePendingRequests(value) {
-    api.kv.set(PENDING_REQUESTS_KEY, value.slice(-32));
+    kv.set(PENDING_REQUESTS_KEY, value.slice(-32));
   }
 
   async function pollResponse(requestId, timeoutMs = serverTimeoutMs, kind = "decision") {
@@ -504,8 +652,8 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         throw new Error(failure);
       }
       const shown = lastShownAt();
-      api.kv.set(LAST_SHOWN_KEY, { ...shown, [fresh.id]: nowFor(api) });
-      if (choice === "dismiss") api.kv.set(DISMISSED_KEY, [...new Set([...dismissedIds(), fresh.id])]);
+      kv.set(LAST_SHOWN_KEY, { ...shown, [fresh.id]: nowFor(api) });
+      if (choice === "dismiss") kv.set(DISMISSED_KEY, [...new Set([...dismissedIds(), fresh.id])]);
       return { ok: true, decision };
     } catch (error) {
       dialogError(api, error instanceof Error ? error.message : String(error));
@@ -684,7 +832,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     const onSelect = (option) => {
       if (option.disabled || inFlight.has(proposal.id)) return;
       if (option.value === "dismiss-audit") {
-        api.kv.set(DISMISSED_KEY, [...new Set([...dismissedIds(), proposal.id])]);
+        kv.set(DISMISSED_KEY, [...new Set([...dismissedIds(), proposal.id])]);
         return;
       }
       void submitChoice(proposal, option.value, body);
@@ -714,7 +862,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       testLimiter?.record(`proposal:${proposal.id}`);
       if (disposed || api.lifecycle.signal.aborted) return { ok: false, reason: "disposed" };
       showProposal(proposal);
-      api.kv.set(LAST_SHOWN_KEY, { ...lastShownAt(), [proposal.id]: nowFor(api) });
+      kv.set(LAST_SHOWN_KEY, { ...lastShownAt(), [proposal.id]: nowFor(api) });
       return { ok: true };
     } catch (error) {
       if (!api.lifecycle.signal.aborted) dialogError(api, error instanceof Error ? error.message : String(error));
@@ -760,19 +908,23 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     scheduleRefresh(0);
   }
 
-  if (testAutoReview && api.kv.get(FIRST_USE_KEY) === undefined) {
+  if (testAutoReview && kv.get(FIRST_USE_KEY) === undefined) {
     showConfirm(api, {
       title: "Enable self-evolve proposal dialogs?",
       message: "Test-only compatibility review opt-in.",
       onConfirm: () => {
-        api.kv.set(FIRST_USE_KEY, true);
+        kv.set(FIRST_USE_KEY, true);
         queueRefresh();
       },
-      onCancel: () => api.kv.set(FIRST_USE_KEY, false),
+      onCancel: () => kv.set(FIRST_USE_KEY, false),
     });
   }
 
-  if (!nativeSurface && typeof api.keymap?.registerLayer === "function" && typeof api.ui?.DialogPrompt === "function") {
+  const missingLegacySettingsCapabilities = [
+    ...(typeof api.keymap?.registerLayer === "function" ? [] : ["keymap.registerLayer"]),
+    ...(typeof api.ui?.DialogPrompt === "function" ? [] : ["ui.DialogPrompt"]),
+  ];
+  if (!nativeSurface && missingLegacySettingsCapabilities.length === 0) {
     api.keymap.registerLayer({
       mode: "base",
       commands: [{
@@ -783,8 +935,8 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         run: () => { void openSettings(); },
       }],
     });
-  } else {
-    console.warn("self-evolve settings command disabled: native keymap or prompt capabilities are unavailable");
+  } else if (!nativeSurface) {
+    console.warn(`self-evolve legacy settings command disabled: missing ${missingLegacySettingsCapabilities.join(", ")}; update external tui.json to load self-evolve-tui.tsx (@mcrescenzo/opencode-self-evolve/tui).`.slice(0, 240));
   }
 
   if (testAutoReview) {

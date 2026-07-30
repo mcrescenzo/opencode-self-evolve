@@ -435,7 +435,7 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
       const pausedStatus = await runCommand(compatibilityHooks, output, sessionID, "status");
       const resume = await runCommand(compatibilityHooks, output, sessionID, "resume");
       const finalStatus = await runCommand(compatibilityHooks, output, sessionID, "status");
-      const analyzer = cfg.agent["self-evolve-analyzer"];
+      const analyzer = cfg.agent["mcrescenzo.self-evolve.analyzer"] ?? cfg.agent["self-evolve-analyzer"];
       const lifecycleCalls = { messages: [], create: [], prompt: [], abort: [], showToast: [], promptAsync: [] };
       const lifecycleProposal = {
         reason: "No-token smoke accepted proposal.",
@@ -488,7 +488,7 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
       await lifecycleHooks.config({ model: "noop/noop", agent: {} });
       const lifecycleOutput = { parts: [{ type: "text", text: "original" }] };
       const lifecycle = await runCommand(lifecycleHooks, lifecycleOutput, "lifecycle-session", "scan");
-      const analyzerLeakPattern = /Analyze this OpenCode session excerpt|Redacted transcript excerpt|JSON schema|\\{"proposal"|self-evolve-analyzer/;
+      const analyzerLeakPattern = /Analyze this OpenCode session excerpt|Redacted transcript excerpt|JSON schema|\\{"proposal"|self-evolve-analyzer|mcrescenzo\.self-evolve\.analyzer/;
 
       const durableFingerprint = projectFingerprintFor("", ctx.worktree || ctx.directory);
       const hostStateRoot = ${JSON.stringify(path.join(stateHome, "opencode-live-state"))};
@@ -656,7 +656,7 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
           partsArrayPreserved: output.parts === originalParts && [status, pause, pausedStatus, resume, finalStatus].every((item) => item.samePartsArray),
           noPassiveHooks: compatibilityHooks.event === undefined && compatibilityHooks["chat.message"] === undefined,
           lifecycleMessagesRead: lifecycleCalls.messages.length === 1,
-          lifecycleAnalyzerCreated: lifecycleCalls.create.length === 1 && lifecycleCalls.create[0].body?.agent === "self-evolve-analyzer",
+          lifecycleAnalyzerCreated: lifecycleCalls.create.length === 1 && ["mcrescenzo.self-evolve.analyzer", "self-evolve-analyzer"].includes(lifecycleCalls.create[0].body?.agent),
           lifecycleAnalyzerPrompted: lifecycleCalls.prompt.length === 1 && /Analyze this OpenCode session excerpt/.test(lifecycleCalls.prompt[0].body?.parts?.[0]?.text || ""),
           lifecycleCleanup: lifecycleCalls.abort.length === 1,
           lifecycleToast: lifecycleCalls.showToast.length === 1,

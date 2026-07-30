@@ -118,6 +118,14 @@ test("integration boot aborts only active orphaned self-evolve analyzer sessions
     appendRecord(record) { records.push(record); return { ok: true }; },
     retain: () => ({ observations: 0 }),
     cleanupExpiredLeases: () => undefined,
+    // Recovery (self-evolve-3r4) requires a durable dead-owner proof. Only
+    // "orphan-synth" has one; the foreign same-name analyzer does not and must
+    // NOT be aborted even though it matches the hidden-agent name filter.
+    hostOwnerStatus(id) {
+      if (id === "orphan-synth") return { classification: "abortable", nonce: "dead-owner-nonce", reason: "host-owner-process-dead" };
+      return { classification: "unknown", reason: "host-owner-not-found" };
+    },
+    releaseHostOwner(id, nonce) { return nonce === "dead-owner-nonce" ? { ok: true } : { ok: false, absent: true }; },
     close() {},
   };
   const integration = createIntegration({
@@ -135,6 +143,7 @@ test("integration boot aborts only active orphaned self-evolve analyzer sessions
   const ctx = { directory: "/workspace/project", client: { session: {
     list: async () => ({ data: [
       { id: "orphan-synth", agent: "self-evolve-synthesizer", state: "running" },
+      { id: "foreign-analyzer", agent: "self-evolve-analyzer", state: "running" },
       { id: "finished-critic", agent: "self-evolve-critic", state: "completed" },
       { id: "working-session", agent: "build", state: "running" },
     ] }),
@@ -144,7 +153,8 @@ test("integration boot aborts only active orphaned self-evolve analyzer sessions
   const result = await integration.boot({ ctx, hostVersion: "1.18.3" });
   assert.equal(result.ok, true);
   assert.deepEqual(aborted, ["orphan-synth"]);
-  assert.deepEqual(result.hiddenSessionRecovery, [{ id: "orphan-synth", ok: true }]);
+  assert.equal(result.hiddenSessionRecovery.find((item) => item.id === "orphan-synth").action, "aborted");
+  assert.equal(result.hiddenSessionRecovery.find((item) => item.id === "foreign-analyzer").action, "unknown");
   assert.equal(records.some((record) => record.payload.details.abortedHiddenSessions === 1), true);
   await integration.shutdown();
 });

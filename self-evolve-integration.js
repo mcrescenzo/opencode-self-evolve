@@ -18,7 +18,13 @@ import {
   publishControlState,
   publishUiProjection,
 } from "./self-evolve-bridge.js";
-import { isDurableLifecycleEvent } from "./self-evolve-core.js";
+import {
+  LEGACY_SELF_EVOLVE_AGENTS,
+  SELF_EVOLVE_ANALYZER_AGENT,
+  SELF_EVOLVE_CRITIC_AGENT,
+  SELF_EVOLVE_SYNTHESIZER_AGENT,
+  isDurableLifecycleEvent,
+} from "./self-evolve-core.js";
 import { buildUiProjection } from "./self-evolve-projection.js";
 import { stateRootIdentity } from "./self-evolve-state-root.js";
 import {
@@ -39,9 +45,10 @@ const DEFAULT_ROLLOUT_GATES = Object.freeze({
   yoloEnablementThreshold: Object.freeze({ minSynthesesObserved: 10, minSuccessRate: 0.8 }),
 });
 const HIDDEN_ANALYZER_AGENTS = new Set([
-  "self-evolve-analyzer",
-  "self-evolve-synthesizer",
-  "self-evolve-critic",
+  SELF_EVOLVE_ANALYZER_AGENT,
+  SELF_EVOLVE_SYNTHESIZER_AGENT,
+  SELF_EVOLVE_CRITIC_AGENT,
+  ...Object.values(LEGACY_SELF_EVOLVE_AGENTS),
 ]);
 const TERMINAL_SESSION_STATES = new Set(["aborted", "cancelled", "completed", "error", "failed", "idle"]);
 const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -49,6 +56,7 @@ const ROUTING_SETTINGS_TTL_MS = 250;
 const UI_PROJECTION_REFRESH_MS = 5_000;
 const UI_PROJECTION_EXPIRY_MARGIN_MS = 5_000;
 const NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) ? constants.O_NOFOLLOW : null;
+let hostOwnerBootGeneration = 0;
 
 export const ROLLOUT_GATES = DEFAULT_ROLLOUT_GATES;
 
@@ -72,7 +80,15 @@ function analyzerSessionState(session) {
   return String(session?.state ?? session?.status?.type ?? session?.status ?? "").toLowerCase();
 }
 
-async function recoverOrphanedAnalyzerSessions(client, directory, { timeoutMs = 2_000, signal, maxSessions = 32 } = {}) {
+export async function recoverOrphanedAnalyzerSessions(client, directory, {
+  store,
+  projectFingerprint,
+  rootIdentity,
+  now = Date.now(),
+  timeoutMs = 2_000,
+  signal,
+  maxSessions = 32,
+} = {}) {
   const ctx = { client, directory };
   const candidates = (await listSessions(ctx, { timeoutMs, signal, label: "session-list" })).filter((session) => {
     const agent = session?.agent ?? session?.mode ?? session?.info?.agent;
@@ -83,11 +99,25 @@ async function recoverOrphanedAnalyzerSessions(client, directory, { timeoutMs = 
   for (const session of candidates) {
     const id = session?.id ?? session?.sessionID;
     if (!id) continue;
+    const status = store?.hostOwnerStatus?.(id, { projectFingerprint, rootIdentity, now })
+      ?? { classification: "unknown", reason: "host-owner-store-unavailable" };
+    if (status.classification !== "abortable") {
+      const action = status.classification === "live-owner" ? "deferred"
+        : status.classification === "foreign" ? "foreign"
+          : status.classification === "unknown" ? "unknown" : "skipped";
+      outcomes.push({ id, ok: true, action, reason: status.reason ?? status.classification });
+      continue;
+    }
+    const claimed = store.releaseHostOwner?.(id, status.nonce);
+    if (!claimed?.ok || claimed.absent) {
+      outcomes.push({ id, ok: true, action: "deferred", reason: claimed?.absent ? "host-owner-already-claimed" : claimed?.reason ?? "host-owner-claim-failed" });
+      continue;
+    }
     try {
       await cleanupSession(ctx, id, { timeoutMs, signal, label: "session-abort" });
-      outcomes.push({ id, ok: true });
+      outcomes.push({ id, ok: true, action: "aborted", reason: status.reason });
     } catch (error) {
-      outcomes.push({ id, ok: false, reason: errorReason(error) });
+      outcomes.push({ id, ok: false, action: "abort-failed", reason: errorReason(error) });
     }
   }
   return outcomes;
@@ -183,6 +213,7 @@ export function createIntegration({
 } = {}) {
   if (!store || !schemas || !pipeline || !scheduler || !applier) throw new TypeError("integration-dependencies-required");
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
+  const hostOwnerGeneration = ++hostOwnerBootGeneration;
   const rolloutGates = frozenRolloutGates(options.rolloutGates ?? options.settings?.rolloutGates);
   const inFlight = new Map();
   let runtimeKillSwitch = process.env.SELF_EVOLVE_KILL === "1" || process.env.SELF_EVOLVE_KILL === "true";
@@ -247,6 +278,14 @@ export function createIntegration({
       lastError = errorReason(error);
       return null;
     }
+  }
+
+  function hostOwnershipContext(projectFingerprint = settings()?.repo?.projectFingerprint) {
+    return {
+      projectFingerprint,
+      rootIdentity: options.stateRoot ? stateRootIdentity(options.stateRoot) : store.rootIdentity,
+      hostOwnerGeneration,
+    };
   }
 
   function exportManager() {
@@ -1371,8 +1410,11 @@ export function createIntegration({
 
   async function runEvolutionCycle(args = {}) {
     const mode = syncSchedulerMode(args.projectFingerprint, "cycle-refresh");
+    const ownership = hostOwnershipContext(args.projectFingerprint ?? settings()?.repo?.projectFingerprint);
     const cycleOptions = {
       ...(args.options ?? {}),
+      synthesis: { ...(args.options?.synthesis ?? {}), ...ownership },
+      critic: { ...(args.options?.critic ?? {}), ...ownership },
       rolloutGates,
       stopAfter: rolloutGates.passiveShadowObservation ? "correlate" : args.options?.stopAfter,
     };
@@ -1635,7 +1677,13 @@ export function createIntegration({
       while (attempts <= retries && !signal.aborted) {
         attempts += 1;
         try {
-          outcomes = await recoverOrphanedAnalyzerSessions(ctx?.client, ctx?.directory, { timeoutMs, signal });
+          outcomes = await recoverOrphanedAnalyzerSessions(ctx?.client, ctx?.directory, {
+            store,
+            ...hostOwnershipContext(),
+            now: now(),
+            timeoutMs,
+            signal,
+          });
           reason = undefined;
           break;
         } catch (error) {
@@ -1651,7 +1699,7 @@ export function createIntegration({
         ok: !signal.aborted && reason === undefined && outcomes.every((item) => item.ok),
         cancelled: signal.aborted,
         attempts,
-        aborted: outcomes.filter((item) => item.ok).length,
+        aborted: outcomes.filter((item) => item.action === "aborted").length,
         failed: outcomes.filter((item) => !item.ok).length,
         outcomes,
         ...(reason ? { reason } : {}),
@@ -1776,7 +1824,11 @@ export function createIntegration({
           recovery.push({ ok: failed.ok, proposalId: proposal.id, action: "failed-closed", reason: resumed.reason ?? "apply-recovery-failed" });
         }
       }
-      if (args.recoverHostSessions !== false) hiddenSessionRecovery = await recoverOrphanedAnalyzerSessions(ctx?.client, ctx?.directory);
+      if (args.recoverHostSessions !== false) hiddenSessionRecovery = await recoverOrphanedAnalyzerSessions(ctx?.client, ctx?.directory, {
+        store,
+        ...hostOwnershipContext(),
+        now: now(),
+      });
       if (options.stateRoot) {
         issueBridgeNonces();
         issueControlGrant();
@@ -1784,7 +1836,7 @@ export function createIntegration({
         startMailboxPolling();
       }
       startRetentionTimer();
-      appendAudit("decision", { action: "boot", hostVersion, hostVersionSource, schemaVersion: schemas.SCHEMA_VERSION, recovered: recovery.length, recoveredSyntheses: synthesisRecovery.length, abortedHiddenSessions: hiddenSessionRecovery.filter((item) => item.ok).length, hiddenSessionRecoveryFailures: hiddenSessionRecovery.filter((item) => !item.ok).length });
+      appendAudit("decision", { action: "boot", hostVersion, hostVersionSource, schemaVersion: schemas.SCHEMA_VERSION, recovered: recovery.length, recoveredSyntheses: synthesisRecovery.length, abortedHiddenSessions: hiddenSessionRecovery.filter((item) => item.action === "aborted").length, hiddenSessionRecoveryFailures: hiddenSessionRecovery.filter((item) => !item.ok).length });
       recovery = recovery.map((item) => recoveredFailedClosed.has(item) ? { ...item, recoveredToFailedClosed: true } : item);
     } catch (error) {
       corrupt = true;
@@ -1815,6 +1867,8 @@ export function createIntegration({
       return { ok: false, reason: "applier-close-degraded", applier: applierClose };
     }
     synthesisModule?.disposeSynthesis?.();
+    const hostOwnerRelease = store.releaseOwnedHostOwners?.({ pid: process.pid, generation: hostOwnerGeneration });
+    if (hostOwnerRelease?.ok === false) lastError = hostOwnerRelease.reason ?? "host-owner-release-degraded";
     if (!terminalPurge) await store.flushAudit?.();
     const storeClose = await store.close?.();
     if (storeClose?.ok === false) {

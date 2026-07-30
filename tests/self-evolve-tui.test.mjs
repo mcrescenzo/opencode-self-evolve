@@ -15,7 +15,7 @@ import {
   safeIdlePredicate,
   shouldShowProposal,
 } from "../self-evolve-tui.js";
-import tuiModule from "../self-evolve-tui.js";
+import tuiModule, { TUI_KV_KEYS } from "../self-evolve-tui.js";
 import { publishControlState, readTuiHostHealth } from "../self-evolve-bridge.js";
 import { openStore, projectFingerprintFor } from "../self-evolve-store.js";
 import * as schemas from "../self-evolve-schemas.js";
@@ -255,7 +255,7 @@ test("first-use consent is shown once and persists across TUI restarts", async (
   await SelfEvolveTuiPlugin(first.api);
   assert.equal(first.confirms.length, 1);
   first.confirms[0].onConfirm();
-  assert.equal(sharedKv.get("self-evolve:first-use-seen"), true);
+  assert.equal(sharedKv.get(TUI_KV_KEYS.firstUse), true);
   await first.dispose();
 
   const second = harness({ kv: sharedKv });
@@ -271,7 +271,7 @@ test("declining first-use consent leaves proposals in the inbox", async () => {
   h.event("self-evolve.proposal");
   await flush();
   assert.equal(h.selects.length, 0);
-  assert.equal(h.kv.get("self-evolve:first-use-seen"), false);
+  assert.equal(h.kv.get(TUI_KV_KEYS.firstUse), false);
   await h.dispose();
 });
 
@@ -502,7 +502,7 @@ test("showing a proposal records last-shown so an unchanged proposal is not re-s
     h.event("session.idle");
     await drain();
     assert.ok(actionDialog(h), "the pending proposal is shown once safely idle");
-    const recorded = h.kv.get("self-evolve:last-shown-at");
+    const recorded = h.kv.get(TUI_KV_KEYS.lastShown);
     assert.equal(typeof recorded?.["proposal-1"], "number", "last-shown is recorded for the displayed proposal");
     const shown = h.selects.length;
     // A later refresh for the same unchanged proposal must not re-display it.

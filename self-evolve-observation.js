@@ -5,7 +5,9 @@ import {
   makeEvidenceCluster,
   makeObservation,
   makeReceipt,
+  ORIGIN_KINDS,
   recordIncident,
+  UNKNOWN_ROOT_LINEAGE_HASH,
   UNKNOWN_SESSION_LINEAGE_HASH,
 } from "./self-evolve-schemas.js";
 
@@ -16,6 +18,11 @@ const INJECTION_MARKER_RE = /\b(?:ignore (?:all |any |the )?(?:previous|prior|ab
 const SELF_REFERENCE_RE = /(?:\/self-evolve|self-evolve(?:'s)?\s+(?:proposal|implementation|output|analysis)|proposal\s+from\s+self-evolve)/i;
 const CLARIFICATION_RE = /(?:\?|\b(?:to clarify|clarification|i mean|what i meant|rather than|instead|not .{0,40} but|no,|actually,)\b)/i;
 const DEFAULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const AUTOMATION_PROVENANCE_SCHEMA = "automation-provenance/v1";
+const AUTOMATION_PROVENANCE_MAX_BYTES = 1024;
+const AUTOMATION_KINDS = new Set(["control", "display"]);
+export const ROOT_LINEAGE_MAX_DEPTH = 16;
+const HIDDEN_ANALYZER_AGENTS = new Set(["self-evolve-analyzer", "self-evolve-synthesizer", "self-evolve-critic"]);
 const clusterMetadata = new WeakMap();
 
 function deepFreeze(value) {
@@ -70,6 +77,138 @@ export function hashSignature(normalizedText) {
 export function hashSessionLineage(sessionID) {
   if (typeof sessionID !== "string" || !sessionID) throw new TypeError("session-id-required");
   return hashSignature(`self-evolve-session-lineage-v1\n${sessionID}`);
+}
+
+export function hashRootLineage(rootSessionID) {
+  if (typeof rootSessionID !== "string" || !rootSessionID) throw new TypeError("root-session-id-required");
+  return hashSignature(`self-evolve-root-lineage-v1\n${rootSessionID}`);
+}
+
+export function isAutomationControlPart(part) {
+  try {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return false;
+    const marker = part.metadata?.automation;
+    if (!marker || typeof marker !== "object" || Array.isArray(marker)) return false;
+    if (marker.schema !== AUTOMATION_PROVENANCE_SCHEMA || !AUTOMATION_KINDS.has(marker.kind)) return false;
+    if (marker.producer !== undefined
+      && (typeof marker.producer !== "string" || marker.producer.length < 1 || marker.producer.length > 64)) return false;
+    if (marker.nonce !== undefined && typeof marker.nonce !== "string") return false;
+    const serialized = JSON.stringify(marker);
+    return typeof serialized === "string" && Buffer.byteLength(serialized, "utf8") <= AUTOMATION_PROVENANCE_MAX_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+export function partIsExcludedFromEvidence(part) {
+  try {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return false;
+    const metadata = part.metadata;
+    const hostExcluded = part.ignored === true
+      || part.display === true
+      || part.displayOnly === true
+      || (metadata && typeof metadata === "object" && !Array.isArray(metadata)
+        && (metadata.ignored === true || metadata.display === true || metadata.displayOnly === true || metadata.kind === "display"));
+    return hostExcluded || isAutomationControlPart(part);
+  } catch {
+    return false;
+  }
+}
+
+function evidenceParts(message) {
+  const parts = message?.parts ?? message?.info?.parts ?? message?.message?.parts;
+  return Array.isArray(parts) ? parts : null;
+}
+
+function messageIsExcludedFromEvidence(message) {
+  if (partIsExcludedFromEvidence(message)) return true;
+  const parts = evidenceParts(message);
+  return parts !== null && parts.length > 0 && parts.every(partIsExcludedFromEvidence);
+}
+
+function firstDefined(value, paths) {
+  for (const path of paths) {
+    let current = value;
+    for (const key of path) current = current?.[key];
+    if (current !== undefined) return current;
+  }
+  return undefined;
+}
+
+function lineageSignal(value, projectFingerprint) {
+  const event = value?.event && typeof value.event === "object" ? value.event : value;
+  const sessionID = firstDefined(event, [["properties", "sessionID"], ["properties", "session", "id"], ["sessionID"], ["session", "id"]]);
+  const parentID = firstDefined(event, [["properties", "parentID"], ["properties", "session", "parentID"], ["parentID"], ["session", "parentID"]]);
+  const fingerprint = firstDefined(event, [["properties", "projectFingerprint"], ["properties", "session", "projectFingerprint"], ["projectFingerprint"], ["session", "projectFingerprint"]]) ?? projectFingerprint;
+  const hidden = firstDefined(event, [["properties", "hidden"], ["properties", "session", "hidden"], ["hidden"], ["session", "hidden"]]);
+  const agent = firstDefined(event, [["properties", "agent"], ["properties", "session", "agent"], ["agent"], ["session", "agent"]]);
+  const createdBy = firstDefined(event, [["properties", "session", "createdBy"], ["session", "createdBy"]]);
+  const anonymous = firstDefined(event, [["properties", "session", "anonymous"], ["session", "anonymous"]]);
+  const reused = event?.reused === true;
+  return { sessionID, parentID, projectFingerprint: fingerprint, hidden, agent, createdBy, anonymous, reused };
+}
+
+function unresolvedRoot(reason) {
+  return deepFreeze({ resolved: false, rootLineageHash: UNKNOWN_ROOT_LINEAGE_HASH, originKind: "unknown", reason });
+}
+
+function rootOriginKind(signal) {
+  if (signal.hidden === true || HIDDEN_ANALYZER_AGENTS.has(signal.agent)) return "hidden";
+  if (signal.createdBy === "plugin" || signal.createdBy === "self-evolve-plugin" || signal.agent === "self-evolve-plugin") return "plugin-created";
+  if (signal.anonymous === true || signal.agent === "anonymous") return "anonymous";
+  if (signal.hidden !== undefined && typeof signal.hidden !== "boolean") return "unknown";
+  if (signal.agent !== undefined && (typeof signal.agent !== "string" || !signal.agent)) return "unknown";
+  if (signal.createdBy !== undefined && !["user", "host"].includes(signal.createdBy)) return "unknown";
+  return "user";
+}
+
+export function resolveRootLineage({
+  sessionID,
+  projectFingerprint,
+  sessions = [],
+  preferredRootSessionID,
+  preferredRootSessionIDHash,
+  maxDepth = ROOT_LINEAGE_MAX_DEPTH,
+} = {}) {
+  if (typeof sessionID !== "string" || !sessionID) return unresolvedRoot("missing-session");
+  if (typeof projectFingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(projectFingerprint)) return unresolvedRoot("missing-project-fingerprint");
+  if (!Number.isSafeInteger(maxDepth) || maxDepth < 1 || maxDepth > 256) return unresolvedRoot("invalid-depth-bound");
+  if (!Array.isArray(sessions)) return unresolvedRoot("invalid-ancestry");
+
+  const index = new Map();
+  for (const value of sessions) {
+    const signal = lineageSignal(value, projectFingerprint);
+    if (typeof signal.sessionID !== "string" || !signal.sessionID) continue;
+    const prior = index.get(signal.sessionID);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(signal)) return unresolvedRoot("reused-session-id");
+    index.set(signal.sessionID, signal);
+  }
+
+  const visited = new Set();
+  let currentID = sessionID;
+  let depth = 0;
+  let delegated = false;
+  while (true) {
+    if (visited.has(currentID)) return unresolvedRoot("ancestry-cycle");
+    visited.add(currentID);
+    const current = index.get(currentID);
+    if (!current) return unresolvedRoot(depth === 0 ? "missing-session" : "missing-parent");
+    if (current.reused) return unresolvedRoot("reused-session-id");
+    if (current.projectFingerprint !== projectFingerprint) return unresolvedRoot("cross-project-parent");
+    if (current.parentID === undefined || current.parentID === null || current.parentID === "") {
+      const rootLineageHash = hashRootLineage(currentID);
+      if (preferredRootSessionID !== undefined && preferredRootSessionID !== currentID) return unresolvedRoot("inconsistent-preferred-root");
+      if (preferredRootSessionIDHash !== undefined && preferredRootSessionIDHash !== rootLineageHash) return unresolvedRoot("inconsistent-preferred-root-hash");
+      const originKind = delegated ? "delegated" : rootOriginKind(current);
+      if (!ORIGIN_KINDS.includes(originKind) || originKind === "unknown") return unresolvedRoot("missing-origin-signal");
+      return deepFreeze({ resolved: true, rootSessionID: currentID, rootLineageHash, originKind });
+    }
+    if (typeof current.parentID !== "string") return unresolvedRoot("invalid-parent");
+    if (depth >= maxDepth) return unresolvedRoot("depth-exceeded");
+    delegated = true;
+    currentID = current.parentID;
+    depth += 1;
+  }
 }
 
 export function hashMessageCursor(message) {
@@ -129,7 +268,10 @@ function receipt(type, signatureHash, occurrences, episode, options) {
 export function extractReceipts(episode, { projectFingerprint, scopeFingerprint, now }) {
   if (!episode || typeof episode !== "object" || !Array.isArray(episode.messages)) throw new TypeError("malformed episode");
   const messages = episode.messages.slice(0, EXTRACT_RULES.maxMessages);
-  const usable = messages.filter((message) => message && typeof message === "object" && !message.isSelfEvolveOutput);
+  const usable = messages.filter((message) => message
+    && typeof message === "object"
+    && !message.isSelfEvolveOutput
+    && !messageIsExcludedFromEvidence(message));
   const commands = usable
     .filter((message) => message.role === "user" && typeof message.commandName === "string" && message.commandName.trim())
     .map((message) => ({ value: message.commandName }));
@@ -194,6 +336,8 @@ function observationInput(value, signatureHash, incidentId) {
     structuredFields: value.structuredFields,
     incidentId,
     sessionLineageHash: value.sessionLineageHash ?? UNKNOWN_SESSION_LINEAGE_HASH,
+    rootLineageHash: value.rootLineageHash ?? UNKNOWN_ROOT_LINEAGE_HASH,
+    originKind: value.originKind ?? "unknown",
     createdAt: value.createdAt,
     injectionFlagged: value.injectionFlagged || injectionHeuristic(value).flagged,
     redacted: value.redacted,
@@ -251,6 +395,8 @@ export function correlateObservations(observations) {
       group.incidents.set(root, {
         createdAt: observation.createdAt,
         sessionLineageHash: observation.sessionLineageHash,
+        rootLineageHash: observation.rootLineageHash,
+        originKind: observation.originKind,
       });
     }
   }
@@ -300,7 +446,9 @@ export function evaluateEligibility(clusters, thresholds = {}) {
     if (!metadata) {
       place(false, "correlationMetadata", true, "correlation-metadata-unavailable");
     } else {
-      const distinctSessions = new Set(metadata.incidents.map((item) => item.sessionLineageHash ?? UNKNOWN_SESSION_LINEAGE_HASH)).size;
+      const distinctSessions = new Set(metadata.incidents
+        .filter((item) => item.originKind === "user" && item.rootLineageHash !== UNKNOWN_ROOT_LINEAGE_HASH)
+        .map((item) => item.rootLineageHash)).size;
       const now = thresholds.now ?? cluster.lastSeenAt;
       const freshCount = metadata.incidents.filter((item) => item.createdAt <= now && now - item.createdAt <= retentionMs).length;
       const freshnessRatio = metadata.incidents.length ? freshCount / metadata.incidents.length : 0;
