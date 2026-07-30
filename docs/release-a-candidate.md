@@ -58,7 +58,7 @@ This record identifies the unpublished sidebar-first Release A candidate. It is 
 
 ## Validation Record
 
-- `npm test` — passed: 644 tests, 0 failed. One managed-sandbox rerun produced inconsistent child-process failures that did not reproduce in focused runs; the authoritative permitted full-suite rerun passed 644/644.
+- `npm test` — passed: 645 tests, 0 failed. One managed-sandbox rerun produced inconsistent child-process failures that did not reproduce in focused runs; the authoritative permitted full-suite rerun passed 645/645.
 - `npm run check` — passed: TypeScript check, raw TUI artifact contract, disposable Bun transpilation, and every Node syntax check. The managed sandbox initially denied the nested Bun spawn with `EPERM`; the authoritative permitted rerun passed.
 - `npm run pack:check` — passed: 34 exact files; raw TUI target validated; server target imported from a fresh peerless consumer.
 - `npm run test:tui-matrix` — passed: aligned packed TUI consumers at exact floor `1.18.3`, fixed adjacent `1.18.4`, and resolved latest-supported `1.18.9`; all observed the exact requested OpenCode/plugin versions and fixed TUI peers.
@@ -69,7 +69,7 @@ Exact-host interactive renderer evidence (mouse, focused Enter, narrow/wide layo
 
 ## Migration, Disable, And Rollback
 
-Release A makes the conditional sidebar card, mounted native review dialog, and `self-evolve.control-center` palette route the normal TUI workflow. Existing `/self-evolve ...` commands remain supported for headless operation, bootstrap recovery, and migration compatibility. The release does not retire or rewrite stored settings, records, proposals, or snapshots.
+Release A makes the persistent clickable sidebar status/attention indicator, mounted native review dialog, and `self-evolve.control-center` palette route the normal TUI workflow. Existing `/self-evolve ...` commands remain supported for headless operation, bootstrap recovery, and migration compatibility. The release does not retire or rewrite stored settings, records, proposals, or snapshots.
 
 After installing or changing package/TUI registration, restart OpenCode; existing sessions retain the already-loaded targets. To disable durable autonomy without deleting state, set `durableAutonomy: false` and restart. To suspend autonomous application while preserving the stored mode preference, use the native kill switch, set `SELF_EVOLVE_KILL=1` before startup, or use `/self-evolve kill-switch on` headlessly.
 

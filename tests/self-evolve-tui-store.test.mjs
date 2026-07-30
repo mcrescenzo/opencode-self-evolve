@@ -127,20 +127,26 @@ async function settle() {
 test.beforeEach(() => __testTuiStore.reset());
 test.afterEach(() => __testTuiStore.reset());
 
-test("sidebar card is absent for healthy empty state and summarizes every attention class without raw identifiers", () => {
+test("sidebar card stays visible for healthy empty state and summarizes every attention class without raw identifiers", () => {
   const snapshot = (overrides = {}) => ({
     phase: "ready",
     pending: [],
     projection: {
       index: {
-        status: { state: "ready" },
+        status: { state: "ready", effectiveMode: "auto" },
         reviews: [],
         operations: [],
         ...overrides,
       },
     },
   });
-  assert.equal(deriveSidebarCard(snapshot()), null);
+  assert.deepEqual(deriveSidebarCard(snapshot()), {
+    kind: "status",
+    tone: "neutral",
+    title: "Self-evolve",
+    summary: "Auto · Ready",
+    count: 0,
+  });
   assert.deepEqual(deriveSidebarCard(snapshot({ status: { state: "setup-required" } })), {
     kind: "setup",
     tone: "warning",
@@ -164,6 +170,16 @@ test("sidebar card is absent for healthy empty state and summarizes every attent
     reviews: [{ proposalId: "private-proposal-id", state: "pending", attention: "normal" }],
   })));
   assert.doesNotMatch(serialized, /private-proposal-id/u);
+});
+
+test("sidebar indicator remains visible while the server projection starts", () => {
+  assert.deepEqual(deriveSidebarCard({ phase: "loading", pending: [], projection: null }), {
+    kind: "status",
+    tone: "neutral",
+    title: "Self-evolve",
+    summary: "Starting…",
+    count: 0,
+  });
 });
 
 test("review dialog model exposes authoritative summary, diff, evidence, audit, actions, and honest truncation", () => {
@@ -288,6 +304,7 @@ test("control center model remains available for healthy, empty, and degraded pr
   assert.match(healthy.sections.overview.join("\n"), /Status: ready[\s\S]*Mode: manual/u);
   assert.match(healthy.sections.reviews.join("\n"), /0 reviews/u);
   assert.match(healthy.sections.health.join("\n"), /Storage quota MiB: 8/u);
+  assert.match(healthy.sections.help.join("\n"), /sidebar indicator is always available/u);
   assert.equal(Object.isFrozen(healthy.sections), true);
 });
 

@@ -162,9 +162,10 @@ Two independent gates, both mandatory:
 
 ### 2.6 Notify / Apply
 
-- **Surface**: a conditional privacy-safe sidebar card opens the mounted native
-  review route by click or focused Enter. A permanent palette-only control
-  center remains available when the card is absent. Background work only
+- **Surface**: a persistent privacy-safe sidebar indicator opens the mounted
+  native control center by click or focused Enter in startup and healthy states;
+  review, audit, and failure summaries open the review route. A palette-only
+  command remains an alternate control-center entry point. Background work only
   changes persistent projection state; it never emits a toast or attention
   notification and never opens a dialog automatically. The durable
   command-accessible inbox remains the headless fallback. **Never** inject a turn into the working session, never
@@ -403,9 +404,12 @@ One npm package exposes two target-only modules:
   index plus hash-bound review details.
 - One project-scoped reactive TUI store performs bounded full rereads. Filesystem
   watches and host events are latency hints, never consistency authority.
-- The sidebar card is absent in healthy empty state and appears only for setup,
-  review, audit, failure, or in-flight operation state. User activation opens a
-  mounted review surface; background refresh never opens it.
+- The sidebar indicator remains visible in startup and healthy empty states with
+  a neutral bounded status summary. Setup, review, audit, failure, or in-flight
+  operation state replaces that summary with the relevant attention state. User
+  activation opens the control center for neutral/setup/operation state or the
+  mounted review surface for review/audit/failure state; background refresh never
+  opens either surface.
 - Apply and Reject retain the exact legacy Decision tuple. Other native actions
   use closed operation schemas bound to project, root, generation, projection
   hash, capability, expiry, subject/version fields, and one-use nonce.
@@ -636,8 +640,8 @@ an overnight range wraps across midnight.
 
 ### 11.1 Sidebar-first Release A
 
-- Release A is additive. The normal interactive surface is the conditional
-  sidebar card plus palette-only control center; no normal interaction depends
+- Release A is additive. The normal interactive surface is the persistent
+  clickable sidebar indicator plus control-center palette command; no normal interaction depends
   on slash input, toast, attention, or an automatically opened dialog.
 - Existing `/self-evolve` verbs, durable inbox, exact headless approval tuple,
   emergency controls, bootstrap recovery, manual scan, export, and purge remain

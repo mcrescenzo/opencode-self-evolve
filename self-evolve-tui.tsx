@@ -227,6 +227,7 @@ function SidebarCard(props: {
     if (tone === "error") return props.api.theme.current.error
     if (tone === "warning") return props.api.theme.current.warning
     if (tone === "success") return props.api.theme.current.success
+    if (tone === "neutral") return props.api.theme.current.borderSubtle
     return props.api.theme.current.info
   }
   return (

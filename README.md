@@ -1,6 +1,6 @@
 # OpenCode Self-Evolve Plugin
 
-`@mcrescenzo/opencode-self-evolve` turns repeated friction in OpenCode sessions into evidence-backed skill improvements. Version 0.2 is a dual-target package: a headless-safe server plugin observes and validates opportunities, while an optional native TUI target provides a conditional sidebar review card and a palette-only control center. The same evidence thresholds apply in every mode, and finding no worthwhile change is a normal result.
+`@mcrescenzo/opencode-self-evolve` turns repeated friction in OpenCode sessions into evidence-backed skill improvements. Version 0.2 is a dual-target package: a headless-safe server plugin observes and validates opportunities, while an optional native TUI target provides a persistent clickable sidebar status/attention indicator and a control center that is also available from the command palette. The same evidence thresholds apply in every mode, and finding no worthwhile change is a normal result.
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ The package TUI entry has the stable ID `mcrescenzo.self-evolve`. It is shipped 
 
 The plain package entry boots durable v0.2 in fail-closed `manual` mode. No wrapper or startup mode is required. The v0.1 session-local analyzer remains available only through the explicit `durableAutonomy: false` compatibility option documented in [docs/configuration.md](docs/configuration.md).
 
-Restart OpenCode after changing registration. In an interactive TUI, open **Self-evolve control center** from the command palette. A compact sidebar card appears only when setup, review, audit, failure, or operation state needs attention. Server-only hosts can confirm loading with `/self-evolve status`.
+Restart OpenCode after changing registration. In an interactive TUI, activate the persistent **Self-evolve** sidebar indicator by click or focused Enter to open the control center; **Self-evolve control center** also remains in the command palette. Healthy state renders a muted mode/status summary, while setup, review, audit, failure, and operation states replace it with the relevant attention summary. Server-only hosts can confirm loading with `/self-evolve status`.
 
 Restart OpenCode after changing the durable mode so the plugin can shape its passive hooks from the persisted effective preference. Already-autonomous processes re-read durable mode and authority settings before each cycle. Applied skill changes require a new session or restart to load.
 
@@ -51,7 +51,7 @@ Select a mode with `/self-evolve manual`, `/self-evolve auto`, or the deliberate
 
 In the native TUI, open **Self-evolve control center** from the command palette. It has no slash metadata and provides Overview, Reviews, Settings, Safety, Evidence, Health/Budgets, Maintenance, and Help sections. Every action is advertised by a fresh server projection and revalidated against project, state root, generation, hashes or settings version, capability, expiry, and a one-use nonce. Yolo displays the exact allowlist before confirmation; allowlist replacement has its own elevated confirmation. Excerpt and cross-repository controls warn that redaction reduces exposure but is not a secrecy guarantee.
 
-Background refresh only updates persistent state. The normal TUI path emits no toast, attention notification, or automatically opened dialog. Click the sidebar card or focus it and press Enter to open review.
+Background refresh only updates persistent state. The normal TUI path emits no toast, attention notification, or automatically opened dialog. Click the sidebar indicator or focus it and press Enter: neutral, setup, and operation states open the control center; review, audit, and failure states open the review surface.
 
 Unknown scopes and non-allowlisted targets always downgrade to pending review. Yolo is high authority: it can change skill files without per-change confirmation. Use narrow allowlisted roots, inspect audit results, and stop autonomous work immediately with `SELF_EVOLVE_KILL=1` or `/self-evolve kill-switch on`.
 

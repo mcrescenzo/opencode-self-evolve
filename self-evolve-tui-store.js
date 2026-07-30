@@ -185,7 +185,15 @@ export function deriveSidebarCard(snapshot) {
   const projection = snapshot?.projection;
   const index = projection?.index;
   if (!index) {
-    if (snapshot?.phase !== "error") return null;
+    if (snapshot?.phase !== "error") {
+      return deepFreeze({
+        kind: "status",
+        tone: "neutral",
+        title: "Self-evolve",
+        summary: "Starting…",
+        count: 0,
+      });
+    }
     return deepFreeze({
       kind: "setup",
       tone: "warning",
@@ -254,7 +262,16 @@ export function deriveSidebarCard(snapshot) {
       count: audits.length,
     });
   }
-  return null;
+  const effectiveMode = typeof status?.effectiveMode === "string" && status.effectiveMode.length
+    ? `${status.effectiveMode[0].toUpperCase()}${status.effectiveMode.slice(1)}`
+    : null;
+  return deepFreeze({
+    kind: "status",
+    tone: "neutral",
+    title: "Self-evolve",
+    summary: effectiveMode ? `${effectiveMode} · Ready` : "Ready",
+    count: 0,
+  });
 }
 
 function overflowText(label, marker) {
@@ -384,7 +401,7 @@ export function buildControlCenterModel(snapshot) {
         evidence: ["No bounded evidence projection is available."],
         health: [`Projection store: ${snapshot?.phase ?? "unavailable"}`],
         maintenance: ["Maintenance operations are unavailable until server authority is restored."],
-        help: ["Use the sidebar card when attention is required.", "Headless recovery remains available through the documented server command surface."],
+        help: ["Use the persistent sidebar indicator to open the control center.", "Headless recovery remains available through the documented server command surface."],
       },
     });
   }
@@ -468,7 +485,8 @@ export function buildControlCenterModel(snapshot) {
         ] : ["No unexpired native export artifact is available."]),
       ],
       help: [
-        "The sidebar card appears only when operator attention is required.",
+        "The sidebar indicator is always available; activate it to open the control center.",
+        "Attention states replace its neutral status with the relevant setup, review, audit, operation, or failure summary.",
         "Review actions are revalidated by the server before mutation.",
         "Background refresh never opens dialogs or emits notifications.",
         "Headless recovery remains available through the documented server command surface.",
