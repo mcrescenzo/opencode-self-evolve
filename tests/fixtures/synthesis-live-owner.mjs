@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { createApplier } from "../../self-evolve-applier.js";
 import { createCommandPolicy } from "../../self-evolve-commands.js";
 import * as inventory from "../../self-evolve-inventory.js";
@@ -32,7 +33,7 @@ const ctx = { directory: root, client: { session: {
     fs.appendFileSync(markerPath, `${agent}\n`);
     if (agent === synthesis.SYNTHESIS_AGENT_NAME) {
       fs.writeFileSync(barrierPath, "provider-open", { mode: 0o600 });
-      while (!fs.existsSync(releasePath)) await new Promise((resolve) => setTimeout(resolve, 5));
+      while (!fs.existsSync(releasePath)) await delay(5);
       const prompt = args?.body?.parts?.[0]?.text ?? "";
       const evidence = JSON.parse(/<UNTRUSTED_EVIDENCE_METADATA>\n([^\n]+)\n<\/UNTRUSTED_EVIDENCE_METADATA>/u.exec(prompt)[1]);
       return { data: { info: { structured_output: {

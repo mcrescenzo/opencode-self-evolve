@@ -899,6 +899,40 @@ test("durable state path SDK calls are bounded and unavailable APIs do not autho
   assert.ok(Date.now() - started < 500);
 });
 
+test("provisional startup inherits global auto mode when a project partition does not exist yet", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-provisional-mode-"));
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(worktree);
+  const projectFingerprint = projectFingerprintFor("", worktree);
+  const seeded = openStore(root, { projectFingerprint });
+  const current = seeded.getSettings();
+  seeded.setGlobalSettings(makeGlobalSettings({
+    ...current.global,
+    mode: "auto",
+    updatedAt: current.global.updatedAt + 1,
+  }));
+  seeded.close();
+  fs.rmSync(path.join(root, "self-evolve", projectFingerprint), { recursive: true, force: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const compatibility = { supported: true };
+  assert.equal(await DefaultSelfEvolvePlugin.__test.provisionalStartupMode(
+    root,
+    { projectFingerprint },
+    {},
+    compatibility,
+  ), "auto");
+
+  fs.mkdirSync(path.join(root, "self-evolve", projectFingerprint), { recursive: true });
+  fs.writeFileSync(path.join(root, "self-evolve", projectFingerprint, "settings.json"), "{}");
+  assert.equal(await DefaultSelfEvolvePlugin.__test.provisionalStartupMode(
+    root,
+    { projectFingerprint },
+    {},
+    compatibility,
+  ), "manual", "a present but invalid repository partition still fails closed");
+});
+
 test("provisional standard root validates after startup before durable initialization", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-root-match-"));
   const stateRoot = path.join(root, "state", "opencode");

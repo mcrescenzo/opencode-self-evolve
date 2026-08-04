@@ -5,6 +5,7 @@ import {
   SCHEMA_VERSION,
   ConsentState,
   Observation,
+  errorReasonCode,
   makeAggregateClaim,
   makeAuditEvent,
   makeConsentState,
@@ -12,7 +13,6 @@ import {
   makeRepoSettings,
   wrapRecord,
 } from "./self-evolve-schemas.js";
-import { projectFingerprintFor } from "./self-evolve-store.js";
 
 const DAY_MS = 86_400_000;
 const DEFAULT_RETENTION_DAYS = 30;
@@ -140,22 +140,6 @@ export function isExpired(timestamp, nowMs) {
   return Number.isSafeInteger(timestamp) && Number.isSafeInteger(nowMs) && timestamp <= nowMs;
 }
 
-export function computeTtlBuckets(records, nowMs) {
-  const buckets = { active: 0, expiringSoon: 0, expired: 0 };
-  for (const item of records) {
-    const expiresAt = typeof item?.expiresAt === "number" ? item.expiresAt : expirationFor(item, DEFAULT_RETENTION_DAYS);
-    if (expiresAt === null) continue;
-    if (isExpired(expiresAt, nowMs)) buckets.expired += 1;
-    else if (expiresAt - nowMs <= 7 * DAY_MS) buckets.expiringSoon += 1;
-    else buckets.active += 1;
-  }
-  return buckets;
-}
-
-export function computeProjectFingerprint({ remoteUrl, worktreePath }) {
-  return projectFingerprintFor(remoteUrl, path.resolve(String(worktreePath)));
-}
-
 export function assertSafeGlobalClaim(record, { allowRepoIdentifiers = false, blockedNames = [] } = {}) {
   if (allowRepoIdentifiers) return { ok: true };
   let reason = null;
@@ -239,7 +223,7 @@ export function createPrivacyGuard({
       const sanitized = makeObservation(Object.fromEntries(Observation.fields.map((key) => [key, observation[key]])));
       return successfulObservation(sanitized);
     } catch (error) {
-      return { ok: false, reason: String(error.message).split(":", 1)[0] };
+      return { ok: false, reason: errorReasonCode(error, "privacy-failed") };
     }
   }
 
@@ -316,7 +300,7 @@ export function createPrivacyGuard({
       if (!safe.ok) return { ok: false, reason: safe.reason };
       return requireStore(store).appendAggregate(record);
     } catch (error) {
-      return { ok: false, reason: String(error.message).split(":", 1)[0] };
+      return { ok: false, reason: errorReasonCode(error, "privacy-failed") };
     }
   }
 
@@ -327,7 +311,7 @@ export function createPrivacyGuard({
     try {
       return { ok: true, records: requireStore(store).readAggregates({ scope, includeExpired, nowMs: now() }) };
     } catch (error) {
-      return { ok: false, reason: String(error.message).split(":", 1)[0], records: [] };
+      return { ok: false, reason: errorReasonCode(error, "privacy-failed"), records: [] };
     }
   }
 
@@ -336,7 +320,7 @@ export function createPrivacyGuard({
     if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
     if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required" };
     try { return { ok: true, ...requireStore(store).retainAggregates(nowMs) }; }
-    catch (error) { return { ok: false, reason: String(error.message).split(":", 1)[0] }; }
+    catch (error) { return { ok: false, reason: errorReasonCode(error, "privacy-failed") }; }
   }
 
   function checkRetention(nowMs = now()) {

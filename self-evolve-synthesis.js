@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { DEFAULT_BUDGETS, makeAuditEvent, makeProposal, makeSynthesisAttempt, wrapRecord } from "./self-evolve-schemas.js";
+import { DEFAULT_BUDGETS, deepFreeze, makeAuditEvent, makeProposal, makeSynthesisAttempt, wrapRecord } from "./self-evolve-schemas.js";
 import { LEGACY_SELF_EVOLVE_AGENTS, SELF_EVOLVE_CRITIC_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT } from "./self-evolve-core.js";
 import { estimateGrowth, hashSkillContent, scanForSecretCanaries, scanForUnsafeContent, validateProposalTarget } from "./self-evolve-inventory.js";
 import {
@@ -21,20 +21,11 @@ const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_CRITIC_THRESHOLD = 0.75;
 const SYNTHESIS_LEASE_TTL_MS = 5 * 60 * 1000;
 const MAX_FILE_BYTES = 64 * 1024;
-const synthesisRuns = [];
-let synthesisActive = false;
+const synthesisStateByStore = new Map();
 const STANDALONE_HOST_OWNER_GENERATION = 1;
 // This is the durable decision-protocol actor authorized by self-evolve-schemas,
 // not the hidden host agent identity used to create the critic session.
 const CRITIC_DECISION_ACTOR = LEGACY_SELF_EVOLVE_AGENTS.critic;
-
-function deepFreeze(value) {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const child of Object.values(value)) deepFreeze(child);
-  }
-  return value;
-}
 
 export const SYNTHESIS_OUTPUT_SCHEMA = deepFreeze({
   type: "object",
@@ -301,6 +292,15 @@ function requireStore(options) {
   return store;
 }
 
+function synthesisState(store) {
+  let state = synthesisStateByStore.get(store);
+  if (!state) {
+    state = { runs: [], active: false };
+    synthesisStateByStore.set(store, state);
+  }
+  return state;
+}
+
 function auditEnvelope(action, subjectId, timestamp, details = {}) {
   const clean = { action, subjectId: String(subjectId), ...details };
   const payloadHash = sha256(JSON.stringify(clean));
@@ -350,6 +350,7 @@ function persistFailedSynthesis(store, cluster, targetSkill, timestamp, reason, 
 
 function preflight({ cluster, targetSkill, inventory, privacy, options, timestamp }) {
   const store = requireStore(options);
+  const state = synthesisState(store);
   const eligibility = options.eligibility ?? cluster?.eligibility ?? cluster?.eligibilityExplanation;
   if (eligibility?.clusterId !== cluster?.id || eligibility?.eligible !== true) return { ok: false, reason: "cluster-not-deterministically-eligible", store };
   if (cluster?.injectionFlagged || observationMetadata(cluster).some((item) => item.injectionFlagged)) return { ok: false, reason: "injection-flagged-evidence", store };
@@ -369,10 +370,10 @@ function preflight({ cluster, targetSkill, inventory, privacy, options, timestam
   const targetValidation = (options.validateTarget ?? validateProposalTarget)(currentCandidate, inventory);
   if (!targetValidation?.ok) return { ok: false, reason: (targetValidation?.errors ?? ["target-validation-failed"]).join(","), store };
   if (isBackedOff(store, "synthesis", cluster.id, timestamp)) return { ok: false, reason: "cluster-recently-failed", store };
-  if (synthesisActive) return { ok: false, reason: "synthesis-lease-busy", store };
-  synthesisRuns.splice(0, synthesisRuns.length, ...synthesisRuns.filter((time) => timestamp - time < DAY_MS));
-  if (synthesisRuns.length >= (options.synthesisPerDay ?? DEFAULT_BUDGETS.synthesisPerDay)) return { ok: false, reason: "synthesis-budget-exhausted", store };
-  return { ok: true, store };
+  if (state.active) return { ok: false, reason: "synthesis-lease-busy", store };
+  state.runs.splice(0, state.runs.length, ...state.runs.filter((time) => timestamp - time < DAY_MS));
+  if (state.runs.length >= (options.synthesisPerDay ?? DEFAULT_BUDGETS.synthesisPerDay)) return { ok: false, reason: "synthesis-budget-exhausted", store };
+  return { ok: true, store, state };
 }
 
 function proposalRationale(result) {
@@ -426,8 +427,8 @@ export async function runSynthesis({ ctx, cluster, targetSkill, inventory, priva
     return { ok: false, reason: admitted?.reason ?? "synthesis-attempt-admission-failed" };
   }
   options.faultInjection?.("synthesis-after-admission", { attempt });
-  synthesisActive = true;
-  synthesisRuns.push(timestamp);
+  gate.state.active = true;
+  gate.state.runs.push(timestamp);
   const currentContent = String(options.currentContent ?? targetSkill.currentContent ?? "");
   try {
     boundedCurrentContent(currentContent, targetSkill);
@@ -472,7 +473,7 @@ export async function runSynthesis({ ctx, cluster, targetSkill, inventory, priva
     persistFailedSynthesis(gate.store, cluster, targetSkill, timestamp, reason, options);
     return { ok: false, reason, attempt, lease };
   } finally {
-    synthesisActive = false;
+    gate.state.active = false;
   }
 }
 
@@ -526,7 +527,7 @@ export async function runCritic({ ctx, proposal, cluster, inventory, options = {
   }
 }
 
-export function disposeSynthesis() {
-  synthesisRuns.length = 0;
-  synthesisActive = false;
+export function disposeSynthesis(store) {
+  if (store) synthesisStateByStore.delete(store);
+  else synthesisStateByStore.clear();
 }

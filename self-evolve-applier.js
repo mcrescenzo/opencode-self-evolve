@@ -3,10 +3,12 @@ import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import {
   evaluateApplyAuthority,
+  errorReasonCode,
   makeAuditEvent,
   makeCircuitBreaker,
   makeDecision,
   makeRollbackRecord,
+  stripUndefined,
   transitionProposalState,
   wrapRecord,
 } from "./self-evolve-schemas.js";
@@ -35,8 +37,7 @@ function sha256(value) {
 
 function errorReason(error, fallback = "apply-failed") {
   if (error?.code === "EEXIST") return "target-exists";
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return message.split(":", 1)[0] || fallback;
+  return errorReasonCode(error, fallback);
 }
 
 function recordsFrom(inventory) {
@@ -88,10 +89,12 @@ function writeTemp(target, content, nonce) {
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
-  const written = fs.readFileSync(temporary);
-  if (hashSkillContent(written) !== hashSkillContent(content)) {
-    fs.rmSync(temporary, { force: true });
-    throw new Error("temp-write-mismatch");
+  try {
+    const written = fs.readFileSync(temporary);
+    if (hashSkillContent(written) !== hashSkillContent(content)) throw new Error("temp-write-mismatch");
+  } catch (readbackError) {
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    throw readbackError;
   }
   return temporary;
 }
@@ -100,7 +103,7 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
   if (!store || typeof store.acquireLease !== "function" || typeof store.appendRecord !== "function") throw new TypeError("store-required");
   if (!privacy || typeof privacy.scanForForbiddenContent !== "function") throw new TypeError("privacy-required");
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
-  const inventoryRecords = recordsFrom(inventory);
+  const initialInventoryRecords = recordsFrom(inventory);
   const snapshotRoot = typeof store.snapshotRoot === "string" ? path.resolve(store.snapshotRoot) : null;
   const held = new Map();
   const priorBreakers = typeof store.readRecords === "function" ? store.readRecords("circuit-breaker") : [];
@@ -114,7 +117,7 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
 
   function appendAudit(kind, proposalId, details) {
     const timestamp = now();
-    const clean = Object.fromEntries(Object.entries(details).filter(([, value]) => value !== undefined));
+    const clean = stripUndefined(details);
     const event = makeAuditEvent({
       id: sha256(JSON.stringify({ kind, proposalId, timestamp, clean, nonce: randomBytes(12).toString("hex") })),
       kind,
@@ -247,6 +250,9 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     if (breakerOpen) return { ok: false, reason: "circuit-breaker-open", auditId: auditFailure(proposal ?? { id: "unknown", skillTarget: {} }, "circuit-breaker-open") };
     if (!proposal?.id || !proposal?.skillTarget) return { ok: false, reason: "invalid-proposal" };
 
+    const inventoryRecords = typeof inventory?.discoverSkills === "function" && Array.isArray(inventory?.canonicalRoots)
+      ? inventory.discoverSkills(inventory.canonicalRoots)
+      : initialInventoryRecords;
     const allowlisted = inventoryRecords.some((item) => item.canonicalRoot === proposal.skillTarget.canonicalRoot)
       || inventory?.canonicalRoots?.includes(proposal.skillTarget.canonicalRoot) === true;
     const releaseGatesPassed = proposal.criticPassed === true && proposal.validDeterministic === true && proposal.injectionFlagged !== true;
@@ -278,13 +284,15 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     let snapshot;
     let pendingAuditId;
     let outcome;
+    let appliedHash;
+    const isNew = proposal.skillTarget.currentHash === MUST_NOT_EXIST;
     const target = path.resolve(proposal.skillTarget.canonicalRoot, proposal.skillTarget.relativePath);
     try {
       const validated = validateProposalTarget(proposal, inventoryRecords);
       if (!validated.ok) {
         const joined = validated.errors.join(" ");
         const reason = joined.includes("must not exist") ? "target-exists"
-          : joined.includes("hash") || joined.includes("stale") ? "stale-hash"
+          : /hash|stale/iu.test(joined) ? "stale-hash"
             : joined.includes("growth budget") ? "growth-limit-exceeded" : "validation-failed";
         throw new Error(reason);
       }
@@ -292,7 +300,6 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         if (resultFlag(scan)) throw new Error("unsafe-content");
       }
 
-      const isNew = proposal.skillTarget.currentHash === MUST_NOT_EXIST;
       let priorContent = null;
       if (isNew) {
         if (!fs.existsSync(path.dirname(target))) ensureParent(target, proposal.skillTarget.canonicalRoot);
@@ -304,7 +311,7 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
 
       temporary = writeTemp(target, proposal.proposedContent, acquired.nonce);
       injectFault("apply-after-temp-write");
-      const appliedHash = hashSkillContent(proposal.proposedContent);
+      appliedHash = hashSkillContent(proposal.proposedContent);
       if (appliedHash !== proposal.proposedContentHash) throw new Error("proposed-hash-mismatch");
       if (priorContent) snapshot = createSnapshot(proposal.id, appliedHash, priorContent);
 
@@ -383,8 +390,16 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     } catch (error) {
       const reason = errorReason(error);
       if (renamed) {
-        const rolledBack = rollbackApplied({ proposalId: proposal.id, actor: ACTOR, reason });
-        if (!rolledBack.ok) tripCritical(proposal.id, rolledBack.reason, { target });
+        const rolledBack = rollbackFromAudit({
+          proposalId: proposal.id,
+          target,
+          appliedHash,
+          priorHash: isNew ? MUST_NOT_EXIST : proposal.skillTarget.currentHash,
+          snapshot: snapshot ?? "none",
+          actor: ACTOR,
+          reason,
+        });
+        if (!rolledBack.ok) tripCritical(proposal.id, rolledBack.reason, { target, appliedHash });
       }
       outcome = { ok: false, reason, auditId: pendingAuditId ?? auditFailure(proposal, reason, { target }) };
       return outcome;
@@ -426,7 +441,8 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
       }
       appendAudit("rollback", proposalId, { state: "rolled-back", target, appliedHash, rolledBackHash, actor: String(actor), reason, "readback-verified": true });
       const rollback = makeRollbackRecord({ proposalId, appliedHash, rolledBackAt: now(), reason });
-      store.appendRecord(wrapRecord("rollback-record", rollback, now()));
+      const recorded = store.appendRecord(wrapRecord("rollback-record", rollback, now()));
+      if (!recorded?.ok) throw new Error(recorded?.reason ?? "rollback-record-write-failed");
       return { ok: true, rolledBackHash };
     } catch (error) {
       const failure = errorReason(error, "rollback-failed");

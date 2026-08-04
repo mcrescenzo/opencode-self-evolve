@@ -253,7 +253,6 @@ async function runDirectPluginChildProbe({ pluginPath, projectDir, baseEnv, conf
       model: "smoke/self-evolve-smoke",
       small_model: "smoke/self-evolve-smoke",
       plugin: [pluginPath],
-      command: { "self-evolve": { description: "Exercise the self-evolve command hook", template: "$ARGUMENTS" } },
       provider: {
         smoke: {
           npm: "@ai-sdk/openai-compatible",
@@ -318,10 +317,17 @@ async function runDirectPluginChildProbe({ pluginPath, projectDir, baseEnv, conf
     if (!stateLayoutCreated) throw new Error(`direct plugin child did not boot durable state at ${settingsPath}`);
     const commandResult = await withTimeout(executeSessionCommand(baseUrl, sessionId, projectDir), "direct plugin child command");
     const messages = await readSessionMessages(baseUrl, sessionId, projectDir);
-    const commandHookExecuted = messages.some((message) => (message?.parts ?? []).some((part) => (
-      typeof part?.text === "string"
-      && part.text.includes(`Self-evolve health: host ${officialHealth.version}; source global-health`)
-    )));
+    const expectedHealth = `Self-evolve health: host ${officialHealth.version}; source global-health`;
+    const commandResultTexts = (commandResult?.parts ?? [])
+      .map((part) => typeof part?.text === "string" ? part.text.slice(0, 500) : "")
+      .filter(Boolean);
+    const sessionMessageTexts = messages
+      .flatMap((message) => message?.parts ?? [])
+      .map((part) => typeof part?.text === "string" ? part.text.slice(0, 500) : "")
+      .filter(Boolean)
+      .slice(-10);
+    const commandHookExecuted = [...commandResultTexts, ...sessionMessageTexts]
+      .some((text) => text.includes(expectedHealth));
     report = {
       pid: child.pid,
       sessionId,
@@ -331,6 +337,8 @@ async function runDirectPluginChildProbe({ pluginPath, projectDir, baseEnv, conf
       commandRegistered,
       commandHookExecuted,
       commandResultReturned: Boolean(commandResult?.info && Array.isArray(commandResult?.parts)),
+      commandResultTexts,
+      sessionMessageTexts,
       localProviderRequests: mockProvider.requests.length,
       directRegistration: true,
       processAliveBeforeStop: child.exitCode === null && child.signalCode === null,

@@ -2,6 +2,20 @@
 
 `self-evolve` has two configuration layers: durable v0.2 autonomy settings stored under the OpenCode state root, plus 13 options for the explicit v0.1 compatibility analyzer. Durable `manual` is the fail-closed package default.
 
+## Installation And Registration
+
+Use OpenCode's native installer for the normal path:
+
+```sh
+opencode plugin @mcrescenzo/opencode-self-evolve --global
+```
+
+Omit `--global` for project scope. The installer writes both the server
+registration in `opencode.json` and the native UI registration in `tui.json`;
+the TUI palette's **Install plugin** command (`plugins.install`) invokes the
+same installer. Restart OpenCode after either registration changes. The plugin
+does not silently create or rewrite external configuration.
+
 ## Plugin Options
 
 OpenCode 1.18.3 documents package plugin entries as strings; it does not document a `[package, options]` tuple. The ordinary package registration therefore uses:
@@ -22,26 +36,44 @@ export default (input) => SelfEvolvePlugin(input, {
 });
 ```
 
-Native review and the embedded-host version relay are separate TUI-plugin behavior. Register the package in `tui.json` as well:
+The native control center and embedded-host version relay are separate TUI-plugin behavior. Register the TUI export in `tui.json` as well:
 
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["@mcrescenzo/opencode-self-evolve/tui"]
+  "plugin": ["@mcrescenzo/opencode-self-evolve"]
 }
 ```
 
-The supported native target is `self-evolve-tui.tsx`, exported by the package as `./tui`. For this repository's local checkout, use `"plugin": ["./plugins/self-evolve/self-evolve-tui.tsx"]` in the config root's `tui.json`. The raw TSX entry is loaded directly by OpenCode’s Bun TUI runtime; the package has no install-time build. `self-evolve-tui.js` is a target-exclusive compatibility fallback used by the native wrapper, not the supported standalone registration. If an external `tui.json` still names `./plugins/self-evolve/self-evolve-tui.js`, replace it with `./plugins/self-evolve/self-evolve-tui.tsx` (or use `@mcrescenzo/opencode-self-evolve/tui` for an installed package) and restart OpenCode. This package does not edit external configuration.
+The supported native target is the deterministic
+`self-evolve-tui.generated.js` artifact exported by the package as `./tui`.
+Register the bare installed package, not its `/tui` subpath. For this
+repository's local checkout, use `"plugin": ["./plugins/self-evolve"]` in the
+config root's `tui.json`; the TUI loader resolves the package directory's
+`./tui` export. The TSX file remains the typechecked authoring source and is not
+a supported registration target. `self-evolve-tui.js` remains a target-only
+helper used by the generated wrapper, not a standalone registration. If an
+external `tui.json` names `self-evolve-tui.js`, `self-evolve-tui.tsx`, or the
+installed `/tui` subpath, replace only that entry with the package root or bare
+package and restart OpenCode.
 
 If advanced identity options such as `stateRoot` or `remoteUrl` are supplied to the server wrapper, pass the same values in the supported TUI plugin-options tuple so both targets derive one partition. The stable module ID is `mcrescenzo.self-evolve`; the hidden agents are `mcrescenzo.self-evolve.analyzer`, `mcrescenzo.self-evolve.synthesizer`, and `mcrescenzo.self-evolve.critic`, while the palette entry is `mcrescenzo.self-evolve.control-center`. Restart OpenCode after changing either registration file.
 
-Mixed versions fail closed without gaining authority: a new TUI with an old server remains legacy/read-only and submits no new writes, while an old TUI with a new server remains legacy/read-only through the retained legacy protocols and also gains no new write authority. The sidebar and control center require the aligned native target and server; headless commands and the durable inbox remain available according to the server version.
+Mixed versions fail closed without gaining new authority. The v1 protocol offer
+and core review index retain the exact Release A capability vocabulary. A new
+TUI with an old server keeps valid core review behavior, labels Release B
+surfaces limited, and submits no new request shape. An old TUI with a new server
+reads that unchanged core projection and ignores the additive dashboard. The
+four-section Release B control center requires aligned targets; headless commands
+and the durable inbox remain available according to the server version.
 
 TUI bookkeeping uses package-owned `mcrescenzo.self-evolve:*` KV keys. On the first read of each canonical key, one bounded compatibility read may migrate a valid raw value from its former `self-evolve:*` key. Invalid canonical values and corrupt or oversized legacy values are preserved and ignored rather than overwritten; legacy keys are never written. This fallback is a one-release migration window and keeps old/new peers able to read the same raw value.
 
-The `./tui` export alone may reach the optional TUI peer contract: `@opencode-ai/plugin ~1.18.3`, `@opentui/core`, `@opentui/keymap`, and `@opentui/solid` in `>=0.4.3 <0.5.0`, plus `solid-js 1.9.12`. A server-only host may omit them all. The package root remains plain Node ESM and imports neither the raw TSX entry nor any TUI peer.
+The `./tui` export alone may reach the optional TUI peer contract: `@opencode-ai/plugin ~1.18.3`, `@opentui/core`, `@opentui/keymap`, and `@opentui/solid` in `>=0.4.5 <0.6.0`, plus `solid-js 1.9.12`. A server-only host may omit them all. The package root remains plain Node ESM and imports neither the generated TUI entry nor any TUI peer. The packed consumer matrix verifies both the 0.4.5 floor and 0.5.0 current line without legacy peer-resolution bypasses; 0.6.x is rejected by the declared peer contract. Coexistence with OpenCode Workflows uses their shared 0.4.5 lane because Workflows currently narrows its OpenTUI peers below 0.5.0.
 
 Durable v0.2 is enabled unless `durableAutonomy: false` explicitly selects legacy v0.1 compatibility. Startup `mode` is not authority and does not initialize or override durable preferences. `/self-evolve manual|auto|yolo` and `/self-evolve repo ...` are authoritative. After the factory returns, the server bounds host-version resolution: it uses `client.global.health()` when present, then falls back after only a recognized SDK transport/capability failure to GET `/global/health` at the exact HTTP(S) origin from official `PluginInput.serverUrl`; an absent SDK method uses that official HTTP path directly. Authentication and other authoritative SDK failures do not fall back. Transient transport failures and cancellable fallback timeouts retry with exponential backoff inside a fixed five-second startup window.
+
+Durable global mode, consent, budgets, and approved skill folders are shared by every project in the same OpenCode installation, so their one-time setup carries forward to future projects. Repository mode and exclusion remain project-specific overrides. There is intentionally no checked-in wrapper or startup option that seeds authority for a team or machine image; adding one would change the durable precedence and consent contract and requires an explicit contract amendment.
 
 When an embedded TUI exposes neither global-health route, the registered package TUI target may relay official `api.app.version` in `<stateRoot>/self-evolve/bridge/<projectFingerprint>/tui-host-health.json`. This operational report has an exact schema, `0600` publication, project and canonical-root binding, a same-account live publisher PID, a random generation nonce, and at most a 60-second lifetime. Consumption requires effective-UID ownership of the state root, report, and bridge ancestors, exact `0600` report permissions, and no group/other writes on the state root or bridge ancestors; `EPERM` and platforms without effective-UID validation fail closed. The TUI refreshes it every 15 seconds and conditionally removes only its own generation on disposal. The server consults it only after official global health is unavailable and still validates the official state root before opening a store or granting command/event authority. The report is trusted local same-account IPC from this package's TUI target, not cryptographic authentication against other code running as the same OS user.
 
@@ -78,7 +110,11 @@ export default (input) => SelfEvolvePlugin(input, {
 
 Global settings are written once in the global namespace and are shared by every project partition. Repository settings and records remain inside the fingerprinted project partition. The TUI host-health file is short-lived operational IPC, participates in project/mailbox quota accounting, is removed when expired, dead, disposed, or purged, and is omitted from exports. Every command, scheduled cycle, decision, apply authorization, excerpt operation, and aggregate contribution/read must read fresh global and repository settings before acting; long-lived processes must not treat startup settings as authority. Thus an auto/yolo process observes pauses, consent revocation, mode downgrades, allowlist changes, and kill switches before its next cycle/apply. Event routing is the narrow exception: only idle/status/compaction lifecycle events are admitted, and active auto/yolo bursts may reuse a non-authoritative settings snapshot for at most 250 milliseconds. Manual routing results are not cached; local command/control/kill-switch writes invalidate immediately; cross-process changes become visible at expiry; and the scheduled cycle still rereads settings before any durable or provider action. Stream deltas never poll settings or the mailbox. All field changes use store updater callbacks whose read and write share one cross-process mutation-lock critical section; the combined updater handles transitions that inspect both scopes. Optional global `updatedAt` CAS returns `stale-settings-version` rather than applying stale state. Restart after changing mode or startup-only plugin options.
 
-The **Self-evolve control center** opens from the persistent sidebar indicator and from its palette-only command, which has no slash metadata. Its mounted Settings section reads validated `control-state.json` and submits bounded create-exclusive controls for global manual/auto/yolo mode, all four consent keys, repository exclusion, and canonical allowlist replacement. Review, Safety, and Maintenance use separate exact operation envelopes for Snooze, Undo, kill switch, pause/resume, scoped purge, purge-all, sensitive export, and bounded bootstrap retry. Project, canonical state-root identity, projection generation/hash, capability, expiry, settings or proposal version, and one-use nonce are revalidated by the server. Stale, replayed, unsupported, or cross-scope requests fail closed.
+The **Self-evolve control center** opens from the persistent sidebar indicator and from its palette-only command, which has no slash metadata. It has exactly four sections: Home, Recommendations, Activity, and Settings. The sidebar uses the server-authored operational model to deep-link setup to Settings, review to the selected Recommendation, failures to Activity/Errors, and healthy or startup state to Home. Activity is a bounded semantic history and diagnostics surface, never a raw-log viewer.
+
+Settings reads validated `control-state.json` and submits bounded create-exclusive controls for global manual/auto/yolo mode, capability-advertised repository inherit/manual/auto/yolo mode, all four consent keys, repository exclusion, and canonical allowlist replacement. Recommendations and the shared shell use separate exact decision or operation envelopes for Apply, Reject with optional structured audit-only feedback, Snooze, Acknowledge, Undo, kill switch, pause/resume, scoped purge, purge-all, sensitive export, and bounded bootstrap retry. Project, canonical state-root identity, projection generation/hash, capability, expiry, settings or proposal version, and one-use nonce are revalidated by the server. Stale, replayed, unsupported, or cross-scope requests fail closed.
+
+The optional additive `dashboard-v1` artifact supplies enhanced readiness, actual usage, semantic activity, diagnostics, and Release B feature capabilities beside the unchanged core review index. Missing or malformed enhanced data yields a labeled limited view without invalidating valid core review data. A new TUI hides structured feedback and repository-mode editing when their dashboard capabilities are absent; an old TUI ignores the additive dashboard and cannot emit the new control shape. Background refresh emits no toast, attention notification, auto-opened dialog, or route change. Manual scan stays an explicit source-session headless fallback.
 
 Project identity is `SHA-256` over the canonical JSON tuple `['self-evolve-project-v1', sourceKind, canonicalSource, canonicalAbsoluteWorktreePath]`. Both targets call one resolver with the same inputs. A valid explicit `projectFingerprint` is preferred only when it matches the identity derivable from the other supplied inputs; invalid or conflicting values fail closed. Otherwise `remoteUrl` comes from the same plugin option in both targets, and the worktree comes from `ctx.worktree` on the server or `api.state.path.worktree` in the TUI, falling back deterministically to each host's directory. OpenCode 1.18.3 documents TUI path/worktree state but no supported remote URL, so the plugin option is the supported way to provide a remote to both targets. Because the worktree path is always included, clones and linked worktrees partition separately, and repository relocation creates a new partition. Monorepo subprojects are scopes within one checkout partition.
 
@@ -111,7 +147,7 @@ The cooldown behavior above is intentionally documented rather than changed in v
 | Global mode | `manual` | `manual`, `auto`, or `yolo`; unknown/corrupt values fail closed to manual. |
 | Repository mode | `inherit` | `inherit`, `manual`, `auto`, or `yolo`. |
 | Repository exclusion | `false` | Excluded repositories cannot run autonomous work. |
-| `allowedSkillRoots` | `[]` | Canonical absolute skill roots. Required for yolo application; no globbing and no symlink expansion. |
+| `allowedSkillRoots` | `[]` | Canonical absolute roots that grant apply authority. Manual and automatic recommendation discovery includes `<project>/.opencode/skills` without granting write authority; no globbing and no symlink expansion. |
 | `SELF_EVOLVE_KILL` | unset | `1` or `true` forces a process-local manual downgrade without rewriting stored mode. |
 
 Yolo activation requires explicit confirmation and an allowlist:
@@ -124,12 +160,14 @@ Yolo activation requires explicit confirmation and an allowlist:
 
 All consent keys default to `false` and are independently controlled with `/self-evolve consent ... on|off`.
 
+Headless users can inspect approved skill folders with `/self-evolve allowlist list`. Add or remove one without granting yolo authority or changing consent with `/self-evolve allowlist <add|remove> <canonical-absolute-path> --confirm UPDATE ALLOWLIST`; the full resulting list is freshly canonicalized by the server, and yolo can never retain an empty list.
+
 | Stored key | Command key | Meaning |
 |---|---|---|
 | `passiveCalls` | `passive` | Permit provider calls at stable idle boundaries. |
 | `durableObservations` | `observations` | Permit automatic durable structured observations. |
 | `sanitizedExcerpts` | `excerpts` | Permit bounded sanitized evidence excerpts; redaction is not a secrecy guarantee. |
-| `crossRepoAggregation` | `cross-repo` | Permit strict normalized global-skill claims; requires excerpt consent. |
+| `crossRepoAggregation` | `cross-repo` | Reserved for strict normalized global-skill claims and not active in the current production pipeline; requires excerpt consent. |
 
 Manual invocation can record bounded observations for that invocation without enabling passive work. Complete transcripts, raw message bodies, and raw host session/message IDs are never persisted. Durable scans store only domain-separated SHA-256 session-lineage and last-message cursor hashes. If the prior cursor is no longer present in the bounded 120-message host window, the scan audits the gap and advances without deriving evidence from the unknown overlap. A transient empty host response preserves an established cursor and derives no evidence.
 
@@ -149,7 +187,7 @@ Cross-project aggregation is disabled unless both `sanitizedExcerpts` and `cross
 
 `passiveCallsPerHour` is a rolling-hour ceiling on actual hidden provider-call slots used by passive auto/yolo work, not on scheduler cycles. Once evidence is eligible, the scheduler acquires a project-scoped process-aware reservation lease, re-reads current budgets and durable reservations, and writes one durable `scheduler-budget` / `passive` audit per slot before either provider call starts. Synthesis and critic require two slots as one operation; if fewer than two remain, neither hidden session starts. Both slots remain conservatively charged when the later synthesis no-ops or either call fails. Explicit manual scans neither reserve nor consume passive slots.
 
-Budget exhaustion fails closed. `synthesisPerDay` remains a separate scheduler budget. The legacy `notificationsPerHour` field remains readable for durable-state compatibility but is not projected and has no Release A scheduling or UI effect. The scheduler accepts `quietHours` as process-startup periods in local time:
+Budget exhaustion fails closed. `synthesisPerDay` remains a separate scheduler budget. The legacy `notificationsPerHour` field remains readable for durable-state compatibility but is not projected and has no current scheduling or UI effect. The scheduler accepts `quietHours` as process-startup periods in local time:
 
 `storageQuotaMiB` is one cap over the complete project-associated durable partition: repository settings, all JSONL files, indexes, rollback snapshots, leases, quarantine files, and project bridge files. It is not multiplied by the number of files. Store and TUI mailbox publishers calculate current plus projected replacement bytes under the same cross-process mutation lock and reject symlinks. Decision, control, and operation requests share a 64-file ceiling and a mailbox sub-budget of `min(512 KiB, storageQuotaMiB / 8)`; each pending request reserves the maximum 4 KiB response, and growing mailbox writes preserve up to 64 KiB (or one eighth of a smaller quota) for later store writes. Native export artifacts use a separate bounded temporary-export quota. A safety-mandatory settings audit envelope of at most 4 KiB is the only documented quota bypass; ordinary records and recursive failure audits remain capped.
 
@@ -179,7 +217,7 @@ The latest `critic-pending`, `pending`, `approved`, or `applied` proposal and it
 
 Project purge includes records, snapshots, projection/mailbox data, native export artifacts, and indexed aggregate contributions but preserves global settings and reinitializes only that project. Purge-all removes the complete `self-evolve/` subtree and is terminal for the loaded store/integration. Native purge-all publishes an authenticated `accepted-terminal` acknowledgement before bounded deletion; the TUI never infers completion only from disappearance. Restart OpenCode to reinitialize.
 
-Native sensitive exports require the exact confirmation `EXPORT SENSITIVE SELF-EVOLVE DATA`. They stream under `<state-root>/self-evolve/exports/<projectFingerprint>/` using private directories, exclusive `0600` files, one active job per project, a separate temporary quota, SHA-256/size/expiry metadata, and expiry/startup cleanup. They never open automatically and are removed by every purge. Active skill content and rollback snapshots are sensitive. The retained headless export commands remain available during Release A.
+Native sensitive exports require the exact confirmation `EXPORT SENSITIVE SELF-EVOLVE DATA`. They stream under `<state-root>/self-evolve/exports/<projectFingerprint>/` using private directories, exclusive `0600` files, one active job per project, a separate temporary quota, SHA-256/size/expiry metadata, and expiry/startup cleanup. They never open automatically and are removed by every purge. Active skill content and rollback snapshots are sensitive. The retained headless export commands remain available throughout the compatibility window.
 
 ## Rollout Gates
 

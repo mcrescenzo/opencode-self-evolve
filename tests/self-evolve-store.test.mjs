@@ -4,7 +4,6 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   SCHEMA_VERSION,
@@ -42,8 +41,8 @@ const SCOPE = H("b");
 const CURRENT = H("c");
 const PROPOSED = H("d");
 const CLUSTER = H("e");
-const CHILD = fileURLToPath(new URL("./fixtures/store-child.mjs", import.meta.url));
-const TRANSACTION_CRASH_CHILD = fileURLToPath(new URL("./fixtures/decision-transaction-crash.mjs", import.meta.url));
+const CHILD = path.join(import.meta.dirname, "fixtures", "store-child.mjs");
+const TRANSACTION_CRASH_CHILD = path.join(import.meta.dirname, "fixtures", "decision-transaction-crash.mjs");
 
 function runChild(root, project, operation, value) {
   return new Promise((resolve, reject) => {
@@ -237,6 +236,39 @@ test("compare-and-swap appends a new version and rejects stale state", () => {
     reason: "stale-prior-state",
   });
   assert.equal(store.readRecords("audit-event").some((record) => record.payload.details.action === "cas"), true);
+  store.close();
+});
+
+test("compare-and-swap supports a kind-specific prior value selector", () => {
+  const { store } = fixture();
+  const initial = makeEpisodeCursor({
+    sessionIDHash: H("f"),
+    lastIdleAt: 1_000,
+    lastObservedMessageHash: H("1"),
+    leaseNonce: null,
+  });
+  const saved = store.appendRecord(wrapRecord("episode-cursor", initial, 1_000));
+  assert.equal(saved.ok, true);
+  const next = makeEpisodeCursor({
+    ...initial,
+    lastIdleAt: 1_001,
+    lastObservedMessageHash: H("2"),
+  });
+
+  assert.equal(store.runCas(
+    "episode-cursor",
+    initial.sessionIDHash,
+    H("1"),
+    () => next,
+    (payload) => payload.lastObservedMessageHash,
+  ).ok, true);
+  assert.deepEqual(store.runCas(
+    "episode-cursor",
+    initial.sessionIDHash,
+    H("1"),
+    (current) => current,
+    (payload) => payload.lastObservedMessageHash,
+  ), { ok: false, reason: "stale-prior-state" });
   store.close();
 });
 
@@ -893,7 +925,7 @@ test("legacy combined settings migrate once into global and repository files wit
   const second = openStore(root, { projectFingerprint: other, now: () => 2 });
   assert.equal(second.getSettings().global.mode, "auto");
   assert.equal(second.getSettings().repo.excluded, true);
-  assert.deepEqual(Object.keys(JSON.parse(readFileSync(path.join(otherDir, "settings.json"), "utf8"))).sort(), ["budgets", "consent", "excluded", "mode", "projectFingerprint", "schemaVersion"]);
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(path.join(otherDir, "settings.json"), "utf8"))).sort(), ["budgets", "excluded", "mode", "projectFingerprint", "schemaVersion"]);
   assert.equal(existsSync(path.join(projectDir, "observations.jsonl")), false);
   second.close();
 });
@@ -1234,4 +1266,52 @@ test("stale dead-owner locks recover while stale live-owner locks time out", asy
   assert.throws(() => openStore(root, { projectFingerprint: PROJECT, staleLockMs: 1, lockTimeoutMs: 30 }), /mutation-lock-timeout/);
   assert.equal(existsSync(lock), true);
   rmSync(lock);
+});
+
+test("a partition written by a compatible earlier schema version is migrated, not quarantined", () => {
+  const now = 1_000;
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-store-migrate-"));
+  try {
+    const first = openStore(root, { projectName: "fixture", projectFingerprint: PROJECT, now: () => now });
+    const envelope = wrapRecord("observation", observation(now), now);
+    assert.equal(first.appendRecord(envelope).ok, true);
+    first.close();
+
+    // Rewrite durable state exactly as the previous release left it on disk.
+    const legacy = "0.2.0";
+    const base = path.join(root, "self-evolve");
+    const versionPath = path.join(base, "version.json");
+    const recordsPath = path.join(base, PROJECT, "observations.jsonl");
+    const settingsPath = path.join(base, PROJECT, "settings.json");
+    writeFileSync(versionPath, JSON.stringify({ schemaVersion: legacy }));
+    writeFileSync(settingsPath, JSON.stringify({
+      ...JSON.parse(readFileSync(settingsPath, "utf8")),
+      schemaVersion: legacy,
+      consent: {
+        passiveCalls: false,
+        durableObservations: false,
+        sanitizedExcerpts: false,
+        crossRepoAggregation: false,
+      },
+    }));
+    writeFileSync(recordsPath, readFileSync(recordsPath, "utf8")
+      .split("\n")
+      .filter((line) => line.trim())
+      .map((line) => JSON.stringify({ ...JSON.parse(line), schemaVersion: legacy }) )
+      .join("\n") + "\n");
+
+    const reopened = openStore(root, { projectName: "fixture", projectFingerprint: PROJECT, now: () => now });
+    const records = reopened.readRecords("observation");
+    reopened.close();
+
+    assert.deepEqual(records, [envelope], "legacy records must be readable and normalized to the current version");
+    assert.equal(JSON.parse(readFileSync(versionPath, "utf8")).schemaVersion, SCHEMA_VERSION, "version.json must be migrated");
+    const migratedSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    assert.equal(migratedSettings.schemaVersion, SCHEMA_VERSION, "repository settings must be migrated");
+    assert.equal("consent" in migratedSettings, false, "legacy repository consent must be removed during migration");
+    const quarantine = path.join(base, PROJECT, "quarantine");
+    assert.equal(existsSync(quarantine) ? readdirSync(quarantine).length : 0, 0, "no legacy record may be quarantined");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

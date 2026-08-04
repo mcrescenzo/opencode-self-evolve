@@ -16,6 +16,7 @@ import {
   writeSync,
 } from "node:fs";
 import path from "node:path";
+import { errorReasonCode } from "./self-evolve-schemas.js";
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -24,10 +25,6 @@ const DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TEMP_QUOTA_BYTES = 128 * 1024 * 1024;
 const HASH_RE = /^[a-f0-9]{64}$/u;
 const NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) ? constants.O_NOFOLLOW : 0;
-
-function fail(error) {
-  return String(error?.message ?? error ?? "export-failed").split(":", 1)[0];
-}
 
 function assertDirectory(directory, boundary) {
   const stat = lstatSync(directory);
@@ -88,6 +85,7 @@ export function createSensitiveExportManager({
   ttlMs = DEFAULT_TTL_MS,
   maxArtifactBytes = DEFAULT_MAX_ARTIFACT_BYTES,
   temporaryQuotaBytes = DEFAULT_TEMP_QUOTA_BYTES,
+  faultInjection,
 } = {}) {
   const boundary = path.resolve(String(stateRoot ?? ""));
   if (!HASH_RE.test(String(projectFingerprint ?? ""))) throw new TypeError("invalid-project-fingerprint");
@@ -170,6 +168,10 @@ export function createSensitiveExportManager({
     const temporaryPath = path.join(projectRoot, `.${timestamp}-${id}.json.tmp`);
     const artifactPath = path.join(projectRoot, `${timestamp}-${id}.json`);
     let descriptor;
+    let metadataDescriptor;
+    let metadataPath;
+    let metadataTemporaryPath;
+    let published = false;
     let bytes = 0;
     const hash = createHash("sha256");
     try {
@@ -202,9 +204,11 @@ export function createSensitiveExportManager({
       descriptor = undefined;
       if (lstatOptional(artifactPath)) throw new Error("export-collision");
       renameSync(temporaryPath, artifactPath);
-      const published = lstatSync(artifactPath);
-      if (!published.isFile() || published.isSymbolicLink() || published.nlink !== 1
-          || (published.mode & 0o777) !== FILE_MODE || published.size !== bytes) {
+      published = true;
+      faultInjection?.("export-after-publication", { artifactPath });
+      const publishedStat = lstatSync(artifactPath);
+      if (!publishedStat.isFile() || publishedStat.isSymbolicLink() || publishedStat.nlink !== 1
+          || (publishedStat.mode & 0o777) !== FILE_MODE || publishedStat.size !== bytes) {
         throw new Error("export-publication-rejected");
       }
       const result = Object.freeze({
@@ -216,9 +220,8 @@ export function createSensitiveExportManager({
         expiresAt: timestamp + ttlMs,
         classification: "sensitive-self-evolve-archive",
       });
-      const metadataPath = `${artifactPath}.meta.json`;
-      const metadataTemporaryPath = `${metadataPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-      let metadataDescriptor;
+      metadataPath = `${artifactPath}.meta.json`;
+      metadataTemporaryPath = `${metadataPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
       try {
         metadataDescriptor = openSync(metadataTemporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NOFOLLOW, FILE_MODE);
         writeSync(metadataDescriptor, `${JSON.stringify(result)}\n`);
@@ -233,8 +236,11 @@ export function createSensitiveExportManager({
       return result;
     } catch (error) {
       if (descriptor !== undefined) closeSync(descriptor);
-      try { removeFile(temporaryPath); } catch {}
-      return { ok: false, reason: fail(error) };
+      if (metadataDescriptor !== undefined) closeSync(metadataDescriptor);
+      try { removeFile(published ? artifactPath : temporaryPath); } catch {}
+      if (metadataTemporaryPath) try { removeFile(metadataTemporaryPath); } catch {}
+      if (metadataPath) try { removeFile(metadataPath); } catch {}
+      return { ok: false, reason: errorReasonCode(error, "export-failed") };
     } finally {
       release();
     }

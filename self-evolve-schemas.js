@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 
-export const SCHEMA_VERSION = "0.2.1";
+export const SCHEMA_VERSION = "0.2.2";
+// Earlier schema versions whose persisted records and settings the current validators still read.
+// Values are normalized to SCHEMA_VERSION on read, so durable state written by a previous release
+// is migrated in place instead of being quarantined as damaged. Record identity is content-addressed
+// over kind+payload only, so re-stamping the version never changes an id; assertRecord still rejects
+// any record whose payload fails to round-trip. Only list a version here once its records are known
+// to re-wrap to an identical id under the current validators.
+export const SUPPORTED_SCHEMA_VERSIONS = Object.freeze(["0.2.0", "0.2.1", SCHEMA_VERSION]);
 export const UNKNOWN_SESSION_LINEAGE_HASH = createHash("sha256").update("self-evolve-session-lineage-v1\nunknown").digest("hex");
 export const UNKNOWN_ROOT_LINEAGE_HASH = createHash("sha256").update("self-evolve-root-lineage-v1\nunknown").digest("hex");
 
@@ -109,12 +116,30 @@ function exactKeys(value, allowed, label, required = allowed) {
   if (missing.length) fail("malformed-payload", `${label} is missing ${missing[0]}`);
 }
 
-function deepFreeze(value) {
+export function deepFreeze(value) {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     Object.freeze(value);
     for (const child of Object.values(value)) deepFreeze(child);
   }
   return value;
+}
+
+export function errorReasonCode(error, fallback = "error") {
+  const message = error instanceof Error ? error.message : String(error ?? fallback);
+  return message.split(":", 1)[0] || fallback;
+}
+
+export function latestByLogicalId(records, { withPayload = false } = {}) {
+  const latest = new Map();
+  for (const record of records ?? []) {
+    const id = record?.payload?.id ?? record?.payload?.proposalId ?? record?.id;
+    latest.set(id, withPayload ? record?.payload ?? record : record);
+  }
+  return latest;
+}
+
+export function stripUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined));
 }
 
 function canonicalize(value) {
@@ -149,8 +174,8 @@ function asBoolean(value, label, defaultValue) {
 }
 
 function schemaVersion(value) {
-  if (value !== SCHEMA_VERSION) fail("unsupported-version", String(value ?? "missing"));
-  return value;
+  if (!SUPPORTED_SCHEMA_VERSIONS.includes(value)) fail("unsupported-version", String(value ?? "missing"));
+  return SCHEMA_VERSION;
 }
 
 export function asString(value, { max = MAX.string } = {}) {
@@ -212,7 +237,7 @@ function absolutePath(value) {
 }
 
 function idString(value, label = "id") {
-  return asNonEmptyString(value, { max: 128 }) || fail("malformed-payload", label);
+  return asNonEmptyString(value, { max: 128 });
 }
 
 function nonceString(value) {
@@ -257,7 +282,7 @@ export const GlobalSettings = deepFreeze({
   fields: ["schemaVersion", "mode", "createdAt", "updatedAt", "paused", "killSwitchActive", "allowedSkillRoots", "consent", "budgets", "retentionDays"],
 });
 export const RepoSettings = deepFreeze({
-  fields: ["schemaVersion", "projectFingerprint", "mode", "excluded", "consent", "budgets"],
+  fields: ["schemaVersion", "projectFingerprint", "mode", "excluded", "budgets"],
 });
 export const EpisodeCursor = deepFreeze({ fields: ["sessionIDHash", "lastIdleAt", "lastObservedMessageHash", "leaseNonce"] });
 export const Receipt = deepFreeze({ fields: ["receiptType", "signatureHash", "occurrences", "firstSeenAt", "lastSeenAt", "projectFingerprint", "scopeFingerprint"] });
@@ -270,6 +295,10 @@ export const Proposal = deepFreeze({
 export const ProposalContent = deepFreeze({ fields: ["proposalId", "contentHash", "contentEncoding", "chunkIndex", "chunkCount", "content"] });
 export const SynthesisAttempt = deepFreeze({ fields: ["outcomeId", "proposalId", "projectFingerprint", "clusterId", "targetHash", "admittedAt", "state"] });
 export const Decision = deepFreeze({ fields: ["proposalId", "targetHash", "proposedContentHash", "decisionVersion", "actor", "timestamp", "nonce", "priorState", "newState"] });
+// Retained for durable-record compatibility and pure transition validation. The
+// production applier deliberately uses the store's process-aware filesystem
+// lease instead of this reducer; removing the schema would make compatible
+// historical `apply-claim` records unreadable.
 export const ApplyClaim = deepFreeze({ fields: ["proposalId", "leaseNonce", "acquiredAt", "expiresAt", "actor"] });
 export const AuditEvent = deepFreeze({ fields: ["id", "kind", "proposalId", "actor", "timestamp", "payloadHash", "details"] });
 export const RollbackRecord = deepFreeze({ fields: ["proposalId", "appliedHash", "rolledBackAt", "reason"] });
@@ -330,7 +359,6 @@ export function makeRepoSettings(data) {
     projectFingerprint: asFingerprint(data.projectFingerprint),
     mode: asEnum(data.mode ?? "inherit", REPO_MODES),
     excluded: asBoolean(data.excluded, "excluded", false),
-    consent: makeConsentState(data.consent ?? {}),
     budgets: validateBudgets(data.budgets ?? {}, true),
   });
 }

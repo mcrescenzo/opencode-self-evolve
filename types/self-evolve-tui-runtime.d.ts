@@ -1,6 +1,7 @@
 // Compile-only declarations for optional TUI peers intentionally omitted from
 // this server-first checkout. Packed consumer lanes load the real exact peers.
 declare module "solid-js" {
+  export function createMemo<Value>(compute: () => Value): () => Value;
   export function createSignal<Value>(value: Value): [
     get: () => Value,
     set: (next: Value | ((prior: Value) => Value)) => Value,
@@ -11,6 +12,10 @@ declare module "solid-js" {
     when: unknown;
     children?: unknown;
   }): unknown;
+}
+
+declare module "node:timers/promises" {
+  export function setTimeout(milliseconds: number): Promise<void>;
 }
 
 declare module "@opentui/core" {

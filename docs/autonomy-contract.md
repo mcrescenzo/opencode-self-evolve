@@ -163,9 +163,13 @@ Two independent gates, both mandatory:
 ### 2.6 Notify / Apply
 
 - **Surface**: a persistent privacy-safe sidebar indicator opens the mounted
-  native control center by click or focused Enter in startup and healthy states;
-  review, audit, and failure summaries open the review route. A palette-only
-  command remains an alternate control-center entry point. Background work only
+  native control center by click or focused Enter in every startup, healthy, and
+  attention state. Its shared operational model deep-links setup to Settings,
+  review to the selected Recommendation, failure to Activity/Errors, and
+  healthy/startup state to Home. A palette-only command remains an alternate
+  Home entry point. The normal state-dependent ReviewDialog is removed only
+  after the Recommendations workspace proves queue/detail/action parity.
+  Background work only
   changes persistent projection state; it never emits a toast or attention
   notification and never opens a dialog automatically. The durable
   command-accessible inbox remains the headless fallback. **Never** inject a turn into the working session, never
@@ -300,8 +304,8 @@ One npm package exposes two target-only modules:
   only. Imports only from `@opencode-ai/plugin` (the `.` target) and Node
   built-ins. **Must not statically import `./tui` or `@opencode-ai/plugin/tui`**
   — those peers are not installed in headless contexts.
-- **TUI entry** (`self-evolve-tui.tsx` reached via `package.json`
-  `exports["./tui"]`): uses the supported `@opencode-ai/plugin/tui` contract
+- **TUI entry** (`self-evolve-tui.generated.js`, deterministically built from
+  `self-evolve-tui.tsx` and reached via `package.json` `exports["./tui"]`): uses the supported `@opencode-ai/plugin/tui` contract
   and the package's own pure-ESM helpers without requiring an OpenTUI runtime
   import. It default-exports one `TuiPluginModule` with stable ID
   `mcrescenzo.self-evolve` and a `tui` function.
@@ -361,13 +365,23 @@ One npm package exposes two target-only modules:
 - Durable controls use a separate `control-requests/` and `control-responses/`
   namespace, not decision fields. The TUI reads a strict server-authored
   `control-state.json` projection and may request only: global manual/auto/yolo
-  mode, one of four consent toggles, repository exclusion, or canonical
-  allowlist replacement. Every envelope binds the project, actor, timestamp,
+  mode, capability-advertised repository inherit/manual/auto/yolo mode, one of
+  four consent toggles, repository exclusion, or canonical allowlist
+  replacement. Every envelope binds the project, actor, timestamp,
   request ID, global `updatedAt`, full global/repository settings hash, exact
   action payload, and a server-issued one-use nonce. Unknown fields/actions,
-  stale settings, replay, and cross-project requests fail closed. Yolo requires
-  a non-empty exact allowlist and two native confirmations; allowlist changes
-  require elevated confirmation. Cross-repository consent requires excerpts.
+  stale settings, replay, and cross-project requests fail closed. The exact
+  `set-repo-mode` payload is only `{mode: inherit|manual|auto|yolo}` and renders
+  only when `dashboard-v1` advertises `control-repo-mode-v1`. Repository yolo is rejected
+  unless current consent, approved folders, rollout evidence, host support,
+  exclusion, pause, emergency-stop, and breaker authority all pass. Yolo
+  requires a non-empty exact allowlist; allowlist changes require the exact
+  displayed confirmation and canonical server revalidation. Cross-project
+  consent requires excerpts.
+- The equivalent headless allowlist surface is `/self-evolve allowlist list`
+  plus confirmed `add` and `remove` operations using the exact `UPDATE
+  ALLOWLIST` phrase. It changes neither mode nor consent and uses the same
+  canonical full-list validation as the native control path.
 - Native actions use separate `operation-requests/` and `operation-responses/`
   namespaces. The closed actions are exact-duration snooze, rollback,
   pause/resume, kill switch, scoped purge, sensitive export, accepted-terminal
@@ -407,9 +421,8 @@ One npm package exposes two target-only modules:
 - The sidebar indicator remains visible in startup and healthy empty states with
   a neutral bounded status summary. Setup, review, audit, failure, or in-flight
   operation state replaces that summary with the relevant attention state. User
-  activation opens the control center for neutral/setup/operation state or the
-  mounted review surface for review/audit/failure state; background refresh never
-  opens either surface.
+  activation always opens an exact control-center deep link; background refresh
+  never opens a route or dialog.
 - Apply and Reject retain the exact legacy Decision tuple. Other native actions
   use closed operation schemas bound to project, root, generation, projection
   hash, capability, expiry, subject/version fields, and one-use nonce.
@@ -422,8 +435,10 @@ One npm package exposes two target-only modules:
 - Neither path injects a prompt or message into a working session.
 - The permanent palette command is `mcrescenzo.self-evolve.control-center`. It has
   `namespace: "palette"` and no slash metadata or aliases. Its namespaced route
-  covers Overview, Reviews, Settings, Safety, Evidence, Health/Budgets,
-  Maintenance, and Help and restores the exact prior host route.
+  has exactly four primary sections: Home, Recommendations, Activity, and
+  Settings. It restores the exact prior host route. The complete presentation,
+  routing, copy, compatibility, and confirmation contract is normative in
+  `docs/control-center-ux.md`.
 
 ## 6. Repository identity
 
@@ -589,7 +604,7 @@ Redaction is **not** a secrecy guarantee. The plugin must disclose this in
 Exceeding any budget fails closed (no write, no call). Budgets are
 configurable; defaults are conservative.
 
-The storage budget is one total cap for each project-associated partition, including repository settings, all record files, indexes, snapshots, leases, quarantine artifacts, and bridge files. Current usage and pending replacement bytes are evaluated while the shared cross-process mutation lock is held, without following symlinks. TUI decision, control, and operation publishers share at most 64 pending request files and a conservative mailbox sub-budget of the smaller of 512 KiB or one eighth of the project quota; pending requests reserve their maximum 4 KiB response and admission also reserves one absent control-state projection. Growing request publications preserve up to 64 KiB (or one eighth of a smaller quota) for later store mutations. A bounded mandatory settings audit envelope of at most 4 KiB may cross an already exhausted cap so a safety control outcome remains durable; ordinary records and recursive failure audits receive no bypass. The legacy `notificationsPerHour` setting is retained only for durable-state compatibility and has no Release A scheduling or UI effect.
+The storage budget is one total cap for each project-associated partition, including repository settings, all record files, indexes, snapshots, leases, quarantine artifacts, and bridge files. Current usage and pending replacement bytes are evaluated while the shared cross-process mutation lock is held, without following symlinks. TUI decision, control, and operation publishers share at most 64 pending request files and a conservative mailbox sub-budget of the smaller of 512 KiB or one eighth of the project quota; pending requests reserve their maximum 4 KiB response and admission also reserves one absent control-state projection. Growing request publications preserve up to 64 KiB (or one eighth of a smaller quota) for later store mutations. A bounded mandatory settings audit envelope of at most 4 KiB may cross an already exhausted cap so a safety control outcome remains durable; ordinary records and recursive failure audits receive no bypass. The legacy `notificationsPerHour` setting is retained only for durable-state compatibility and has no current scheduling or UI effect.
 
 Quiet hours use local wall-clock time and the canonical shape
 `{ "from": "22:00", "to": "07:00" }`. Equal endpoints disable that period;
@@ -647,8 +662,9 @@ an overnight range wraps across midnight.
   emergency controls, bootstrap recovery, manual scan, export, and purge remain
   supported for one compatibility release and for server-only operation.
 - Projection and operation protocols negotiate independently at version 1.
-  New-TUI/old-server and old-TUI/new-server pairs remain legacy/read-only and
-  gain no new write authority.
+  Their offer and core index keep the Release A capability vocabulary.
+  New-TUI/old-server and old-TUI/new-server pairs retain valid core behavior but
+  gain no Release B request shape or write authority.
 - Manual Scan now remains headless because the exact 1.18.3 native API does not
   provide a safe binding from a palette route to one exact source session.
 - Disable the native target by removing it from `tui.json` and restarting while
@@ -657,6 +673,22 @@ an overnight range wraps across midnight.
   State roots are never copied, merged, or migrated automatically.
 - Slash retirement is outside Release A. It requires a complete two-release
   compatibility window and a separate maintainer-approved disposition.
+
+### 11.2 Four-section Release B
+
+- Release B keeps the sidebar as a persistent entry point but makes its state an
+  exact deep link into Home, Recommendations, Activity, or Settings.
+- A strict optional `dashboard-v1` derived artifact adds bounded operational
+  state, actual usage, and privacy-safe semantic activity beside the unchanged
+  v1 review index. It also advertises the closed Release B feature capabilities
+  without changing the strict v1 offer or index vocabulary. It does not migrate
+  durable records or grant authority.
+- The state-dependent normal ReviewDialog is retired only after Recommendations
+  proves equivalent or better queue, detail, action, focus, and outcome behavior.
+- New-TUI/old-server shows an explicit limited view; old-TUI/new-server ignores
+  the additive dashboard. Neither combination gains write authority.
+- `docs/control-center-ux.md` is the normative Release B native presentation and
+  interaction contract.
 
 - v0.1.2 has no durable state, so migration is essentially configuration-only.
 - On first start, v0.2.x:
@@ -672,7 +704,7 @@ an overnight range wraps across midnight.
   `durableAutonomy: false` compatibility option. Startup `mode` is not durable
   authority and does not override an existing preference; commands own later
   mode changes, and restart reshapes passive hooks from persisted effective mode.
-- The package supports the OpenCode 1.18 patch line `>=1.18.3 <1.19.0`. Its raw `./tui` target alone may reach the approved optional peers: `@opencode-ai/plugin ~1.18.3`, `@opentui/core`, `@opentui/keymap`, and `@opentui/solid` in `>=0.4.3 <0.5.0`, plus `solid-js 1.9.12`. The package root and shared server graph import none of them; headless consumers may omit all optional peers.
+- The package supports the OpenCode 1.18 patch line `>=1.18.3 <1.19.0`. Its generated `./tui` target alone may reach the approved optional peers: `@opencode-ai/plugin ~1.18.3`, `@opentui/core`, `@opentui/keymap`, and `@opentui/solid` in `>=0.4.5 <0.6.0`, plus `solid-js 1.9.12`. The package root and shared server graph import none of them; headless consumers may omit all optional peers. Compatibility is exercised at the 0.4.5 floor and on 0.5.0 without disabling npm peer checks, while 0.6.x is an explicit package-manager rejection lane.
   After the factory returns, production startup derives the running OpenCode
   version from bounded official health: `client.global.health()` when present,
   followed only after a recognized SDK transport/capability error by exact-origin GET

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   createDecisionRequest,
   pollDecisionResponse,
@@ -7,8 +8,6 @@ import {
 } from "../../self-evolve-bridge.js";
 
 const [stateRoot, projectFingerprint, action, proposalId, replayFile, resultFile] = process.argv.slice(2);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 let request;
 if (action === "replay") {
   request = JSON.parse(fs.readFileSync(replayFile, "utf8"));

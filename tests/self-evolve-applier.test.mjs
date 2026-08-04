@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { createApplier } from "../self-evolve-applier.js";
 import * as applierModule from "../self-evolve-applier.js";
 import { makeAuditEvent, makeProposal, wrapRecord } from "../self-evolve-schemas.js";
@@ -19,14 +18,14 @@ import { createPrivacyGuard } from "../self-evolve-privacy.js";
 
 const PROJECT = "a".repeat(64);
 const CLUSTER = "b".repeat(64);
-const NEW_SKILL_CRASH_CHILD = fileURLToPath(new URL("./fixtures/new-skill-crash.mjs", import.meta.url));
+const NEW_SKILL_CRASH_CHILD = path.join(import.meta.dirname, "fixtures", "new-skill-crash.mjs");
 let clock = 10_000;
 
 function skill(name, body = "# Guidance\nKeep deterministic checks bounded.\n") {
   return `---\nname: ${name}\ndescription: Handles deterministic workflow checks safely.\n---\n${body}`;
 }
 
-function fixture(t, { existing = true, quota = 8, releaseLease } = {}) {
+function fixture(t, { existing = true, quota = 8, releaseLease, appendRecord } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-applier-"));
   t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
   const root = path.join(temp, "skills");
@@ -51,7 +50,7 @@ function fixture(t, { existing = true, quota = 8, releaseLease } = {}) {
   const store = Object.freeze({
     snapshotRoot: snapshots,
     getSettings: (...args) => baseStore.getSettings(...args),
-    appendRecord: (...args) => baseStore.appendRecord(...args),
+    appendRecord: (...args) => appendRecord ? appendRecord(baseStore, ...args) : baseStore.appendRecord(...args),
     readRecords: (...args) => baseStore.readRecords(...args),
     acquireLease: (...args) => baseStore.acquireLease(...args),
     releaseLease: (...args) => releaseLease ? releaseLease(baseStore, ...args) : baseStore.releaseLease(...args),
@@ -60,7 +59,7 @@ function fixture(t, { existing = true, quota = 8, releaseLease } = {}) {
     exportAll: (...args) => baseStore.exportAll(...args),
   });
   const privacy = createPrivacyGuard({ consent: {}, projectFingerprint: PROJECT, storageQuotaMiB: quota, store: baseStore, now: () => ++clock });
-  const inventory = { records, canonicalRoots: roots };
+  const inventory = { records, canonicalRoots: roots, discoverSkills };
   const applier = createApplier({ store, inventory, privacy, now: () => ++clock });
   t.after(() => { applier.close(); baseStore.close(); });
   return { temp, root, target, before, records, inventory, store, baseStore, privacy, applier, snapshots };
@@ -164,6 +163,26 @@ test("a failed content write cleans up the exclusive temp file instead of leakin
   assert.deepEqual(leaked, [], "no exclusive temp file leaks after a write failure");
 });
 
+test("a failed temp readback removes the exclusive temp file", async (t) => {
+  const f = fixture(t);
+  const p = proposal(f);
+  const realRead = fs.readFileSync;
+  fs.readFileSync = (target, ...args) => {
+    if (typeof target === "string" && target.includes(".self-evolve-tmp-")) throw new Error("injected-readback-failure");
+    return realRead(target, ...args);
+  };
+  let result;
+  try {
+    result = await f.applier.applyProposal({ proposal: p, decision: decision(p), actor: "reviewer", mode: "auto", headless: false });
+  } finally {
+    fs.readFileSync = realRead;
+  }
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /injected-readback-failure/u);
+  const leaked = fs.readdirSync(path.dirname(f.target)).filter((name) => name.includes(".self-evolve-tmp-"));
+  assert.deepEqual(leaked, []);
+});
+
 test("stale target hash is rejected and audited", async (t) => {
   const f = fixture(t);
   const p = proposal(f);
@@ -231,13 +250,17 @@ for (const point of ["apply-after-pending-audit", "apply-after-publication", "ap
     const monitor = setInterval(() => {
       try { observed.push(fs.readFileSync(target, "utf8")); } catch (error) { if (error?.code !== "ENOENT") observed.push(`ERROR:${error.code}`); }
     }, 1);
-    const exit = await new Promise((resolve, reject) => {
-      let stderr = "";
-      child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-      child.on("error", reject);
-      child.on("close", (code, signal) => resolve({ code, signal, stderr }));
-    });
-    clearInterval(monitor);
+    let exit;
+    try {
+      exit = await new Promise((resolve, reject) => {
+        let stderr = "";
+        child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+        child.on("error", reject);
+        child.on("close", (code, signal) => resolve({ code, signal, stderr }));
+      });
+    } finally {
+      clearInterval(monitor);
+    }
     assert.equal(exit.signal, "SIGKILL", exit.stderr);
     assert.equal(observed.every((value) => value === content), true, JSON.stringify(observed));
     if (fs.existsSync(target)) assert.equal(fs.readFileSync(target, "utf8"), content);
@@ -382,6 +405,55 @@ test("readback mismatch rolls back the prior content", async (t) => {
   assert.equal(f.applier.circuitBreakerOpen(), true);
 });
 
+test("post-publication readback errors use the known apply details to roll back", async (t) => {
+  const f = fixture(t);
+  const p = proposal(f);
+  const originalRename = fs.renameSync;
+  const originalRead = fs.readFileSync;
+  let published = false;
+  let failedReadback = false;
+  fs.renameSync = function (from, to) {
+    const value = originalRename(from, to);
+    if (String(from).includes("self-evolve-tmp") && to === f.target) published = true;
+    return value;
+  };
+  fs.readFileSync = function (target, ...args) {
+    if (published && !failedReadback && target === f.target) {
+      failedReadback = true;
+      throw new Error("simulated-readback-error");
+    }
+    return originalRead(target, ...args);
+  };
+  let result;
+  try {
+    result = await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" });
+  } finally {
+    fs.renameSync = originalRename;
+    fs.readFileSync = originalRead;
+  }
+  assert.equal(result.reason, "simulated-readback-error");
+  assert.equal(fs.readFileSync(f.target, "utf8"), f.before);
+  assert.equal(f.applier.circuitBreakerOpen(), false);
+});
+
+test("apply refreshes inventory for skills created after applier startup", async (t) => {
+  const f = fixture(t, { existing: false });
+  const directory = path.join(f.root, "late-skill");
+  const target = path.join(directory, "SKILL.md");
+  const before = skill("late-skill");
+  fs.mkdirSync(directory);
+  fs.writeFileSync(target, before);
+  const p = proposal(f, {
+    name: "late-skill",
+    currentHash: hashSkillContent(before),
+    content: skill("late-skill", "# Updated\nUse the current inventory.\n"),
+  });
+
+  const result = await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" });
+  assert.equal(result.ok, true);
+  assert.equal(fs.readFileSync(target, "utf8"), p.proposedContent);
+});
+
 test("successful apply writes one verified apply event", async (t) => {
   const f = fixture(t);
   const p = proposal(f);
@@ -485,6 +557,17 @@ test("hash-safe rollback restores the prior content and records one rollback", a
   assert.equal(rollback.ok, true);
   assert.equal(fs.readFileSync(f.target, "utf8"), f.before);
   assert.equal(f.baseStore.readRecords("audit-event").filter((r) => r.payload.kind === "rollback" && r.payload.details["readback-verified"]).length, 1);
+});
+
+test("rollback reports a failed durable rollback-record write", async (t) => {
+  const f = fixture(t, {
+    appendRecord: (store, record, ...args) => record?.kind === "rollback-record"
+      ? { ok: false, reason: "rollback-record-write-denied" }
+      : store.appendRecord(record, ...args),
+  });
+  const p = proposal(f);
+  assert.equal((await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" })).ok, true);
+  assert.equal(f.applier.rollbackApplied({ proposalId: p.id }).reason, "rollback-record-write-denied");
 });
 
 test("hash-safe rollback refuses on disk drift", async (t) => {

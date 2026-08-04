@@ -5,6 +5,7 @@ import { createIntegration } from "../../self-evolve-integration.js";
 import { openStore } from "../../self-evolve-store.js";
 import * as schemas from "../../self-evolve-schemas.js";
 import * as commands from "../../self-evolve-commands.js";
+import * as inventory from "../../self-evolve-inventory.js";
 
 const [stateRoot, projectFingerprint, skillRoot, readyFile] = process.argv.slice(2);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -63,7 +64,7 @@ const scheduler = {
 const privacy = { exportScope: () => ({ records: [] }), purgeScope: () => ({ ok: true }), scanForForbiddenContent: () => ({ ok: true }) };
 const integration = createIntegration({
   store,
-  inventory: {},
+  inventory,
   privacy,
   schemas,
   observation: {},

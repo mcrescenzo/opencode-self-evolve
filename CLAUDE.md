@@ -20,7 +20,18 @@ Run `npm test`, `npm run check`, and `npm run pack:check`. Run `npm run smoke:li
 - `self-evolve-scheduler.js`: idle dedup, budgets, leases, epochs.
 - `self-evolve-integration.js`: effective mode, boot recovery, bridge, shutdown.
 - `self-evolve-lock.js`: shared synchronous cross-process store/mailbox lock.
-- `self-evolve-tui.js`: native safe-idle review and consent UI.
+- `self-evolve-state-root.js`: canonical dual-target root precedence and identity.
+- `self-evolve-bridge.js`: strict filesystem mailbox/IPC between server and TUI processes.
+- `self-evolve-client.js`: bounded OpenCode SDK client adapter and compatibility handling.
+- `self-evolve-core.js`: legacy analyzer helpers reused by the durable pipeline.
+- `self-evolve-ui-protocol.js`: exact projection, grant, request, and response schemas.
+- `self-evolve-projection.js`: bounded server-authored control-center projections.
+- `self-evolve-export.js`: private short-lived sensitive export artifacts.
+- `self-evolve-tui-store.js`: project-scoped reactive projection and mailbox client runtime.
+- `self-evolve-tui.tsx`: typechecked target-exclusive authoring source.
+- `self-evolve-tui.generated.js`: deterministic public `./tui` entry built before pack.
+- `self-evolve-tui.js`: target-exclusive host registration and lifecycle wiring.
+- `self-evolve.js`: single-export server entry, hook wiring, and coordinated module registry.
 
 ## Invariants
 

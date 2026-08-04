@@ -121,14 +121,25 @@ test("parser covers the complete command surface and rejects malformed input", (
     ["pause", "pause"], ["resume", "resume"], ["review se-1", "review"], [approvalInput(), "approve"],
     ["reject se-1", "reject"], ["snooze se-1 7d", "snooze"], ["undo se-1", "undo"],
     ["exclude", "repo-override"], ["include", "repo-override"], ["repo inherit", "repo-mode"],
-    ["consent passive on", "consent"], ["inspect observations 3", "inspect"],
+    ["consent passive on", "consent"], ["allowlist list", "allowlist"],
+    ["allowlist add /skills --confirm UPDATE ALLOWLIST", "allowlist"], ["inspect observations 3", "inspect"],
     ["inspect eligibility", "inspect"], ["inbox", "inbox"], ["export all", "export"],
     ["purge --all", "purge"], ["budget", "budget"], ["health", "health"], ["kill-switch on", "kill-switch"],
   ];
   for (const [input, verb] of cases) assert.equal(command(input).verb, verb, input);
   assert.equal(parseSelfEvolveCommand("approve").ok, false);
+  assert.equal(parseSelfEvolveCommand("allowlist add /skills").ok, false);
   assert.equal(parseSelfEvolveCommand("purge").ok, false);
   assert.equal(parseSelfEvolveCommand("wat").ok, false);
+});
+
+test("status exposes consent and approved skill folders headlessly", (t) => {
+  const { policy } = fixture(t);
+  policy.execute(command("consent passive on"), { projectFingerprint: FINGERPRINT });
+  policy.execute(command("yolo confirm --allowlist /skills"), { projectFingerprint: FINGERPRINT });
+  const status = policy.execute(command("status"), { projectFingerprint: FINGERPRINT }).responseText;
+  assert.match(status, /Consent: passive on; observations off; excerpts off; cross-repo off/u);
+  assert.match(status, /Approved skill folders \(1\):\n- \/skills/u);
 });
 
 test("observation inspection limit accepts only bounded positive safe integers", () => {

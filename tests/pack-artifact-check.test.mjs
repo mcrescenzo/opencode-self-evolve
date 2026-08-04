@@ -4,15 +4,18 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
-import { assertApprovedTuiPackageContract } from "../scripts/check-tui-artifact.mjs";
+import {
+  assertApprovedTuiPackageContract,
+  assertCurrentTuiArtifact,
+  assertGeneratedTuiArtifact,
+} from "../scripts/check-tui-artifact.mjs";
 import { assertNoForbiddenImports, assertServerEntryContract, assertSpawnSucceeded } from "../scripts/pack-artifact-check.mjs";
 import { parseExact118Version, resolveLatestCommon18 } from "../scripts/packed-tui-consumer-matrix.mjs";
 import { createIntegration } from "../self-evolve-integration.js";
 import * as schemas from "../self-evolve-schemas.js";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = path.resolve(import.meta.dirname, "..");
 const script = path.join(repoRoot, "scripts", "pack-artifact-check.mjs");
 
 function runPackCheck(root = repoRoot) {
@@ -26,7 +29,9 @@ function runPackCheck(root = repoRoot) {
 test("pack artifact check passes for the release package", () => {
   const result = runPackCheck();
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout, /raw TUI target validated and server target imported from a fresh peerless consumer/u);
+  assert.match(result.stdout, /deterministic built TUI target validated and root plus explicit server targets imported from a fresh peerless consumer/u);
+  assert.match(result.stdout, /Packed artifact SHA-256: [a-f0-9]{64}/u);
+  assert.match(result.stdout, /Packed inventory SHA-256: [a-f0-9]{64}/u);
 });
 
 test("pack artifact check rejects a forbidden package files entry", (t) => {
@@ -58,7 +63,7 @@ test("pack scanner rejects named server exports and TUI imports", () => {
   assert.throws(() => assertServerEntryContract('import "@opencode-ai/plugin/tui"; export default function Plugin() {}\n'), /prohibited TUI/u);
 });
 
-test("approved raw TUI package contract is exact and rejects dependency drift", () => {
+test("approved built TUI package contract is exact and rejects dependency drift", () => {
   const packageJSON = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
   const source = readFileSync(path.join(repoRoot, "self-evolve-tui.tsx"), "utf8");
   assert.equal(assertApprovedTuiPackageContract(packageJSON, source), true);
@@ -72,6 +77,17 @@ test("approved raw TUI package contract is exact and rejects dependency drift", 
       peerDependencies: { ...packageJSON.peerDependencies, "solid-js": "^1.9.12" },
     }, source),
     /optional peer contract does not match maintainer approval/u,
+  );
+});
+
+test("generated TUI inventory rejects bundled runtimes and stale content", () => {
+  const generated = readFileSync(path.join(repoRoot, "self-evolve-tui.generated.js"), "utf8");
+  assert.equal(assertGeneratedTuiArtifact(generated), true);
+  assert.equal(assertCurrentTuiArtifact(generated, generated), true);
+  assert.throws(() => assertCurrentTuiArtifact(generated, `${generated}\n// stale`), /artifact is stale/u);
+  assert.throws(
+    () => assertGeneratedTuiArtifact(`${generated}\nfunction createScheduler() {}`),
+    /bundled prohibited runtime content/u,
   );
 });
 

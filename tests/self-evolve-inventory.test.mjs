@@ -6,7 +6,6 @@ import test from "node:test";
 import {
   discoverSkills,
   estimateGrowth,
-  findOverlappingSkills,
   hashSkillContent,
   isPathContained,
   loadAllowlist,
@@ -225,23 +224,6 @@ test("stale hashes and inventory snapshots fail closed", (t) => {
   assert.equal(changed.ok, false);
   assert.match(changed.errors.join("\n"), /inventory target hash is stale/);
   assert.equal(changed.canonicalTarget, null);
-});
-
-test("duplicate identities and similar routing descriptions produce overlap warnings", (t) => {
-  const temp = tempTree(t);
-  const globalRoot = path.join(temp, "global-skills");
-  const project = path.join(temp, "project");
-  const repoRoot = path.join(project, "skills");
-  fs.mkdirSync(globalRoot);
-  fs.mkdirSync(repoRoot, { recursive: true });
-  writeSkill(globalRoot, "review", skillContent("review", "Reviews deterministic command failures and tool evidence."));
-  writeSkill(repoRoot, "review", skillContent("review", "Routes repository review requests."));
-  writeSkill(repoRoot, "failure-review", skillContent("failure-review", "Audits deterministic command failures and tool evidence."));
-  const loaded = loadAllowlist({ globalSkillRoots: [globalRoot], repoSkillRoots: [repoRoot], projectRoot: project });
-  const inventory = discoverSkills(loaded.canonicalRoots);
-  const target = inventory.find((record) => record.canonicalRoot === globalRoot);
-  const overlaps = findOverlappingSkills(target, inventory);
-  assert.deepEqual(new Set(overlaps.map((record) => record.logicalName)), new Set(["review", "failure-review"]));
 });
 
 test("malformed frontmatter reports missing fields and invalid descriptions", () => {

@@ -1,6 +1,7 @@
 import { createMockKeys, createMockMouse } from "@opentui/core/testing";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as wait } from "node:timers/promises";
 
 const PLUGIN_ID = "mcrescenzo.self-evolve-host-spike";
 const WITNESS_ID = "mcrescenzo.self-evolve-host-spike-witness";
@@ -14,8 +15,6 @@ const REQUIRED_VERSION = "1.18.3";
 const RECEIPT_SCHEMA_VERSION = 1;
 const WAIT_MS = 30_000;
 const decoder = new TextDecoder();
-
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function spikeError(code, message) {
   const error = new Error(message);
@@ -224,7 +223,7 @@ async function runStageOne(api, state) {
   await eventually(() => pluginStatus(api).length === 1 && pluginStatus(api)[0].active, "packed product activation");
   const initialEvents = await eventually(async () => {
     const events = await productEvents(eventsPath);
-    return events.some((event) => event.type === "activated" && event.targetIsTsx === true
+    return events.some((event) => event.type === "activated" && event.targetIsBuilt === true
       && event.productVersion === state.productVersion && event.hostVersion === REQUIRED_VERSION) ? events : false;
   }, "packed target identity");
   if (initialEvents.filter((event) => event.type === "activated").length !== 1) {

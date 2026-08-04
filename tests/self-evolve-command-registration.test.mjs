@@ -29,7 +29,7 @@ function trackedOutput(text = "original") {
   let mutations = 0;
   parts.splice = function (...args) {
     mutations += 1;
-    return splice.apply(this, args);
+    return splice.call(this, ...args);
   };
   return {
     output: { parts },

@@ -4,7 +4,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { createApplier } from "../self-evolve-applier.js";
 import { createCommandPolicy } from "../self-evolve-commands.js";
 import * as commandModule from "../self-evolve-commands.js";
@@ -22,7 +21,7 @@ const PROJECT = inventoryModule.hashSkillContent("pipeline-project");
 const SCOPE = inventoryModule.hashSkillContent("pipeline-scope");
 const CURRENT = "---\nname: durable-review\ndescription: Reviews repeated commands with bounded evidence.\n---\n\n# Durable Review\n\nCheck the command once.\n";
 const PROPOSED = `${CURRENT}\nWhen the same command recurs, verify the result before continuing.\n`;
-const SYNTHESIS_CRASH_CHILD = fileURLToPath(new URL("./fixtures/synthesis-attempt-crash.mjs", import.meta.url));
+const SYNTHESIS_CRASH_CHILD = path.join(import.meta.dirname, "fixtures", "synthesis-attempt-crash.mjs");
 
 function runKilledSynthesis(args) {
   return new Promise((resolve, reject) => {
@@ -299,6 +298,30 @@ test("non-eligible scan records observations and exact default threshold explana
   assert.equal(f.calls.create.length, 0);
 });
 
+test("project-local skills synthesize recommendations without an apply allowlist", async (t) => {
+  const f = fixture(t);
+  const repoSkillRoot = path.join(f.temp, ".opencode", "skills");
+  const repoSkillPath = path.join(repoSkillRoot, "durable-review", "SKILL.md");
+  fs.mkdirSync(path.dirname(repoSkillPath), { recursive: true });
+  fs.writeFileSync(repoSkillPath, CURRENT);
+
+  let result;
+  for (let index = 1; index <= 3; index += 1) {
+    const sessionID = `repo-discovery-${index}`;
+    f.messages.set(sessionID, commandMessages("/repo-discovery"));
+    result = await scan(f, sessionID, {
+      inventoryRecords: undefined,
+      targetSkill: undefined,
+      projectRoot: f.temp,
+    });
+  }
+
+  assert.equal(result.result, "proposal-pending");
+  assert.equal(result.proposal.skillTarget.canonicalRoot, repoSkillRoot);
+  assert.equal(f.runtime.store.getSettings().global.allowedSkillRoots.length, 0);
+  assert.equal(f.calls.apply.length, 0);
+});
+
 test("passive synthesis reserves both provider slots before either hidden session starts", async (t) => {
   const f = fixture(t);
   const reservations = [];
@@ -339,7 +362,12 @@ test("production synthesis attempts persist exactly one bounded terminal status"
   ]) {
     await t.test(providerScenario, async (t) => {
       const f = fixture(t, { providerScenario });
-      await seedEligible(f, `status-${providerScenario}`, `/status-${providerScenario}`);
+      const result = await seedEligible(f, `status-${providerScenario}`, `/status-${providerScenario}`);
+      assert.equal(result.result, providerScenario === "no-change" ? "no-change" : "failed-closed");
+      assert.equal(
+        result.cycleOutcome,
+        providerScenario === "no-change" ? "valid-no-change" : "failed-closed",
+      );
       const outcomes = f.runtime.store.readRecords("audit-event").filter((record) => record.payload.details.action === "synthesis-outcome");
       assert.equal(outcomes.length, 1);
       assert.equal(outcomes[0].payload.details.status, status);

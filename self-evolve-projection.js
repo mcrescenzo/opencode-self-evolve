@@ -1,14 +1,21 @@
 import { createHash } from "node:crypto";
 import { scanForSecretCanaries, scanForUnsafeContent } from "./self-evolve-inventory.js";
-import { resolveMode } from "./self-evolve-schemas.js";
+import { deepFreeze, resolveMode } from "./self-evolve-schemas.js";
 import {
   UI_ACTION_CAPABILITIES,
   UI_CAPABILITIES,
+  UI_DASHBOARD_CAPABILITIES,
+  UI_DASHBOARD_AUTOMATION_STATES,
+  UI_DASHBOARD_BLOCKER_CODES,
+  UI_DASHBOARD_OUTCOMES,
+  UI_DASHBOARD_REASON_CODES,
+  UI_DASHBOARD_VERSION,
   UI_PROJECTION_VERSION,
   UI_PROTOCOL_LIMITS,
   assertUiProjectionFootprint,
   canonicalUiJson,
   hashUiProtocol,
+  makeUiDashboard,
   makeUiOverflowMarker,
   makeUiProjectionIndex,
   makeUiReviewDetail,
@@ -22,17 +29,11 @@ const CHECK_NAME_RE = /^[A-Za-z][A-Za-z0-9.-]{0,63}$/u;
 const PRIVATE_ID_RE = /\b(?:msg|message|ses|session)_[A-Za-z0-9_-]{4,}\b/u;
 const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu;
 const MAX_DETAIL_REVISION = 1_000_000;
+const CYCLE_OUTCOMES = new Set(UI_DASHBOARD_OUTCOMES.slice(0, 9));
+const DASHBOARD_REASONS = new Set(UI_DASHBOARD_REASON_CODES);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function deepFreeze(value) {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const child of Object.values(value)) deepFreeze(child);
-  }
-  return value;
 }
 
 function truncateUtf8(value, maxBytes) {
@@ -349,7 +350,6 @@ function auditSummary(event) {
 function auditFor(proposal, auditRecords) {
   return (auditRecords ?? [])
     .map((record) => record.payload)
-    .filter((event) => event.proposalId === proposal.id)
     .map((event) => ({
       id: event.id,
       kind: event.kind,
@@ -362,8 +362,7 @@ function auditFor(proposal, auditRecords) {
 function latestAppliedAudit(proposal, auditRecords) {
   return [...(auditRecords ?? [])].reverse()
     .map((record) => record.payload)
-    .find((event) => event.proposalId === proposal.id
-      && event.kind === "apply"
+    .find((event) => event.kind === "apply"
       && event.details?.["readback-verified"] === true
       && HASH_RE.test(String(event.details?.appliedHash ?? "")));
 }
@@ -375,7 +374,6 @@ function matchingLegacyGrant(proposal, auditRecords, now) {
       const value = event.details;
       return event.kind === "decision"
         && event.actor === "self-evolve-integration"
-        && event.proposalId === proposal.id
         && value?.action === "bridge-nonce"
         && value.projectFingerprint === proposal.projectFingerprint
         && value.subjectId === proposal.id
@@ -529,20 +527,23 @@ function detailRevision(proposalId, byKind) {
 }
 
 function statusFrom(settings, health, breakerOpen, effectiveMode) {
+  const backgroundRestartRequired = health.passiveEventHookInstalled === false && effectiveMode !== "manual";
   const state = health.state
     ?? (health.terminal ? "terminal"
       : health.corrupt ? "corrupt"
         : health.startupPending ? "startup-pending"
-          : health.setupRequired ? "setup-required"
+          : health.setupRequired || backgroundRestartRequired ? "setup-required"
             : health.unavailable ? "unavailable"
               : "ready");
   return {
     state,
     reason: state === "ready"
       ? null
-      : REASON_CODE_RE.test(String(health.reason ?? ""))
-        ? String(health.reason)
-        : state,
+      : backgroundRestartRequired
+        ? "restart-required"
+        : REASON_CODE_RE.test(String(health.reason ?? ""))
+          ? String(health.reason)
+          : state,
     storedMode: settings.global.mode,
     effectiveMode,
     paused: settings.global.paused,
@@ -570,7 +571,6 @@ function indexAllowedActions(operationGrants, expiresAt, statusState) {
     "export-data",
     "purge-all",
     "purge-scope",
-    "retry-bootstrap",
     "set-kill-switch",
     "set-paused",
   ]) {
@@ -578,6 +578,503 @@ function indexAllowedActions(operationGrants, expiresAt, statusState) {
     if (grant) output.push(actionGrant(action, grant, expiresAt));
   }
   return output.sort((left, right) => left.action.localeCompare(right.action));
+}
+
+function exactFieldSet(value, fields) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === fields.length
+    && fields.every((field) => Object.hasOwn(value, field));
+}
+
+function cycleTriggerClass(value) {
+  return ["manual", "idle", "recovery", "other"].includes(value) ? value : "other";
+}
+
+function cycleAuditValue(record) {
+  const event = record?.payload;
+  const details = event?.details;
+  const fields = [
+    "action", "outcome", "triggerClass", "mode", "observationCount",
+    "eligibilityCount", "occurredAt", "reason",
+  ];
+  if (record?.kind !== "audit-event"
+      || event?.kind !== "decision"
+      || event.actor !== "self-evolve-integration"
+      || !exactFieldSet(details, fields)
+      || details.action !== "cycle-outcome"
+      || !CYCLE_OUTCOMES.has(details.outcome)
+      || !["manual", "auto", "yolo"].includes(details.mode)
+      || !Number.isSafeInteger(details.observationCount)
+      || details.observationCount < 0
+      || !Number.isSafeInteger(details.eligibilityCount)
+      || details.eligibilityCount < 0
+      || !Number.isSafeInteger(details.occurredAt)
+      || details.occurredAt !== event.timestamp
+      || (details.reason !== null && !DASHBOARD_REASONS.has(details.reason))) return null;
+  return {
+    outcome: details.outcome,
+    triggerClass: cycleTriggerClass(details.triggerClass),
+    mode: details.mode,
+    observationCount: details.observationCount,
+    eligibilityCount: details.eligibilityCount,
+    proposalId: typeof event.proposalId === "string"
+      && ID_RE.test(event.proposalId)
+      && !PRIVATE_ID_RE.test(event.proposalId)
+      ? event.proposalId
+      : null,
+    occurredAt: event.timestamp,
+    reason: details.reason,
+  };
+}
+
+function cycleSummary(outcome) {
+  return {
+    "cursor-unchanged": "No duplicate work was created because this activity was already processed.",
+    "no-observations": "The cycle completed without new structured observations.",
+    "not-eligible": "Saved structured patterns are not yet eligible for a recommendation.",
+    "valid-no-change": "Analysis completed successfully and found no useful safe change.",
+    "recommendation-created": "A recommendation was created and is ready for review.",
+    applied: "A recommendation was applied and verified.",
+    deferred: "The cycle was safely deferred.",
+    "failed-closed": "The cycle stopped without granting or applying unsafe authority.",
+    failed: "The cycle failed before it could complete.",
+  }[outcome] ?? "A Self-evolve cycle completed.";
+}
+
+function semanticActivity(records) {
+  const output = [];
+  for (const record of records ?? []) {
+    const cycle = cycleAuditValue(record);
+    if (cycle) {
+      output.push({
+        id: record.payload.id,
+        category: ["failed", "failed-closed"].includes(cycle.outcome) ? "error" : "cycle",
+        audience: "default",
+        outcome: cycle.outcome,
+        summary: cycleSummary(cycle.outcome),
+        occurredAt: cycle.occurredAt,
+        proposalId: cycle.proposalId,
+        reason: cycle.reason,
+      });
+      continue;
+    }
+    const event = record?.payload;
+    if (record?.kind === "decision"
+        && ["approved", "rejected", "rolled-back"].includes(event?.newState)
+        && Number.isSafeInteger(event?.timestamp)) {
+      const outcome = {
+        approved: "recommendation-approved",
+        rejected: "recommendation-rejected",
+        "rolled-back": "rolled-back",
+      }[event.newState];
+      output.push({
+        id: record.id,
+        category: "recommendation",
+        audience: "default",
+        outcome,
+        summary: event.newState === "approved"
+          ? "A recommendation was approved for fresh server-side validation."
+          : event.newState === "rejected"
+            ? "A recommendation was dismissed without changing skill files."
+            : "A recommendation was approved for rollback.",
+        occurredAt: event.timestamp,
+        proposalId: typeof event.proposalId === "string"
+          && ID_RE.test(event.proposalId)
+          && !PRIVATE_ID_RE.test(event.proposalId)
+          ? event.proposalId
+          : null,
+        reason: null,
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.kind === "apply"
+        && event.details?.["readback-verified"] === true) {
+      output.push({
+        id: event.id,
+        category: "recommendation",
+        audience: "default",
+        outcome: "applied",
+        summary: "A Self-evolve change was applied and readback was verified.",
+        occurredAt: event.timestamp,
+        proposalId: typeof event.proposalId === "string" && ID_RE.test(event.proposalId) ? event.proposalId : null,
+        reason: null,
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.kind === "decision"
+        && event.details?.action === "snooze"
+        && Number.isSafeInteger(event.details?.snoozedUntil)) {
+      output.push({
+        id: event.id,
+        category: "recommendation",
+        audience: "default",
+        outcome: "recommendation-snoozed",
+        summary: "A recommendation remains pending and was snoozed until the requested time.",
+        occurredAt: event.timestamp,
+        proposalId: typeof event.proposalId === "string"
+          && ID_RE.test(event.proposalId)
+          && !PRIVATE_ID_RE.test(event.proposalId)
+          ? event.proposalId
+          : null,
+        reason: null,
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.kind === "mode-change"
+        && ["pause", "resume", "exclude", "include"].includes(event.details?.action)) {
+      const mapping = {
+        pause: ["paused", "Automatic work was paused.", "paused"],
+        resume: ["resumed", "Automatic work was resumed.", null],
+        exclude: ["project-excluded", "This project was excluded from automatic work.", "repository-excluded"],
+        include: ["project-included", "This project was included in automatic work.", null],
+      };
+      const [outcome, summary, reason] = mapping[event.details.action];
+      output.push({
+        id: event.id,
+        category: "system",
+        audience: "default",
+        outcome,
+        summary,
+        occurredAt: event.timestamp,
+        proposalId: null,
+        reason,
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.kind === "kill-switch"
+        && ["on", "off"].includes(event.details?.action)) {
+      output.push({
+        id: event.id,
+        category: "system",
+        audience: "default",
+        outcome: event.details.action === "on" ? "emergency-stop-enabled" : "emergency-stop-disabled",
+        summary: event.details.action === "on"
+          ? "Emergency stop disabled automatic provider calls and writes."
+          : "Emergency stop was turned off after review.",
+        occurredAt: event.timestamp,
+        proposalId: null,
+        reason: event.details.action === "on" ? "emergency-stop" : null,
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.kind === "decision"
+        && event.details?.action === "ui-operation-complete"
+        && event.details?.accepted === true
+        && ["export-data", "purge-scope", "purge-all"].includes(event.details?.uiAction)) {
+      const purgeAll = event.details.uiAction === "purge-all";
+      output.push({
+        id: event.id,
+        category: "system",
+        audience: "default",
+        outcome: event.details.uiAction === "export-data"
+          ? "export-completed"
+          : purgeAll ? "purge-all-accepted" : "purge-completed",
+        summary: event.details.uiAction === "export-data"
+          ? "A private, short-lived sensitive export was completed."
+          : purgeAll
+            ? "A full purge was accepted and Self-evolve stopped its authority."
+            : "A scoped purge completed.",
+        occurredAt: event.timestamp,
+        proposalId: null,
+        reason: null,
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.kind === "decision"
+        && event.details?.action === "boot"
+        && typeof event.details?.hostVersion === "string") {
+      const recovered = Number.isSafeInteger(event.details.recovered) && event.details.recovered > 0;
+      output.push({
+        id: event.id,
+        category: "system",
+        audience: "default",
+        outcome: recovered ? "recovery-completed" : "bootstrap-completed",
+        summary: recovered
+          ? "Startup checks completed and bounded recovery work was reconciled."
+          : "Startup checks completed successfully.",
+        occurredAt: event.timestamp,
+        proposalId: null,
+        reason: null,
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.kind === "rollback"
+        && event.details?.["readback-verified"] === true) {
+      output.push({
+        id: event.id,
+        category: "recommendation",
+        audience: "default",
+        outcome: "rolled-back",
+        summary: "A Self-evolve change was rolled back and readback was verified.",
+        occurredAt: event.timestamp,
+        proposalId: typeof event.proposalId === "string" && ID_RE.test(event.proposalId) ? event.proposalId : null,
+        reason: null,
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.actor === "self-evolve-scheduler"
+        && event.details?.action === "work-failure"
+        && Number.isSafeInteger(event.details?.backoffUntil)) {
+      output.push({
+        id: event.id,
+        category: "error",
+        audience: "default",
+        outcome: "failed",
+        summary: "Automatic work failed and entered bounded backoff.",
+        occurredAt: event.timestamp,
+        proposalId: null,
+        reason: "backoff",
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.actor === "self-evolve-scheduler"
+        && event.details?.action === "schedule-suppressed"
+        && ["quiet-period", "budget-exhausted"].includes(event.details?.reason)) {
+      output.push({
+        id: event.id,
+        category: "system",
+        audience: "diagnostic",
+        outcome: "deferred",
+        summary: event.details.reason === "quiet-period"
+          ? "Automatic work waited for the configured quiet period."
+          : "Automatic work waited because a configured budget was exhausted.",
+        occurredAt: event.timestamp,
+        proposalId: null,
+        reason: event.details.reason === "quiet-period" ? "quiet-period" : "synthesis-budget-exhausted",
+      });
+      continue;
+    }
+    if (record?.kind === "circuit-breaker" && typeof event?.open === "boolean") {
+      output.push({
+        id: record.id,
+        category: event.open ? "error" : "system",
+        audience: "default",
+        outcome: event.open ? "breaker-open" : "breaker-recovered",
+        summary: event.open
+          ? "Automatic work paused after repeated failures."
+          : "The automatic-work circuit breaker was reset.",
+        occurredAt: event.openedAt ?? record.createdAt,
+        proposalId: null,
+        reason: event.open ? "three-failures-in-24h" : null,
+      });
+    }
+  }
+  const deduplicated = new Map();
+  for (const entry of output) deduplicated.set(entry.id, entry);
+  return [...deduplicated.values()]
+    .sort((left, right) => right.occurredAt - left.occurredAt || left.id.localeCompare(right.id));
+}
+
+function latestBackoffUntil(records, now) {
+  return Math.max(0, ...(records ?? [])
+    .filter((record) => record.kind === "audit-event"
+      && record.payload?.actor === "self-evolve-scheduler"
+      && record.payload?.details?.action === "work-failure"
+      && Number.isSafeInteger(record.payload.details.backoffUntil)
+      && record.payload.details.backoffUntil > now)
+    .map((record) => record.payload.details.backoffUntil));
+}
+
+function rolloutSummary(records, health) {
+  if (health.rollout) return health.rollout;
+  const outcomes = new Map();
+  for (const record of records ?? []) {
+    const details = record.kind === "audit-event" ? record.payload?.details : null;
+    if (details?.action !== "synthesis-outcome"
+        || typeof details.outcomeId !== "string"
+        || outcomes.has(details.outcomeId)
+        || typeof details.success !== "boolean") continue;
+    outcomes.set(details.outcomeId, details.success);
+  }
+  const synthesesObserved = outcomes.size;
+  const successes = [...outcomes.values()].filter(Boolean).length;
+  const minSynthesesObserved = Number.isSafeInteger(health.minSynthesesObserved) ? health.minSynthesesObserved : 10;
+  const minSuccessRateBasisPoints = Number.isSafeInteger(health.minSuccessRateBasisPoints)
+    ? health.minSuccessRateBasisPoints
+    : 8_000;
+  const successRateBasisPoints = synthesesObserved ? Math.floor((successes * 10_000) / synthesesObserved) : 0;
+  return {
+    ready: synthesesObserved >= minSynthesesObserved && successRateBasisPoints >= minSuccessRateBasisPoints,
+    synthesesObserved,
+    minSynthesesObserved,
+    successRateBasisPoints,
+    minSuccessRateBasisPoints,
+  };
+}
+
+function dashboardBlockers(snapshot, health, breakerOpen, effectiveMode) {
+  const output = [];
+  const add = (code, summary, destination = "settings") => output.push({ code, summary, destination });
+  const globalSettings = snapshot.settings.global;
+  const consent = globalSettings.consent;
+  const firstRun = effectiveMode === "manual"
+    && globalSettings.mode === "manual"
+    && globalSettings.createdAt === globalSettings.updatedAt
+    && consent.passiveCalls === false
+    && consent.durableObservations === false
+    && consent.sanitizedExcerpts === false
+    && consent.crossRepoAggregation === false;
+  if (health.corrupt === true) add("corrupt-state", "Stored state could not be validated.", "activity-errors");
+  if (health.hostSupported === false) add("unsupported-host", "This OpenCode host version is not supported.");
+  if (health.stateRootReady === false) add("state-root", "The official OpenCode state root is not validated.");
+  if (health.providerReady === false) add("provider", "Background analysis has no usable provider.");
+  if (snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true) {
+    add("emergency-stop", "Emergency stop disables automatic provider and write authority.");
+  }
+  if (breakerOpen) add("circuit-breaker", "Repeated failures paused automatic work.", "activity-errors");
+  if (snapshot.settings.global.paused) add("paused", "Automatic work is paused.", "home");
+  if (snapshot.settings.repo.excluded) add("repository-excluded", "This project is excluded from automatic work.");
+  if (firstRun) add("first-run", "Automatic recommendations have not been set up yet.", "home");
+  if (health.passiveEventHookInstalled === false && effectiveMode !== "manual") {
+    add("restart-required", "Background analysis is awaiting an OpenCode restart before it can activate.");
+  }
+  if (effectiveMode !== "manual") {
+    if (!snapshot.settings.global.consent.passiveCalls) add("passive-consent", "Background AI analysis is not allowed.");
+    if (!snapshot.settings.global.consent.durableObservations) add("observation-consent", "Saved structured patterns are not allowed.");
+  }
+  if (effectiveMode === "yolo" && !snapshot.settings.global.allowedSkillRoots.length) {
+    add("approved-skill-folders", "No approved skill folder is configured.");
+  }
+  const rollout = rolloutSummary(snapshot.records, health);
+  if (effectiveMode === "yolo" && !rollout.ready) add("yolo-rollout", "Automatic apply rollout evidence is not ready.");
+  const order = new Map(UI_DASHBOARD_BLOCKER_CODES.map((code, index) => [code, index]));
+  return output
+    .filter((item, index, values) => values.findIndex((candidate) => candidate.code === item.code) === index)
+    .sort((left, right) => order.get(left.code) - order.get(right.code));
+}
+
+function dashboardAutomation({
+  status,
+  snapshot,
+  health,
+  breakerOpen,
+  effectiveMode,
+  blockers,
+  backoffUntil,
+}) {
+  let state;
+  let reason = null;
+  if (status.state === "terminal") state = "terminal";
+  else if (status.state === "corrupt" || status.state === "unavailable") state = "corrupt";
+  else if (snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true) state = "emergency-stop";
+  else if (breakerOpen) state = "circuit-breaker";
+  else if (snapshot.settings.global.paused) state = "paused";
+  else if (snapshot.settings.repo.excluded) state = "excluded";
+  else if (effectiveMode === "manual") state = "on-demand";
+  else if (blockers.length || status.state === "setup-required") state = "setup-required";
+  else if ((health.inFlightCount ?? 0) > 0) state = "running";
+  else if (backoffUntil > health.now) {
+    state = "backoff";
+    reason = "backoff";
+  } else if (snapshot.usage.passive.remaining === 0 || snapshot.usage.synthesis.remaining === 0) {
+    state = "budget";
+    reason = snapshot.usage.passive.remaining === 0
+      ? "passive-provider-budget-exhausted"
+      : "synthesis-budget-exhausted";
+  } else if (health.budgetStatus?.withinQuietPeriod === true) {
+    state = "quiet-period";
+    reason = "quiet-period";
+  } else state = "ready";
+  if (!UI_DASHBOARD_AUTOMATION_STATES.includes(state)) throw new Error("invalid-dashboard-automation-state");
+  return { state, reason };
+}
+
+function buildDashboard(snapshot, {
+  index,
+  stateRootIdentity,
+  now,
+  status,
+  effectiveMode,
+  breakerOpen,
+  health,
+  supportedCapabilities,
+  dashboardCapabilities,
+}) {
+  const records = snapshot.records ?? [];
+  const blockers = dashboardBlockers(snapshot, health, breakerOpen, effectiveMode);
+  const backoffUntil = latestBackoffUntil(records, now);
+  const automation = dashboardAutomation({
+    status,
+    snapshot,
+    health: { ...health, now },
+    breakerOpen,
+    effectiveMode,
+    blockers,
+    backoffUntil,
+  });
+  const activities = semanticActivity(records);
+  const boundedActivity = bounded(activities, UI_PROTOCOL_LIMITS.activityEntries);
+  const lastCycleRecord = [...records].reverse().map(cycleAuditValue).find(Boolean) ?? null;
+  const inFlightCount = Math.max(0, Math.min(1_000, Number.isSafeInteger(health.inFlightCount) ? health.inFlightCount : 0));
+  const inFlightStartedAt = inFlightCount > 0 && Number.isSafeInteger(health.inFlightStartedAt)
+    ? health.inFlightStartedAt
+    : inFlightCount > 0 ? now : null;
+  const nextEligibleAt = Math.max(
+    0,
+    backoffUntil,
+    snapshot.usage.passive.remaining === 0 ? snapshot.usage.passive.resetAt ?? 0 : 0,
+    snapshot.usage.synthesis.remaining === 0 ? snapshot.usage.synthesis.resetAt ?? 0 : 0,
+    Number.isSafeInteger(health.nextEligibleAt) ? health.nextEligibleAt : 0,
+  ) || null;
+  const body = {
+    dashboardVersion: UI_DASHBOARD_VERSION,
+    projectFingerprint: snapshot.projectFingerprint,
+    stateRootIdentity,
+    generation: index.generation,
+    indexHash: index.projectionHash,
+    generatedAt: now,
+    capabilities: dashboardCapabilities,
+    automation,
+    blockers,
+    inFlight: {
+      active: inFlightCount > 0,
+      count: inFlightCount,
+      stage: inFlightCount > 0 ? (health.inFlightStage ?? "pipeline") : null,
+      startedAt: inFlightStartedAt,
+    },
+    lastCycle: lastCycleRecord,
+    nextEligibleAt,
+    usage: snapshot.usage,
+    rollout: rolloutSummary(records, health),
+    settings: {
+      globalMode: snapshot.settings.global.mode,
+      repositoryMode: snapshot.settings.repo.mode,
+      effectiveMode,
+      paused: snapshot.settings.global.paused,
+      killSwitchActive: snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true,
+      repositoryExcluded: snapshot.settings.repo.excluded,
+      consent: snapshot.settings.global.consent,
+      approvedSkillFolderCount: snapshot.settings.global.allowedSkillRoots.length,
+    },
+    retention: {
+      observationsDays: snapshot.settings.global.retentionDays,
+      operationalDays: 90,
+    },
+    supportedControls: Object.entries(UI_ACTION_CAPABILITIES)
+      .filter(([, capability]) => (
+        supportedCapabilities.includes(capability) || dashboardCapabilities.includes(capability)
+      ))
+      .map(([action]) => action)
+      .sort(),
+    activity: boundedActivity.included,
+    overflow: { activity: boundedActivity.overflow },
+  };
+  return makeUiDashboard({ ...body, dashboardHash: hashUiProtocol("dashboard", body) }, {
+    projectFingerprint: snapshot.projectFingerprint,
+    stateRootIdentity,
+    generation: index.generation,
+    indexHash: index.projectionHash,
+    now,
+  });
 }
 
 function assertProjectionInput(snapshot, options) {
@@ -597,11 +1094,13 @@ export function buildUiProjection(snapshot, {
   inventory,
   health = {},
   capabilities = UI_CAPABILITIES,
+  dashboardCapabilities = UI_DASHBOARD_CAPABILITIES,
   detailProposalIds = [],
 } = {}) {
   const options = { stateRootIdentity, now };
   assertProjectionInput(snapshot, options);
   const supportedCapabilities = [...new Set(capabilities)].sort();
+  const supportedDashboardCapabilities = [...new Set(dashboardCapabilities)].sort();
   const byKind = recordsByKind(snapshot);
   const latestProposals = latestPayloads(byKind.get("proposal"), (proposal) => proposal.id);
   const proposals = [...latestProposals.values()]
@@ -617,6 +1116,14 @@ export function buildUiProjection(snapshot, {
     targets: proposals.map((proposal) => targetDescriptor(proposal, firstTargets.get(proposal.id))),
   })}`);
   const auditRecords = byKind.get("audit-event") ?? [];
+  const auditByProposal = new Map();
+  for (const record of auditRecords) {
+    const proposalId = record.payload?.proposalId;
+    if (!proposalId) continue;
+    const grouped = auditByProposal.get(proposalId) ?? [];
+    grouped.push(record);
+    auditByProposal.set(proposalId, grouped);
+  }
   const breakerOpen = (byKind.get("circuit-breaker") ?? []).at(-1)?.payload?.open === true;
   const effectiveMode = resolveMode(snapshot.settings.global.mode, snapshot.settings.repo.mode, {
     killSwitchActive: snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true,
@@ -641,19 +1148,20 @@ export function buildUiProjection(snapshot, {
   const detailCandidates = [];
 
   for (const proposal of proposals) {
+    const proposalAudits = auditByProposal.get(proposal.id) ?? [];
     const target = firstTargets.get(proposal.id);
-    const appliedAudit = latestAppliedAudit(proposal, auditRecords);
+    const appliedAudit = latestAppliedAudit(proposal, proposalAudits);
     const integrity = combineIntegrity(
       targetIntegrity(proposal, target, appliedAudit),
       inventoryIntegrity(proposal, target, inventory, snapshot.settings.global.allowedSkillRoots),
     );
     const content = decodeProposalContent(proposal, byKind.get("proposal-content"));
     const risk = riskFor(proposal, integrity, content);
-    const auditValues = auditFor(proposal, auditRecords);
+    const auditValues = auditFor(proposal, proposalAudits);
     const boundedAudit = bounded(auditValues, UI_PROTOCOL_LIMITS.auditEntries);
     const evidenceValues = evidenceFor(proposal, byKind.get("evidence-cluster"));
     const boundedEvidence = bounded(evidenceValues, UI_PROTOCOL_LIMITS.evidenceEntries);
-    const legacyGrant = matchingLegacyGrant(proposal, auditRecords, now);
+    const legacyGrant = matchingLegacyGrant(proposal, proposalAudits, now);
     const allowedActions = detailAllowedActions({
       proposal,
       effectiveMode,
@@ -700,7 +1208,7 @@ export function buildUiProjection(snapshot, {
         },
         eligibility: eligibilityFor(proposal, byKind.get("eligibility-explanation")),
         rollback: rollbackFor(proposal, target, appliedAudit),
-        operation: latestDetailOperation(proposal.id, operations, auditRecords),
+        operation: latestDetailOperation(proposal.id, operations, proposalAudits),
       },
       diff: makeDiff(proposal, target, content, integrity),
       evidence: boundedEvidence.included,
@@ -778,6 +1286,17 @@ export function buildUiProjection(snapshot, {
     now,
     supportedCapabilities,
   });
+  const dashboard = buildDashboard(snapshot, {
+    index,
+    stateRootIdentity,
+    now,
+    status,
+    effectiveMode,
+    breakerOpen,
+    health,
+    supportedCapabilities,
+    dashboardCapabilities: supportedDashboardCapabilities,
+  });
   const requested = [...new Set(detailProposalIds)].slice(0, UI_PROTOCOL_LIMITS.residentDetails);
   const detailById = new Map(detailCandidates.map((candidate) => [candidate.proposal.id, candidate.detail]));
   const publicationDetails = boundedReviews.included.map((review) => detailById.get(review.proposalId));
@@ -802,6 +1321,7 @@ export function buildUiProjection(snapshot, {
   return deepFreeze({
     generation,
     index: footprint.index,
+    dashboard,
     publicationDetails,
     details: footprint.details,
     unavailableDetailIds: unavailableDetailIds.sort(),

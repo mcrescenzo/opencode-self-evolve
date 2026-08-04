@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -118,6 +118,7 @@ function harness(t, config = {}) {
     cancelled: [],
     workResults: [],
     reservations: [],
+    episodeLeases: [],
     recoveries: 0,
     synthesisRecoveries: 0,
     published: [],
@@ -231,6 +232,10 @@ function harness(t, config = {}) {
         getCircuitBreaker: () => ({ open: config.breakerOpen === true }),
         cancelPending(sessionID) { calls.cancelled.push(sessionID); return true; },
         reservePassiveProviderCalls(count, context) { calls.reservations.push({ count, context }); return { ok: true, reserved: count }; },
+        async runWithEpisodeLease(scope, operation) {
+          calls.episodeLeases.push(scope);
+          return { ok: true, value: await operation() };
+        },
         recordWorkResult(item, result) { calls.workResults.push({ item, result }); return { accepted: true }; },
         dispose() {},
       };
@@ -308,6 +313,52 @@ test("all three modes preserve identical evidence and proposal thresholds", asyn
   }
 });
 
+test("every admitted cycle records one bounded semantic terminal outcome", async (t) => {
+  const h = harness(t);
+  assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+  const result = await h.integration.runEvolutionCycle({
+    sessionID: "session-sensitive-id",
+    projectFingerprint: FINGERPRINT,
+    scopeFingerprint: FINGERPRINT,
+    trigger: "scheduler",
+  });
+  assert.equal(result.result, "proposal-ready");
+  const outcomes = h.store.readRecords("audit-event")
+    .map((record) => record.payload)
+    .filter((event) => event.details?.action === "cycle-outcome");
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].proposalId, result.proposal.id);
+  assert.deepEqual(outcomes[0].details, {
+    action: "cycle-outcome",
+    outcome: "recommendation-created",
+    triggerClass: "idle",
+    mode: "auto",
+    observationCount: 1,
+    eligibilityCount: 1,
+    occurredAt: outcomes[0].timestamp,
+    reason: null,
+  });
+  assert.doesNotMatch(JSON.stringify(outcomes[0]), /session-sensitive-id/u);
+
+  const failed = harness(t, { cycleError: "private provider detail" });
+  await assert.rejects(
+    failed.integration.runEvolutionCycle({
+      sessionID: "another-sensitive-session",
+      projectFingerprint: FINGERPRINT,
+      trigger: "manual-command",
+    }),
+    /private provider detail/u,
+  );
+  const failedOutcomes = failed.store.readRecords("audit-event")
+    .map((record) => record.payload)
+    .filter((event) => event.details?.action === "cycle-outcome");
+  assert.equal(failedOutcomes.length, 1);
+  assert.equal(failedOutcomes[0].details.outcome, "failed");
+  assert.equal(failedOutcomes[0].details.triggerClass, "manual");
+  assert.equal(failedOutcomes[0].details.reason, "pipeline-failed");
+  assert.doesNotMatch(JSON.stringify(failedOutcomes[0]), /private provider detail|another-sensitive-session/u);
+});
+
 test("manual mode has no passive scheduler activity or writes", async (t) => {
   const h = harness(t);
   const before = h.store.exportAll().records.length;
@@ -315,6 +366,40 @@ test("manual mode has no passive scheduler activity or writes", async (t) => {
   assert.deepEqual(result, { scheduled: false, reason: "manual-mode" });
   assert.equal(h.calls.events.length, 0);
   assert.equal(h.store.exportAll().records.length, before);
+});
+
+test("manual scan commands hold the scheduler episode lease", async (t) => {
+  const h = harness(t);
+  const result = await h.integration.handleCommand({
+    command: { verb: "scan" },
+    sessionID: "manual-source-session",
+    projectFingerprint: FINGERPRINT,
+    scopeFingerprint: FINGERPRINT,
+  });
+  assert.equal(result.result, "proposal-ready");
+  assert.deepEqual(h.calls.episodeLeases, [{
+    projectFingerprint: FINGERPRINT,
+    sessionID: "manual-source-session",
+  }]);
+});
+
+test("status and health disclose when automatic background analysis awaits restart", async (t) => {
+  const h = harness(t, { integrationOptions: { passiveEventHookInstalled: false } });
+  assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+  for (const verb of ["status", "health"]) {
+    const result = await h.integration.handleCommand({
+      command: { verb },
+      projectFingerprint: FINGERPRINT,
+    });
+    assert.match(result.responseText, /Background analysis is awaiting an OpenCode restart/u);
+  }
+  assert.deepEqual(
+    {
+      passiveEventHookInstalled: h.integration.__testBridge.getHealth().passiveEventHookInstalled,
+      backgroundRestartRequired: h.integration.__testBridge.getHealth().backgroundRestartRequired,
+    },
+    { passiveEventHookInstalled: false, backgroundRestartRequired: true },
+  );
 });
 
 test("stream delta bursts perform zero durable integration work in every mode", async (t) => {
@@ -457,6 +542,7 @@ test("an empty manual mailbox pass reads settings once and skips decision-nonce 
 
 test("the production integration publishes a negotiated server-authored UI projection", async (t) => {
   const h = harness(t, {
+    initialClock: Date.now(),
     inventory: inventoryModule,
     integrationOptions: { stateRoot: true },
   });
@@ -476,6 +562,164 @@ test("the production integration publishes a negotiated server-authored UI proje
   assert.equal(projected.index.projectFingerprint, FINGERPRINT);
   assert.equal(projected.index.status.effectiveMode, "manual");
   assert.deepEqual(projected.index.reviews, []);
+  assert.equal(projected.dashboard.indexHash, projected.index.projectionHash);
+  assert.equal(projected.dashboard.automation.state, "on-demand");
+  assert.equal(projected.dashboard.usage.storage.usedBytes > 0, true);
+  assert.equal(projected.dashboardError, null);
+});
+
+test("repository mode control is capability-advertised, exact, version-bound, replay-safe, and yolo-gated", async (t) => {
+  const h = harness(t, {
+    initialClock: Date.now(),
+    inventory: inventoryModule,
+    integrationOptions: { stateRoot: true },
+  });
+  await h.integration.processMailbox();
+  let projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  assert.equal(projected.capabilities.includes("control-repo-mode-v1"), false);
+  assert.equal(projected.dashboard.capabilities.includes("control-repo-mode-v1"), true);
+  assert.equal(projected.dashboard.supportedControls.includes("set-repo-mode"), true);
+
+  for (const mode of ["manual", "auto", "yolo", "inherit"]) {
+    const controlState = readControlState(h.root, FINGERPRINT, { now: h.now() });
+    const request = createControlRequest({
+      controlState,
+      action: "set-repo-mode",
+      payload: { mode },
+      timestamp: h.now(),
+      requestId: `repository-mode-${mode}`,
+    });
+    submitControlRequest(h.root, request);
+    const pass = await h.integration.processMailbox();
+    assert.equal(pass.controls.length, 1);
+    const response = pollControlResponse(h.root, FINGERPRINT, request.requestId);
+    assert.equal(response.ok, true, `${mode}: ${response.reason}`);
+    assert.equal(h.store.getSettings().repo.mode, mode);
+    submitControlRequest(h.root, request);
+    await h.integration.processMailbox();
+    assert.equal(h.store.getSettings().repo.mode, mode, "replay recovery must not repeat the settings mutation");
+    if (mode === "yolo") {
+      const yoloState = readControlState(h.root, FINGERPRINT, { now: h.now() });
+      const empty = createControlRequest({
+        controlState: yoloState,
+        action: "update-allowlist",
+        payload: { allowlist: [], confirmation: "UPDATE ALLOWLIST" },
+        timestamp: h.now(),
+        requestId: "repository-yolo-empty-allowlist",
+      });
+      submitControlRequest(h.root, empty);
+      await h.integration.processMailbox();
+      assert.equal(pollControlResponse(h.root, FINGERPRINT, empty.requestId).reason, "yolo-allowlist-required");
+      assert.deepEqual(h.store.getSettings().global.allowedSkillRoots, [h.root]);
+    }
+  }
+  const repoTransitions = h.store.readRecords("audit-event")
+    .map((record) => record.payload)
+    .filter((event) => event.kind === "mode-change" && event.details?.scope === "repo");
+  assert.deepEqual(repoTransitions.map((event) => event.details.requestedMode), [
+    "manual", "auto", "yolo", "inherit",
+  ]);
+
+  projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  assert.equal(projected.dashboard.settings.repositoryMode, "inherit");
+
+  const staleState = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  assert.equal(h.integration.__testBridge.setMode("manual").ok, true);
+  const stale = createControlRequest({
+    controlState: staleState,
+    action: "set-repo-mode",
+    payload: { mode: "auto" },
+    timestamp: h.now(),
+    requestId: "repository-mode-stale",
+  });
+  submitControlRequest(h.root, stale);
+  await h.integration.processMailbox();
+  assert.equal(pollControlResponse(h.root, FINGERPRINT, stale.requestId).ok, false);
+  assert.match(pollControlResponse(h.root, FINGERPRINT, stale.requestId).reason, /stale|nonce/u);
+
+  const canonicalState = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  const canonical = createControlRequest({
+    controlState: canonicalState,
+    action: "update-allowlist",
+    payload: {
+      allowlist: [path.join(h.root, "missing-skill-folder")],
+      confirmation: "UPDATE ALLOWLIST",
+    },
+    timestamp: h.now(),
+    requestId: "repository-invalid-folder",
+  });
+  submitControlRequest(h.root, canonical);
+  await h.integration.processMailbox();
+  assert.equal(pollControlResponse(h.root, FINGERPRINT, canonical.requestId).reason,
+    "invalid-or-unsupported-skill-folder");
+  assert.deepEqual(h.store.getSettings().global.allowedSkillRoots, [h.root]);
+
+  const blockedCases = [
+    {
+      name: "allowlist",
+      config: { allowlisted: false, rolloutOutcomes: 0 },
+      reason: "yolo-allowlist-required",
+    },
+    {
+      name: "consent",
+      mutate(blocked) {
+        blocked.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+          ...global,
+          consent: { ...global.consent, passiveCalls: false },
+          updatedAt: blocked.now(),
+        }));
+      },
+      reason: "passive-consent-required",
+    },
+    {
+      name: "rollout",
+      config: { rolloutOutcomes: 0 },
+      reason: "yolo-rollout-not-ready",
+    },
+    {
+      name: "breaker",
+      config: { breakerOpen: true },
+      reason: "circuit-breaker-open",
+    },
+  ];
+  for (const blockedCase of blockedCases) {
+    const blocked = harness(t, {
+      initialClock: Date.now(),
+      inventory: inventoryModule,
+      integrationOptions: { stateRoot: true },
+      ...blockedCase.config,
+    });
+    blockedCase.mutate?.(blocked);
+    await blocked.integration.processMailbox();
+    const blockedState = readControlState(blocked.root, FINGERPRINT, { now: blocked.now() });
+    const yolo = createControlRequest({
+      controlState: blockedState,
+      action: "set-repo-mode",
+      payload: { mode: "yolo" },
+      timestamp: blocked.now(),
+      requestId: `repository-yolo-blocked-${blockedCase.name}`,
+    });
+    submitControlRequest(blocked.root, yolo);
+    await blocked.integration.processMailbox();
+    const blockedResponse = pollControlResponse(blocked.root, FINGERPRINT, yolo.requestId);
+    assert.equal(blockedResponse.ok, false);
+    assert.equal(blockedResponse.reason, blockedCase.reason);
+    assert.equal(blocked.store.getSettings().repo.mode, "inherit");
+  }
 });
 
 test("native operation mailbox version-binds pause and recovers one exact response", async (t) => {
@@ -562,7 +806,9 @@ test("native purge-all acknowledges accepted-terminal before bounded destructive
       exportScope: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
       exportAll: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
       purgeScope({ scope }) {
-        return store.purge({ scope });
+        const result = store.purge({ scope });
+        if (scope === "all") throw new Error("simulated-terminal-purge-failure");
+        return result;
       },
       scanForForbiddenContent: () => ({ ok: true, issues: [] }),
     }),
@@ -598,6 +844,7 @@ test("native purge-all acknowledges accepted-terminal before bounded destructive
   purgeCallback();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(existsSync(path.join(h.root, "self-evolve")), false);
+  assert.equal(h.integration.__testBridge.getHealth().lastError, "simulated-terminal-purge-failure");
   assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: {} }), {
     scheduled: false,
     reason: "restart-required-after-purge-all",
@@ -663,6 +910,34 @@ test("auto headless command applies only the exact server-issued tuple once", as
   const replay = await withState.integration.handleCommand(command);
   assert.equal(replay.ok, false);
   assert.equal(withState.calls.applies.length, 1);
+});
+
+test("headless allowlist changes are canonical, confirmed, and mode-independent", async (t) => {
+  const h = harness(t, { inventory: inventoryModule });
+  const extra = path.join(h.root, "approved-extra");
+  mkdirSync(extra);
+  const initial = await h.integration.handleCommand("allowlist list");
+  assert.equal(initial.responseText.includes(h.root), true);
+
+  const added = await h.integration.handleCommand(`allowlist add ${extra} --confirm UPDATE ALLOWLIST`);
+  assert.equal(added.ok, true);
+  assert.deepEqual(h.store.getSettings().global.allowedSkillRoots, [h.root, extra]);
+  assert.equal(h.store.getSettings().global.mode, "manual");
+  assert.equal(h.store.getSettings().global.consent.passiveCalls, true);
+
+  const removed = await h.integration.handleCommand(`allowlist remove ${extra} --confirm UPDATE ALLOWLIST`);
+  assert.equal(removed.ok, true);
+  assert.deepEqual(h.store.getSettings().global.allowedSkillRoots, [h.root]);
+  assert.match((await h.integration.handleCommand("allowlist add /not/a/real/folder --confirm UPDATE ALLOWLIST")).responseText, /invalid-or-unsupported-skill-folder/u);
+});
+
+test("bridge nonce issuance reads audit history once for the full actionable inbox", (t) => {
+  const h = harness(t, { instrumentStore: true, integrationOptions: { stateRoot: true } });
+  seedProposal(h.store, proposal(h.root, { id: "nonce-read-one" }));
+  seedProposal(h.store, proposal(h.root, { id: "nonce-read-two" }));
+  const baseline = h.calls.recordReads;
+  h.integration.issueBridgeNonces();
+  assert.equal(h.calls.recordReads - baseline, 2, "one audit read plus one proposal read");
 });
 
 test("headless approval mismatches and manual mode fail closed without apply", async (t) => {
@@ -857,6 +1132,50 @@ test("server-side TUI bridge works without a TUI process and rejects duplicate C
   const duplicate = await h.integration.__testBridge.decide({ decision });
   assert.equal(first.ok, true);
   assert.deepEqual(duplicate, { ok: false, reason: "stale-prior-state" });
+});
+
+test("structured rejection feedback is completion-audit-only and never becomes evidence", async (t) => {
+  const h = harness(t, {
+    initialClock: Date.now(),
+    integrationOptions: {
+      stateRoot: true,
+      __testSetMailboxInterval: () => ({ unref() {} }),
+      __testClearMailboxInterval: () => {},
+    },
+  });
+  h.integration.__testBridge.setMode("auto");
+  const item = proposal(h.root, { id: "feedback-rejection" });
+  seedProposal(h.store, item, h.now());
+  await h.integration.boot({ recoverHostSessions: false });
+  const projected = readProjectInbox(h.root, FINGERPRINT, { now: h.now() })
+    .find((entry) => entry.id === item.id);
+  const request = createDecisionRequest({
+    projectFingerprint: FINGERPRINT,
+    proposal: projected,
+    newState: "rejected",
+    feedback: {
+      reason: "other",
+      text: "The recommendation duplicates a project-specific workflow.",
+    },
+    timestamp: h.now(),
+    requestId: "feedback-rejection-request",
+  });
+  submitDecisionRequest(h.root, request);
+  assert.equal((await h.integration.processMailbox()).ok, true);
+  assert.equal(pollDecisionResponse(h.root, FINGERPRINT, request.requestId).ok, true);
+  const completion = h.store.readRecords("audit-event").findLast((record) =>
+    record.payload.proposalId === item.id
+    && record.payload.details?.action === "bridge-request-complete");
+  assert.equal(completion.payload.details.rejectionFeedbackReason, "other");
+  assert.equal(
+    completion.payload.details.rejectionFeedbackText,
+    "The recommendation duplicates a project-specific workflow.",
+  );
+  assert.doesNotMatch(
+    JSON.stringify(h.store.readRecords("observation")),
+    /duplicates a project-specific workflow/u,
+  );
+  await h.integration.shutdown();
 });
 
 test("a committed decision outcome is republished after response publication fails", async (t) => {

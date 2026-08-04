@@ -4,7 +4,20 @@
 
 ## Quick Start
 
-Register the package in `opencode.json`:
+Install and register both plugin targets with OpenCode's native installer:
+
+```sh
+opencode plugin @mcrescenzo/opencode-self-evolve --global
+```
+
+`--global` updates the global OpenCode configuration. Omit it to install at
+project scope under `.opencode/`. The installer reads the package exports and
+writes the server registration to `opencode.json` and the native UI
+registration to `tui.json`. The TUI command palette exposes the same operation
+as **Install plugin** (`plugins.install`). Restart OpenCode after installation.
+
+For a manual installation, both files are required for the native UI. Register
+the package in `opencode.json`:
 
 ```json
 {
@@ -13,7 +26,9 @@ Register the package in `opencode.json`:
 }
 ```
 
-OpenCode uses Bun to install the package at startup. The standard `plugin` entry loads the server (`.`) target. Native dialogs and embedded-host version reporting require the separate TUI target in `tui.json`:
+The standard `plugin` entry loads the server (`.`) target. Register the same
+bare package in `tui.json`; OpenCode resolves its `./tui` export for that config
+kind:
 
 ```json
 {
@@ -22,7 +37,14 @@ OpenCode uses Bun to install the package at startup. The standard `plugin` entry
 }
 ```
 
-The package TUI entry has the stable ID `mcrescenzo.self-evolve`. It is shipped as raw `self-evolve-tui.tsx`, which OpenCode’s Bun-based TUI loader consumes directly without an install-time build. A source checkout can register `./self-evolve.js` in `opencode.json` and `./self-evolve-tui.tsx` in `tui.json`. Server-only/headless hosts need only the server target and may omit every optional TUI peer.
+The package TUI entry has the stable ID `mcrescenzo.self-evolve`. The published
+`./tui` export is the deterministic `self-evolve-tui.generated.js` artifact;
+the package builds it before packing, never in a consumer install hook. For a
+source checkout, register `./plugins/self-evolve/self-evolve.js` in
+`opencode.json` and the package directory `./plugins/self-evolve` in `tui.json`.
+Do not register the authoring TSX file directly. Server-only/headless hosts need
+only the server target and may omit every optional TUI peer. This plugin never
+edits external OpenCode configuration itself.
 
 The plain package entry boots durable v0.2 in fail-closed `manual` mode. No wrapper or startup mode is required. The v0.1 session-local analyzer remains available only through the explicit `durableAutonomy: false` compatibility option documented in [docs/configuration.md](docs/configuration.md).
 
@@ -39,7 +61,7 @@ Restart OpenCode after changing the durable mode so the plugin can shape its pas
 | Passive provider calls | Never | At stable idle boundaries | At stable idle boundaries |
 | Durable observations | Only on `/self-evolve` or `scan` | Automatic at idle | Automatic at idle |
 | Correlate, synthesize, validate | On invocation | Automatic | Automatic |
-| Eligible proposal | Durable headless result | Conditional sidebar review card | Conditional sidebar audit/review card |
+| Eligible proposal | Durable headless result | Recommendation deep-link from the sidebar | Recommendation or applied-result deep-link from the sidebar |
 | Apply | Never; advisory only | Explicit approval for each change | Automatic only in canonical allowlisted skill roots after release gates pass |
 | Headless | Commands and durable inbox | Apply only from an exact one-use hash/version-bound approval command | Apply only in an explicit allowlist after all gates pass |
 
@@ -49,9 +71,9 @@ Select a mode with `/self-evolve manual`, `/self-evolve auto`, or the deliberate
 /self-evolve yolo confirm --allowlist /absolute/path/to/skills
 ```
 
-In the native TUI, open **Self-evolve control center** from the command palette. It has no slash metadata and provides Overview, Reviews, Settings, Safety, Evidence, Health/Budgets, Maintenance, and Help sections. Every action is advertised by a fresh server projection and revalidated against project, state root, generation, hashes or settings version, capability, expiry, and a one-use nonce. Yolo displays the exact allowlist before confirmation; allowlist replacement has its own elevated confirmation. Excerpt and cross-repository controls warn that redaction reduces exposure but is not a secrecy guarantee.
+In the native TUI, open **Self-evolve control center** from the command palette or the persistent sidebar entry. It has no slash metadata and provides exactly four sections: Home, Recommendations, Activity, and Settings. Settings contains human mode cards, global/project/effective scope, consent dependencies, one approved skill folder per row, actual-versus-configured limits, and scoped export/delete maintenance. Every action is advertised by a fresh server projection and revalidated against project, state root, generation, hashes or settings version, capability, expiry, and a one-use nonce. Apply automatically (YOLO), allowlist replacement, sensitive export, and delete flows require their displayed exact phrase. Excerpt and cross-project controls warn that redaction reduces exposure but is not a secrecy guarantee.
 
-Background refresh only updates persistent state. The normal TUI path emits no toast, attention notification, or automatically opened dialog. Click the sidebar indicator or focus it and press Enter: neutral, setup, and operation states open the control center; review, audit, and failure states open the review surface.
+Background refresh only updates persistent state. The normal TUI path emits no toast, attention notification, or automatically opened dialog. Click the sidebar indicator, or focus it and press Enter or Space: neutral and startup states open Home, setup opens Settings, review opens the selected Recommendation, and audit/failure states open Activity.
 
 Unknown scopes and non-allowlisted targets always downgrade to pending review. Yolo is high authority: it can change skill files without per-change confirmation. Use narrow allowlisted roots, inspect audit results, and stop autonomous work immediately with `SELF_EVOLVE_KILL=1` or `/self-evolve kill-switch on`.
 
@@ -70,7 +92,7 @@ The real proposal is based on structured receipts from your sessions. It may ret
 
 ## Commands
 
-Release A keeps the complete `/self-evolve` surface as a compatibility and deterministic headless fallback. Normal interactive use is sidebar-first and does not require slash input. Manual **Scan now** remains headless because OpenCode 1.18.3 does not expose a safe native binding from the palette route to one exact source session.
+Release B keeps the complete `/self-evolve` surface as a compatibility and deterministic headless fallback. Normal interactive use is sidebar-first and does not require slash input. Manual **Scan now** remains headless because OpenCode 1.18.3 does not expose a safe native binding from the palette route to one exact source session.
 
 - `/self-evolve` opens status and the durable inbox; `/self-evolve scan` runs the shared pipeline explicitly.
 - `/self-evolve status`, `health`, and `budget` inspect state without a self-evolve analyzer or synthesis call. OpenCode 1.18.3 still completes its configured slash-command model turn after command hooks, so these are not zero-model-turn host commands.
@@ -86,13 +108,14 @@ Existing skills remain bound to an exact lowercase SHA-256 current hash. New ski
 - `/self-evolve manual`, `auto`, `yolo`, and `repo <manual|auto|yolo|inherit>` manage modes.
 - `/self-evolve exclude` and `include` control the current repository.
 - `/self-evolve consent <passive|observations|excerpts|cross-repo> <on|off>` controls privacy consent.
+- `/self-evolve allowlist list` shows approved skill folders. Add or remove one without changing mode or consent using `/self-evolve allowlist <add|remove> <canonical-absolute-path> --confirm UPDATE ALLOWLIST`; the server freshly canonicalizes the complete result.
 - `/self-evolve export [observations|proposals|project|all]` exports state.
 - `/self-evolve purge <observations|proposals|project|all>` and `/self-evolve purge --all` remove state by scope.
 - `/self-evolve kill-switch <on|off>` controls the durable emergency stop.
 
 ## Configuration
 
-Manual mode requires no allowlist or passive consent. Auto and yolo configuration covers mode and repository overrides, canonical skill-root allowlists, four separate consent keys, provider/token/concurrency/storage budgets, retention, quiet periods, and rollout gates. Passive synthesis reserves two rolling-hour provider slots durably before starting the synthesizer/critic pair; if both slots are unavailable, neither hidden session starts. The two slots are conservatively charged if the later operation no-ops or fails, while explicit manual scans do not consume this passive budget. See [docs/configuration.md](docs/configuration.md) for defaults and exact controls. The legacy `notificationsPerHour` setting remains readable for state compatibility but has no Release A scheduling or UI effect.
+Manual mode requires no allowlist or passive consent. Auto and yolo configuration covers mode and repository overrides, canonical skill-root allowlists, four separate consent keys, provider/token/concurrency/storage budgets, retention, quiet periods, and rollout gates. Passive synthesis reserves two rolling-hour provider slots durably before starting the synthesizer/critic pair; if both slots are unavailable, neither hidden session starts. The two slots are conservatively charged if the later operation no-ops or fails, while explicit manual scans do not consume this passive budget. See [docs/configuration.md](docs/configuration.md) for defaults and exact controls. The legacy `notificationsPerHour` setting remains readable for state compatibility but has no current scheduling or UI effect.
 
 ## Storage And Privacy
 
@@ -120,7 +143,7 @@ Complete transcripts and raw message bodies are never stored. Deterministic rece
 
 `storageQuotaMiB` is one total cap for the project partition, not a per-record-file allowance. The store counts repository settings, every JSONL record file, indexes, snapshots, leases, quarantine artifacts, and project bridge files, rejects symlinks, and checks projected replacement bytes while holding the cross-process mutation lock. TUI decision/control/operation requests use that same lock, share a 64-file ceiling and a conservative one-eighth-quota mailbox budget capped at 512 KiB, reserve their bounded responses, and leave store-write capacity available. Only a bounded mandatory audit event of at most 4 KiB may cross an exhausted quota so a safety-relevant settings outcome is not silently lost; ordinary failure logging cannot recursively bypass the cap.
 
-Native Maintenance exports observations, proposals, the project, or all data only after exact sensitive-data confirmation. It streams a private `0600` artifact under the state root, reports its path, byte size, SHA-256, and short expiry, never opens it automatically, and warns that active skill content and rollback snapshots may be sensitive. These temporary artifacts have a separate bounded quota, are excluded from ordinary archive recursion, and are removed by expiry or any purge.
+Settings maintenance exports or deletes Observations, Recommendations, This project, or Everything only after the exact displayed confirmation. Export streams a private `0600` artifact under the state root, reports its path, byte size, SHA-256, and short expiry, never opens it automatically, and warns that active skill content and rollback snapshots may be sensitive. These temporary artifacts have a separate bounded quota, are excluded from ordinary archive recursion, and are removed by expiry or any purge.
 
 The retained `/self-evolve export all` fallback returns the same bounded sensitive archive data directly. `/self-evolve purge --all` and native **Purge all** are terminal for the loaded plugin instance. Native purge-all first returns an authenticated `accepted-terminal` acknowledgement, then stops scheduling, retention, projections, and mailbox work before deleting the subtree. Disappearance alone is not reported as proof of completion; restart OpenCode and verify health.
 
@@ -132,16 +155,16 @@ Headless hosts load the server target without `@opentui/*`. Pending reviews rema
 
 ## Supported Environment
 
-- Node.js `>=20.11.0`.
+- Node.js `>=22.11.0`.
 - OpenCode `>=1.18.3 <1.19.0` and `@opencode-ai/plugin ~1.18.3`; package gates keep exact 1.18.3 and 1.18.4 lanes and resolve the latest common stable aligned 1.18.x pair when the compatibility matrix runs.
-- Plain Node ESM for the server/shared target plus one raw TSX TUI artifact; there is no preinstall, install, postinstall, or consumer build.
-- The TUI-only optional peers are `@opencode-ai/plugin ~1.18.3`, `@opentui/core >=0.4.3 <0.5.0`, `@opentui/keymap >=0.4.3 <0.5.0`, `@opentui/solid >=0.4.3 <0.5.0`, and `solid-js 1.9.12`. The package root reaches none of them. The packed-artifact check imports only the server root from a fresh consumer with all optional peers omitted; the separate packed-TUI matrix loads `./tui` through Bun with aligned host peers.
+- Plain Node ESM for the server/shared target plus one deterministic prebuilt JavaScript TUI artifact; there is no preinstall, install, postinstall, or consumer build.
+- The TUI-only optional peers are `@opencode-ai/plugin ~1.18.3`, `@opentui/core >=0.4.5 <0.6.0`, `@opentui/keymap >=0.4.5 <0.6.0`, `@opentui/solid >=0.4.5 <0.6.0`, and `solid-js 1.9.12`. The package root reaches none of them. The packed-artifact check imports only the server root from a fresh consumer with all optional peers omitted; the separate packed-TUI matrix loads `./tui` through Bun against both the 0.4.5 floor and 0.5.0 current peers without bypassing npm peer resolution.
 
-## Release A Migration And Rollback
+## Native UX Migration And Rollback
 
-Release A is additive. Existing `/self-evolve` commands, the durable inbox, exact headless approval tuple, emergency controls, manual scan, recovery, export, and purge remain supported. The normal TUI moves to the sidebar card and palette control center; no legacy state migration is required. Mixed-version peers negotiate capabilities and keep new writes disabled when they cannot agree on projection and operation protocol v1.
+The native UX changes are additive. Existing `/self-evolve` commands, the durable inbox, exact headless approval tuple, emergency controls, manual scan, recovery, export, and purge remain supported. The normal TUI uses the sidebar and four-section control center; no legacy state migration is required. The v1 offer and review index retain the Release A capability vocabulary; Release B capabilities are advertised inside the optional `dashboard-v1` sidecar. A new TUI hides repository-mode editing without dashboard capability `control-repo-mode-v1`; an older TUI reads the unchanged core projection, ignores the sidecar, and cannot emit the new exact control action.
 
-To disable the native surface, remove the package from `tui.json`, keep the server registration in `opencode.json`, and restart OpenCode. To disable all plugin behavior, remove both registrations and restart. To roll back, install the prior package version, retain the state-root backup, restore the prior registrations, and restart; do not copy or merge state roots. Release A does not authorize a publish, tag, push, or GitHub Release.
+To disable the native surface, remove the package from `tui.json`, keep the server registration in `opencode.json`, and restart OpenCode. To disable all plugin behavior, remove both registrations and restart. To roll back, install the prior package version, retain the state-root backup, restore the prior registrations, and restart; do not copy or merge state roots. This repository change does not authorize a publish, tag, push, or GitHub Release.
 
 ## Troubleshooting
 
@@ -161,5 +184,23 @@ npm test
 npm run check
 npm run pack:check
 ```
+
+The heavier deterministic lanes are `npm run test:tui-matrix` for packed peer-version compatibility and `npm run bench:perf` for the bounded performance budgets. `npm run operator:evidence` drives the isolated Release B operator fixture; its generated receipt is operator evidence, not independent human acceptance.
+
+OpenCode Workflows owns the canonical two-TUI coexistence harness. Run it from
+this checkout through the bounded wrapper:
+
+```sh
+npm run test:tui-coexistence -- --workflows ../opencode-workflows --attempts 10 --witness
+```
+
+Each attempt first starts the product plugins without a witness, server plugin,
+MCP dependency, or provider request in both registration orders. The witness is
+added only after readiness to assert both stable plugin IDs and palette
+commands. Packed candidates are accepted with `--self-evolve` and
+`--workflows`; when the Workflows candidate is packed, also pass `--runner
+<workflows-checkout>` so the repository-owned harness remains the orchestrator.
+Separate `--symlinked-config` and `--server-stack` runs cover those release
+cases without changing the real OpenCode configuration.
 
 `npm run smoke:live` is an isolated no-external-token OpenCode process check. It compares `opencode --version` with the fresh server's GET `/global/health` response and the version reported by the plugin, then live-loads both targets and the durable server integration. It also starts a separate child server with `self-evolve.js` registered directly, creates a real child session, executes `/self-evolve health` through the production session-command endpoint using a local loopback mock provider, verifies the hook-generated user part and durable boot against official health, stops every child/provider process, and removes its isolated state root. Deterministic target/store/integration coverage is distinct from exact-host interactive rendering evidence. See [docs/internals.md](docs/internals.md), [SECURITY.md](SECURITY.md), and [CONTRIBUTING.md](CONTRIBUTING.md).

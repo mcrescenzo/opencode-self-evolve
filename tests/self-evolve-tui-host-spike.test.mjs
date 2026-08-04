@@ -77,7 +77,7 @@ function sourcePackage() {
     name: "@mcrescenzo/opencode-self-evolve",
     version: "0.2.0",
     type: "module",
-    engines: { node: ">=20.11.0", opencode: ">=1.18.3 <1.19.0" },
+    engines: { node: ">=22.11.0", opencode: ">=1.18.3 <1.19.0" },
     exports: { ".": "./self-evolve.js", "./tui": "./self-evolve-tui.js" },
     files: ["self-evolve.js", "self-evolve-tui.js"],
     scripts: { test: "node --test tests/*.test.mjs" },
@@ -127,15 +127,15 @@ test("candidate mutation is disposable, exact-floor, optional-peer, and lifecycl
   const candidate = mutateCandidatePackage(source);
   assert.deepEqual(source, before, "the source manifest must not be mutated");
   assert.equal(candidate.version, CANDIDATE_VERSION);
-  assert.deepEqual(candidate.engines, { node: ">=20.11.0", opencode: "1.18.3" });
+  assert.deepEqual(candidate.engines, { node: ">=22.11.0", opencode: "1.18.3" });
   assert.equal(candidate.exports["."], "./self-evolve.js");
-  assert.equal(candidate.exports["./tui"], "./tui.tsx");
-  assert.equal(candidate.files.filter((entry) => entry === "tui.tsx").length, 1);
+  assert.equal(candidate.exports["./tui"], "./tui.generated.js");
+  assert.equal(candidate.files.filter((entry) => entry === "tui.generated.js").length, 1);
   assert.deepEqual(candidate.peerDependencies, {
     "@opencode-ai/plugin": "~1.18.3",
-    "@opentui/core": ">=0.4.3 <0.5.0",
-    "@opentui/keymap": ">=0.4.3 <0.5.0",
-    "@opentui/solid": ">=0.4.3 <0.5.0",
+    "@opentui/core": ">=0.4.5 <0.6.0",
+    "@opentui/keymap": ">=0.4.5 <0.6.0",
+    "@opentui/solid": ">=0.4.5 <0.6.0",
     "solid-js": "1.9.12",
   });
   for (const name of Object.keys(candidate.peerDependencies)) {
@@ -144,7 +144,7 @@ test("candidate mutation is disposable, exact-floor, optional-peer, and lifecycl
   assert.equal(validateCandidatePackage(candidate), candidate);
   assert.throws(() => mutateCandidatePackage({ ...source, scripts: { install: "unsafe" } }), /forbidden install/);
   assert.throws(() => mutateCandidatePackage({ ...source, exports: {} }), /root export/);
-  assert.throws(() => validateCandidatePackage({ ...candidate, files: [...candidate.files, "tui.tsx"] }), /mutation is incomplete/);
+  assert.throws(() => validateCandidatePackage({ ...candidate, files: [...candidate.files, "tui.generated.js"] }), /mutation is incomplete/);
 });
 
 test("scratch configs preserve witness-first load order and isolated host state", () => {

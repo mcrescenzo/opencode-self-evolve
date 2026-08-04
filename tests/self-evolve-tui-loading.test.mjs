@@ -6,19 +6,26 @@ import { fileURLToPath } from "node:url";
 import { SelfEvolveTuiPlugin } from "../self-evolve-tui.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PACKAGE_TUI_TARGET = "@mcrescenzo/opencode-self-evolve/tui";
-const LOCAL_NATIVE_TARGET = "./plugins/self-evolve/self-evolve-tui.tsx";
+const PACKAGE_TUI_TARGET = "@mcrescenzo/opencode-self-evolve";
+const LOCAL_NATIVE_TARGET = "./plugins/self-evolve";
+const LEGACY_PACKAGE_TARGET = "@mcrescenzo/opencode-self-evolve/tui";
+const LOCAL_RAW_TARGET = "./plugins/self-evolve/self-evolve-tui.tsx";
 const LOCAL_LEGACY_TARGET = "./plugins/self-evolve/self-evolve-tui.js";
 
 function loadingFixture(plugins) {
   const configured = Array.isArray(plugins) ? plugins : [];
   const nativeLoaded = configured.some((entry) => entry === PACKAGE_TUI_TARGET || entry === LOCAL_NATIVE_TARGET);
-  const legacyLoaded = configured.includes(LOCAL_LEGACY_TARGET);
+  const legacyTarget = configured.find((entry) => [
+    LEGACY_PACKAGE_TARGET,
+    LOCAL_RAW_TARGET,
+    LOCAL_LEGACY_TARGET,
+  ].includes(entry));
+  const legacyLoaded = legacyTarget !== undefined;
   return {
     nativeLoaded,
     legacyOnly: legacyLoaded && !nativeLoaded,
     migration: legacyLoaded && !nativeLoaded
-      ? `External tui.json migration required: replace ${LOCAL_LEGACY_TARGET} with ${LOCAL_NATIVE_TARGET} (or ${PACKAGE_TUI_TARGET}) and restart OpenCode.`
+      ? `External tui.json migration required: replace ${legacyTarget} with ${LOCAL_NATIVE_TARGET} (or ${PACKAGE_TUI_TARGET}) and restart OpenCode.`
       : null,
   };
 }
@@ -96,35 +103,65 @@ test("requested legacy settings surface warns once when a required capability is
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /legacy settings command/i);
   assert.match(warnings[0], /keymap\.registerLayer/u);
-  assert.match(warnings[0], /self-evolve-tui\.tsx/u);
+  assert.match(warnings[0], /package root/u);
   assert.match(warnings[0], /tui\.json/u);
   assert.ok(warnings[0].length <= 240);
 });
 
 test("legacy-only registration fixture reports the external native-target migration", () => {
-  const config = { plugin: [LOCAL_LEGACY_TARGET] };
-  const result = loadingFixture(config.plugin);
+  for (const legacy of [LEGACY_PACKAGE_TARGET, LOCAL_RAW_TARGET, LOCAL_LEGACY_TARGET]) {
+    const config = { plugin: [legacy] };
+    const result = loadingFixture(config.plugin);
+    assert.equal(result.nativeLoaded, false);
+    assert.equal(result.legacyOnly, true);
+    assert.match(result.migration, /External tui\.json migration required/u);
+    assert.deepEqual(config, { plugin: [legacy] });
+  }
+});
 
-  assert.deepEqual(result, {
-    nativeLoaded: false,
-    legacyOnly: true,
-    migration: `External tui.json migration required: replace ${LOCAL_LEGACY_TARGET} with ${LOCAL_NATIVE_TARGET} (or ${PACKAGE_TUI_TARGET}) and restart OpenCode.`,
-  });
-  assert.deepEqual(config, { plugin: [LOCAL_LEGACY_TARGET] });
+test("bare package and source package-root registrations select the built export", () => {
+  for (const current of [PACKAGE_TUI_TARGET, LOCAL_NATIVE_TARGET]) {
+    assert.deepEqual(loadingFixture([current]), {
+      nativeLoaded: true,
+      legacyOnly: false,
+      migration: null,
+    });
+  }
 });
 
 test("package exports and TUI loading docs select the native target and explain mixed-version fallback", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
   const configuration = fs.readFileSync(path.join(root, "docs/configuration.md"), "utf8");
+  const contract = fs.readFileSync(path.join(root, "docs/control-center-ux.md"), "utf8");
   const internals = fs.readFileSync(path.join(root, "docs/internals.md"), "utf8");
+  const releaseB = fs.readFileSync(path.join(root, "docs/release-b-candidate.md"), "utf8");
+  const releaseBEvidence = fs.readFileSync(
+    path.join(root, "docs/release-b-operator-evidence.md"),
+    "utf8",
+  );
   const helper = fs.readFileSync(path.join(root, "self-evolve-tui.js"), "utf8");
 
-  assert.equal(manifest.exports["./tui"], "./self-evolve-tui.tsx");
-  assert.match(configuration, /@mcrescenzo\/opencode-self-evolve\/tui/u);
-  assert.match(configuration, /self-evolve-tui\.js[^\n]+compatibility fallback/iu);
-  assert.match(configuration, /self-evolve-tui\.js[^\n]+replace[^\n]+self-evolve-tui\.tsx/iu);
-  assert.match(configuration, /new TUI[^\n]+old server[^\n]+legacy\/read-only/iu);
-  assert.match(configuration, /old TUI[^\n]+new server[^\n]+legacy\/read-only/iu);
-  assert.match(internals, /self-evolve-tui\.tsx[^\n]+public native target/iu);
+  assert.equal(manifest.exports["./tui"], "./self-evolve-tui.generated.js");
+  assert.equal(manifest.exports["./server"], "./self-evolve.js");
+  assert.equal(manifest.exports["."], manifest.exports["./server"]);
+  assert.match(readme, /opencode plugin @mcrescenzo\/opencode-self-evolve --global/u);
+  assert.match(readme, /"plugin": \["@mcrescenzo\/opencode-self-evolve"\]/u);
+  assert.match(readme, /exactly four sections: Home, Recommendations, Activity, and Settings/u);
+  assert.match(configuration, /opencode plugin @mcrescenzo\/opencode-self-evolve/u);
+  assert.match(configuration, /self-evolve-tui\.generated\.js/u);
+  assert.match(configuration, /self-evolve-tui\.js[^\n]+target-only[\s\S]{0,80}not a standalone registration/iu);
+  assert.match(configuration, /self-evolve-tui\.(?:js|tsx)[\s\S]{0,180}replace[\s\S]{0,80}package root/iu);
+  assert.match(configuration, /new\s+TUI with an old server[\s\S]{0,160}valid core review/iu);
+  assert.match(configuration, /old TUI with a new server[\s\S]{0,160}unchanged core projection/iu);
+  assert.match(configuration, /exact Release A capability vocabulary/iu);
+  assert.match(configuration, /exactly four sections: Home, Recommendations, Activity, and Settings/u);
+  assert.match(configuration, /dashboard-v1/u);
+  assert.match(configuration, /never a raw-log viewer/u);
+  assert.match(contract, /Release B removes it from\s+normal routing/u);
+  assert.match(internals, /self-evolve-tui\.generated\.js[^\n]+public native target/iu);
+  assert.match(internals, /renders? exactly Home, Recommendations, Activity, and Settings/u);
+  assert.match(releaseB, /automated implementer-authored evidence is\s+not independent human acceptance/iu);
+  assert.match(releaseBEvidence, /it is not independent human\s+review/iu);
   assert.doesNotMatch(helper, /from\s+["'](?:\.\/tui|@opentui\/)/u);
 });

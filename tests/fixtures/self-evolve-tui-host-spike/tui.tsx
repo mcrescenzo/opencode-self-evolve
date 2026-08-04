@@ -155,7 +155,7 @@ function DelayedDialog(props: { api: Parameters<TuiPlugin>[0] }) {
 const tui: TuiPlugin = async (api) => {
   activations += 1
   const activation = activations
-  if (packageVersion !== expectedVersion || !import.meta.url.endsWith("/tui.tsx") || api.app.version !== "1.18.3") {
+  if (packageVersion !== expectedVersion || !import.meta.url.endsWith("/tui.generated.js") || api.app.version !== "1.18.3") {
     throw new Error("live spike loaded an unexpected product or host version")
   }
   const [visible, setVisible] = createSignal(fixtureVisible())
@@ -187,7 +187,7 @@ const tui: TuiPlugin = async (api) => {
     activation,
     productVersion: packageVersion,
     hostVersion: api.app.version,
-    targetIsTsx: import.meta.url.endsWith("/tui.tsx"),
+    targetIsBuilt: import.meta.url.endsWith("/tui.generated.js"),
   })
 
   schedule(() => setVisible(fixtureVisible()))

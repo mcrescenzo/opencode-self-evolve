@@ -11,11 +11,13 @@
   "author": "Michael Crescenzo",
   "exports": {
     ".": "./self-evolve.js",
-    "./tui": "./self-evolve-tui.tsx"
+    "./server": "./self-evolve.js",
+    "./tui": "./self-evolve-tui.generated.js"
   },
   "files": [
     "self-evolve.js",
     "self-evolve-tui.tsx",
+    "self-evolve-tui.generated.js",
     "self-evolve-tui.js",
     "self-evolve-tui-store.js",
     "self-evolve-bridge.js",
@@ -38,6 +40,7 @@
     "self-evolve-scheduler.js",
     "self-evolve-integration.js",
     "analyzer-prompt.js",
+    "docs/control-center-ux.md",
     "docs/autonomy-contract.md",
     "docs/configuration.md",
     "docs/internals.md",
@@ -48,7 +51,7 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=20.11.0",
+    "node": ">=22.11.0",
     "opencode": ">=1.18.3 <1.19.0"
   },
   "publishConfig": {
@@ -68,20 +71,23 @@
     "autonomy"
   ],
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
-    "check": "npm run typecheck:tui && npm run build:tui && node --check self-evolve.js && node --check self-evolve-tui.js && node --check self-evolve-tui-store.js && node --check self-evolve-bridge.js && node --check self-evolve-lock.js && node --check self-evolve-state-root.js && node --check self-evolve-client.js && node --check self-evolve-core.js && node --check self-evolve-integration.js && node --check self-evolve-pipeline.js && node --check self-evolve-scheduler.js && node --check self-evolve-schemas.js && node --check self-evolve-ui-protocol.js && node --check self-evolve-projection.js && node --check self-evolve-export.js && node --check self-evolve-observation.js && node --check self-evolve-store.js && node --check self-evolve-privacy.js && node --check self-evolve-inventory.js && node --check self-evolve-applier.js && node --check self-evolve-commands.js && node --check self-evolve-synthesis.js && node --check analyzer-prompt.js && node --check scripts/live-command-hook-smoke.mjs && node --check scripts/live-tui-host-spike.mjs && node --check scripts/check-tui-artifact.mjs && node --check scripts/packed-tui-consumer-matrix.mjs && node --check scripts/pack-artifact-check.mjs && node --check scripts/bench-store-perf.mjs",
+    "test": "node scripts/run-tests.mjs",
+    "check": "npm run typecheck:tui && npm run build:tui && node --check self-evolve.js && node --check self-evolve-tui.generated.js && node --check self-evolve-tui.js && node --check self-evolve-tui-store.js && node --check self-evolve-bridge.js && node --check self-evolve-lock.js && node --check self-evolve-state-root.js && node --check self-evolve-client.js && node --check self-evolve-core.js && node --check self-evolve-integration.js && node --check self-evolve-pipeline.js && node --check self-evolve-scheduler.js && node --check self-evolve-schemas.js && node --check self-evolve-ui-protocol.js && node --check self-evolve-projection.js && node --check self-evolve-export.js && node --check self-evolve-observation.js && node --check self-evolve-store.js && node --check self-evolve-privacy.js && node --check self-evolve-inventory.js && node --check self-evolve-applier.js && node --check self-evolve-commands.js && node --check self-evolve-synthesis.js && node --check analyzer-prompt.js && node --check scripts/live-command-hook-smoke.mjs && node --check scripts/live-tui-host-spike.mjs && node --check scripts/release-b-operator-evidence.mjs && node --check scripts/check-tui-artifact.mjs && node --check scripts/packed-tui-consumer-matrix.mjs && node --check scripts/tui-coexistence-smoke.mjs && node --check scripts/pack-artifact-check.mjs && node --check scripts/run-tests.mjs && node --check scripts/bench-store-perf.mjs",
     "typecheck:tui": "tsc --noEmit --allowJs --checkJs false --skipLibCheck --target ES2022 --module ESNext --moduleResolution Bundler --jsx preserve types/self-evolve-tui-runtime.d.ts self-evolve-tui.tsx",
     "build:tui": "node scripts/check-tui-artifact.mjs",
+    "prepack": "npm run build:tui",
     "test:tui-matrix": "node scripts/packed-tui-consumer-matrix.mjs",
+    "test:tui-coexistence": "node scripts/tui-coexistence-smoke.mjs",
     "bench:perf": "node scripts/bench-store-perf.mjs",
     "pack:check": "node scripts/pack-artifact-check.mjs",
-    "smoke:live": "node scripts/live-command-hook-smoke.mjs"
+    "smoke:live": "node scripts/live-command-hook-smoke.mjs",
+    "operator:evidence": "node scripts/release-b-operator-evidence.mjs"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "~1.18.3",
-    "@opentui/core": ">=0.4.3 <0.5.0",
-    "@opentui/keymap": ">=0.4.3 <0.5.0",
-    "@opentui/solid": ">=0.4.3 <0.5.0",
+    "@opentui/core": ">=0.4.5 <0.6.0",
+    "@opentui/keymap": ">=0.4.5 <0.6.0",
+    "@opentui/solid": ">=0.4.5 <0.6.0",
     "solid-js": "1.9.12"
   },
   "peerDependenciesMeta": {
@@ -102,6 +108,11 @@
     }
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "~1.18.3"
+    "@opencode-ai/plugin": "~1.18.3",
+    "@opentui/core": "0.4.5",
+    "@opentui/keymap": "0.4.5",
+    "@opentui/solid": "0.4.5",
+    "solid-js": "1.9.12",
+    "typescript": "^5.9.0"
   }
 }

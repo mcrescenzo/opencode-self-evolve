@@ -18,7 +18,7 @@ import {
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { BRIDGE_CONTROL_STATE_RESERVE_BYTES, BRIDGE_RESPONSE_RESERVE_BYTES, validateBridgeExportMetadata } from "./self-evolve-bridge.js";
-import { stateMutationLockHeld, withStateMutationLock } from "./self-evolve-lock.js";
+import { processIsAlive, stateMutationLockHeld, withStateMutationLock } from "./self-evolve-lock.js";
 import {
   LEGACY_SELF_EVOLVE_AGENTS,
   SELF_EVOLVE_ANALYZER_AGENT,
@@ -27,7 +27,9 @@ import {
 } from "./self-evolve-core.js";
 import {
   SCHEMA_VERSION,
+  SUPPORTED_SCHEMA_VERSIONS,
   assertRecord,
+  errorReasonCode,
   makeAggregateClaim,
   makeAuditEvent,
   makeDecision,
@@ -35,6 +37,7 @@ import {
   makeProposal,
   makeProposalContent,
   makeRepoSettings,
+  stripUndefined,
   burnNonce,
   transitionProposalState,
   wrapRecord,
@@ -150,11 +153,6 @@ function json(value) {
   return `${JSON.stringify(value)}\n`;
 }
 
-function reasonCode(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.split(":", 1)[0] || "corrupt-record";
-}
-
 export function quarantineRecord(record, reason, quarantineDir) {
   if (!quarantineDir) throw new TypeError("quarantine-directory-required");
   ensureDir(quarantineDir);
@@ -181,11 +179,19 @@ export function migrate(settings) {
   const comparison = compareVersions(settings.schemaVersion, SCHEMA_VERSION);
   if (comparison === null || comparison > 0) return null;
   if (comparison === 0) return settings;
+  const migrateRepo = (repo) => {
+    if (!repo || typeof repo !== "object" || Array.isArray(repo)) return repo;
+    const { consent: _removedConsent, ...rest } = repo;
+    return { ...rest, schemaVersion: SCHEMA_VERSION };
+  };
+  if ("projectFingerprint" in settings && !("global" in settings) && !("repo" in settings)) {
+    return migrateRepo(settings);
+  }
   return {
     ...settings,
     schemaVersion: SCHEMA_VERSION,
     ...(settings.global ? { global: { ...settings.global, schemaVersion: SCHEMA_VERSION } } : {}),
-    ...(settings.repo ? { repo: { ...settings.repo, schemaVersion: SCHEMA_VERSION } } : {}),
+    ...(settings.repo ? { repo: migrateRepo(settings.repo) } : {}),
   };
 }
 
@@ -196,16 +202,11 @@ function fileForKind(kind) {
 }
 
 function logicalId(envelope) {
-  return envelope.payload?.id ?? envelope.payload?.proposalId ?? envelope.id;
+  return envelope.payload?.id ?? envelope.payload?.proposalId ?? envelope.payload?.sessionIDHash ?? envelope.id;
 }
 
 function eventState(event) {
   return event.payload?.details?.state ?? event.payload?.details?.status ?? event.payload?.details?.action;
-}
-
-function processIsAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
 }
 
 export function openStore(rootDir, {
@@ -270,6 +271,15 @@ export function openStore(rootDir, {
     ensureDir(snapshotsDir);
     const versionPath = path.join(baseDir, "version.json");
     if (!existsSync(versionPath)) atomicWrite(versionPath, json({ schemaVersion: SCHEMA_VERSION }));
+    else {
+      // Upgrade a partition written by a compatible earlier release. Anything unreadable, newer, or
+      // unrecognized is left untouched so it stays visible rather than being silently rewritten.
+      let stored = null;
+      try { stored = JSON.parse(readFileSync(versionPath, "utf8"))?.schemaVersion ?? null; } catch { stored = null; }
+      if (typeof stored === "string" && stored !== SCHEMA_VERSION && SUPPORTED_SCHEMA_VERSIONS.includes(stored)) {
+        atomicWrite(versionPath, json({ schemaVersion: SCHEMA_VERSION }));
+      }
+    }
   }
 
   function safeTreeFiles(directory, { optional = true } = {}) {
@@ -392,7 +402,7 @@ export function openStore(rootDir, {
     const damaged = [];
     for (const line of source.split("\n")) {
       if (!line.trim()) continue;
-      try { records.push(validator(JSON.parse(line))); } catch (error) { damaged.push({ line, reason: reasonCode(error) }); }
+      try { records.push(validator(JSON.parse(line))); } catch (error) { damaged.push({ line, reason: errorReasonCode(error, "corrupt-record") }); }
     }
     return { records, damaged };
   }
@@ -674,8 +684,8 @@ export function openStore(rootDir, {
       raw = readFileSync(decisionTransactionPath, "utf8");
       intent = validateDecisionTransaction(JSON.parse(raw));
     } catch (error) {
-      try { quarantine(raw ?? "unreadable decision transaction", reasonCode(error)); } finally { rmSync(decisionTransactionPath, { force: true }); }
-      throw new Error(reasonCode(error));
+      try { quarantine(raw ?? "unreadable decision transaction", errorReasonCode(error, "corrupt-record")); } finally { rmSync(decisionTransactionPath, { force: true }); }
+      throw new Error(errorReasonCode(error, "corrupt-record"));
     }
     const proposals = readFileRecords(STORE_FILES.proposal).filter((record) => record.kind === "proposal" && record.payload.id === intent.proposalId);
     const current = proposals.at(-1);
@@ -732,7 +742,7 @@ export function openStore(rootDir, {
         return { ...recovered, recovered: false };
       });
     } catch (error) {
-      return { ok: false, reason: reasonCode(error) };
+      return { ok: false, reason: errorReasonCode(error, "corrupt-record") };
     }
   }
 
@@ -782,7 +792,7 @@ export function openStore(rootDir, {
       if (raw.schemaVersion !== SCHEMA_VERSION) atomicWrite(globalSettingsPath, json(clean));
       return clean;
     } catch (error) {
-      quarantine(readFileSync(globalSettingsPath, "utf8"), reasonCode(error), globalQuarantineDir);
+      quarantine(readFileSync(globalSettingsPath, "utf8"), errorReasonCode(error, "corrupt-record"), globalQuarantineDir);
       return null;
     }
   }
@@ -805,7 +815,7 @@ export function openStore(rootDir, {
       }
       return clean;
     } catch (error) {
-      quarantine(readFileSync(repoSettingsPath, "utf8"), reasonCode(error));
+      quarantine(readFileSync(repoSettingsPath, "utf8"), errorReasonCode(error, "corrupt-record"));
       return null;
     }
   }
@@ -848,7 +858,13 @@ export function openStore(rootDir, {
       // generation-bearing.
       const generationRecords = records.filter((record) => !(
         record.kind === "audit-event"
-        && record.payload?.details?.action === "ui-operation-nonce"
+        && (
+          record.payload?.details?.action === "ui-operation-nonce"
+          || (
+            record.payload?.actor === "self-evolve-scheduler"
+            && record.payload?.details?.action === "scheduler-budget"
+          )
+        )
       ));
       const generation = hashContent(JSON.stringify([
         "self-evolve-projection-store-snapshot-v1",
@@ -856,11 +872,46 @@ export function openStore(rootDir, {
         settings.repo,
         generationRecords,
       ]));
+      const timestamp = now();
+      const schedulerBudgets = records
+        .map((record) => record.kind === "audit-event" ? record.payload : null)
+        .filter((event) => event?.actor === "self-evolve-scheduler"
+          && event.details?.action === "scheduler-budget");
+      const budgetUsage = (budgetType, windowMs, limit) => {
+        const relevant = schedulerBudgets
+          .filter((event) => event.details?.budgetType === budgetType
+            && event.timestamp >= timestamp - windowMs
+            && event.timestamp <= timestamp)
+          .sort((left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id));
+        return Object.freeze({
+          used: relevant.length,
+          limit,
+          remaining: Math.max(0, limit - relevant.length),
+          resetAt: relevant.length ? relevant[0].timestamp + windowMs : null,
+        });
+      };
+      const passiveLimit = settings.repo.budgets.passiveCallsPerHour
+        ?? settings.global.budgets.passiveCallsPerHour;
+      const synthesisLimit = settings.repo.budgets.synthesisPerDay
+        ?? settings.global.budgets.synthesisPerDay;
+      const storageQuotaBytes = (settings.repo.budgets.storageQuotaMiB
+        ?? settings.global.budgets.storageQuotaMiB) * 1024 * 1024;
+      const storageBytesUsed = projectedProjectBytesUnlocked();
+      const usage = Object.freeze({
+        passive: budgetUsage("passive", 60 * 60 * 1000, passiveLimit),
+        synthesis: budgetUsage("synthesis", DAY_MS, synthesisLimit),
+        storage: Object.freeze({
+          usedBytes: storageBytesUsed,
+          limitBytes: storageQuotaBytes,
+          remainingBytes: Math.max(0, storageQuotaBytes - storageBytesUsed),
+        }),
+      });
       return Object.freeze({
         projectFingerprint,
         generation,
         settings: Object.freeze({ global: settings.global, repo: settings.repo }),
         records: Object.freeze([...records]),
+        usage,
       });
     });
   }
@@ -873,7 +924,7 @@ export function openStore(rootDir, {
 
   function makeAudit(kind, details, proposalId, actor = "self-evolve-store") {
     const timestamp = now();
-    const cleanDetails = Object.fromEntries(Object.entries(details).filter(([, value]) => value !== undefined));
+    const cleanDetails = stripUndefined(details);
     const payloadHash = hashContent(JSON.stringify(cleanDetails));
     const event = makeAuditEvent({
       id: hashContent(JSON.stringify({ kind, details: cleanDetails, proposalId, actor, timestamp, nonce: randomBytes(8).toString("hex") })),
@@ -912,7 +963,7 @@ export function openStore(rootDir, {
     try {
       assertProjectQuotaUnlocked(new Map([[path.resolve(filePath), source]]), { mandatoryAuditBytes: mandatoryAudit ? addedBytes : 0 });
     } catch (error) {
-      return { ok: false, reason: reasonCode(error) };
+      return { ok: false, reason: errorReasonCode(error, "corrupt-record") };
     }
     atomicWrite(filePath, source);
     cacheParsedRecords(filePath, source, [...records, clean]);
@@ -957,7 +1008,7 @@ export function openStore(rootDir, {
         return { ok: true, changed: true, settings: { global: nextGlobal, repo: nextRepo }, auditEvent: audit.payload };
       });
     } catch (error) {
-      return { ok: false, reason: reasonCode(error) };
+      return { ok: false, reason: errorReasonCode(error, "corrupt-record") };
     }
   }
 
@@ -981,8 +1032,8 @@ export function openStore(rootDir, {
   function appendRecord(envelope) {
     try { return withMutationLock(() => appendValidUnlocked(envelope)); }
     catch (error) {
-      try { withMutationLock(() => quarantine(envelope, reasonCode(error))); } catch {}
-      return { ok: false, reason: reasonCode(error) };
+      try { withMutationLock(() => quarantine(envelope, errorReasonCode(error, "corrupt-record"))); } catch {}
+      return { ok: false, reason: errorReasonCode(error, "corrupt-record") };
     }
   }
 
@@ -1092,7 +1143,7 @@ export function openStore(rootDir, {
       return { ok: true, nonce, expiresAt: acquiredAt + ttlMs, ...(repairedCorruptLease ? { repairedCorruptLease: true } : {}) };
       });
     } catch (error) {
-      return { ok: false, reason: "lease-acquire-error", code: String(error?.code ?? reasonCode(error)) };
+      return { ok: false, reason: "lease-acquire-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) };
     }
   }
 
@@ -1110,7 +1161,7 @@ export function openStore(rootDir, {
       return { ok: true };
       });
     } catch (error) {
-      return { ok: false, reason: "lease-release-error", code: String(error?.code ?? reasonCode(error)) };
+      return { ok: false, reason: "lease-release-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) };
     }
   }
 
@@ -1275,7 +1326,7 @@ export function openStore(rootDir, {
         return { ok: true, nonce, expiresAt };
       });
     } catch (error) {
-      return { ok: false, reason: "host-owner-acquire-error", code: String(error?.code ?? reasonCode(error)) };
+      return { ok: false, reason: "host-owner-acquire-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) };
     }
   }
 
@@ -1294,13 +1345,13 @@ export function openStore(rootDir, {
         return { ok: true };
       });
     } catch (error) {
-      return { ok: false, reason: "host-owner-release-error", code: String(error?.code ?? reasonCode(error)) };
+      return { ok: false, reason: "host-owner-release-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) };
     }
   }
 
   function hostOwnerStatus(sessionId, options) {
     try { return withMutationLock(() => hostOwnerStatusUnlocked(sessionId, options)); }
-    catch (error) { return { classification: "unknown", reason: "host-owner-status-error", code: String(error?.code ?? reasonCode(error)) }; }
+    catch (error) { return { classification: "unknown", reason: "host-owner-status-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) }; }
   }
 
   function releaseOwnedHostOwners({ pid, generation } = {}) {
@@ -1321,7 +1372,7 @@ export function openStore(rootDir, {
         return failures.length ? { ok: false, released, failures } : { ok: true, released };
       });
     } catch (error) {
-      return { ok: false, released: 0, reason: "host-owner-release-error", code: String(error?.code ?? reasonCode(error)) };
+      return { ok: false, released: 0, reason: "host-owner-release-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) };
     }
   }
 
@@ -1355,12 +1406,12 @@ export function openStore(rootDir, {
     });
   }
 
-  function runCas(kind, id, expectedPriorState, mutateFn) {
+  function runCas(kind, id, expectedPriorState, mutateFn, selectPriorState = (payload) => payload?.state) {
     try {
       return withMutationLock(() => {
         const current = getRecordUnlocked(kind, id);
         if (!current) return { ok: false, reason: "record-not-found" };
-        if (current.payload?.state !== expectedPriorState) return { ok: false, reason: "stale-prior-state" };
+        if (selectPriorState(current.payload) !== expectedPriorState) return { ok: false, reason: "stale-prior-state" };
         const mutation = mutateFn(current.payload);
         const next = mutation?.schemaVersion && mutation?.kind ? assertRecord(mutation) : wrapRecord(kind, mutation, now());
         const result = appendValidUnlocked(next);
@@ -1369,7 +1420,7 @@ export function openStore(rootDir, {
         if (kind === "proposal" && ["rejected", "rolled-back", "superseded", "failed-closed"].includes(next.payload.state)) compactProposalContentUnlocked(new Set([next.payload.id]));
         return { ok: true, newRecord: next };
       });
-    } catch (error) { return { ok: false, reason: reasonCode(error) }; }
+    } catch (error) { return { ok: false, reason: errorReasonCode(error, "corrupt-record") }; }
   }
 
   function canonicalRecordTimestamp(record) {
@@ -1541,7 +1592,7 @@ export function openStore(rootDir, {
       if (ids.some((id) => !/^[a-f0-9]{64}$/.test(id))) throw new Error("corrupt-aggregate-index");
       return ids;
     } catch (error) {
-      quarantine(readFileSync(filePath, "utf8"), reasonCode(error), path.join(path.dirname(filePath), "quarantine"));
+      quarantine(readFileSync(filePath, "utf8"), errorReasonCode(error, "corrupt-record"), path.join(path.dirname(filePath), "quarantine"));
       throw new Error("corrupt-aggregate-index");
     }
   }
@@ -1585,7 +1636,7 @@ export function openStore(rootDir, {
         writeJsonl(aggregatesPath, [...records, clean]);
         return { ok: true, duplicate: false, record: clean };
       });
-    } catch (error) { return { ok: false, reason: reasonCode(error) }; }
+    } catch (error) { return { ok: false, reason: errorReasonCode(error, "corrupt-record") }; }
   }
 
   function readAggregates({ scope = "global", includeExpired = false, nowMs = now() } = {}) {
@@ -1905,7 +1956,7 @@ export function openStore(rootDir, {
         appendAuditUnlocked("purge", { action: scope, removed: removed.length });
         return { ok: true, counts };
       });
-    } catch (error) { return { ok: false, reason: reasonCode(error), counts: countKinds([]) }; }
+    } catch (error) { return { ok: false, reason: errorReasonCode(error, "corrupt-record"), counts: countKinds([]) }; }
   }
 
   function getRecoveryPending() {
@@ -1952,12 +2003,12 @@ export function openStore(rootDir, {
             released += 1;
           } catch (error) {
             if (error?.code === "ENOENT") ownedLeases.delete(leaseKey);
-            else failures.push({ leaseKey, reason: "lease-release-error", code: String(error?.code ?? reasonCode(error)) });
+            else failures.push({ leaseKey, reason: "lease-release-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) });
           }
         }
       });
     } catch (error) {
-      failures.push({ leaseKey: null, reason: "lease-release-error", code: String(error?.code ?? reasonCode(error)) });
+      failures.push({ leaseKey: null, reason: "lease-release-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) });
     }
     if (failures.length) return { ok: false, released, failures };
     closed = true;

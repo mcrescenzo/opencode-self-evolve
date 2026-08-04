@@ -4,7 +4,6 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   makeAuditEvent,
@@ -17,8 +16,6 @@ import {
 import { hashContent, openStore } from "../self-evolve-store.js";
 import {
   assertSafeGlobalClaim,
-  computeProjectFingerprint,
-  computeTtlBuckets,
   createPrivacyGuard,
   isExpired,
   observationExpiresAt,
@@ -34,7 +31,7 @@ const PROPOSED = H("e");
 const CLUSTER = H("f");
 const DAY = 86_400_000;
 const NOW = 120 * DAY;
-const CHILD = fileURLToPath(new URL("./fixtures/store-child.mjs", import.meta.url));
+const CHILD = path.join(import.meta.dirname, "fixtures", "store-child.mjs");
 
 function runAggregateChild(root, fingerprint, incidentId) {
   return runStoreChild(root, fingerprint, "aggregate", incidentId);
@@ -162,15 +159,6 @@ test("proposal and decision TTL expires after the 90-day window", () => {
   const createdAt = NOW - 91 * DAY;
   assert.equal(proposalExpiresAt(createdAt, 30), createdAt + 90 * DAY);
   assert.equal(isExpired(proposalExpiresAt(createdAt, 30), NOW), true);
-});
-
-test("mixed TTL records classify as active, expiring soon, and expired", () => {
-  fixture().store.close();
-  assert.deepEqual(computeTtlBuckets([
-    { expiresAt: NOW + 20 * DAY },
-    { expiresAt: NOW + 3 * DAY },
-    { expiresAt: NOW - 1 },
-  ], NOW), { active: 1, expiringSoon: 1, expired: 1 });
 });
 
 test("retention inspector reports expired durable records without deleting them", () => {
@@ -473,20 +461,6 @@ test("metadata-only mode accepts and exports typed observations without excerpts
   const archive = guard.exportScope(PROJECT_A);
   assert.equal(archive.records.length, 1);
   assert.deepEqual(archive.records[0].payload.structuredFields, observation().structuredFields);
-  store.close();
-});
-
-test("project fingerprints delegate canonical remote and local-path identity", () => {
-  const { store } = fixture();
-  assert.equal(
-    computeProjectFingerprint({ remoteUrl: "https://GitHub.com/example/repo.git", worktreePath: "/one" }),
-    computeProjectFingerprint({ remoteUrl: "https://github.com/example/repo", worktreePath: "/one" }),
-  );
-  assert.notEqual(
-    computeProjectFingerprint({ remoteUrl: "https://github.com/example/repo", worktreePath: "/one" }),
-    computeProjectFingerprint({ remoteUrl: "https://github.com/example/repo", worktreePath: "/two" }),
-  );
-  assert.match(computeProjectFingerprint({ remoteUrl: "", worktreePath: "/tmp/private-project" }), /^[a-f0-9]{64}$/);
   store.close();
 });
 

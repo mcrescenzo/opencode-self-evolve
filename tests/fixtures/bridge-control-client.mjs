@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   createControlRequest,
   pollControlResponse,
@@ -8,8 +9,6 @@ import {
 } from "../../self-evolve-bridge.js";
 
 const [stateRoot, projectFingerprint, operation, value, requestFile, resultFile] = process.argv.slice(2);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 async function stateAfter(nonce) {
   for (let attempt = 0; attempt < 300; attempt += 1) {
     try {
@@ -51,6 +50,9 @@ if (operation === "replay") {
   } else if (operation === "exclude") {
     action = "set-repo-excluded";
     payload = { excluded: value === "true" };
+  } else if (operation === "repo-mode") {
+    action = "set-repo-mode";
+    payload = { mode: value };
   } else if (operation === "allowlist") {
     action = "update-allowlist";
     payload = { allowlist: value ? value.split(path.delimiter) : [], confirmation: "UPDATE ALLOWLIST" };

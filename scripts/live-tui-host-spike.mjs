@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
 export const REQUIRED_OPENCODE_VERSION = "1.18.3";
 export const LIVE_SPIKE_ENV = "SELF_EVOLVE_TUI_HOST_SPIKE";
@@ -16,7 +17,7 @@ export const WITNESS_PLUGIN_ID = "mcrescenzo.self-evolve-host-spike-witness";
 export const PRODUCT_COMMAND_ID = "self-evolve.control-center";
 export const PRODUCT_ROUTE_ID = "self-evolve.control-center.route";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = path.resolve(import.meta.dirname, "..");
 const fixtureRoot = path.join(root, "tests", "fixtures", "self-evolve-tui-host-spike");
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MIN_TIMEOUT_MS = 30_000;
@@ -26,16 +27,16 @@ const MAX_RECEIPT_BYTES = 64 * 1024;
 const POLICY_FILES = Object.freeze(["package.json", "bun.lock", "AGENTS.md"]);
 const EXACT_TUI_PACKAGES = Object.freeze({
   "@opencode-ai/plugin": "1.18.3",
-  "@opentui/core": "0.4.3",
-  "@opentui/keymap": "0.4.3",
-  "@opentui/solid": "0.4.3",
+  "@opentui/core": "0.4.5",
+  "@opentui/keymap": "0.4.5",
+  "@opentui/solid": "0.4.5",
   "solid-js": "1.9.12",
 });
 const CANDIDATE_OPTIONAL_PEERS = Object.freeze({
   "@opencode-ai/plugin": "~1.18.3",
-  "@opentui/core": ">=0.4.3 <0.5.0",
-  "@opentui/keymap": ">=0.4.3 <0.5.0",
-  "@opentui/solid": ">=0.4.3 <0.5.0",
+  "@opentui/core": ">=0.4.5 <0.6.0",
+  "@opentui/keymap": ">=0.4.5 <0.6.0",
+  "@opentui/solid": ">=0.4.5 <0.6.0",
   "solid-js": "1.9.12",
 });
 const REQUIRED_STAGE_ONE_PROOFS = Object.freeze([
@@ -74,7 +75,7 @@ function isRecord(value) {
 }
 
 function clone(value) {
-  return JSON.parse(JSON.stringify(value));
+  return structuredClone(value);
 }
 
 function exactTrueRecord(value, keys, label) {
@@ -137,8 +138,8 @@ export function mutateCandidatePackage(source) {
     ...(isRecord(candidate.engines) ? candidate.engines : {}),
     opencode: REQUIRED_OPENCODE_VERSION,
   };
-  candidate.exports["./tui"] = "./tui.tsx";
-  candidate.files = [...new Set([...candidate.files, "tui.tsx"])];
+  candidate.exports["./tui"] = "./tui.generated.js";
+  candidate.files = [...new Set([...candidate.files, "tui.generated.js"])];
   candidate.peerDependencies = {
     ...(isRecord(candidate.peerDependencies) ? candidate.peerDependencies : {}),
     ...CANDIDATE_OPTIONAL_PEERS,
@@ -154,9 +155,9 @@ export function validateCandidatePackage(candidate) {
   if (!isRecord(candidate) || candidate.version !== CANDIDATE_VERSION
     || candidate.engines?.opencode !== REQUIRED_OPENCODE_VERSION
     || candidate.exports?.["."] !== "./self-evolve.js"
-    || candidate.exports?.["./tui"] !== "./tui.tsx"
+    || candidate.exports?.["./tui"] !== "./tui.generated.js"
     || !Array.isArray(candidate.files)
-    || candidate.files.filter((entry) => entry === "tui.tsx").length !== 1) {
+    || candidate.files.filter((entry) => entry === "tui.generated.js").length !== 1) {
     throw new Error("candidate package target mutation is incomplete");
   }
   for (const [name, version] of Object.entries(CANDIDATE_OPTIONAL_PEERS)) {
@@ -460,7 +461,15 @@ async function preparePackage(scratch, env, timeoutMs) {
   const packageDir = path.join(candidateDir, "package");
   const sourceManifest = JSON.parse(await fs.readFile(path.join(packageDir, "package.json"), "utf8"));
   const candidateManifest = mutateCandidatePackage(sourceManifest);
-  await fs.copyFile(path.join(fixtureRoot, "tui.tsx"), path.join(packageDir, "tui.tsx"));
+  await run("bun", [
+    "build",
+    "--no-bundle",
+    "--target=bun",
+    "--format=esm",
+    "--sourcemap=none",
+    `--outfile=${path.join(packageDir, "tui.generated.js")}`,
+    path.join(fixtureRoot, "tui.tsx"),
+  ], { cwd: root, env, timeoutMs });
   await writeJson(path.join(packageDir, "package.json"), candidateManifest);
   const second = await run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", packDir], {
     cwd: packageDir,
@@ -472,7 +481,9 @@ async function preparePackage(scratch, env, timeoutMs) {
   const inventory = candidatePack.files
     .map(({ path: file, size, mode }) => ({ path: file, size, mode }))
     .sort((a, b) => a.path.localeCompare(b.path));
-  if (!inventory.some((entry) => entry.path === "tui.tsx")) throw new Error("candidate tarball omitted tui.tsx");
+  if (!inventory.some((entry) => entry.path === "tui.generated.js")) {
+    throw new Error("candidate tarball omitted tui.generated.js");
+  }
   return {
     tarball,
     manifest: candidateManifest,
@@ -574,7 +585,7 @@ async function waitForProcessGroupExit(pid, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!processGroupAlive(pid)) return true;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await delay(25);
   }
   return !processGroupAlive(pid);
 }
@@ -637,7 +648,7 @@ async function runTuiStage({ stage, columns, rows, opencodeBin, timeoutMs, direc
         if (overflow) throw new Error(`stage ${stage} diagnostics exceeded their byte bound`);
         return receipt;
       }
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await delay(50);
     }
     throw new Error(`stage ${stage} timed out`);
   } finally {
@@ -752,6 +763,6 @@ export async function main(options = {}) {
   return 1;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename) {
   process.exit(await main());
 }

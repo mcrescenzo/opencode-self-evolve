@@ -1,5 +1,6 @@
 import { DEFAULT_BUDGETS, makeDecision } from "./self-evolve-schemas.js";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   BRIDGE_ACTOR,
   createControlRequest,
@@ -25,7 +26,13 @@ import { acquireProjectTuiStore } from "./self-evolve-tui-store.js";
 /** @typedef {import("@opencode-ai/plugin/tui").TuiPluginApi} TuiPluginApi */
 
 const PREVIEW_LINE_LIMIT = 50;
+const PROPOSAL_ACTION_LABELS = Object.freeze({
+  applied: "Review applied change",
+  pending: "Review proposal",
+  "failed-closed": "Critical failed-closed record",
+});
 export const SELF_EVOLVE_MODULE_ID = "mcrescenzo.self-evolve";
+export const SELF_EVOLVE_PLUGIN_VERSION = "0.2.0";
 export const TUI_IDENTITIES = Object.freeze({
   command: `${SELF_EVOLVE_MODULE_ID}.control-center`,
   route: `${SELF_EVOLVE_MODULE_ID}.control-center.route`,
@@ -40,6 +47,7 @@ export const TUI_KV_KEYS = Object.freeze({
   dismissed: `${SELF_EVOLVE_MODULE_ID}:dismissed-ids`,
   lastShown: `${SELF_EVOLVE_MODULE_ID}:last-shown-at`,
   pendingRequests: `${SELF_EVOLVE_MODULE_ID}:pending-request-ids`,
+  acknowledgedAudits: `${SELF_EVOLVE_MODULE_ID}:acknowledged-audits-v1`,
 });
 export const TUI_LEGACY_KV_KEYS = Object.freeze({
   notificationHistory: "self-evolve:notification-history",
@@ -47,6 +55,7 @@ export const TUI_LEGACY_KV_KEYS = Object.freeze({
   dismissed: "self-evolve:dismissed-ids",
   lastShown: "self-evolve:last-shown-at",
   pendingRequests: "self-evolve:pending-request-ids",
+  acknowledgedAudits: "self-evolve:native-audit-acknowledged",
 });
 const NOTIFICATION_KEY = TUI_KV_KEYS.notificationHistory;
 const FIRST_USE_KEY = TUI_KV_KEYS.firstUse;
@@ -56,7 +65,9 @@ const PENDING_REQUESTS_KEY = TUI_KV_KEYS.pendingRequests;
 const TUI_SURFACE_REGISTRY = Symbol.for("mcrescenzo.self-evolve.tui.surface-registry");
 const TUI_SURFACE_FINGERPRINT = "mcrescenzo.self-evolve.control-center.v1";
 const TUI_KV_MAX_BYTES = 32 * 1024;
+const TUI_ACKNOWLEDGEMENT_MAX_BYTES = 64 * 1024;
 const ownedKvCache = new WeakMap();
+const acknowledgementStoreCache = new WeakMap();
 const ACTOR = BRIDGE_ACTOR;
 const MAX_SERVER_WAIT_MS = 5_000;
 const HOST_HEALTH_REFRESH_MS = 15_000;
@@ -104,6 +115,24 @@ function validPendingRequests(value) {
     if (entry.proposalId !== undefined && !boundedString(entry.proposalId)) return false;
     return Number.isFinite(entry.submittedAt);
   });
+}
+
+function validAcknowledgedAudits(value) {
+  return Array.isArray(value) && value.length <= REVIEW_BOOKKEEPING_CAP && value.every((entry) =>
+    entry && typeof entry === "object" && !Array.isArray(entry)
+      && /^[a-f0-9]{64}$/u.test(entry.projectFingerprint)
+      && boundedString(entry.auditId)
+      && Number.isSafeInteger(entry.acknowledgedAt)
+      && entry.acknowledgedAt >= 0);
+}
+
+function boundedAcknowledgedAudits(value) {
+  if (!validAcknowledgedAudits(value)) return false;
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8") <= TUI_ACKNOWLEDGEMENT_MAX_BYTES;
+  } catch {
+    return false;
+  }
 }
 
 const TUI_KV_DEFINITIONS = new Map([
@@ -157,6 +186,79 @@ export function createOwnedKv(rawKv) {
   });
   ownedKvCache.set(rawKv, ownedKv);
   return ownedKv;
+}
+
+// Applied-result acknowledgement is presentation-only. It is deliberately
+// project-partitioned in the host KV, never sent to the server, and bounded
+// across all projects. The Release A single-string value is claimed by the
+// first current project that reads it during the one-release migration window.
+export function createTuiAcknowledgementStore(rawKv, { now = Date.now } = {}) {
+  if (!rawKv || typeof rawKv.get !== "function" || typeof rawKv.set !== "function") {
+    throw new TypeError("tui-kv-unavailable");
+  }
+  if (typeof now !== "function") throw new TypeError("tui-acknowledgement-clock-required");
+  const cached = acknowledgementStoreCache.get(rawKv);
+  if (cached) return cached;
+  let legacyRead = false;
+
+  function readCanonical(projectFingerprint) {
+    let stored = rawKv.get(TUI_KV_KEYS.acknowledgedAudits);
+    if (stored === undefined && !legacyRead) {
+      legacyRead = true;
+      const legacy = rawKv.get(TUI_LEGACY_KV_KEYS.acknowledgedAudits);
+      if (boundedString(legacy)) {
+        const migrated = [{
+          projectFingerprint,
+          auditId: legacy,
+          acknowledgedAt: 0,
+        }];
+        if (boundedAcknowledgedAudits(migrated)) {
+          rawKv.set(TUI_KV_KEYS.acknowledgedAudits, migrated);
+          stored = migrated;
+        }
+      }
+    }
+    return boundedAcknowledgedAudits(stored) ? stored : [];
+  }
+
+  const store = Object.freeze({
+    read(projectFingerprint) {
+      if (!/^[a-f0-9]{64}$/u.test(String(projectFingerprint ?? ""))) return Object.freeze([]);
+      return Object.freeze(readCanonical(projectFingerprint)
+        .filter((entry) => entry.projectFingerprint === projectFingerprint)
+        .map((entry) => entry.auditId));
+    },
+    acknowledge(projectFingerprint, auditIds) {
+      if (!/^[a-f0-9]{64}$/u.test(String(projectFingerprint ?? ""))) return Object.freeze([]);
+      const cleanIds = [...new Set((Array.isArray(auditIds) ? auditIds : [auditIds])
+        .filter((auditId) => boundedString(auditId)))].sort();
+      if (!cleanIds.length) return this.read(projectFingerprint);
+      const current = readCanonical(projectFingerprint);
+      const canonical = rawKv.get(TUI_KV_KEYS.acknowledgedAudits);
+      if (canonical !== undefined && !boundedAcknowledgedAudits(canonical)) {
+        return Object.freeze([]);
+      }
+      const acknowledgedAt = Math.max(0, Math.trunc(now()));
+      const merged = new Map(current.map((entry) => [
+        `${entry.projectFingerprint}\n${entry.auditId}`,
+        entry,
+      ]));
+      for (const auditId of cleanIds) {
+        const entry = { projectFingerprint, auditId, acknowledgedAt };
+        merged.set(`${projectFingerprint}\n${auditId}`, entry);
+      }
+      const next = [...merged.values()]
+        .sort((left, right) => left.acknowledgedAt - right.acknowledgedAt
+          || left.projectFingerprint.localeCompare(right.projectFingerprint)
+          || left.auditId.localeCompare(right.auditId))
+        .slice(-REVIEW_BOOKKEEPING_CAP);
+      if (!boundedAcknowledgedAudits(next)) return Object.freeze([]);
+      rawKv.set(TUI_KV_KEYS.acknowledgedAudits, next);
+      return this.read(projectFingerprint);
+    },
+  });
+  acknowledgementStoreCache.set(rawKv, store);
+  return store;
 }
 
 export function claimTuiSurfaceOwnership(api) {
@@ -217,7 +319,7 @@ export function formatProposalDigest(proposal, inventory = {}) {
     : Number.isFinite(currentTokens) && Number.isFinite(proposedTokens)
       ? proposedTokens - currentTokens
       : 0;
-  const actionLabel = proposal?.state === "applied" ? "Review applied change" : proposal?.state === "pending" ? "Review proposal" : proposal?.state === "failed-closed" ? "Critical failed-closed record" : "Review record";
+  const actionLabel = PROPOSAL_ACTION_LABELS[proposal?.state] ?? "Review record";
   return {
     title: `${actionLabel}: ${target}`,
     body: String(proposal?.rationaleText ?? proposal?.rationale ?? "No rationale supplied."),
@@ -449,6 +551,14 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         worktree: identity.worktreePath,
       },
       clientFactory: options?.__testTuiStoreClientFactory,
+      acknowledgementStore: createTuiAcknowledgementStore(api.kv, {
+        now: () => nowFor(api),
+      }),
+      runtimeMetadata: {
+        hostVersion: typeof api.app?.version === "string" ? api.app.version : "unknown",
+        hostVersionSource: "tui-app-version",
+        pluginVersion: SELF_EVOLVE_PLUGIN_VERSION,
+      },
     });
   } catch (error) {
     console.warn(`self-evolve native projection store disabled: ${error instanceof Error ? error.message : String(error)}`);
@@ -591,7 +701,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     while (!disposed && !api.lifecycle.signal.aborted && Date.now() - startedAt <= timeoutMs) {
       const response = kind === "control" ? await mailbox.pollControl(requestId) : await mailbox.poll(requestId);
       if (response) return response;
-      await new Promise((resolve) => setTimeout(resolve, Math.min(100, pollMs)));
+      await delay(Math.min(100, pollMs));
     }
     return null;
   }
@@ -936,7 +1046,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       }],
     });
   } else if (!nativeSurface) {
-    console.warn(`self-evolve legacy settings command disabled: missing ${missingLegacySettingsCapabilities.join(", ")}; update external tui.json to load self-evolve-tui.tsx (@mcrescenzo/opencode-self-evolve/tui).`.slice(0, 240));
+    console.warn(`self-evolve legacy settings command disabled: missing ${missingLegacySettingsCapabilities.join(", ")}; update external tui.json to load the package root (@mcrescenzo/opencode-self-evolve).`.slice(0, 240));
   }
 
   if (testAutoReview) {

@@ -1,5 +1,7 @@
+import path from "node:path";
 import { readSessionMessages } from "./self-evolve-client.js";
 import { partIsExcludedFromEvidence } from "./self-evolve-observation.js";
+import { latestByLogicalId } from "./self-evolve-schemas.js";
 
 const DEFAULT_MESSAGE_LIMIT = 120;
 const CONTENT_CHUNK_SIZE = 400;
@@ -55,12 +57,6 @@ function metadataMessages(messages, privacy) {
       isSelfEvolveOutput: base.isSelfEvolveOutput,
     }))];
   });
-}
-
-function latestByLogicalId(records) {
-  const latest = new Map();
-  for (const record of records) latest.set(record.payload?.id ?? record.payload?.proposalId ?? record.id, record);
-  return latest;
 }
 
 function currentProposal(store, proposalId) {
@@ -222,10 +218,14 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
 
   function inventoryFor(options) {
     if (Array.isArray(options.inventoryRecords)) return options.inventoryRecords;
+    const projectRoot = options.projectRoot;
+    const repoSkillRoots = options.repoSkillRoots ?? (typeof projectRoot === "string" && projectRoot
+      ? [path.join(projectRoot, ".opencode", "skills")]
+      : []);
     const roots = options.canonicalRoots ?? inventory.loadAllowlist?.({
       globalSkillRoots: options.globalSkillRoots ?? store.getSettings?.().global.allowedSkillRoots ?? [],
-      repoSkillRoots: options.repoSkillRoots ?? [],
-      projectRoot: options.projectRoot,
+      repoSkillRoots,
+      projectRoot,
     })?.canonicalRoots ?? [];
     return inventory.discoverSkills?.(roots) ?? [];
   }
@@ -246,7 +246,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         session: {
           ...ctx.client.session,
           prompt: async (...args) => {
-            const result = await prompt.apply(ctx.client.session, args);
+            const result = await prompt.call(ctx.client.session, ...args);
             const output = result?.data?.info?.structured_output ?? result?.data?.structured_output ?? result?.info?.structured_output ?? result?.structured_output;
             if (typeof output?.proposedContent === "string" && typeof output?.proposedContentHash === "string") {
               captured.set(output.proposedContentHash, output.proposedContent);
@@ -379,6 +379,8 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         appendAudit("message-window-empty", sessionIDHash, { sessionIDHash, preservedMessageHash: cursor.lastObservedMessageHash });
         return {
           result: "no-eligible",
+          cycleOutcome: "no-observations",
+          cycleReason: "empty-window",
           observations,
           eligibility,
           auditEvents: auditSince(store, auditStart),
@@ -389,6 +391,8 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         const proposal = pendingProposal(store, projectFingerprint);
         return {
           result: proposal ? "proposal-pending" : "no-eligible",
+          cycleOutcome: "cursor-unchanged",
+          cycleReason: "already-processed",
           ...(proposal ? { proposal } : {}),
           observations,
           eligibility,
@@ -404,7 +408,13 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
       const nextCursor = schemas.makeEpisodeCursor({ sessionIDHash, lastIdleAt: timestamp, lastObservedMessageHash, leaseNonce: null });
       const advanceCursor = () => {
         if (cursorRecord) {
-          const updated = store.runCas("episode-cursor", cursorRecord.id, undefined, () => nextCursor);
+          const updated = store.runCas(
+            "episode-cursor",
+            cursor.sessionIDHash,
+            cursor.lastObservedMessageHash,
+            () => nextCursor,
+            (payload) => payload?.lastObservedMessageHash,
+          );
           if (!updated?.ok) throw new Error(updated?.reason ?? "cursor-cas-failed");
         } else {
           append("episode-cursor", nextCursor, timestamp);
@@ -415,6 +425,8 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         appendAudit("message-cursor-gap", sessionIDHash, { sessionIDHash, priorMessageHash: cursor.lastObservedMessageHash, lastObservedMessageHash });
         return {
           result: "no-eligible",
+          cycleOutcome: "no-observations",
+          cycleReason: "cursor-gap",
           observations,
           eligibility,
           auditEvents: auditSince(store, auditStart),
@@ -477,7 +489,15 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         }];
       });
       if (!eligible.length) {
-        return { result: "no-eligible", observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: noEligibleText(eligibility) };
+        return {
+          result: "no-eligible",
+          cycleOutcome: observations.length ? "not-eligible" : "no-observations",
+          cycleReason: "insufficient-evidence",
+          observations,
+          eligibility,
+          auditEvents: auditSince(store, auditStart),
+          responseText: noEligibleText(eligibility),
+        };
       }
 
       const records = inventoryFor(options);
@@ -485,6 +505,8 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
       if (!targetSkill) throw new Error("eligible-cluster-has-no-skill-target");
       const captured = new Map();
       const synthesisCtx = captureSynthesisContent(ctx, captured);
+      let validNoChange = false;
+      let hadSynthesisFailure = false;
       for (const cluster of eligible) {
         if (typeof options.reservePassiveProviderCalls === "function") {
           let reservation;
@@ -502,6 +524,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
             });
             return {
               result: "deferred",
+              cycleOutcome: "deferred",
               deferred: true,
               reason,
               requested: 2,
@@ -524,7 +547,9 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         });
         if (!synthesized?.ok || !synthesized.proposal) {
           appendAudit("pipeline-synthesis-failure", cluster.id, { reason: synthesized?.reason ?? (synthesized?.noChange ? "no-change" : "unknown") });
-           persistSynthesisOutcome(synthesized, synthesized?.noChange ? "no-change" : "failed", synthesized?.reason, options.faultInjection);
+          persistSynthesisOutcome(synthesized, synthesized?.noChange ? "no-change" : "failed", synthesized?.reason, options.faultInjection);
+          if (synthesized?.ok === true && synthesized?.noChange === true) validNoChange = true;
+          else hadSynthesisFailure = true;
           continue;
         }
         const cleanProposal = schemas.makeProposal(synthesized.proposal);
@@ -539,6 +564,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
          });
         options.faultInjection?.("pipeline-after-critic-transaction", { synthesized, criticized });
         if (!criticized?.ok || !criticized.proposal?.criticPassed) {
+          hadSynthesisFailure = true;
           appendAudit("pipeline-critic-failure", cleanProposal.id, { reason: criticized?.reason ?? "critic-rejected" });
           persistSynthesisOutcome(synthesized, criticized?.criticResult ? "critic-rejected" : "failed", criticized?.reason, options.faultInjection);
           continue;
@@ -549,6 +575,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
           persistProposalContent(proposal, content, options.faultInjection);
           options.faultInjection?.("pipeline-after-content-chunks", { proposal });
         } catch (error) {
+          hadSynthesisFailure = true;
           const reason = String(error?.message ?? error) === "proposal-content-unavailable"
             ? "proposal-content-unavailable"
             : "proposal-content-persistence-failed";
@@ -561,12 +588,21 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         if (mode === "yolo") {
           const applied = await applier.applyProposal({ proposal: { ...proposal, proposedContent: content }, mode, actor: "self-evolve-applier" });
           if (applied?.ok === true && applied.disposition === "applied") {
-            return { result: "applied", proposal, observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: `Self-evolve applied proposal ${proposal.id}; appliedHash ${applied.appliedHash}; auditId ${applied.auditId}.` };
+            return {
+              result: "applied",
+              cycleOutcome: "applied",
+              proposal,
+              observations,
+              eligibility,
+              auditEvents: auditSince(store, auditStart),
+              responseText: `Self-evolve applied proposal ${proposal.id}; appliedHash ${applied.appliedHash}; auditId ${applied.auditId}.`,
+            };
           }
           const latest = currentProposal(store, proposal.id) ?? proposal;
           if (applied?.disposition === "deferred" && applied.deferred === true) {
             return {
               result: "deferred",
+              cycleOutcome: "deferred",
               deferred: true,
               reason: applied.reason ?? "apply-deferred",
               proposal: latest,
@@ -581,6 +617,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
             const failed = failProposalClosed(latest, reason);
             return {
               result: "failed-closed",
+              cycleOutcome: "failed-closed",
               reason,
               proposal: failed,
               observations,
@@ -592,6 +629,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         }
         return {
           result: mode === "manual" ? "proposal-pending" : "proposal-ready",
+          cycleOutcome: "recommendation-created",
           proposal,
           observations,
           eligibility,
@@ -599,10 +637,35 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
           responseText: proposalText(proposal, mode),
         };
       }
-      return { result: "failed-closed", observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: "Self-evolve evidence was eligible, but synthesis or critic validation failed closed. No files were applied." };
+      if (validNoChange && !hadSynthesisFailure) {
+        return {
+          result: "no-change",
+          cycleOutcome: "valid-no-change",
+          cycleReason: "no-change",
+          observations,
+          eligibility,
+          auditEvents: auditSince(store, auditStart),
+          responseText: "Self-evolve analysis completed successfully and found no useful safe change. No files were applied.",
+        };
+      }
+      return {
+        result: "failed-closed",
+        cycleOutcome: "failed-closed",
+        observations,
+        eligibility,
+        auditEvents: auditSince(store, auditStart),
+        responseText: "Self-evolve evidence was eligible, but synthesis or critic validation failed closed. No files were applied.",
+      };
     } catch (error) {
       try { appendAudit("pipeline-failure", observation.hashSessionLineage(sessionID), { reason: String(error?.message ?? error).slice(0, 400), trigger: String(trigger?.reason ?? trigger?.kind ?? trigger ?? "manual") }); } catch {}
-      return { result: "failed-closed", observations, eligibility, auditEvents: auditSince(store, auditStart), responseText: `Self-evolve failed closed: ${String(error?.message ?? error)}. No files were applied.` };
+      return {
+        result: "failed-closed",
+        cycleOutcome: "failed-closed",
+        observations,
+        eligibility,
+        auditEvents: auditSince(store, auditStart),
+        responseText: `Self-evolve failed closed: ${String(error?.message ?? error)}. No files were applied.`,
+      };
     }
   }
 
@@ -651,7 +714,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
 
   function close() {
     applier.close?.();
-    synthesis.disposeSynthesis?.();
+    synthesis.disposeSynthesis?.(store);
     store.close?.();
   }
 

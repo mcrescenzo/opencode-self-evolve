@@ -1,9 +1,17 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertApprovedTuiPackageContract } from "./check-tui-artifact.mjs";
+import {
+  GENERATED_TUI_FILE,
+  TUI_SOURCE_FILE,
+  assertApprovedTuiPackageContract,
+  assertCurrentTuiArtifact,
+  assertGeneratedTuiArtifact,
+  compileTuiArtifact,
+} from "./check-tui-artifact.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const defaultRepoRoot = path.resolve(path.dirname(scriptPath), "..");
@@ -110,11 +118,22 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
   try {
     const packageJSON = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
     assertPublicFilesManifest(packageJSON);
+    const source = readFileSync(path.join(repoRoot, TUI_SOURCE_FILE), "utf8");
+    const generated = readFileSync(path.join(repoRoot, GENERATED_TUI_FILE), "utf8");
+    assertApprovedTuiPackageContract(packageJSON, source);
+    assertGeneratedTuiArtifact(generated);
+    const rebuilt = compileTuiArtifact(path.join(tempRoot, GENERATED_TUI_FILE), { root: repoRoot });
+    assertCurrentTuiArtifact(rebuilt, generated);
     const npmEnv = { ...process.env, npm_config_cache: path.join(tempRoot, "npm-cache") };
     const packed = parsePackResult(run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", tempRoot], { cwd: repoRoot, env: npmEnv }).stdout);
     const files = assertExactArtifactFiles(packed.files.map((file) => file.path), packageJSON);
     const tarball = path.join(tempRoot, packed.filename);
     if (!existsSync(tarball)) fail(`Expected npm pack output was not created: ${tarball}`);
+    const inventory = packed.files
+      .map(({ path: file, size, mode }) => ({ path: file, size, mode }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    const tarballSha256 = createHash("sha256").update(readFileSync(tarball)).digest("hex");
+    const inventorySha256 = createHash("sha256").update(JSON.stringify(inventory)).digest("hex");
 
     const extractDir = path.join(tempRoot, "extract");
     mkdirSync(extractDir);
@@ -124,10 +143,8 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
       assertNoForbiddenImports(file, readFileSync(path.join(extractDir, "package", file), "utf8"));
     }
     assertServerEntryContract(readFileSync(path.join(extractDir, "package", "self-evolve.js"), "utf8"));
-    assertApprovedTuiPackageContract(
-      packageJSON,
-      readFileSync(path.join(extractDir, "package", "self-evolve-tui.tsx"), "utf8"),
-    );
+    assertApprovedTuiPackageContract(packageJSON, readFileSync(path.join(extractDir, "package", TUI_SOURCE_FILE), "utf8"));
+    assertGeneratedTuiArtifact(readFileSync(path.join(extractDir, "package", GENERATED_TUI_FILE), "utf8"));
 
     const consumerDir = path.join(tempRoot, "consumer");
     mkdirSync(consumerDir);
@@ -144,12 +161,16 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
 
     const smoke = [
       `const server = await import(${JSON.stringify(packageJSON.name)});`,
+      `const explicitServer = await import(${JSON.stringify(`${packageJSON.name}/server`)});`,
       `if (typeof server.default !== "function") throw new Error("server default export is not a Plugin factory");`,
       `if (Object.keys(server).join(",") !== "default") throw new Error("server target exposes named exports");`,
+      `if (explicitServer.default !== server.default || Object.keys(explicitServer).join(",") !== "default") throw new Error("explicit server target diverged from package root");`,
     ].join("\n");
     run(process.execPath, ["--input-type=module", "--eval", smoke], { cwd: consumerDir });
 
-    console.log(`Pack artifact check passed: ${files.size} exact files; raw TUI target validated and server target imported from a fresh peerless consumer.`);
+    console.log(`Pack artifact check passed: ${files.size} exact files; deterministic built TUI target validated and root plus explicit server targets imported from a fresh peerless consumer.`);
+    console.log(`Packed artifact SHA-256: ${tarballSha256}`);
+    console.log(`Packed inventory SHA-256: ${inventorySha256}`);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }

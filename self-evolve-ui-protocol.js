@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
+import { deepFreeze } from "./self-evolve-schemas.js";
 
 export const UI_PROJECTION_VERSION = 1;
+export const UI_DASHBOARD_VERSION = 1;
 export const UI_OPERATION_PROTOCOL_VERSION = 1;
 export const UI_CAPABILITIES = Object.freeze([
   "legacy-control-v1",
@@ -15,6 +17,10 @@ export const UI_CAPABILITIES = Object.freeze([
   "operation-snooze-v1",
   "projection-index-v1",
   "projection-review-detail-v1",
+]);
+export const UI_DASHBOARD_CAPABILITIES = Object.freeze([
+  "control-repo-mode-v1",
+  "decision-feedback-v1",
 ]);
 export const UI_PROTOCOL_COMPATIBILITY = Object.freeze({
   newTuiOldServer: "legacy-read-only-no-new-writes",
@@ -32,11 +38,14 @@ export const UI_PROTOCOL_LIMITS = Object.freeze({
   diffBytes: 64 * 1024,
   evidenceEntries: 32,
   auditEntries: 64,
+  activityEntries: 64,
   eligibilityReasons: 32,
   reasonBytes: 512,
+  dashboardSummaryBytes: 512,
   summaryBytes: 2 * 1024,
   rationaleBytes: 2 * 1024,
   indexBytes: 64 * 1024,
+  dashboardBytes: 64 * 1024,
   detailBytes: 128 * 1024,
   operationBytes: 8 * 1024,
   responseBytes: 4 * 1024,
@@ -59,6 +68,7 @@ export const UI_ACTIONS = Object.freeze([
   "rollback-proposal",
   "set-kill-switch",
   "set-paused",
+  "set-repo-mode",
   "snooze-proposal",
 ]);
 export const UI_OPERATION_ACTIONS = Object.freeze([
@@ -80,6 +90,12 @@ export const UI_REVIEW_DETAIL_FIELDS = Object.freeze([
   "projectionVersion", "projectFingerprint", "stateRootIdentity",
   "generation", "proposalId", "revision", "issuedAt", "expiresAt", "summary", "diff",
   "evidence", "audit", "allowedActions", "overflow", "detailHash",
+]);
+export const UI_DASHBOARD_FIELDS = Object.freeze([
+  "dashboardVersion", "projectFingerprint", "stateRootIdentity", "generation", "indexHash",
+  "generatedAt", "capabilities", "automation", "blockers", "inFlight", "lastCycle", "nextEligibleAt",
+  "usage", "rollout", "settings", "retention", "supportedControls", "activity",
+  "overflow", "dashboardHash",
 ]);
 export const UI_OPERATION_REQUEST_FIELDS = Object.freeze([
   "operationProtocolVersion", "requestId", "projectFingerprint", "stateRootIdentity",
@@ -123,6 +139,32 @@ const DIFF_FIELDS = Object.freeze(["kind", "lines", "overflow"]);
 const EVIDENCE_FIELDS = Object.freeze(["id", "kind", "summary", "occurredAt", "redacted"]);
 const AUDIT_FIELDS = Object.freeze(["id", "kind", "summary", "timestamp"]);
 const DETAIL_OVERFLOW_FIELDS = Object.freeze(["evidence", "audit", "allowedActions"]);
+const DASHBOARD_AUTOMATION_FIELDS = Object.freeze(["state", "reason"]);
+const DASHBOARD_BLOCKER_FIELDS = Object.freeze(["code", "summary", "destination"]);
+const DASHBOARD_IN_FLIGHT_FIELDS = Object.freeze(["active", "count", "stage", "startedAt"]);
+const DASHBOARD_LAST_CYCLE_FIELDS = Object.freeze([
+  "outcome", "triggerClass", "mode", "observationCount", "eligibilityCount",
+  "proposalId", "occurredAt", "reason",
+]);
+const DASHBOARD_USAGE_FIELDS = Object.freeze(["passive", "synthesis", "storage"]);
+const DASHBOARD_BUDGET_USAGE_FIELDS = Object.freeze(["used", "limit", "remaining", "resetAt"]);
+const DASHBOARD_STORAGE_USAGE_FIELDS = Object.freeze(["usedBytes", "limitBytes", "remainingBytes"]);
+const DASHBOARD_ROLLOUT_FIELDS = Object.freeze([
+  "ready", "synthesesObserved", "minSynthesesObserved", "successRateBasisPoints",
+  "minSuccessRateBasisPoints",
+]);
+const DASHBOARD_SETTINGS_FIELDS = Object.freeze([
+  "globalMode", "repositoryMode", "effectiveMode", "paused", "killSwitchActive",
+  "repositoryExcluded", "consent", "approvedSkillFolderCount",
+]);
+const DASHBOARD_CONSENT_FIELDS = Object.freeze([
+  "passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation",
+]);
+const DASHBOARD_RETENTION_FIELDS = Object.freeze(["observationsDays", "operationalDays"]);
+const DASHBOARD_ACTIVITY_FIELDS = Object.freeze([
+  "id", "category", "audience", "outcome", "summary", "occurredAt", "proposalId", "reason",
+]);
+const DASHBOARD_OVERFLOW_FIELDS = Object.freeze(["activity"]);
 const SNOOZE_PAYLOAD_FIELDS = Object.freeze([
   "proposalId", "targetHash", "proposedContentHash", "decisionVersion", "snoozedUntil",
 ]);
@@ -136,6 +178,34 @@ const MODES = Object.freeze(["manual", "auto", "yolo"]);
 const PROPOSAL_STATES = Object.freeze([
   "critic-pending", "pending", "approved", "rejected", "applied", "rolled-back", "superseded", "failed-closed",
 ]);
+export const UI_DASHBOARD_AUTOMATION_STATES = Object.freeze([
+  "terminal", "corrupt", "emergency-stop", "circuit-breaker", "paused", "excluded",
+  "on-demand", "setup-required", "running", "backoff", "budget", "quiet-period", "ready",
+]);
+export const UI_DASHBOARD_BLOCKER_CODES = Object.freeze([
+  "unsupported-host", "state-root", "provider", "first-run", "restart-required", "passive-consent", "observation-consent",
+  "approved-skill-folders", "yolo-rollout", "corrupt-state", "emergency-stop",
+  "circuit-breaker", "paused", "repository-excluded",
+]);
+export const UI_DASHBOARD_OUTCOMES = Object.freeze([
+  "cursor-unchanged", "no-observations", "not-eligible", "valid-no-change",
+  "recommendation-created", "applied", "deferred", "failed-closed", "failed",
+  "rolled-back", "recommendation-approved", "recommendation-rejected",
+  "recommendation-snoozed", "recommendation-acknowledged", "breaker-open",
+  "breaker-recovered", "paused", "resumed", "emergency-stop-enabled",
+  "emergency-stop-disabled", "project-excluded", "project-included",
+  "export-completed", "purge-completed", "purge-all-accepted", "bootstrap-completed",
+  "recovery-completed",
+]);
+export const UI_DASHBOARD_REASON_CODES = Object.freeze([
+  "already-processed", "empty-window", "cursor-gap", "insufficient-evidence",
+  "passive-provider-budget-exhausted", "passive-provider-budget-insufficient",
+  "synthesis-budget-exhausted", "quiet-period", "backoff", "lease-busy",
+  "no-change", "critic-rejected", "validation-failed", "apply-deferred",
+  "apply-failed", "pipeline-failed", "operation-failed", "three-failures-in-24h",
+  "startup-pending", "setup-required", "restart-required", "unsupported-host", "corrupt-state",
+  "emergency-stop", "paused", "repository-excluded", "unknown",
+]);
 export const UI_ACTION_CAPABILITIES = Object.freeze({
   "acknowledge-audit": "projection-review-detail-v1",
   "apply-proposal": "legacy-decision-v1",
@@ -147,6 +217,7 @@ export const UI_ACTION_CAPABILITIES = Object.freeze({
   "rollback-proposal": "operation-rollback-v1",
   "set-kill-switch": "operation-kill-switch-v1",
   "set-paused": "operation-pause-v1",
+  "set-repo-mode": "control-repo-mode-v1",
   "snooze-proposal": "operation-snooze-v1",
 });
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
@@ -160,6 +231,7 @@ const AUDIT_KINDS = Object.freeze([
 
 const HASH_DOMAINS = Object.freeze({
   "projection-index": "self-evolve-ui-projection-index-v1",
+  dashboard: "self-evolve-ui-dashboard-v1",
   "review-detail": "self-evolve-ui-review-detail-v1",
   "operation-request": "self-evolve-ui-operation-request-v1",
   "operation-response": "self-evolve-ui-operation-response-v1",
@@ -167,14 +239,6 @@ const HASH_DOMAINS = Object.freeze({
 
 function fail(code, detail = "") {
   throw new TypeError(detail ? `${code}: ${detail}` : code);
-}
-
-function deepFreeze(value) {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const child of Object.values(value)) deepFreeze(child);
-  }
-  return value;
 }
 
 function exactKeys(value, fields, label) {
@@ -327,6 +391,8 @@ export function hashUiProtocol(kind, value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("canonical-object");
   const omittedField = kind === "projection-index"
     ? "projectionHash"
+    : kind === "dashboard"
+      ? "dashboardHash"
     : kind === "review-detail"
       ? "detailHash"
       : kind === "operation-request"
@@ -471,6 +537,209 @@ function makeStatus(value) {
 function makeBudgets(value) {
   exactKeys(value, BUDGET_FIELDS, "ui-projection-budgets");
   return Object.fromEntries(BUDGET_FIELDS.map((field) => [field, asInt(value[field], `budget-${field}`, { max: 1_000_000_000 })]));
+}
+
+function asNullableTimestamp(value, label) {
+  return value === null ? null : asTimestamp(value, label);
+}
+
+function makeDashboardReason(value, label = "dashboard-reason") {
+  return value === null ? null : asEnum(value, UI_DASHBOARD_REASON_CODES, label);
+}
+
+function makeDashboardBudgetUsage(value, label) {
+  exactKeys(value, DASHBOARD_BUDGET_USAGE_FIELDS, `${label}-usage`);
+  const used = asInt(value.used, `${label}-used`, { max: 1_000_000_000 });
+  const limit = asInt(value.limit, `${label}-limit`, { max: 1_000_000_000 });
+  const remaining = asInt(value.remaining, `${label}-remaining`, { max: 1_000_000_000 });
+  if (remaining !== Math.max(0, limit - used)) fail(`${label}-remaining-mismatch`);
+  return { used, limit, remaining, resetAt: asNullableTimestamp(value.resetAt, `${label}-reset-at`) };
+}
+
+function makeDashboardUsage(value) {
+  exactKeys(value, DASHBOARD_USAGE_FIELDS, "dashboard-usage");
+  exactKeys(value.storage, DASHBOARD_STORAGE_USAGE_FIELDS, "dashboard-storage-usage");
+  const usedBytes = asInt(value.storage.usedBytes, "storage-used-bytes");
+  const limitBytes = asInt(value.storage.limitBytes, "storage-limit-bytes");
+  const remainingBytes = asInt(value.storage.remainingBytes, "storage-remaining-bytes");
+  if (remainingBytes !== Math.max(0, limitBytes - usedBytes)) fail("storage-remaining-mismatch");
+  return {
+    passive: makeDashboardBudgetUsage(value.passive, "passive"),
+    synthesis: makeDashboardBudgetUsage(value.synthesis, "synthesis"),
+    storage: { usedBytes, limitBytes, remainingBytes },
+  };
+}
+
+function makeDashboardLastCycle(value) {
+  if (value === null) return null;
+  exactKeys(value, DASHBOARD_LAST_CYCLE_FIELDS, "dashboard-last-cycle");
+  return {
+    outcome: asEnum(value.outcome, UI_DASHBOARD_OUTCOMES.slice(0, 9), "cycle-outcome"),
+    triggerClass: asEnum(value.triggerClass, ["manual", "idle", "recovery", "other"], "cycle-trigger-class"),
+    mode: asEnum(value.mode, MODES, "cycle-mode"),
+    observationCount: asInt(value.observationCount, "cycle-observation-count", { max: 1_000_000 }),
+    eligibilityCount: asInt(value.eligibilityCount, "cycle-eligibility-count", { max: 1_000_000 }),
+    proposalId: value.proposalId === null ? null : asId(value.proposalId, "cycle-proposal-id"),
+    occurredAt: asTimestamp(value.occurredAt, "cycle-occurred-at"),
+    reason: makeDashboardReason(value.reason, "cycle-reason"),
+  };
+}
+
+function makeDashboardActivity(value) {
+  exactKeys(value, DASHBOARD_ACTIVITY_FIELDS, "dashboard-activity-entry");
+  return {
+    id: asHash(value.id, "activity-id"),
+    category: asEnum(value.category, ["cycle", "recommendation", "system", "error"], "activity-category"),
+    audience: asEnum(value.audience, ["default", "diagnostic"], "activity-audience"),
+    outcome: asEnum(value.outcome, UI_DASHBOARD_OUTCOMES, "activity-outcome"),
+    summary: asText(value.summary, "activity-summary", UI_PROTOCOL_LIMITS.dashboardSummaryBytes),
+    occurredAt: asTimestamp(value.occurredAt, "activity-occurred-at"),
+    proposalId: value.proposalId === null ? null : asId(value.proposalId, "activity-proposal-id"),
+    reason: makeDashboardReason(value.reason, "activity-reason"),
+  };
+}
+
+function makeDashboardContext(value) {
+  exactKeys(value, [
+    "projectFingerprint", "stateRootIdentity", "generation", "indexHash", "now",
+  ], "dashboard-context");
+  return {
+    projectFingerprint: asHash(value.projectFingerprint, "project-fingerprint"),
+    stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
+    generation: asHash(value.generation, "generation"),
+    indexHash: asHash(value.indexHash, "index-hash"),
+    now: asTimestamp(value.now, "now"),
+  };
+}
+
+export function makeUiDashboard(value, expectedValue) {
+  assertEnvelopeVersion(value, "dashboardVersion", UI_DASHBOARD_VERSION, "dashboard", "ui-dashboard");
+  exactKeys(value, UI_DASHBOARD_FIELDS, "ui-dashboard");
+  const expected = makeDashboardContext(expectedValue);
+  const projectFingerprint = asHash(value.projectFingerprint, "project-fingerprint");
+  const stateRootIdentity = asHash(value.stateRootIdentity, "state-root-identity");
+  const generation = asHash(value.generation, "generation");
+  const indexHash = asHash(value.indexHash, "index-hash");
+  if (projectFingerprint !== expected.projectFingerprint) fail("cross-project");
+  if (stateRootIdentity !== expected.stateRootIdentity) fail("cross-root");
+  if (generation !== expected.generation) fail("stale-generation");
+  if (indexHash !== expected.indexHash) fail("stale-projection");
+  const generatedAt = asTimestamp(value.generatedAt, "dashboard-generated-at");
+  if (generatedAt > expected.now + UI_PROTOCOL_LIMITS.futureSkewMs) fail("future-dashboard");
+  if (generatedAt + UI_PROTOCOL_LIMITS.projectionTtlMs <= expected.now) fail("expired-dashboard");
+  const capabilities = exactSortedList(
+    value.capabilities,
+    "dashboard-capabilities",
+    UI_DASHBOARD_CAPABILITIES,
+    UI_DASHBOARD_CAPABILITIES.length,
+    "unknown-dashboard-capability",
+  );
+  exactKeys(value.automation, DASHBOARD_AUTOMATION_FIELDS, "dashboard-automation");
+  const automation = {
+    state: asEnum(value.automation.state, UI_DASHBOARD_AUTOMATION_STATES, "dashboard-automation-state"),
+    reason: makeDashboardReason(value.automation.reason, "dashboard-automation-reason"),
+  };
+  if (!Array.isArray(value.blockers) || value.blockers.length > UI_DASHBOARD_BLOCKER_CODES.length) fail("dashboard-blockers-out-of-bounds");
+  const blockers = value.blockers.map((blocker) => {
+    exactKeys(blocker, DASHBOARD_BLOCKER_FIELDS, "dashboard-blocker");
+    return {
+      code: asEnum(blocker.code, UI_DASHBOARD_BLOCKER_CODES, "dashboard-blocker-code"),
+      summary: asText(blocker.summary, "dashboard-blocker-summary", UI_PROTOCOL_LIMITS.dashboardSummaryBytes),
+      destination: asEnum(blocker.destination, ["home", "recommendations", "activity-errors", "settings"], "dashboard-destination"),
+    };
+  });
+  if (new Set(blockers.map((blocker) => blocker.code)).size !== blockers.length) fail("dashboard-blocker-duplicate");
+  exactKeys(value.inFlight, DASHBOARD_IN_FLIGHT_FIELDS, "dashboard-in-flight");
+  const inFlight = {
+    active: asBoolean(value.inFlight.active, "dashboard-in-flight-active"),
+    count: asInt(value.inFlight.count, "dashboard-in-flight-count", { max: 1_000 }),
+    stage: value.inFlight.stage === null
+      ? null
+      : asEnum(value.inFlight.stage, ["pipeline", "apply", "operation"], "dashboard-in-flight-stage"),
+    startedAt: asNullableTimestamp(value.inFlight.startedAt, "dashboard-in-flight-started-at"),
+  };
+  if (inFlight.active !== (inFlight.count > 0)
+      || (inFlight.active && (inFlight.stage === null || inFlight.startedAt === null))
+      || (!inFlight.active && (inFlight.stage !== null || inFlight.startedAt !== null))) {
+    fail("dashboard-in-flight-inconsistent");
+  }
+  const lastCycle = makeDashboardLastCycle(value.lastCycle);
+  const nextEligibleAt = asNullableTimestamp(value.nextEligibleAt, "dashboard-next-eligible-at");
+  exactKeys(value.rollout, DASHBOARD_ROLLOUT_FIELDS, "dashboard-rollout");
+  const rollout = {
+    ready: asBoolean(value.rollout.ready, "dashboard-rollout-ready"),
+    synthesesObserved: asInt(value.rollout.synthesesObserved, "dashboard-syntheses-observed", { max: 1_000_000_000 }),
+    minSynthesesObserved: asInt(value.rollout.minSynthesesObserved, "dashboard-min-syntheses-observed", { max: 1_000_000_000 }),
+    successRateBasisPoints: asInt(value.rollout.successRateBasisPoints, "dashboard-success-rate", { max: 10_000 }),
+    minSuccessRateBasisPoints: asInt(value.rollout.minSuccessRateBasisPoints, "dashboard-min-success-rate", { max: 10_000 }),
+  };
+  if (rollout.ready !== (rollout.synthesesObserved >= rollout.minSynthesesObserved
+      && rollout.successRateBasisPoints >= rollout.minSuccessRateBasisPoints)) {
+    fail("dashboard-rollout-readiness-mismatch");
+  }
+  exactKeys(value.settings, DASHBOARD_SETTINGS_FIELDS, "dashboard-settings");
+  exactKeys(value.settings.consent, DASHBOARD_CONSENT_FIELDS, "dashboard-consent");
+  const settings = {
+    globalMode: asEnum(value.settings.globalMode, MODES, "dashboard-global-mode"),
+    repositoryMode: asEnum(value.settings.repositoryMode, ["inherit", ...MODES], "dashboard-repository-mode"),
+    effectiveMode: asEnum(value.settings.effectiveMode, MODES, "dashboard-effective-mode"),
+    paused: asBoolean(value.settings.paused, "dashboard-paused"),
+    killSwitchActive: asBoolean(value.settings.killSwitchActive, "dashboard-kill-switch"),
+    repositoryExcluded: asBoolean(value.settings.repositoryExcluded, "dashboard-repository-excluded"),
+    consent: Object.fromEntries(DASHBOARD_CONSENT_FIELDS.map((field) => [
+      field, asBoolean(value.settings.consent[field], `dashboard-consent-${field}`),
+    ])),
+    approvedSkillFolderCount: asInt(value.settings.approvedSkillFolderCount, "dashboard-approved-skill-folder-count", { max: 1_000_000 }),
+  };
+  exactKeys(value.retention, DASHBOARD_RETENTION_FIELDS, "dashboard-retention");
+  const retention = {
+    observationsDays: asInt(value.retention.observationsDays, "dashboard-observation-retention", { min: 1, max: 3_650 }),
+    operationalDays: asInt(value.retention.operationalDays, "dashboard-operational-retention", { min: 1, max: 3_650 }),
+  };
+  const supportedControls = exactSortedList(
+    value.supportedControls,
+    "dashboard-supported-controls",
+    UI_ACTIONS,
+    UI_ACTIONS.length,
+    "unknown-dashboard-control",
+  );
+  for (const action of supportedControls) {
+    const capability = UI_ACTION_CAPABILITIES[action];
+    if (!UI_CAPABILITIES.includes(capability) && !capabilities.includes(capability)) {
+      fail("unsupported-dashboard-control", action);
+    }
+  }
+  if (!Array.isArray(value.activity) || value.activity.length > UI_PROTOCOL_LIMITS.activityEntries) fail("dashboard-activity-out-of-bounds");
+  const activity = value.activity.map(makeDashboardActivity);
+  assertOrdered(activity, (left, right) => right.occurredAt - left.occurredAt || compareText(left.id, right.id), "dashboard-activity");
+  if (new Set(activity.map((entry) => entry.id)).size !== activity.length) fail("dashboard-activity-duplicate");
+  exactKeys(value.overflow, DASHBOARD_OVERFLOW_FIELDS, "dashboard-overflow");
+  const overflow = { activity: makeOverflow(value.overflow.activity, activity.length, "dashboard-activity") };
+  const clean = {
+    dashboardVersion: assertVersion(value.dashboardVersion, UI_DASHBOARD_VERSION, "dashboard"),
+    projectFingerprint,
+    stateRootIdentity,
+    generation,
+    indexHash,
+    generatedAt,
+    capabilities,
+    automation,
+    blockers,
+    inFlight,
+    lastCycle,
+    nextEligibleAt,
+    usage: makeDashboardUsage(value.usage),
+    rollout,
+    settings,
+    retention,
+    supportedControls,
+    activity,
+    overflow,
+    dashboardHash: asHash(value.dashboardHash, "dashboard-hash"),
+  };
+  if (hashUiProtocol("dashboard", clean) !== clean.dashboardHash) fail("dashboard-hash-mismatch");
+  if (Buffer.byteLength(canonicalUiJson(clean), "utf8") > UI_PROTOCOL_LIMITS.dashboardBytes) fail("dashboard-footprint-exceeded");
+  return deepFreeze(clean);
 }
 
 function makeReviewIndexEntry(value) {

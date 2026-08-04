@@ -21,12 +21,13 @@ import {
   DEFAULT_BUDGETS,
   SCHEMA_VERSION,
   assertRecord,
+  errorReasonCode,
   makeDecision,
   makeGlobalSettings,
   makeProposal,
   makeRepoSettings,
 } from "./self-evolve-schemas.js";
-import { withStateMutationLock } from "./self-evolve-lock.js";
+import { processIsAlive, withStateMutationLock } from "./self-evolve-lock.js";
 import { stateRootIdentity as computeStateRootIdentity } from "./self-evolve-state-root.js";
 import {
   UI_CAPABILITIES,
@@ -34,6 +35,7 @@ import {
   UI_PROJECTION_VERSION,
   UI_PROTOCOL_LIMITS,
   hashUiProtocol,
+  makeUiDashboard,
   makeUiOperationRequest,
   makeUiOperationResponse,
   makeUiProjectionIndex,
@@ -50,6 +52,15 @@ export const BRIDGE_REQUEST_FIELDS = Object.freeze([
   "schemaVersion", "requestId", "projectFingerprint", "proposalId", "targetHash",
   "proposedContentHash", "decisionVersion", "priorState", "newState", "actor",
   "timestamp", "nonce",
+]);
+export const DECISION_FEEDBACK_VERSION = 1;
+export const DECISION_REJECTION_REASONS = Object.freeze([
+  "incorrect-evidence", "already-covered", "wrong-scope", "too-specific",
+  "not-worth-token-cost", "other",
+]);
+export const BRIDGE_FEEDBACK_REQUEST_FIELDS = Object.freeze([
+  ...BRIDGE_REQUEST_FIELDS,
+  "feedbackVersion", "feedback",
 ]);
 export const BRIDGE_RESPONSE_FIELDS = Object.freeze([
   "schemaVersion", "requestId", "projectFingerprint", "proposalId", "ok", "status",
@@ -70,7 +81,9 @@ export const TUI_HOST_HEALTH_FIELDS = Object.freeze([
   "schemaVersion", "projectFingerprint", "actor", "issuedAt", "expiresAt",
   "stateRootIdentity", "hostVersion", "publisherPid", "nonce",
 ]);
-export const CONTROL_ACTIONS = Object.freeze(["set-mode", "set-consent", "set-repo-excluded", "update-allowlist"]);
+export const CONTROL_ACTIONS = Object.freeze([
+  "set-mode", "set-consent", "set-repo-excluded", "set-repo-mode", "update-allowlist",
+]);
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -82,7 +95,7 @@ const MAX_SETTINGS_BYTES = 64 * 1024;
 const MAX_MAILBOX_BYTES = 512 * 1024;
 const MAX_MAILBOX_FILES = 64;
 const MAX_STORE_RESERVE_BYTES = 64 * 1024;
-const MAX_UI_PROJECTION_FILES = 2 + UI_PROTOCOL_LIMITS.reviewIndexEntries;
+const MAX_UI_PROJECTION_FILES = 3 + UI_PROTOCOL_LIMITS.reviewIndexEntries;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const HOST_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/u;
@@ -123,10 +136,6 @@ function canonicalRoots(value, { nonEmpty = false } = {}) {
   });
   if (new Set(roots).size !== roots.length) throw new TypeError("invalid-control-allowlist");
   return Object.freeze(roots);
-}
-
-function reason(error) {
-  return String(error?.message ?? error ?? "bridge-error").split(":", 1)[0];
 }
 
 function boundedJson(value, maxBytes, label) {
@@ -230,6 +239,7 @@ function uiProjectionPaths(paths, { create = false, generation } = {}) {
     details,
     offer: path.join(root, "protocol-offer.json"),
     index: path.join(root, "index.json"),
+    dashboard: generationRoot ? path.join(generationRoot, "dashboard-v1.json") : null,
   };
 }
 
@@ -585,19 +595,35 @@ function atomicWrite(paths, filePath, source, { exclusive = false } = {}) {
   }
 }
 
-function processIsAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
-}
-
 function sameAccountProcessIsAlive(pid, signalProcess = process.kill) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { signalProcess(pid, 0); return true; } catch { return false; }
 }
 
 export function makeBridgeRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_TTL_MS, projectFingerprint } = {}) {
-  exactKeys(value, BRIDGE_REQUEST_FIELDS, "bridge-request");
+  const hasFeedbackFields = Object.hasOwn(value ?? {}, "feedbackVersion")
+    || Object.hasOwn(value ?? {}, "feedback");
+  exactKeys(value, hasFeedbackFields ? BRIDGE_FEEDBACK_REQUEST_FIELDS : BRIDGE_REQUEST_FIELDS, "bridge-request");
   if (value.schemaVersion !== SCHEMA_VERSION) throw new TypeError("unsupported-schema-version");
+  let feedback;
+  if (hasFeedbackFields) {
+    if (value.feedbackVersion !== DECISION_FEEDBACK_VERSION) throw new TypeError("unsupported-decision-feedback-version");
+    exactKeys(value.feedback, ["reason", "text"], "decision-feedback");
+    if (value.newState !== "rejected" || !DECISION_REJECTION_REASONS.includes(value.feedback.reason)) {
+      throw new TypeError("invalid-decision-feedback-reason");
+    }
+    if (value.feedback.text !== null
+        && (typeof value.feedback.text !== "string"
+          || value.feedback.text.length < 1
+          || value.feedback.text.length > 512
+          || Buffer.byteLength(value.feedback.text, "utf8") > 1_024)) {
+      throw new TypeError("invalid-decision-feedback-text");
+    }
+    if (value.feedback.reason !== "other" && value.feedback.text !== null) {
+      throw new TypeError("unexpected-decision-feedback-text");
+    }
+    feedback = Object.freeze({ reason: value.feedback.reason, text: value.feedback.text });
+  }
   const request = Object.freeze({
     schemaVersion: value.schemaVersion,
     requestId: validId(value.requestId, "request-id"),
@@ -611,6 +637,10 @@ export function makeBridgeRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_T
     actor: value.actor,
     timestamp: validTimestamp(value.timestamp),
     nonce: validId(value.nonce, "nonce"),
+    ...(hasFeedbackFields ? {
+      feedbackVersion: DECISION_FEEDBACK_VERSION,
+      feedback,
+    } : {}),
   });
   makeDecision({
     proposalId: request.proposalId,
@@ -668,6 +698,13 @@ function controlPayload(action, value) {
     exactKeys(value, ["excluded"], "control-payload");
     if (typeof value.excluded !== "boolean") throw new TypeError("invalid-exclusion-control");
     return Object.freeze({ excluded: value.excluded });
+  }
+  if (action === "set-repo-mode") {
+    exactKeys(value, ["mode"], "control-payload");
+    if (!["inherit", "manual", "auto", "yolo"].includes(value.mode)) {
+      throw new TypeError("invalid-repository-mode-control");
+    }
+    return Object.freeze({ mode: value.mode });
   }
   if (action === "update-allowlist") {
     exactKeys(value, ["allowlist", "confirmation"], "control-payload");
@@ -830,7 +867,15 @@ export function validateBridgeExportMetadata(type, value, { projectFingerprint, 
   return clean;
 }
 
-export function createDecisionRequest({ projectFingerprint, proposal, newState, actor = BRIDGE_ACTOR, timestamp = Date.now(), requestId = randomBytes(16).toString("hex") } = {}) {
+export function createDecisionRequest({
+  projectFingerprint,
+  proposal,
+  newState,
+  feedback,
+  actor = BRIDGE_ACTOR,
+  timestamp = Date.now(),
+  requestId = randomBytes(16).toString("hex"),
+} = {}) {
   return makeBridgeRequest({
     schemaVersion: SCHEMA_VERSION,
     requestId,
@@ -844,6 +889,13 @@ export function createDecisionRequest({ projectFingerprint, proposal, newState, 
     actor,
     timestamp,
     nonce: proposal?.decisionNonce,
+    ...(feedback === undefined ? {} : {
+      feedbackVersion: DECISION_FEEDBACK_VERSION,
+      feedback: {
+        reason: feedback?.reason,
+        text: feedback?.text ?? null,
+      },
+    }),
   }, { now: timestamp, projectFingerprint });
 }
 
@@ -959,7 +1011,7 @@ function pollResponse(stateRoot, projectFingerprint, requestId, type) {
   const filePath = path.join(directory, `${id}.json`);
   let read;
   try { read = secureRead(paths, filePath, MAX_RESPONSE_BYTES, `${type}-response`); }
-  catch (error) { if (/hardlink-rejected$/u.test(reason(error))) return null; throw error; }
+  catch (error) { if (/hardlink-rejected$/u.test(errorReasonCode(error, "bridge-error"))) return null; throw error; }
   if (!read) return null;
   const response = type === "control" ? makeControlResponse(JSON.parse(read.source)) : makeBridgeResponse(JSON.parse(read.source));
   if (response.projectFingerprint !== projectFingerprint || response.requestId !== id) throw new Error("cross-project-response");
@@ -1019,6 +1071,7 @@ export function readControlState(stateRoot, projectFingerprint, { now = Date.now
 function validateUiProjectionBundle({
   index: indexValue,
   details: detailValues,
+  dashboard: dashboardValue,
   offer: offerValue,
   projectFingerprint,
   stateRootIdentity,
@@ -1067,7 +1120,16 @@ function validateUiProjectionBundle({
     return detail;
   }).sort((left, right) => left.proposalId.localeCompare(right.proposalId));
   if (seen.size !== reviews.size) throw new Error("ui-projection-detail-set-incomplete");
-  return Object.freeze({ offer, index, details: Object.freeze(details) });
+  const dashboard = dashboardValue === undefined || dashboardValue === null
+    ? null
+    : makeUiDashboard(dashboardValue, {
+        projectFingerprint,
+        stateRootIdentity,
+        generation: index.generation,
+        indexHash: index.projectionHash,
+        now,
+      });
+  return Object.freeze({ offer, index, details: Object.freeze(details), dashboard });
 }
 
 function cleanupStaleUiGenerationsUnlocked(paths, activeGeneration) {
@@ -1111,6 +1173,7 @@ function cleanupUiProjectionTempsUnlocked(paths, directory) {
 export function publishUiProjection(stateRoot, {
   index,
   details,
+  dashboard,
   offer,
   now = Date.now(),
   __testFaultInjection,
@@ -1122,6 +1185,7 @@ export function publishUiProjection(stateRoot, {
   const clean = validateUiProjectionBundle({
     index,
     details,
+    dashboard,
     offer,
     projectFingerprint,
     stateRootIdentity: expectedRootIdentity,
@@ -1135,6 +1199,9 @@ export function publishUiProjection(stateRoot, {
     let removed = cleanupUiProjectionTempsUnlocked(paths, projection.root);
     const offerSource = boundedJson(clean.offer, MAX_REQUEST_BYTES, "ui-protocol-offer");
     const indexSource = boundedJson(clean.index, UI_PROTOCOL_LIMITS.indexBytes, "ui-projection-index");
+    const dashboardSource = clean.dashboard
+      ? boundedJson(clean.dashboard, UI_PROTOCOL_LIMITS.dashboardBytes, "ui-dashboard")
+      : null;
     const detailSources = new Map(clean.details.map((detail) => [
       projectionDetailPath(projection, detail.proposalId),
       boundedJson(detail, UI_PROTOCOL_LIMITS.detailBytes, "ui-review-detail"),
@@ -1142,11 +1209,14 @@ export function publishUiProjection(stateRoot, {
     const planned = new Map([
       [projection.offer, offerSource],
       [projection.index, indexSource],
+      ...(dashboardSource ? [[projection.dashboard, dashboardSource]] : []),
       ...detailSources,
     ]);
     assertUiProjectionPublication(paths, planned);
     for (const [filePath, source] of detailSources) atomicWrite(paths, filePath, source);
     __testFaultInjection?.("ui-projection-after-details", { generation: clean.index.generation });
+    if (dashboardSource) atomicWrite(paths, projection.dashboard, dashboardSource);
+    __testFaultInjection?.("ui-projection-after-dashboard", { generation: clean.index.generation });
     atomicWrite(paths, projection.offer, offerSource);
     __testFaultInjection?.("ui-projection-before-index", { generation: clean.index.generation });
     atomicWrite(paths, projection.index, indexSource);
@@ -1156,20 +1226,10 @@ export function publishUiProjection(stateRoot, {
       offer: clean.offer,
       index: clean.index,
       details: clean.details,
+      dashboard: clean.dashboard,
       staleFilesRemoved: removed,
     });
   });
-}
-
-export function readUiProtocolOffer(stateRoot, projectFingerprint, { __testEffectiveUid } = {}) {
-  const paths = bridgePaths(stateRoot, projectFingerprint);
-  if (!paths) return null;
-  const projection = uiProjectionPaths(paths);
-  if (!projection) return null;
-  const read = secureProjectionRead(paths, projection.offer, MAX_REQUEST_BYTES, "ui-protocol-offer", {
-    effectiveUid: __testEffectiveUid,
-  });
-  return read ? makeUiProtocolOffer(JSON.parse(read.source)) : null;
 }
 
 export function readUiProjection(stateRoot, projectFingerprint, {
@@ -1189,6 +1249,8 @@ export function readUiProjection(stateRoot, projectFingerprint, {
     ...negotiateUiProtocol(null, clientOffer),
     reason: reasonValue,
     index: null,
+    dashboard: null,
+    dashboardError: null,
     details: Object.freeze([]),
     effectiveIndexActions: Object.freeze([]),
     effectiveDetailActions: Object.freeze({}),
@@ -1206,6 +1268,8 @@ export function readUiProjection(stateRoot, projectFingerprint, {
     return Object.freeze({
       ...negotiation,
       index: null,
+      dashboard: null,
+      dashboardError: null,
       details: Object.freeze([]),
       effectiveIndexActions: Object.freeze([]),
       effectiveDetailActions: Object.freeze({}),
@@ -1232,6 +1296,31 @@ export function readUiProjection(stateRoot, projectFingerprint, {
   const reviews = new Map(index.reviews.map((review) => [review.proposalId, review]));
   const generationPaths = uiProjectionPaths(paths, { generation: index.generation });
   if (!generationPaths) throw new Error("ui-projection-generation-unavailable");
+  let dashboard = null;
+  let dashboardError = null;
+  let dashboardRead = null;
+  try {
+    dashboardRead = secureProjectionRead(
+      paths,
+      generationPaths.dashboard,
+      UI_PROTOCOL_LIMITS.dashboardBytes,
+      "ui-dashboard",
+      { effectiveUid: __testEffectiveUid },
+    );
+    if (dashboardRead) {
+      dashboard = makeUiDashboard(JSON.parse(dashboardRead.source), {
+        projectFingerprint: fingerprint,
+        stateRootIdentity: expectedRootIdentity,
+        generation: index.generation,
+        indexHash: index.projectionHash,
+        now,
+      });
+    }
+  } catch (error) {
+    const code = errorReasonCode(error, "ui-dashboard-malformed");
+    if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(code)) throw error;
+    dashboardError = code || "ui-dashboard-malformed";
+  }
   const details = detailProposalIds.map((proposalId) => {
     const review = reviews.get(proposalId);
     if (!review) throw new Error("ui-projection-detail-unlisted");
@@ -1254,7 +1343,7 @@ export function readUiProjection(stateRoot, projectFingerprint, {
     }
     return detail;
   });
-  __testAfterDetailsRead?.({ index, details });
+  __testAfterDetailsRead?.({ index, details, dashboard, dashboardError });
   const indexReadback = secureProjectionRead(paths, projection.index, UI_PROTOCOL_LIMITS.indexBytes, "ui-projection-index", {
     effectiveUid: __testEffectiveUid,
   });
@@ -1271,6 +1360,20 @@ export function readUiProjection(stateRoot, projectFingerprint, {
       || offerRead.source !== offerReadback.source) {
     throw new Error("ui-protocol-offer-replaced");
   }
+  if (dashboard && dashboardRead) {
+    const dashboardReadback = secureProjectionRead(
+      paths,
+      generationPaths.dashboard,
+      UI_PROTOCOL_LIMITS.dashboardBytes,
+      "ui-dashboard",
+      { effectiveUid: __testEffectiveUid },
+    );
+    if (!dashboardReadback
+        || !sameInode(dashboardRead.stat, dashboardReadback.stat)
+        || dashboardRead.source !== dashboardReadback.source) {
+      throw new Error("ui-dashboard-replaced");
+    }
+  }
   const effectiveCapabilities = new Set(negotiation.capabilities);
   const effectiveDetailActions = Object.fromEntries(details.map((detail) => [
     detail.proposalId,
@@ -1279,6 +1382,8 @@ export function readUiProjection(stateRoot, projectFingerprint, {
   return Object.freeze({
     ...negotiation,
     index,
+    dashboard,
+    dashboardError,
     details: Object.freeze(details),
     effectiveIndexActions: Object.freeze(index.allowedActions.filter((action) => effectiveCapabilities.has(action.capability))),
     effectiveDetailActions: Object.freeze(effectiveDetailActions),
@@ -1459,7 +1564,7 @@ export function readBoundedInspection(stateRoot, projectFingerprint, { limit = 3
     }));
   return Object.freeze({
     observations: Object.freeze(observations.slice(0, limit).map(Object.freeze)),
-    eligibility: Object.freeze(eligibility.slice(-limit).reverse().map(Object.freeze)),
+    eligibility: Object.freeze((limit > 0 ? eligibility.slice(-limit) : []).reverse().map(Object.freeze)),
     overflow: Object.freeze({
       observations: Math.max(0, observations.length - limit),
       eligibility: Math.max(0, eligibility.length - limit),
@@ -1474,7 +1579,7 @@ function acquireConsumerLock(paths, now, ttlMs) {
       atomicWrite(paths, paths.lock, boundedJson(lease, 1024, "bridge-lock"), { exclusive: true });
       return lease;
     } catch (error) {
-      if (error?.code !== "EEXIST" && reason(error) !== "bridge-file-exists") return null;
+      if (error?.code !== "EEXIST" && errorReasonCode(error, "bridge-error") !== "bridge-file-exists") return null;
       try {
         const read = secureRead(paths, paths.lock, 1024, "bridge-lock");
         const current = JSON.parse(read.source);
@@ -1546,7 +1651,7 @@ async function consumeType({ paths, projectFingerprint, now, maxRequests, type, 
       if (request.requestId !== item.requestId) throw new Error("request-id-path-mismatch");
       result = await handler(request);
     } catch (error) {
-      result = { ok: false, reason: reason(error) };
+      result = { ok: false, reason: errorReasonCode(error, "bridge-error") };
     }
     await afterHandled?.({ type, request, result, filePath: item.filePath, requestId: item.requestId });
     const common = {
@@ -1601,7 +1706,7 @@ async function consumeOperationType({
       if (request.requestId !== item.requestId) throw new Error("request-id-path-mismatch");
       result = await handler(request);
     } catch (error) {
-      result = { ok: false, reason: reason(error) };
+      result = { ok: false, reason: errorReasonCode(error, "bridge-error") };
     }
     await afterHandled?.({
       type: "operation",
@@ -1782,6 +1887,28 @@ function cleanupUiProjectionUnlocked(paths, projectFingerprint, now) {
     });
     const generation = uiProjectionPaths(paths, { generation: index.generation });
     if (!generation) throw new Error("ui-projection-generation-unavailable");
+    let removedDashboard = 0;
+    const dashboardRead = secureProjectionRead(
+      paths,
+      generation.dashboard,
+      UI_PROTOCOL_LIMITS.dashboardBytes,
+      "ui-dashboard",
+    );
+    if (dashboardRead) {
+      try {
+        makeUiDashboard(JSON.parse(dashboardRead.source), {
+          projectFingerprint,
+          stateRootIdentity: index.stateRootIdentity,
+          generation: index.generation,
+          indexHash: index.projectionHash,
+          now,
+        });
+      } catch (error) {
+        if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(errorReasonCode(error, "bridge-error"))) throw error;
+        const current = lstatOptional(generation.dashboard);
+        if (current && secureUnlink(paths, generation.dashboard, current)) removedDashboard += 1;
+      }
+    }
     for (const review of index.reviews) {
       const detailRead = secureProjectionRead(
         paths,
@@ -1803,10 +1930,11 @@ function cleanupUiProjectionUnlocked(paths, projectFingerprint, now) {
         throw new Error("ui-projection-detail-index-mismatch");
       }
     }
-    return cleanupUiProjectionTempsUnlocked(paths, projection.root)
+    return removedDashboard
+      + cleanupUiProjectionTempsUnlocked(paths, projection.root)
       + cleanupStaleUiGenerationsUnlocked(paths, index.generation);
   } catch (error) {
-    if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(reason(error))) throw error;
+    if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(errorReasonCode(error, "bridge-error"))) throw error;
     return removePrivateProjectionTree(paths, projection.root);
   }
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   ConsentState,
+  Mode,
   SCHEMA_VERSION,
   makeAuditEvent,
   makeConsentState,
@@ -9,6 +10,7 @@ import {
   makeRepoSettings,
   resolveMode,
   transitionMode,
+  stripUndefined,
   wrapRecord,
 } from "./self-evolve-schemas.js";
 
@@ -16,7 +18,7 @@ export const MIGRATION_NOTE = Object.freeze(
   "v0.1.2 -> v0.2: status, pause, resume, scan, and help are unchanged; disable is deprecated and maps to pause; dismiss maps to reject (use snooze to defer); bare /self-evolve scans in legacy contexts and opens status/inbox in new contexts.",
 );
 
-const MODES = new Set(["manual", "auto", "yolo"]);
+const MODES = new Set(Mode.values);
 const REPO_MODES = new Set([...MODES, "inherit"]);
 const EXPORT_SCOPES = new Set(["observations", "proposals", "project", "all"]);
 const PURGE_SCOPES = new Set(["observations", "proposals", "project", "all"]);
@@ -128,6 +130,19 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
     }
     return parsed("consent", { key, value: value === "on" });
   }
+  if (verb === "allowlist") {
+    const action = args[0]?.toLowerCase();
+    if (action === "list" && args.length === 1) return parsed("allowlist", { action });
+    if (["add", "remove"].includes(action)
+        && args.length === 5
+        && args[1]
+        && args[2] === "--confirm"
+        && args[3] === "UPDATE"
+        && args[4] === "ALLOWLIST") {
+      return parsed("allowlist", { action, path: args[1], confirmation: "UPDATE ALLOWLIST" });
+    }
+    return error("Usage: /self-evolve allowlist list | allowlist <add|remove> <canonical-absolute-path> --confirm UPDATE ALLOWLIST");
+  }
   if (verb === "inspect") {
     const subject = args[0]?.toLowerCase();
     if (subject === "observations" && args.length <= 2) {
@@ -170,6 +185,7 @@ function helpText() {
     "The current approval tuple is shown by inbox and review; it contains hashes, version, and a one-use nonce, never proposal content.",
     "/self-evolve exclude | include | repo <manual|auto|yolo|inherit>",
     "/self-evolve consent <passive|observations|excerpts|cross-repo> <on|off>",
+    "/self-evolve allowlist list | allowlist <add|remove> <canonical-absolute-path> --confirm UPDATE ALLOWLIST",
     "/self-evolve inspect observations [N] | inspect eligibility [clusterId]",
     "/self-evolve export [observations|proposals|project|all]",
     "/self-evolve purge <observations|proposals|project|all>",
@@ -225,7 +241,7 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
 
   function appendAudit(kind, details, proposalId, actor = "self-evolve-command") {
     const timestamp = now();
-    const clean = Object.fromEntries(Object.entries(details).filter(([, value]) => value !== undefined));
+    const clean = stripUndefined(details);
     const payloadHash = sha256(JSON.stringify(clean));
     const payload = makeAuditEvent({
       id: sha256(JSON.stringify({ kind, clean, proposalId, actor, timestamp })),
@@ -425,7 +441,9 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     }
     if (verb === "status") {
       const current = settingsResult().settings;
-      return { responseText: `Self-evolve status: stored mode ${health.mode}; effective mode ${getEffectiveMode({ projectFingerprint })}; repo mode ${health.repoMode}; paused ${current.global.paused}; excluded ${current.repo.excluded}.` };
+      const consent = current.global.consent;
+      const roots = current.global.allowedSkillRoots;
+      return { responseText: `Self-evolve status: stored mode ${health.mode}; effective mode ${getEffectiveMode({ projectFingerprint })}; repo mode ${health.repoMode}; paused ${current.global.paused}; excluded ${current.repo.excluded}.\nConsent: passive ${consent.passiveCalls ? "on" : "off"}; observations ${consent.durableObservations ? "on" : "off"}; excerpts ${consent.sanitizedExcerpts ? "on" : "off"}; cross-repo ${consent.crossRepoAggregation ? "on" : "off"}.\nApproved skill folders (${roots.length}):${roots.length ? `\n${roots.map((root) => `- ${root}`).join("\n")}` : " none"}` };
     }
     if (verb === "health") return { responseText: `Self-evolve health: host ${health.hostVersion}; source ${health.hostVersionSource ?? "global-health"}; schema ${health.schemaVersion}; mode ${health.mode}; repo mode ${health.repoMode}; circuit breaker ${health.circuitBreakerOpen ? "open" : "closed"}; kill switch ${health.killSwitchActive ? "on" : "off"}.${health.lastError ? ` Last error: ${health.lastError}` : ""}` };
     if (verb === "mode") {

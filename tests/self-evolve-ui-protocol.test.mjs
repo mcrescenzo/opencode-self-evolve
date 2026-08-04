@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   BRIDGE_REQUEST_FIELDS,
@@ -16,6 +17,9 @@ import { SCHEMA_VERSION, Decision, makeDecision } from "../self-evolve-schemas.j
 import {
   UI_CAPABILITIES,
   UI_ACTION_CAPABILITIES,
+  UI_DASHBOARD_CAPABILITIES,
+  UI_DASHBOARD_FIELDS,
+  UI_DASHBOARD_VERSION,
   UI_OPERATION_ACTIONS,
   UI_OPERATION_REQUEST_FIELDS,
   UI_OPERATION_RESPONSE_FIELDS,
@@ -28,6 +32,7 @@ import {
   assertUiProjectionFootprint,
   canonicalUiJson,
   hashUiProtocol,
+  makeUiDashboard,
   makeUiOperationRequest,
   makeUiOperationResponse,
   makeUiOverflowMarker,
@@ -123,6 +128,85 @@ function projectionIndex(overrides = {}) {
     ...overrides,
   };
   return { ...body, projectionHash: hashUiProtocol("projection-index", body) };
+}
+
+function dashboard(overrides = {}) {
+  const body = {
+    dashboardVersion: UI_DASHBOARD_VERSION,
+    projectFingerprint: PROJECT,
+    stateRootIdentity: ROOT,
+    generation: GENERATION,
+    indexHash: H("d"),
+    generatedAt: NOW - 500,
+    capabilities: UI_DASHBOARD_CAPABILITIES,
+    automation: { state: "ready", reason: null },
+    blockers: [],
+    inFlight: { active: false, count: 0, stage: null, startedAt: null },
+    lastCycle: {
+      outcome: "valid-no-change",
+      triggerClass: "idle",
+      mode: "auto",
+      observationCount: 2,
+      eligibilityCount: 1,
+      proposalId: null,
+      occurredAt: NOW - 1_000,
+      reason: "no-change",
+    },
+    nextEligibleAt: null,
+    usage: {
+      passive: { used: 2, limit: 6, remaining: 4, resetAt: NOW + 30_000 },
+      synthesis: { used: 4, limit: 24, remaining: 20, resetAt: NOW + 60_000 },
+      storage: { usedBytes: 4_096, limitBytes: 8_388_608, remainingBytes: 8_384_512 },
+    },
+    rollout: {
+      ready: true,
+      synthesesObserved: 10,
+      minSynthesesObserved: 10,
+      successRateBasisPoints: 9_000,
+      minSuccessRateBasisPoints: 8_000,
+    },
+    settings: {
+      globalMode: "auto",
+      repositoryMode: "inherit",
+      effectiveMode: "auto",
+      paused: false,
+      killSwitchActive: false,
+      repositoryExcluded: false,
+      consent: {
+        passiveCalls: true,
+        durableObservations: true,
+        sanitizedExcerpts: false,
+        crossRepoAggregation: false,
+      },
+      approvedSkillFolderCount: 1,
+    },
+    retention: { observationsDays: 30, operationalDays: 90 },
+    supportedControls: ["set-paused"],
+    activity: [{
+      id: H("9"),
+      category: "cycle",
+      audience: "default",
+      outcome: "valid-no-change",
+      summary: "Analysis completed successfully and found no useful safe change.",
+      occurredAt: NOW - 1_000,
+      proposalId: null,
+      reason: "no-change",
+    }],
+    overflow: { activity: overflow(1) },
+    ...overrides,
+  };
+  return { ...body, dashboardHash: hashUiProtocol("dashboard", body) };
+}
+
+function dashboardContext(value, overrides = {}) {
+  return {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: ROOT,
+    generation: GENERATION,
+    indexHash: H("d"),
+    now: NOW,
+    ...overrides,
+  };
 }
 
 function reviewDetail(overrides = {}) {
@@ -314,6 +398,24 @@ test("overflow markers deterministically account for omitted canonical bytes", (
 });
 
 test("capability negotiation is strict and mixed-version peers remain legacy-only", () => {
+  assert.deepEqual(UI_CAPABILITIES, [
+    "legacy-control-v1",
+    "legacy-decision-v1",
+    "operation-export-v1",
+    "operation-kill-switch-v1",
+    "operation-pause-v1",
+    "operation-purge-all-v1",
+    "operation-purge-scope-v1",
+    "operation-retry-bootstrap-v1",
+    "operation-rollback-v1",
+    "operation-snooze-v1",
+    "projection-index-v1",
+    "projection-review-detail-v1",
+  ], "v1 offer and index capabilities stay byte-schema compatible with Release A");
+  assert.deepEqual(UI_DASHBOARD_CAPABILITIES, [
+    "control-repo-mode-v1",
+    "decision-feedback-v1",
+  ]);
   const server = makeUiProtocolOffer({
     projectionVersions: [UI_PROJECTION_VERSION],
     operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
@@ -525,6 +627,88 @@ test("projection indexes enforce collection, reason, ordering, capability, overf
     },
   });
   assert.throws(() => makeUiProjectionIndex(oversized, projectionContext()), /projection-index-footprint-exceeded/u);
+});
+
+test("dashboard-v1 is exact, hash-bound to the core index, bounded, and deeply frozen", () => {
+  const value = dashboard();
+  const clean = makeUiDashboard(value, dashboardContext(value));
+  assert.deepEqual(Object.keys(clean), UI_DASHBOARD_FIELDS);
+  assert.equal(clean.dashboardVersion, UI_DASHBOARD_VERSION);
+  assert.deepEqual(clean.capabilities, UI_DASHBOARD_CAPABILITIES);
+  assert.equal(clean.indexHash, H("d"));
+  assert.equal(clean.lastCycle.outcome, "valid-no-change");
+  assert.equal(clean.usage.passive.remaining, 4);
+  assert.equal(Object.isFrozen(clean), true);
+  assert.equal(Object.isFrozen(clean.activity), true);
+  assert.equal(Object.isFrozen(clean.settings.consent), true);
+
+  assert.throws(
+    () => makeUiDashboard(dashboard({ extra: true }), dashboardContext(value)),
+    /ui-dashboard-unknown-field/u,
+  );
+  assert.throws(
+    () => makeUiDashboard(value, dashboardContext(value, { projectFingerprint: H("f") })),
+    /cross-project/u,
+  );
+  assert.throws(
+    () => makeUiDashboard(value, dashboardContext(value, { generation: H("f") })),
+    /stale-generation/u,
+  );
+  assert.throws(
+    () => makeUiDashboard(value, dashboardContext(value, { indexHash: H("f") })),
+    /stale-projection/u,
+  );
+  assert.throws(
+    () => makeUiDashboard({ ...value, dashboardHash: H("0") }, dashboardContext(value)),
+    /dashboard-hash-mismatch/u,
+  );
+  assert.throws(
+    () => makeUiDashboard(dashboard({ capabilities: ["unknown-dashboard-v1"] }), dashboardContext(value)),
+    /unknown-dashboard-capability/u,
+  );
+});
+
+test("dashboard-v1 rejects inconsistent usage, rollout, activity, and in-flight state", () => {
+  const value = dashboard();
+  const invalidUsage = dashboard({
+    usage: {
+      ...value.usage,
+      passive: { ...value.usage.passive, remaining: 5 },
+    },
+  });
+  assert.throws(() => makeUiDashboard(invalidUsage, dashboardContext(invalidUsage)), /passive-remaining-mismatch/u);
+
+  const invalidRollout = dashboard({
+    rollout: { ...value.rollout, ready: false },
+  });
+  assert.throws(() => makeUiDashboard(invalidRollout, dashboardContext(invalidRollout)), /rollout-readiness-mismatch/u);
+
+  const invalidInFlight = dashboard({
+    inFlight: { active: false, count: 1, stage: "pipeline", startedAt: NOW - 1_000 },
+  });
+  assert.throws(() => makeUiDashboard(invalidInFlight, dashboardContext(invalidInFlight)), /in-flight-inconsistent/u);
+
+  const newer = { ...value.activity[0], id: H("8"), occurredAt: NOW - 500 };
+  const unsorted = dashboard({
+    activity: [value.activity[0], newer],
+    overflow: { activity: overflow(2) },
+  });
+  assert.throws(() => makeUiDashboard(unsorted, dashboardContext(unsorted)), /dashboard-activity-not-sorted/u);
+
+  const oversized = dashboard({
+    activity: Array.from({ length: UI_PROTOCOL_LIMITS.activityEntries + 1 }, (_, index) => ({
+      ...value.activity[0],
+      id: createHash("sha256").update(`activity-${index}`).digest("hex"),
+      occurredAt: NOW - index,
+    })),
+    overflow: { activity: overflow(UI_PROTOCOL_LIMITS.activityEntries + 1) },
+  });
+  assert.throws(() => makeUiDashboard(oversized, dashboardContext(oversized)), /dashboard-activity-out-of-bounds/u);
+
+  const arbitraryReason = dashboard({
+    activity: [{ ...value.activity[0], reason: "raw-provider-message" }],
+  });
+  assert.throws(() => makeUiDashboard(arbitraryReason, dashboardContext(arbitraryReason)), /invalid-activity-reason/u);
 });
 
 test("review details are exact, hash/revision/generation-bound, fresh, and privacy-safe", () => {

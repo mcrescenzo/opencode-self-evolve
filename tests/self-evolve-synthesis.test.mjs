@@ -336,6 +336,33 @@ test("a live synthesis attempt prevents duplicate provider work for the same clu
   assert.equal(store.readRecords("proposal").filter((record) => record.payload.state === "critic-pending").length, 1);
 });
 
+test("live synthesis state is isolated by store", async () => {
+  const firstStore = memoryStore();
+  const firstSdk = fakeContext(undefined, { never: true });
+  const first = runSynthesis({
+    ctx: firstSdk.ctx,
+    cluster: cluster(),
+    targetSkill: target(),
+    inventory: [target()],
+    privacy: privacy(),
+    options: options(firstStore, { timeoutMs: 25, cleanupTimeoutMs: 5 }),
+    now: NOW,
+  });
+  while (firstSdk.calls.prompt.length === 0) await new Promise((resolve) => setImmediate(resolve));
+
+  const secondStore = memoryStore();
+  const second = await synthesize(synthesisOutput({
+    action: "no-op",
+    proposedContent: CURRENT,
+    proposedContentHash: H(CURRENT),
+    sizeDeltaBytes: 0,
+    approxTokenDelta: 0,
+  }), { store: secondStore, now: NOW });
+  assert.equal(second.result.ok, true);
+  assert.equal(second.result.noChange, true);
+  assert.equal((await first).ok, false);
+});
+
 test("expired and deterministically ineligible evidence are refused before model calls", async () => {
   const expired = await synthesize(synthesisOutput(), { cluster: cluster({ lastSeenAt: NOW - 31 * 86_400_000, observations: [{ id: OBSERVATION_ID, createdAt: NOW - 31 * 86_400_000 }] }) });
   assert.equal(expired.result.reason, "expired-evidence");
@@ -387,9 +414,10 @@ test("three synthesis failures in 24h activate persisted cluster backoff", async
 });
 
 test("the per-day synthesis budget refuses calls beyond the configured cap", async () => {
-  const first = await synthesize(synthesisOutput({ action: "no-op", proposedContent: CURRENT, proposedContentHash: H(CURRENT), sizeDeltaBytes: 0, approxTokenDelta: 0 }), { options: { synthesisPerDay: 1 } });
+  const store = memoryStore();
+  const first = await synthesize(synthesisOutput({ action: "no-op", proposedContent: CURRENT, proposedContentHash: H(CURRENT), sizeDeltaBytes: 0, approxTokenDelta: 0 }), { store, options: { synthesisPerDay: 1 } });
   assert.equal(first.result.ok, true);
-  const second = await synthesize(synthesisOutput(), { options: { synthesisPerDay: 1 }, now: NOW + 1 });
+  const second = await synthesize(synthesisOutput(), { store, options: { synthesisPerDay: 1 }, now: NOW + 1 });
   assert.equal(second.result.reason, "synthesis-budget-exhausted");
   assert.equal(second.calls.create.length, 0);
 });

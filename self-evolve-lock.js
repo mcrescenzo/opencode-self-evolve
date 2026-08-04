@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import {
   closeSync,
   constants,
-  existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -20,13 +20,18 @@ const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 const DEFAULT_STALE_LOCK_MS = 30_000;
 const heldStateMutationLocks = new Map();
 
-function processIsAlive(pid) {
+export function processIsAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
 }
 
 function sleep(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function assertSynchronous(result) {
+  if (result && typeof result.then === "function") throw new TypeError("mutation-lock-action-must-be-synchronous");
+  return result;
 }
 
 export function stateMutationLockHeld(rootDir) {
@@ -44,7 +49,7 @@ export function withStateMutationLock(rootDir, action, {
   const reentrant = heldStateMutationLocks.get(root);
   if (reentrant) {
     reentrant.depth += 1;
-    try { return action(); } finally { reentrant.depth -= 1; }
+    try { return assertSynchronous(action()); } finally { reentrant.depth -= 1; }
   }
 
   mkdirSync(root, { recursive: true, mode: DIR_MODE });
@@ -82,7 +87,10 @@ export function withStateMutationLock(rootDir, action, {
         let recovered = null;
         try { recovered = JSON.parse(readFileSync(recoveryPath, "utf8")); } catch {}
         if (owner?.nonce && recovered?.nonce !== owner.nonce) {
-          if (!existsSync(lockPath)) renameSync(recoveryPath, lockPath);
+          try { linkSync(recoveryPath, lockPath); } catch (linkError) {
+            if (linkError?.code !== "EEXIST") throw linkError;
+          }
+          try { unlinkSync(recoveryPath); } catch {}
         } else rmSync(recoveryPath, { force: true });
         continue;
       } catch (error) {
@@ -94,9 +102,7 @@ export function withStateMutationLock(rootDir, action, {
   const held = heldStateMutationLocks.get(root);
   if (!held) throw new Error("mutation-lock-timeout");
   try {
-    const result = action();
-    if (result && typeof result.then === "function") throw new TypeError("mutation-lock-action-must-be-synchronous");
-    return result;
+    return assertSynchronous(action());
   } finally {
     held.depth -= 1;
     if (held.depth === 0) {

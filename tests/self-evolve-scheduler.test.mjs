@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 import { hashSessionLineage } from "../self-evolve-observation.js";
 import { createScheduler } from "../self-evolve-scheduler.js";
 import { openStore } from "../self-evolve-store.js";
@@ -12,7 +12,7 @@ import { openStore } from "../self-evolve-store.js";
 const H = (character) => character.repeat(64);
 const PROJECT = H("a");
 const SCOPE = H("b");
-const RESERVATION_CHILD = fileURLToPath(new URL("./fixtures/passive-provider-reservation.mjs", import.meta.url));
+const RESERVATION_CHILD = path.join(import.meta.dirname, "fixtures", "passive-provider-reservation.mjs");
 
 function runReservationChild(args) {
   return new Promise((resolve, reject) => {
@@ -24,7 +24,7 @@ function runReservationChild(args) {
 }
 
 function wait(ms = 20) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return delay(ms);
 }
 
 async function waitFor(predicate, label) {
@@ -57,7 +57,7 @@ function fixture(t, options = {}) {
   const clock = options.clock ?? { value: 1_000_000 };
   const records = options.records ?? new Map();
   const leases = options.leases ?? new Map();
-  const calls = { append: [], acquire: [], release: [], cleanup: [], logs: [] };
+  const calls = { append: [], acquire: [], release: [], cleanup: [], logs: [], settingsReads: 0 };
   const settings = options.settings ?? {
     global: {
       mode: options.mode ?? "auto",
@@ -69,7 +69,7 @@ function fixture(t, options = {}) {
     repo: { projectFingerprint: PROJECT, mode: "inherit", excluded: false, budgets: {} },
   };
   const store = {
-    getSettings: () => settings,
+    getSettings() { calls.settingsReads += 1; return settings; },
     readRecords: (kind) => records.get(kind) ?? [],
     appendRecord(envelope) {
       calls.append.push(envelope);
@@ -129,6 +129,15 @@ test("duplicate idle signals debounce to one work item", async (t) => {
   scheduler.dispose();
 });
 
+test("one admitted episode uses one settings snapshot", async (t) => {
+  const { scheduler, work, calls } = fixture(t);
+  const baseline = calls.settingsReads;
+  await scheduler.handleEvent(idle("single-settings-read", { projectFingerprint: PROJECT }));
+  await waitFor(() => work.length === 1, "one admitted episode");
+  assert.equal(calls.settingsReads - baseline, 1);
+  scheduler.dispose();
+});
+
 test("an older explicit epoch cannot replace newer idle work", async (t) => {
   const { scheduler, work, records } = fixture(t);
   await scheduler.handleEvent(idle("epoch", { epoch: 8 }));
@@ -160,6 +169,26 @@ test("continuation idle is deferred while prior work remains in flight", async (
   await wait(15);
   assert.equal(work.length, 1);
   assert.equal(actions(records, "continuation-deferred").length, 1);
+  scheduler.dispose();
+});
+
+test("manual work shares the create-exclusive episode lease", async (t) => {
+  const { scheduler, calls } = fixture(t);
+  let releaseFirst;
+  const gate = new Promise((resolve) => { releaseFirst = resolve; });
+  const first = scheduler.runWithEpisodeLease({ projectFingerprint: PROJECT, sessionID: "manual" }, async () => {
+    await gate;
+    return "first";
+  });
+  await waitFor(() => calls.acquire.length === 1, "first manual lease");
+  const second = await scheduler.runWithEpisodeLease(
+    { projectFingerprint: PROJECT, sessionID: "manual" },
+    async () => "second",
+  );
+  assert.deepEqual(second, { ok: false, reason: "episode-lease-busy", deferred: true });
+  releaseFirst();
+  assert.deepEqual(await first, { ok: true, value: "first" });
+  assert.equal(calls.release.length, 1);
   scheduler.dispose();
 });
 
@@ -240,6 +269,18 @@ test("manual mode returns without scheduling or durable writes", async (t) => {
   scheduler.dispose();
 });
 
+test("missing background consent is durably visible as a scheduling suppression", async (t) => {
+  const { scheduler, settings, work, records } = fixture(t);
+  settings.global.consent.passiveCalls = false;
+  await scheduler.handleEvent(idle("missing-consent", { projectFingerprint: PROJECT }));
+  await wait(15);
+  assert.equal(work.length, 0);
+  const suppressed = actions(records, "schedule-suppressed");
+  assert.equal(suppressed.length, 1);
+  assert.equal(suppressed[0].payload.details.reason, "consent-missing");
+  scheduler.dispose();
+});
+
 test("six passive provider slots are the hard hourly ceiling", (t) => {
   const { scheduler, records } = fixture(t);
   assert.equal(scheduler.reservePassiveProviderCalls(2, { rootSessionID: "parent" }).ok, true);
@@ -281,6 +322,20 @@ test("passive reservations re-read the configured budget under the reservation l
     reason: "passive-provider-budget-exhausted",
     requested: 1,
     remaining: 0,
+  });
+  scheduler.dispose();
+});
+
+test("a persisted passive reservation remains successful when lease release degrades", (t) => {
+  const { scheduler, store, calls, records } = fixture(t);
+  store.releaseLease = () => ({ ok: false, reason: "injected-release-failure" });
+  const result = scheduler.reservePassiveProviderCalls(1, { rootSessionID: "release-failure" });
+  assert.equal(result.ok, true);
+  assert.equal(actions(records, "scheduler-budget").length, 1);
+  assert.deepEqual(calls.logs.at(-1), {
+    level: "warn",
+    action: "release-passive-provider-budget-lease",
+    error: "injected-release-failure",
   });
   scheduler.dispose();
 });

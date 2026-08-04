@@ -155,6 +155,13 @@ function normalizeResultFailure(result) {
     || result?.error !== undefined;
 }
 
+function changedField(nextValue, priorValue, absent) {
+  return nextValue !== absent
+    && priorValue !== undefined
+    && priorValue !== absent
+    && priorValue !== nextValue;
+}
+
 export function createScheduler({ store, privacy, budgets = {}, now = () => Date.now(), enqueueWork, log = () => {} } = {}) {
   if (!store || typeof enqueueWork !== "function") throw new TypeError("scheduler-dependencies-required");
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
@@ -259,6 +266,9 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       sessions.delete(sessionID);
       audit("late-session-cleanup", { sessionIDHash: hashSessionLineage(sessionID) }, timestamp);
     }
+    for (const [key, until] of backoffUntil) {
+      if (until <= timestamp - FAILURE_WINDOW_MS) backoffUntil.delete(key);
+    }
   }
 
   function scheduleDebounce(state, delay = configured.idleDebounceMs) {
@@ -270,9 +280,9 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     state.timer.unref?.();
   }
 
-  function runBudgetCheck(timestamp = now()) {
+  function runBudgetCheck(timestamp = now(), settings = safeSettings(store)) {
     const events = schedulerAudits(store);
-    const fresh = currentBudgets();
+    const fresh = currentBudgets(settings);
     return Object.freeze({
       passiveCallsRemainingThisHour: Math.max(0, fresh.passiveCallsPerHour - budgetCount(events, "passive", timestamp - HOUR_MS)),
       synthesesRemainingToday: Math.max(0, fresh.synthesisPerDay - budgetCount(events, "synthesis", timestamp - DAY_MS)),
@@ -332,9 +342,9 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       if (lease?.ok) {
         try {
           const released = store.releaseLease(PASSIVE_BUDGET_LEASE_KEY, lease.nonce);
-          if (!released?.ok) result = { ok: false, reason: released?.reason ?? "passive-provider-budget-lease-release-failed" };
+          if (!released?.ok) log({ level: "warn", action: "release-passive-provider-budget-lease", error: released?.reason ?? "passive-provider-budget-lease-release-failed" });
         } catch (error) {
-          result = { ok: false, reason: String(error?.message ?? error) };
+          log({ level: "warn", action: "release-passive-provider-budget-lease", error: String(error?.message ?? error) });
         }
       }
     }
@@ -350,11 +360,40 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     if (result?.ok || result?.reason === "lease-not-found") heldLeases.delete(key);
   }
 
+  async function runWithEpisodeLease({ projectFingerprint, sessionID } = {}, operation) {
+    if (typeof projectFingerprint !== "string" || !projectFingerprint
+        || typeof sessionID !== "string" || !sessionID
+        || typeof operation !== "function") {
+      return { ok: false, reason: "invalid-episode-lease-request" };
+    }
+    const key = leaseKey(projectFingerprint, sessionID);
+    let lease;
+    try {
+      lease = store.acquireLease(key, { ttlMs: leaseTtlMs, actor: ACTOR });
+    } catch (error) {
+      return { ok: false, reason: String(error?.message ?? error) };
+    }
+    if (!lease?.ok) {
+      return {
+        ok: false,
+        reason: lease?.reason === "lease-busy" ? "episode-lease-busy" : String(lease?.reason ?? "episode-lease-failed"),
+        deferred: lease?.reason === "lease-busy",
+      };
+    }
+    heldLeases.set(key, lease.nonce);
+    try {
+      return { ok: true, value: await operation() };
+    } finally {
+      releaseWorkLease({ _leaseKey: key, leaseNonce: lease.nonce, projectFingerprint, sessionID });
+    }
+  }
+
   async function reserveEpisode(state) {
     if (disposed) return;
     const timestamp = now();
     cleanupStaleSessions(timestamp);
-    cachedMode = effectiveMode();
+    const settings = safeSettings(store);
+    cachedMode = effectiveMode(settings);
     if (cachedMode === "manual" || breaker.open) return;
     if (timestamp - state.touchedAt > STALE_SESSION_MS) {
       sessions.delete(state.sessionID);
@@ -366,7 +405,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       audit("continuation-deferred", { sessionIDHash: hashSessionLineage(state.sessionID), epoch: state.epoch }, timestamp);
       return;
     }
-    const budget = runBudgetCheck(timestamp);
+    const budget = runBudgetCheck(timestamp, settings);
     if (budget.withinQuietPeriod || budget.passiveCallsRemainingThisHour === 0 || budget.synthesesRemainingToday === 0) {
       audit("schedule-suppressed", {
         sessionIDHash: hashSessionLineage(state.sessionID),
@@ -382,11 +421,16 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       return;
     }
 
-    const settings = safeSettings(store);
     const projectFingerprint = settings?.repo?.projectFingerprint;
     if (!projectFingerprint) return;
     const consent = settings.global.consent;
-    if (consent && (!consent.passiveCalls || !consent.durableObservations)) return;
+    if (!consent?.passiveCalls || !consent?.durableObservations) {
+      audit("schedule-suppressed", {
+        sessionIDHash: hashSessionLineage(state.sessionID),
+        reason: "consent-missing",
+      }, timestamp);
+      return;
+    }
     const sessionIDHash = hashSessionLineage(state.sessionID);
     const cursor = latestCursor(store, sessionIDHash);
     if (!canStartEpisode(cursor, timestamp, configured.idleDebounceMs)) {
@@ -467,12 +511,12 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     const agent = eventAgent(event);
     const createdBy = eventCreatedBy(event);
     const anonymous = eventAnonymous(event);
-    state.reused ||= (parentID !== null && prior?.parentID !== undefined && prior.parentID !== null && prior.parentID !== parentID)
-      || (projectFingerprint !== null && prior?.projectFingerprint !== undefined && prior.projectFingerprint !== projectFingerprint)
-      || (hidden !== undefined && prior?.hidden !== undefined && prior.hidden !== hidden)
-      || (agent !== undefined && prior?.agent !== undefined && prior.agent !== agent)
-      || (createdBy !== undefined && prior?.createdBy !== undefined && prior.createdBy !== createdBy)
-      || (anonymous !== undefined && prior?.anonymous !== undefined && prior.anonymous !== anonymous);
+    state.reused ||= changedField(parentID, prior?.parentID, null)
+      || changedField(projectFingerprint, prior?.projectFingerprint, null)
+      || changedField(hidden, prior?.hidden, undefined)
+      || changedField(agent, prior?.agent, undefined)
+      || changedField(createdBy, prior?.createdBy, undefined)
+      || changedField(anonymous, prior?.anonymous, undefined);
     state.parentID = parentID !== null ? parentID : prior?.parentID ?? null;
     state.projectFingerprint = projectFingerprint ?? prior?.projectFingerprint;
     state.hidden = hidden ?? prior?.hidden;
@@ -616,6 +660,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     }
     heldLeases.clear();
     sessions.clear();
+    backoffUntil.clear();
   }
 
   try {
@@ -630,6 +675,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     cancelPending,
     runBudgetCheck,
     reservePassiveProviderCalls,
+    runWithEpisodeLease,
     getCircuitBreaker: () => breaker,
     tripCircuitBreaker,
     resetCircuitBreaker,

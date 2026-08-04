@@ -27,9 +27,13 @@ import {
 } from "./self-evolve-core.js";
 import { buildUiProjection } from "./self-evolve-projection.js";
 import { stateRootIdentity } from "./self-evolve-state-root.js";
+import { errorReasonCode, latestByLogicalId } from "./self-evolve-schemas.js";
 import {
   UI_ACTION_CAPABILITIES,
   UI_CAPABILITIES,
+  UI_DASHBOARD_OUTCOMES,
+  UI_DASHBOARD_REASON_CODES,
+  UI_OPERATION_ACTIONS,
   UI_PROTOCOL_LIMITS,
   makeUiOperationRequest,
 } from "./self-evolve-ui-protocol.js";
@@ -37,6 +41,8 @@ import { boundedHostCall, cleanupSession, listSessions } from "./self-evolve-cli
 import { createSensitiveExportManager } from "./self-evolve-export.js";
 
 const RESTART_REMINDER = "OpenCode must be restarted for the new skill content to load in existing sessions; new sessions will pick it up automatically.";
+const CYCLE_OUTCOMES = new Set(UI_DASHBOARD_OUTCOMES.slice(0, 9));
+const CYCLE_REASONS = new Set(UI_DASHBOARD_REASON_CODES);
 const DEFAULT_ROLLOUT_GATES = Object.freeze({
   offlineCorpus: false,
   passiveShadowObservation: false,
@@ -72,12 +78,12 @@ function completionReason(result, fallback) {
   return result?.ok === true ? "accepted" : String(result?.reason ?? fallback).slice(0, 256);
 }
 
-function errorReason(error) {
-  return String(error?.message ?? error ?? "unknown-error").split(":", 1)[0];
-}
-
 function analyzerSessionState(session) {
   return String(session?.state ?? session?.status?.type ?? session?.status ?? "").toLowerCase();
+}
+
+function latestById(records) {
+  return latestByLogicalId(records, { withPayload: true });
 }
 
 export async function recoverOrphanedAnalyzerSessions(client, directory, {
@@ -117,16 +123,10 @@ export async function recoverOrphanedAnalyzerSessions(client, directory, {
       await cleanupSession(ctx, id, { timeoutMs, signal, label: "session-abort" });
       outcomes.push({ id, ok: true, action: "aborted", reason: status.reason });
     } catch (error) {
-      outcomes.push({ id, ok: false, action: "abort-failed", reason: errorReason(error) });
+      outcomes.push({ id, ok: false, action: "abort-failed", reason: errorReasonCode(error, "unknown-error") });
     }
   }
   return outcomes;
-}
-
-function latestById(records) {
-  const latest = new Map();
-  for (const record of records ?? []) latest.set(record.payload?.id ?? record.payload?.proposalId ?? record.id, record.payload ?? record);
-  return latest;
 }
 
 function frozenRolloutGates(value = {}) {
@@ -275,7 +275,7 @@ export function createIntegration({
     } catch (error) {
       invalidateRoutingSettings();
       corrupt = true;
-      lastError = errorReason(error);
+      lastError = errorReasonCode(error, "unknown-error");
       return null;
     }
   }
@@ -333,6 +333,11 @@ export function createIntegration({
     return schemas.Mode?.values?.includes(mode) ? mode : "manual";
   }
 
+  function backgroundRestartRequired(current = settings()) {
+    return options.passiveEventHookInstalled === false
+      && resolveEffectiveMode(current?.repo?.projectFingerprint, current) !== "manual";
+  }
+
   function rolloutMetrics() {
     const records = store.readRecords?.("audit-event") ?? [];
     const projectFingerprint = settings()?.repo?.projectFingerprint;
@@ -357,6 +362,59 @@ export function createIntegration({
   function targetAllowlisted(proposal, current = settings()) {
     const root = proposal?.skillTarget?.canonicalRoot;
     return typeof root === "string" && (current?.global?.allowedSkillRoots ?? []).includes(root);
+  }
+
+  function validateCanonicalAllowlist(roots) {
+    const validated = inventory?.loadAllowlist?.({ globalSkillRoots: roots });
+    if (!validated
+        || validated.errors?.length
+        || validated.canonicalRoots?.length !== roots.length
+        || validated.canonicalRoots.some((root, index) => root !== roots[index])) {
+      return { ok: false, reason: "invalid-or-unsupported-skill-folder" };
+    }
+    return { ok: true, roots: validated.canonicalRoots };
+  }
+
+  function updateHeadlessAllowlist(command) {
+    if (command.action === "list") {
+      const roots = settings()?.global?.allowedSkillRoots ?? [];
+      return {
+        ok: true,
+        responseText: roots.length
+          ? `Approved skill folders (${roots.length}):\n${roots.map((root) => `- ${root}`).join("\n")}`
+          : "Approved skill folders (0): none.",
+      };
+    }
+    if (command.confirmation !== "UPDATE ALLOWLIST") {
+      return { ok: false, reason: "allowlist-confirmation-required", responseText: "Allowlist update refused: allowlist-confirmation-required." };
+    }
+    let savedRoots;
+    const saved = store.updateSettings((current) => {
+      const existing = current.global.allowedSkillRoots;
+      const candidate = command.action === "add"
+        ? [...existing, ...(!existing.includes(command.path) ? [command.path] : [])]
+        : existing.filter((root) => root !== command.path);
+      if (command.action === "remove" && candidate.length === existing.length) throw new Error("skill-folder-not-approved");
+      const validated = validateCanonicalAllowlist(candidate);
+      if (!validated.ok) throw new Error(validated.reason);
+      if (validated.roots.length === 0 && (current.global.mode === "yolo" || current.repo.mode === "yolo")) {
+        throw new Error("yolo-allowlist-required");
+      }
+      savedRoots = validated.roots;
+      return { global: schemas.makeGlobalSettings({ ...current.global, allowedSkillRoots: savedRoots, updatedAt: now() }) };
+    });
+    if (!saved.ok) return { ok: false, reason: saved.reason, responseText: `Allowlist update refused: ${saved.reason}.` };
+    appendAudit("decision", {
+      action: "allowlist",
+      operation: command.action,
+      approvedSkillFolderCount: savedRoots.length,
+    }, undefined, "self-evolve-command");
+    invalidateRoutingSettings();
+    syncSchedulerMode(settings()?.repo?.projectFingerprint, `command-allowlist-${command.action}`);
+    return {
+      ok: true,
+      responseText: `Approved skill folders updated (${savedRoots.length}). No mode or consent setting changed.`,
+    };
   }
 
   function releaseGatesPassed(proposal) {
@@ -410,7 +468,7 @@ export function createIntegration({
       try {
         result = await applier.applyProposal({ ...args, proposal, decision });
       } catch (error) {
-        return { ok: false, reason: errorReason(error), disposition: "terminal-failure" };
+        return { ok: false, reason: errorReasonCode(error, "unknown-error"), disposition: "terminal-failure" };
       }
       if (result?.ok === true) return { ...result, disposition: "applied" };
       if (result?.deferred === true) return { ...result, disposition: "deferred" };
@@ -480,8 +538,8 @@ export function createIntegration({
     log: options.log,
   });
 
-  function appendAudit(kind, details, proposalId, actor = "self-evolve-integration") {
-    const timestamp = now();
+  function appendAudit(kind, details, proposalId, actor = "self-evolve-integration", timestampOverride) {
+    const timestamp = timestampOverride ?? now();
     const clean = Object.fromEntries(Object.entries(details).filter(([, value]) => ["string", "boolean", "number"].includes(typeof value) || value === null));
     const payloadHash = sha256(JSON.stringify(clean));
     const event = schemas.makeAuditEvent({
@@ -503,9 +561,9 @@ export function createIntegration({
     const method = ctx?.client?.tui?.publish;
     if (typeof method !== "function") return;
     try {
-      Promise.resolve(method.call(ctx.client.tui, { type, properties })).catch((error) => { lastError = errorReason(error); });
+      Promise.resolve(method.call(ctx.client.tui, { type, properties })).catch((error) => { lastError = errorReasonCode(error, "unknown-error"); });
     } catch (error) {
-      lastError = errorReason(error);
+      lastError = errorReasonCode(error, "unknown-error");
     }
   }
 
@@ -524,23 +582,12 @@ export function createIntegration({
       .filter((proposal) => proposal.projectFingerprint === settings()?.repo?.projectFingerprint && ["pending", "applied"].includes(proposal.state));
   }
 
-  const IMPLEMENTED_UI_OPERATIONS = Object.freeze([
-    "export-data",
-    "purge-all",
-    "purge-scope",
-    "retry-bootstrap",
-    "rollback-proposal",
-    "set-kill-switch",
-    "set-paused",
-    "snooze-proposal",
-  ]);
-
   function operationGrantKey(subjectId, uiAction) {
     return `${subjectId ?? ""}\n${uiAction}`;
   }
 
   function operationGrantSubjects(snapshot) {
-    const output = IMPLEMENTED_UI_OPERATIONS
+    const output = UI_OPERATION_ACTIONS
       .filter((uiAction) => !["rollback-proposal", "snooze-proposal"].includes(uiAction))
       .map((uiAction) => ({ subjectId: undefined, uiAction }));
     for (const proposal of [...latestById(
@@ -593,21 +640,19 @@ export function createIntegration({
     return issued;
   }
 
-  function latestBridgeGrant(proposalId) {
-    return (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
-      event.proposalId === proposalId && event.details?.action === "bridge-nonce");
-  }
-
-  function latestHeadlessGrant(proposalId) {
-    return (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
-      event.proposalId === proposalId && event.details?.action === "headless-approval-nonce");
-  }
-
   function issueBridgeNonces() {
     if (!options.stateRoot) return [];
     const issued = [];
+    const bridgeGrants = new Map();
+    const headlessGrants = new Map();
+    for (const record of store.readRecords?.("audit-event") ?? []) {
+      const event = record.payload;
+      if (!event?.proposalId) continue;
+      if (event.details?.action === "bridge-nonce") bridgeGrants.set(event.proposalId, event);
+      if (event.details?.action === "headless-approval-nonce") headlessGrants.set(event.proposalId, event);
+    }
     for (const proposal of actionableProposals()) {
-      const existing = latestBridgeGrant(proposal.id)?.details;
+      const existing = bridgeGrants.get(proposal.id)?.details;
       const timestamp = now();
       if (!(existing
         && existing.expiresAt > timestamp
@@ -616,7 +661,7 @@ export function createIntegration({
         && existing.decisionVersion === proposal.decisionVersion + 1
         && existing.priorState === proposal.state
         && existing.actor === BRIDGE_ACTOR)) {
-        appendAudit("decision", {
+        const event = appendAudit("decision", {
           action: "bridge-nonce",
           projectFingerprint: proposal.projectFingerprint,
           subjectId: proposal.id,
@@ -628,15 +673,16 @@ export function createIntegration({
           nonce: randomBytes(24).toString("hex"),
           expiresAt: timestamp + BRIDGE_TTL_MS,
         }, proposal.id);
+        bridgeGrants.set(proposal.id, event);
       }
-      const headless = latestHeadlessGrant(proposal.id)?.details;
+      const headless = headlessGrants.get(proposal.id)?.details;
       if (!headless
         || headless.expiresAt <= timestamp
         || headless.targetHash !== proposal.skillTarget.currentHash
         || headless.proposedContentHash !== proposal.proposedContentHash
         || headless.decisionVersion !== proposal.decisionVersion + 1
         || headless.priorState !== proposal.state) {
-        appendAudit("decision", {
+        const event = appendAudit("decision", {
           action: "headless-approval-nonce",
           projectFingerprint: proposal.projectFingerprint,
           subjectId: proposal.id,
@@ -648,10 +694,23 @@ export function createIntegration({
           nonce: randomBytes(24).toString("hex"),
           expiresAt: timestamp + BRIDGE_TTL_MS,
         }, proposal.id);
+        headlessGrants.set(proposal.id, event);
       }
       issued.push(proposal.id);
     }
     return issued;
+  }
+
+  function latestBridgeGrant(proposalId) {
+    return (store.readRecords?.("audit-event") ?? [])
+      .map((record) => record.payload)
+      .findLast((event) => event.proposalId === proposalId && event.details?.action === "bridge-nonce");
+  }
+
+  function latestHeadlessGrant(proposalId) {
+    return (store.readRecords?.("audit-event") ?? [])
+      .map((record) => record.payload)
+      .findLast((event) => event.proposalId === proposalId && event.details?.action === "headless-approval-nonce");
   }
 
   function refreshUiProjection({ force = false } = {}) {
@@ -672,6 +731,7 @@ export function createIntegration({
       health: {
         runtimeKillSwitch,
         hostSupported: options.hostSupported !== false,
+        passiveEventHookInstalled: options.passiveEventHookInstalled !== false,
         corrupt,
       },
     });
@@ -683,6 +743,7 @@ export function createIntegration({
     uiProjection = publishUiProjection(options.stateRoot, {
       index: built.index,
       details: built.publicationDetails,
+      dashboard: built.dashboard,
       now: timestamp,
     });
     uiProjectionDirty = false;
@@ -815,6 +876,10 @@ export function createIntegration({
       accepted: result.ok === true,
       reason: completionReason(result, "decision-rejected"),
       recovered,
+      ...(request.newState === "rejected" && request.feedback ? {
+        rejectionFeedbackReason: request.feedback.reason,
+        ...(request.feedback.text ? { rejectionFeedbackText: request.feedback.text } : {}),
+      } : {}),
     }, request.proposalId, "self-evolve-integration");
   }
 
@@ -1022,7 +1087,7 @@ export function createIntegration({
         exportManager().purge();
         sensitiveExportManager = undefined;
       } catch (error) {
-        return { ok: false, reason: errorReason(error) };
+        return { ok: false, reason: errorReasonCode(error, "unknown-error") };
       }
       const result = privacy.purgeScope({
         scope: request.payload.scope,
@@ -1042,6 +1107,8 @@ export function createIntegration({
                 sensitiveExportManager?.purge();
                 sensitiveExportManager = undefined;
                 privacy.purgeScope({ scope: "all" });
+              } catch (error) {
+                lastError = errorReasonCode(error, "unknown-error");
               } finally {
                 resolve();
               }
@@ -1112,7 +1179,7 @@ export function createIntegration({
         grant,
       });
     } catch (error) {
-      return finishOperationRequest(request, { ok: false, reason: errorReason(error) });
+      return finishOperationRequest(request, { ok: false, reason: errorReasonCode(error, "unknown-error") });
     }
     const subjectId = operationSubjectId(request);
     recordOperationStatus(request, "queued", subjectId);
@@ -1121,7 +1188,7 @@ export function createIntegration({
     try {
       result = await executeUiOperation(request);
     } catch (error) {
-      result = { ok: false, reason: errorReason(error) };
+      result = { ok: false, reason: errorReasonCode(error, "unknown-error") };
     }
     return finishOperationRequest(request, result);
   }
@@ -1149,6 +1216,16 @@ export function createIntegration({
       return finishControlRequest(request, result);
     }
 
+    if (request.action === "set-repo-mode" && request.payload.mode === "yolo") {
+      const roots = fresh.global.allowedSkillRoots;
+      if (!roots.length) result = { ok: false, reason: "yolo-allowlist-required" };
+      else if (!fresh.global.consent.passiveCalls) result = { ok: false, reason: "passive-consent-required" };
+      else if (!fresh.global.consent.durableObservations) result = { ok: false, reason: "observation-consent-required" };
+      else if (!yoloThresholdMet()) result = { ok: false, reason: "yolo-rollout-not-ready" };
+      else if (circuitBreakerOpen()) result = { ok: false, reason: "circuit-breaker-open" };
+      if (result) return finishControlRequest(request, result);
+    }
+
     let transitionEvents = [];
     const saved = store.updateSettings((current) => {
       if (current.global.updatedAt !== request.settingsUpdatedAt || settingsVersion(current) !== request.settingsVersion) throw new Error("stale-settings-version");
@@ -1167,6 +1244,16 @@ export function createIntegration({
         transitionEvents = transitioned.events;
         return { global: transitioned.state.global };
       }
+      if (request.action === "set-repo-mode") {
+        const transitioned = schemas.transitionMode(current.global, current.repo, {
+          scope: "repo",
+          mode: request.payload.mode,
+          overrides: modeOverrides(current, current.repo.projectFingerprint),
+        }, now(), BRIDGE_ACTOR);
+        if (!transitioned.ok) throw new Error(transitioned.error);
+        transitionEvents = transitioned.events;
+        return { repo: transitioned.state.repo };
+      }
       if (request.action === "set-consent") {
         const consent = schemas.makeConsentState({ ...current.global.consent, [request.payload.key]: request.payload.enabled });
         if (consent.crossRepoAggregation && !consent.sanitizedExcerpts) throw new Error("sanitized-excerpts-consent-required");
@@ -1177,6 +1264,12 @@ export function createIntegration({
       }
       if (request.action === "update-allowlist") {
         if (request.payload.confirmation !== "UPDATE ALLOWLIST") throw new Error("allowlist-confirmation-required");
+        const validated = validateCanonicalAllowlist(request.payload.allowlist);
+        if (!validated.ok) throw new Error(validated.reason);
+        if (request.payload.allowlist.length === 0
+            && (current.global.mode === "yolo" || current.repo.mode === "yolo")) {
+          throw new Error("yolo-allowlist-required");
+        }
         return { global: schemas.makeGlobalSettings({ ...current.global, allowedSkillRoots: request.payload.allowlist, updatedAt: now() }) };
       }
       throw new Error("unknown-control-action");
@@ -1276,7 +1369,7 @@ export function createIntegration({
       // proactive decision-nonce work when no decision request is waiting.
       if (pending.decisions > 0 || effective !== "manual") issueBridgeNonces();
       let controlStateError;
-      try { issueControlGrant(current); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
+      try { issueControlGrant(current); } catch (error) { controlStateError = errorReasonCode(error, "unknown-error"); lastError = controlStateError; }
       const consumed = await consumeMailbox({
         stateRoot: options.stateRoot,
         projectFingerprint,
@@ -1288,17 +1381,17 @@ export function createIntegration({
         __testAfterRequestHandled: options.__testAfterRequestHandled,
       });
       if (consumed.controls?.length || consumed.processed?.length || consumed.operations?.length) {
-        try { issueControlGrant(); } catch (error) { controlStateError = errorReason(error); lastError = controlStateError; }
+        try { issueControlGrant(); } catch (error) { controlStateError = errorReasonCode(error, "unknown-error"); lastError = controlStateError; }
       }
       let uiProjectionError;
-      try { refreshUiProjection(); } catch (error) { uiProjectionError = errorReason(error); lastError = uiProjectionError; }
+      try { refreshUiProjection(); } catch (error) { uiProjectionError = errorReasonCode(error, "unknown-error"); lastError = uiProjectionError; }
       return {
         ...consumed,
         ...(controlStateError ? { controlStateError } : {}),
         ...(uiProjectionError ? { uiProjectionError } : {}),
       };
     } catch (error) {
-      lastError = errorReason(error);
+      lastError = errorReasonCode(error, "unknown-error");
       return { ok: false, reason: lastError, processed: [] };
     }
   }
@@ -1346,7 +1439,7 @@ export function createIntegration({
       if (options.stateRoot && projectFingerprint) bridge = cleanupBridge(options.stateRoot, projectFingerprint, { now: timestamp });
       return { ok: true, records, bridge, sweptAt: timestamp };
     }).catch((error) => {
-      lastError = errorReason(error);
+      lastError = errorReasonCode(error, "unknown-error");
       return { ok: false, reason: lastError };
     }).finally(() => {
       retentionTask = undefined;
@@ -1411,8 +1504,10 @@ export function createIntegration({
   async function runEvolutionCycle(args = {}) {
     const mode = syncSchedulerMode(args.projectFingerprint, "cycle-refresh");
     const ownership = hostOwnershipContext(args.projectFingerprint ?? settings()?.repo?.projectFingerprint);
+    const projectRoot = args.options?.projectRoot ?? options.worktree ?? ctx?.worktree ?? ctx?.directory;
     const cycleOptions = {
       ...(args.options ?? {}),
+      projectRoot,
       synthesis: { ...(args.options?.synthesis ?? {}), ...ownership },
       critic: { ...(args.options?.critic ?? {}), ...ownership },
       rolloutGates,
@@ -1420,17 +1515,57 @@ export function createIntegration({
     };
     const pipelineMode = rolloutGates.automaticSynthesisApplicationDisabled || (mode === "auto" && !rolloutGates.autoReviewRollout) ? "manual" : mode;
     let result;
+    let failure = null;
     try {
       result = await pipelineInstance.runEvolutionCycle({ ...args, ctx: args.ctx ?? ctx, mode: pipelineMode, options: cycleOptions });
+      if (result?.result === "applied") {
+        const finalized = currentProposal(result.proposal?.id) ? markApplied(result.proposal?.id) : { ok: true };
+        result = !finalized?.ok
+          ? { result: "failed-closed", cycleOutcome: "failed-closed", reason: finalized?.reason ?? "apply-failed", responseText: `Proposal ${result.proposal?.id} was applied but final state recovery is required.` }
+          : { ...result, responseText: `${result.responseText}\n${RESTART_REMINDER}` };
+      }
+      return result;
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
       uiProjectionDirty = true;
+      const trigger = args.trigger?.reason ?? args.trigger?.kind ?? args.trigger;
+      const triggerClass = trigger === "scheduler" || trigger === "idle"
+        ? "idle"
+        : trigger === "recovery"
+          ? "recovery"
+          : typeof trigger === "string" && trigger.startsWith("manual")
+            ? "manual"
+            : "other";
+      const inferredOutcome = {
+        "proposal-ready": "recommendation-created",
+        "proposal-pending": "recommendation-created",
+        applied: "applied",
+        deferred: "deferred",
+        "failed-closed": "failed-closed",
+        "no-change": "valid-no-change",
+      }[result?.result];
+      const rawOutcome = failure ? "failed" : result?.cycleOutcome ?? inferredOutcome;
+      const outcome = CYCLE_OUTCOMES.has(rawOutcome) ? rawOutcome : failure ? "failed" : "failed-closed";
+      const rawReason = failure ? "pipeline-failed" : result?.cycleReason ?? result?.reason ?? null;
+      const reason = rawReason === null || CYCLE_REASONS.has(rawReason)
+        ? rawReason
+        : outcome === "failed" ? "pipeline-failed" : null;
+      const occurredAt = now();
+      appendAudit("decision", {
+        action: "cycle-outcome",
+        outcome,
+        triggerClass,
+        mode,
+        observationCount: Array.isArray(result?.observations) ? result.observations.length : 0,
+        eligibilityCount: Array.isArray(result?.eligibility)
+          ? result.eligibility.filter((item) => item?.eligible === true).length
+          : 0,
+        occurredAt,
+        reason,
+      }, result?.proposal?.id, "self-evolve-integration", occurredAt);
     }
-    if (result?.result === "applied") {
-      const finalized = currentProposal(result.proposal?.id) ? markApplied(result.proposal?.id) : { ok: true };
-      if (!finalized?.ok) return { result: "failed-closed", reason: finalized?.reason ?? "applied-transition-failed", responseText: `Proposal ${result.proposal?.id} was applied but final state recovery is required.` };
-      return { ...result, responseText: `${result.responseText}\n${RESTART_REMINDER}` };
-    }
-    return result;
   }
 
   async function runApprovalFlow(args = {}) {
@@ -1576,6 +1711,8 @@ export function createIntegration({
     let result;
     if (command.verb === "approve") {
       result = await approveHeadless(command);
+    } else if (command.verb === "allowlist") {
+      result = updateHeadlessAllowlist(command);
     } else if (command.verb === "reject" || command.verb === "dismiss" || command.verb === "undo") {
       const proposal = currentProposal(command.proposalId);
       if (!proposal) result = { ok: false, reason: "record-not-found", responseText: `Proposal ${command.proposalId} was not found.` };
@@ -1584,9 +1721,29 @@ export function createIntegration({
         result = await decide({ proposalId: proposal.id, decision: makeDecision(proposal, state, "self-evolve-command"), actor: "self-evolve-command" });
       }
     } else if (command.verb === "scan") {
-      result = await runEvolutionCycle({ ...(typeof input === "object" ? input : {}), trigger: "manual-command" });
+      const scanArgs = { ...(typeof input === "object" ? input : {}), trigger: "manual-command" };
+      const episode = await schedulerInstance.runWithEpisodeLease({
+        projectFingerprint: scanArgs.projectFingerprint ?? settings()?.repo?.projectFingerprint,
+        sessionID: scanArgs.sessionID,
+      }, () => runEvolutionCycle(scanArgs));
+      result = episode.ok
+        ? episode.value
+        : {
+          result: episode.deferred ? "deferred" : "failed-closed",
+          deferred: episode.deferred === true,
+          reason: episode.reason,
+          responseText: episode.deferred
+            ? "Self-evolve deferred this scan because another scan for the same session is already running."
+            : `Self-evolve could not start this scan: ${episode.reason}.`,
+        };
     } else {
       result = commandPolicy.execute(command, { projectFingerprint: input?.projectFingerprint ?? settings()?.repo?.projectFingerprint });
+      if ((command.verb === "status" || command.verb === "health") && backgroundRestartRequired()) {
+        result = {
+          ...result,
+          responseText: `${result.responseText} Background analysis is awaiting an OpenCode restart before it can activate.`,
+        };
+      }
       if (result.terminalPurge) stopAfterPurgeAll();
       else {
         invalidateRoutingSettings();
@@ -1656,6 +1813,8 @@ export function createIntegration({
       hostVersion,
       hostVersionSource,
       schemaVersion: schemas.SCHEMA_VERSION,
+      passiveEventHookInstalled: options.passiveEventHookInstalled !== false,
+      backgroundRestartRequired: backgroundRestartRequired(current),
       ...(hostSessionRecovery ? { hostSessionRecovery } : {}),
       ...(lastError ? { lastError } : {}),
     };
@@ -1687,7 +1846,7 @@ export function createIntegration({
           reason = undefined;
           break;
         } catch (error) {
-          reason = errorReason(error);
+          reason = errorReasonCode(error, "unknown-error");
           if (attempts > retries || signal.aborted) break;
           await boundedHostCall(
             () => new Promise((resolve) => setTimeout(resolve, backoffMs * (2 ** (attempts - 1)))),
@@ -1840,7 +1999,7 @@ export function createIntegration({
       recovery = recovery.map((item) => recoveredFailedClosed.has(item) ? { ...item, recoveredToFailedClosed: true } : item);
     } catch (error) {
       corrupt = true;
-      lastError = errorReason(error);
+      lastError = errorReasonCode(error, "unknown-error");
     }
     const mode = syncSchedulerMode(settings()?.repo?.projectFingerprint, "boot");
     return { ok: !corrupt && recovery.every((item) => item.ok !== false || item.recoveredToFailedClosed === true) && synthesisRecovery.every((item) => item.ok) && hiddenSessionRecovery.every((item) => item.ok), mode, recovered: recovery, synthesisRecovery, hiddenSessionRecovery, health: getHealth() };
@@ -1866,7 +2025,7 @@ export function createIntegration({
       shutdownDegraded = true;
       return { ok: false, reason: "applier-close-degraded", applier: applierClose };
     }
-    synthesisModule?.disposeSynthesis?.();
+    synthesisModule?.disposeSynthesis?.(store);
     const hostOwnerRelease = store.releaseOwnedHostOwners?.({ pid: process.pid, generation: hostOwnerGeneration });
     if (hostOwnerRelease?.ok === false) lastError = hostOwnerRelease.reason ?? "host-owner-release-degraded";
     if (!terminalPurge) await store.flushAudit?.();

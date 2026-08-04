@@ -6,11 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { openStore } from "../self-evolve-store.js";
 
 const execFileAsync = promisify(execFile);
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HERE = import.meta.dirname;
 const SERVER = path.join(HERE, "fixtures", "bridge-server.mjs");
 const CLIENT = path.join(HERE, "fixtures", "bridge-tui-client.mjs");
 const CONTROL_CLIENT = path.join(HERE, "fixtures", "bridge-control-client.mjs");
@@ -139,8 +138,10 @@ test("fresh TUI clients use authenticated server controls and persist every allo
   }
   assert.equal((await controlClient(root, "exclude", "true")).response.ok, true);
   assert.equal((await controlClient(root, "exclude", "false")).response.ok, true);
+  assert.equal((await controlClient(root, "repo-mode", "auto")).response.ok, true);
+  assert.equal((await controlClient(root, "repo-mode", "inherit")).response.ok, true);
   const allowlist = await controlClient(root, "allowlist", secondRoot);
-  assert.equal(allowlist.response.ok, true);
+  assert.equal(allowlist.response.ok, true, allowlist.response.reason);
   assert.deepEqual(allowlist.next.allowedSkillRoots, [secondRoot]);
 
   assert.equal((await controlClient(root, "consent", "crossRepoAggregation=false")).response.ok, true);
@@ -188,6 +189,7 @@ test("fresh TUI clients use authenticated server controls and persist every allo
   assert.deepEqual(settings.global.allowedSkillRoots, [secondRoot]);
   assert.deepEqual(settings.global.consent, { passiveCalls: false, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false });
   assert.equal(settings.repo.excluded, false);
+  assert.equal(settings.repo.mode, "inherit");
   store.close();
 
   server = await startServer(root, skillRoot);

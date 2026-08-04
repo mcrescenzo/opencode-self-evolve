@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   SelfEvolveTuiPlugin,
   buildDecisionFromDialog,
+  createTuiAcknowledgementStore,
   formatDiffOrNewSkillPreview,
   formatEligibilityExplanation,
   formatProposalDigest,
@@ -15,7 +16,7 @@ import {
   safeIdlePredicate,
   shouldShowProposal,
 } from "../self-evolve-tui.js";
-import tuiModule, { TUI_KV_KEYS } from "../self-evolve-tui.js";
+import tuiModule, { TUI_KV_KEYS, TUI_LEGACY_KV_KEYS } from "../self-evolve-tui.js";
 import { publishControlState, readTuiHostHealth } from "../self-evolve-bridge.js";
 import { openStore, projectFingerprintFor } from "../self-evolve-store.js";
 import * as schemas from "../self-evolve-schemas.js";
@@ -191,6 +192,7 @@ test("default export is a TUI-only plugin module", () => {
 
 test("production TUI acquires and refreshes the project-scoped projection store", async () => {
   const h = harness({ kv: enabledKv() });
+  h.api.app = { version: "1.18.3" };
   const calls = [];
   const projectStore = {
     refresh() {
@@ -208,6 +210,11 @@ test("production TUI acquires and refreshes the project-scoped projection store"
   assert.equal(calls[0].config.stateRoot, "/state");
   assert.equal(calls[0].config.worktree, "/worktree");
   assert.match(calls[0].config.projectFingerprint, /^[a-f0-9]{64}$/u);
+  assert.deepEqual(calls[0].runtimeMetadata, {
+    hostVersion: "1.18.3",
+    hostVersionSource: "tui-app-version",
+    pluginVersion: JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version,
+  });
   assert.equal(calls[1], "refresh");
   await h.dispose();
 });
@@ -554,6 +561,44 @@ test("review bookkeeping prunes stale and absent entries to a fixed cap", () => 
   assert.equal(Object.keys(result.lastShownAt).length, 256);
   assert.equal(result.dismissedIds.includes("absent"), false);
   assert.equal(Object.hasOwn(result.lastShownAt, "absent"), false);
+});
+
+test("applied acknowledgement KV migrates the Release A string into the current project", () => {
+  const kv = new Map([[TUI_LEGACY_KV_KEYS.acknowledgedAudits, "legacy-applied-proposal"]]);
+  const acknowledgements = createTuiAcknowledgementStore(kv, { now: () => 1_000 });
+  assert.deepEqual(acknowledgements.read(HASH_A), ["legacy-applied-proposal"]);
+  assert.deepEqual(acknowledgements.read(HASH_B), []);
+  assert.deepEqual(kv.get(TUI_KV_KEYS.acknowledgedAudits), [{
+    projectFingerprint: HASH_A,
+    auditId: "legacy-applied-proposal",
+    acknowledgedAt: 0,
+  }]);
+  assert.equal(kv.get(TUI_LEGACY_KV_KEYS.acknowledgedAudits), "legacy-applied-proposal");
+});
+
+test("applied acknowledgement KV retains multiple projects and deterministically caps the newest 256 entries", () => {
+  const kv = new Map();
+  let clock = 0;
+  const acknowledgements = createTuiAcknowledgementStore(kv, { now: () => ++clock });
+  for (let index = 0; index < 300; index += 1) {
+    const projectFingerprint = index % 2 === 0 ? HASH_A : HASH_B;
+    acknowledgements.acknowledge(projectFingerprint, `audit-${String(index).padStart(3, "0")}`);
+  }
+  const stored = kv.get(TUI_KV_KEYS.acknowledgedAudits);
+  assert.equal(stored.length, 256);
+  assert.equal(stored[0].auditId, "audit-044");
+  assert.equal(stored.at(-1).auditId, "audit-299");
+  assert.equal(acknowledgements.read(HASH_A).every((id) => Number(id.slice(-3)) % 2 === 0), true);
+  assert.equal(acknowledgements.read(HASH_B).every((id) => Number(id.slice(-3)) % 2 === 1), true);
+});
+
+test("foreign or corrupt canonical acknowledgement KV is preserved with a conservative empty view", () => {
+  const foreign = { owner: "another-plugin" };
+  const kv = new Map([[TUI_KV_KEYS.acknowledgedAudits, foreign]]);
+  const acknowledgements = createTuiAcknowledgementStore(kv);
+  assert.deepEqual(acknowledgements.read(HASH_A), []);
+  assert.deepEqual(acknowledgements.acknowledge(HASH_A, "audit-one"), []);
+  assert.equal(kv.get(TUI_KV_KEYS.acknowledgedAudits), foreign);
 });
 
 test("busy refresh bursts coalesce and late inbox completion is inert after dispose", async () => {

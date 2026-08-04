@@ -94,6 +94,23 @@ test("size failure removes temporary state and stale artifacts are cleaned", (t)
   }), null);
 });
 
+test("a post-publication failure removes the sensitive artifact before reporting failure", (t) => {
+  const root = fixture(t);
+  const manager = createSensitiveExportManager({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    now: () => 2_500,
+    faultInjection(stage) {
+      if (stage === "export-after-publication") throw new Error("injected-metadata-failure");
+    },
+  });
+  assert.deepEqual(manager.run({ scope: "all", archive: { records: [] } }), {
+    ok: false,
+    reason: "injected-metadata-failure",
+  });
+  assert.deepEqual(readdirSync(manager.root), []);
+});
+
 test("store purge removes sensitive artifacts for every data scope", (t) => {
   for (const scope of ["observations", "proposals", "project", "all"]) {
     const root = fixture(t);

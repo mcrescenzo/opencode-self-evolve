@@ -9,6 +9,21 @@ const CURRENT = H("c");
 const PROPOSED = H("d");
 const CLUSTER = H("e");
 
+test("errorReasonCode consistently extracts bounded reason prefixes", () => {
+  assert.equal(schemas.errorReasonCode(new Error("invalid-input: detail"), "fallback"), "invalid-input");
+  assert.equal(schemas.errorReasonCode("plain-reason", "fallback"), "plain-reason");
+  assert.equal(schemas.errorReasonCode(new Error(""), "fallback"), "fallback");
+  assert.equal(schemas.errorReasonCode(null, "fallback"), "fallback");
+});
+
+test("shared record and object helpers preserve latest-record and undefined-stripping semantics", () => {
+  const first = { id: "envelope-1", payload: { id: "logical", value: 1 } };
+  const latest = { id: "envelope-2", payload: { id: "logical", value: 2 } };
+  assert.equal(schemas.latestByLogicalId([first, latest]).get("logical"), latest);
+  assert.equal(schemas.latestByLogicalId([first, latest], { withPayload: true }).get("logical"), latest.payload);
+  assert.deepEqual(schemas.stripUndefined({ kept: false, empty: null, removed: undefined }), { kept: false, empty: null });
+});
+
 function globalSettings(overrides = {}) {
   return schemas.makeGlobalSettings({
     createdAt: 100,
@@ -137,6 +152,9 @@ test("settings enforce versions, canonical roots, booleans, retention, and budge
   assert.throws(() => schemas.makeBudgets({ tokensPerSynthesis: -1 }), /out-of-bounds/);
   assert.throws(() => repoSettings({ budgets: { unknownBudget: 1 } }), /unexpected field/);
   assert.deepEqual(repoSettings({ budgets: { passiveCallsPerHour: 2 } }).budgets, { passiveCallsPerHour: 2 });
+  assert.deepEqual(Object.keys(repoSettings()), schemas.RepoSettings.fields);
+  assert.equal("consent" in repoSettings(), false, "consent is installation-wide, not repository-scoped");
+  assert.throws(() => repoSettings({ consent: schemas.makeConsentState() }), /unexpected field consent/);
   assert.throws(() => globalSettings({ allowedSkillRoots: Array.from({ length: 33 }, (_, i) => `/skills/${i}`) }), /out-of-bounds/);
 });
 
@@ -171,6 +189,47 @@ test("record envelopes are canonical, content-addressed, versioned, and corrupti
   assert.throws(() => schemas.assertRecord({ ...first, schemaVersion: "0.3.0" }), /unsupported-version/);
   assert.throws(() => schemas.assertRecord({ ...first, id: H("f") }), /corrupt-record/);
   assert.throws(() => schemas.assertRecord({ ...first, kind: "receipt" }), /malformed-payload/);
+});
+
+test("the supported schema version list always retains a migration path off the previous release", () => {
+  const supported = schemas.SUPPORTED_SCHEMA_VERSIONS;
+  assert.ok(Object.isFrozen(supported), "the supported version list must be frozen");
+  assert.equal(supported.at(-1), schemas.SCHEMA_VERSION, "the current version must be listed last");
+  // Guards the July 2026 regression: bumping SCHEMA_VERSION without listing its predecessor made
+  // every already-persisted record fail validation and get quarantined as damaged.
+  assert.ok(supported.length >= 2, "bumping SCHEMA_VERSION requires keeping the prior version readable");
+  const ordered = [...supported].sort((a, b) => {
+    const [x, y] = [a, b].map((v) => v.split(".").map(Number));
+    return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+  });
+  assert.deepEqual(supported, ordered, "supported versions must be listed oldest to newest");
+  assert.equal(new Set(supported).size, supported.length, "supported versions must be unique");
+});
+
+test("records written by a compatible earlier schema version are read and normalized, not quarantined", () => {
+  const current = schemas.wrapRecord("proposal", proposal(), 300);
+  assert.ok(
+    schemas.SUPPORTED_SCHEMA_VERSIONS.includes(schemas.SCHEMA_VERSION),
+    "the current version must be a supported version",
+  );
+  for (const legacy of schemas.SUPPORTED_SCHEMA_VERSIONS.filter((v) => v !== schemas.SCHEMA_VERSION)) {
+    const stored = { ...current, schemaVersion: legacy };
+    const read = schemas.assertRecord(stored);
+    assert.equal(read.schemaVersion, schemas.SCHEMA_VERSION, `${legacy} must be normalized to current`);
+    assert.equal(read.id, current.id, `${legacy} record identity must survive migration`);
+    assert.deepEqual(read.payload, current.payload, `${legacy} payload must be preserved`);
+  }
+  assert.throws(() => schemas.assertRecord({ ...current, schemaVersion: "0.1.0" }), /unsupported-version/);
+  assert.throws(() => schemas.assertRecord({ ...current, schemaVersion: "9.9.9" }), /unsupported-version/);
+});
+
+test("settings written by a compatible earlier schema version are normalized to the current version", () => {
+  for (const legacy of schemas.SUPPORTED_SCHEMA_VERSIONS.filter((v) => v !== schemas.SCHEMA_VERSION)) {
+    assert.equal(globalSettings({ schemaVersion: legacy }).schemaVersion, schemas.SCHEMA_VERSION);
+    assert.equal(repoSettings({ schemaVersion: legacy }).schemaVersion, schemas.SCHEMA_VERSION);
+  }
+  assert.throws(() => globalSettings({ schemaVersion: "9.0.0" }), /unsupported-version/);
+  assert.throws(() => globalSettings({ schemaVersion: "0.1.0" }), /unsupported-version/);
 });
 
 test("mode resolution follows kill, pause, exclusion, opt-out, repo, global, default precedence", () => {

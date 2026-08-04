@@ -30,6 +30,8 @@ import { stateRootIdentity } from "../self-evolve-state-root.js";
 import {
   UI_ACTION_CAPABILITIES,
   UI_CAPABILITIES,
+  UI_DASHBOARD_CAPABILITIES,
+  UI_DASHBOARD_VERSION,
   UI_OPERATION_PROTOCOL_VERSION,
   UI_PROJECTION_VERSION,
   hashUiProtocol,
@@ -65,6 +67,7 @@ function bundle(root, {
   proposalId = "proposal-1",
   issuedAt = NOW,
   includeActions = true,
+  includeDashboard = false,
 } = {}) {
   const rootIdentity = stateRootIdentity(root);
   const expiresAt = issuedAt + 60_000;
@@ -169,9 +172,58 @@ function bundle(root, {
       allowedActions: overflow(includeActions ? 1 : 0),
     },
   };
+  const index = { ...indexBody, projectionHash: hashUiProtocol("projection-index", indexBody) };
+  const dashboardBody = {
+    dashboardVersion: UI_DASHBOARD_VERSION,
+    projectFingerprint: PROJECT,
+    stateRootIdentity: rootIdentity,
+    generation,
+    indexHash: index.projectionHash,
+    generatedAt: issuedAt,
+    capabilities: UI_DASHBOARD_CAPABILITIES,
+    automation: { state: "ready", reason: null },
+    blockers: [],
+    inFlight: { active: false, count: 0, stage: null, startedAt: null },
+    lastCycle: null,
+    nextEligibleAt: null,
+    usage: {
+      passive: { used: 0, limit: 6, remaining: 6, resetAt: null },
+      synthesis: { used: 0, limit: 24, remaining: 24, resetAt: null },
+      storage: { usedBytes: 0, limitBytes: 8_388_608, remainingBytes: 8_388_608 },
+    },
+    rollout: {
+      ready: false,
+      synthesesObserved: 0,
+      minSynthesesObserved: 10,
+      successRateBasisPoints: 0,
+      minSuccessRateBasisPoints: 8_000,
+    },
+    settings: {
+      globalMode: "auto",
+      repositoryMode: "inherit",
+      effectiveMode: "auto",
+      paused: false,
+      killSwitchActive: false,
+      repositoryExcluded: false,
+      consent: {
+        passiveCalls: true,
+        durableObservations: true,
+        sanitizedExcerpts: false,
+        crossRepoAggregation: false,
+      },
+      approvedSkillFolderCount: 1,
+    },
+    retention: { observationsDays: 30, operationalDays: 90 },
+    supportedControls: ["set-paused"],
+    activity: [],
+    overflow: { activity: overflow(0) },
+  };
   return {
-    index: { ...indexBody, projectionHash: hashUiProtocol("projection-index", indexBody) },
+    index,
     details: [detail],
+    ...(includeDashboard
+      ? { dashboard: { ...dashboardBody, dashboardHash: hashUiProtocol("dashboard", dashboardBody) } }
+      : {}),
     offer: clientOffer(),
     now: issuedAt,
   };
@@ -188,21 +240,34 @@ function detailPath(root, generation) {
   return path.join(directory, names[0]);
 }
 
+function dashboardPath(root, generation) {
+  return path.join(projectionRoot(root), "generations", generation, "dashboard-v1.json");
+}
+
 function runPublisher(root, bundlePath) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [FIXTURE.pathname, root, bundlePath], {
-      stdio: ["ignore", "pipe", "pipe"],
+    const resultPath = `${bundlePath}.result`;
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawn(process.execPath, [FIXTURE.pathname, root, bundlePath, resultPath], {
+      env,
+      stdio: ["ignore", "ignore", "pipe"],
     });
-    let stdout = "";
     let stderr = "";
-    child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.once("error", reject);
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       if (code !== 0) reject(new Error(`publisher failed (${code ?? signal}): ${stderr}`));
-      else resolve(JSON.parse(stdout));
+      else {
+        try {
+          resolve(JSON.parse(readFileSync(resultPath, "utf8")));
+        } catch (error) {
+          reject(new Error(`publisher result receipt was invalid: stderr=${JSON.stringify(stderr)}`, {
+            cause: error,
+          }));
+        }
+      }
     });
   });
 }
@@ -249,6 +314,68 @@ test("publication is atomic, private, negotiated, and preserves the legacy inbox
   assert.equal(oldTui.mode, "legacy");
   assert.equal(oldTui.index, null);
   assert.deepEqual(readProjectInbox(root, PROJECT, { now: NOW }), []);
+});
+
+test("dashboard-v1 publishes before the index and malformed enhanced data degrades without invalidating core review", (t) => {
+  const root = fixture(t);
+  const first = bundle(root, { generation: "7".repeat(64) });
+  publishUiProjection(root, first);
+  const enhanced = bundle(root, { generation: "8".repeat(64), includeDashboard: true });
+  assert.throws(() => publishUiProjection(root, {
+    ...enhanced,
+    __testFaultInjection(point) {
+      if (point === "ui-projection-after-dashboard") throw new Error("fixture-after-dashboard");
+    },
+  }), /fixture-after-dashboard/u);
+  assert.equal(readUiProjection(root, PROJECT, {
+    now: NOW,
+    clientOffer: clientOffer(),
+  }).index.generation, first.index.generation);
+
+  publishUiProjection(root, enhanced);
+  const dashboardFile = dashboardPath(root, enhanced.index.generation);
+  assert.equal(statMode(dashboardFile), 0o600);
+  const read = readUiProjection(root, PROJECT, {
+    now: NOW,
+    clientOffer: clientOffer(),
+    detailProposalIds: ["proposal-1"],
+  });
+  assert.equal(read.dashboard.dashboardHash, enhanced.dashboard.dashboardHash);
+  assert.equal(read.dashboard.indexHash, read.index.projectionHash);
+  assert.equal(read.dashboardError, null);
+  const dashboardWithReducedCoreOffer = readUiProjection(root, PROJECT, {
+    now: NOW,
+    clientOffer: clientOffer({
+      capabilities: UI_CAPABILITIES.filter((capability) => capability !== "operation-export-v1"),
+    }),
+  });
+  assert.equal(dashboardWithReducedCoreOffer.dashboard.dashboardHash, enhanced.dashboard.dashboardHash);
+  assert.equal(dashboardWithReducedCoreOffer.dashboardError, null);
+
+  writeFileSync(dashboardFile, "{}\n", { mode: 0o600 });
+  const degraded = readUiProjection(root, PROJECT, {
+    now: NOW,
+    clientOffer: clientOffer(),
+    detailProposalIds: ["proposal-1"],
+  });
+  assert.equal(degraded.index.projectionHash, enhanced.index.projectionHash);
+  assert.equal(degraded.details[0].detailHash, enhanced.details[0].detailHash);
+  assert.equal(degraded.dashboard, null);
+  assert.match(degraded.dashboardError, /ui-dashboard/u);
+  const cleaned = cleanupBridge(root, PROJECT, { now: NOW });
+  assert.equal(cleaned.ok, true);
+  assert.equal(existsSync(dashboardFile), false);
+  assert.equal(existsSync(path.join(projectionRoot(root), "index.json")), true);
+
+  const { dashboardHash: _hash, ...wrongBody } = enhanced.dashboard;
+  const wrongBindingBody = { ...wrongBody, indexHash: "f".repeat(64) };
+  assert.throws(() => publishUiProjection(root, {
+    ...enhanced,
+    dashboard: {
+      ...wrongBindingBody,
+      dashboardHash: hashUiProtocol("dashboard", wrongBindingBody),
+    },
+  }), /stale-projection/u);
 });
 
 test("publication permits a non-writable shared state-root mode but rejects writable roots before creating artifacts", (t) => {

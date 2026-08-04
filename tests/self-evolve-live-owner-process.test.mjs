@@ -3,7 +3,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createApplier } from "../self-evolve-applier.js";
 import { createCommandPolicy } from "../self-evolve-commands.js";
@@ -17,8 +16,8 @@ import * as schemas from "../self-evolve-schemas.js";
 import { openStore } from "../self-evolve-store.js";
 import * as synthesis from "../self-evolve-synthesis.js";
 
-const CHILD = fileURLToPath(new URL("./fixtures/apply-live-owner.mjs", import.meta.url));
-const SYNTHESIS_CHILD = fileURLToPath(new URL("./fixtures/synthesis-live-owner.mjs", import.meta.url));
+const CHILD = path.join(import.meta.dirname, "fixtures", "apply-live-owner.mjs");
+const SYNTHESIS_CHILD = path.join(import.meta.dirname, "fixtures", "synthesis-live-owner.mjs");
 const PROJECT = inventory.hashSkillContent("live-owner-project");
 const CURRENT = "---\nname: live-owner\ndescription: Handles process lease recovery safely.\n---\n# Live Owner\nKeep the current instruction.\n";
 const PROPOSED = `${CURRENT}Verify ownership before recovery.\n`;

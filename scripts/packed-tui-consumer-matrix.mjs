@@ -3,13 +3,13 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
-const scriptPath = fileURLToPath(import.meta.url);
-const repoRoot = path.resolve(path.dirname(scriptPath), "..");
+const repoRoot = path.resolve(import.meta.dirname, "..");
 const FLOOR = "1.18.3";
 const ADJACENT = "1.18.4";
-const OPENTUI_VERSION = "0.4.3";
+const OPENTUI_FLOOR = "0.4.5";
+const OPENTUI_CURRENT = "0.5.0";
+const OPENTUI_UNSUPPORTED = "0.6.0";
 const SOLID_VERSION = "1.9.12";
 
 function fail(message, detail = "") {
@@ -74,7 +74,7 @@ function packArtifact(root, env) {
   };
 }
 
-function runLane({ label, version, packageName, artifact, root, env }) {
+function runLane({ label, version, opentuiVersion, packageName, artifact, root, env }) {
   const consumer = path.join(root, `consumer-${label}`);
   mkdirSync(consumer);
   writeFileSync(path.join(consumer, "package.json"), `${JSON.stringify({
@@ -87,13 +87,12 @@ function runLane({ label, version, packageName, artifact, root, env }) {
     "--no-audit",
     "--no-fund",
     "--no-package-lock",
-    "--legacy-peer-deps",
     artifact.tarball,
     `opencode-ai@${version}`,
     `@opencode-ai/plugin@${version}`,
-    `@opentui/core@${OPENTUI_VERSION}`,
-    `@opentui/keymap@${OPENTUI_VERSION}`,
-    `@opentui/solid@${OPENTUI_VERSION}`,
+    `@opentui/core@${opentuiVersion}`,
+    `@opentui/keymap@${opentuiVersion}`,
+    `@opentui/solid@${opentuiVersion}`,
     `solid-js@${SOLID_VERSION}`,
   ], { cwd: consumer, env });
   const smoke = `
@@ -122,6 +121,48 @@ function runLane({ label, version, packageName, artifact, root, env }) {
   return { label, requestedVersion: version, observed, ok: true };
 }
 
+function runUnsupportedPeerLane({ version, packageName, artifact, root, env }) {
+  const consumer = path.join(root, "consumer-unsupported-opentui");
+  mkdirSync(consumer);
+  writeFileSync(path.join(consumer, "package.json"), `${JSON.stringify({
+    private: true,
+    type: "module",
+  }, null, 2)}\n`);
+  const args = [
+    "install",
+    "--strict-peer-deps",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--no-package-lock",
+    artifact.tarball,
+    `@opencode-ai/plugin@${version}`,
+    `@opentui/core@${OPENTUI_UNSUPPORTED}`,
+    `@opentui/keymap@${OPENTUI_UNSUPPORTED}`,
+    `@opentui/solid@${OPENTUI_UNSUPPORTED}`,
+    `solid-js@${SOLID_VERSION}`,
+  ];
+  const result = spawnSync("npm", args, {
+    cwd: consumer,
+    env,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (result.error) fail(`unsupported-peer npm diagnostic could not run (${result.error.code ?? "spawn-error"})`, result.error.message);
+  if (result.signal) fail(`unsupported-peer npm diagnostic terminated by ${result.signal}`);
+  if (result.status === 0) fail(`unsupported OpenTUI ${OPENTUI_UNSUPPORTED} unexpectedly installed for ${packageName}`);
+  const diagnostic = `${result.stdout}\n${result.stderr}`;
+  if (!/(?:ERESOLVE|peer dependency|peerDependencies|Conflicting peer dependency|could not resolve dependency)/iu.test(diagnostic)) {
+    fail("unsupported OpenTUI combination did not produce a clear package-manager peer diagnostic", diagnostic.slice(-4_000));
+  }
+  return {
+    label: "unsupported-opentui",
+    requestedVersion: OPENTUI_UNSUPPORTED,
+    rejected: true,
+    diagnostic: "npm-peer-contract-rejected",
+  };
+}
+
 export function main() {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-tui-matrix-"));
   const env = {
@@ -135,9 +176,10 @@ export function main() {
     const latest = resolveLatestCommon18(openCodeVersions, pluginVersions);
     const artifact = packArtifact(root, env);
     const lanes = [
-      { label: "floor", version: FLOOR },
-      { label: "adjacent", version: ADJACENT },
-      { label: "latest-supported", version: latest },
+      { label: "floor", version: FLOOR, opentuiVersion: OPENTUI_FLOOR },
+      { label: "adjacent", version: ADJACENT, opentuiVersion: OPENTUI_FLOOR },
+      { label: "latest-supported", version: latest, opentuiVersion: OPENTUI_FLOOR },
+      { label: "opentui-current", version: latest, opentuiVersion: OPENTUI_CURRENT },
     ];
     const results = lanes.map((lane) => runLane({
       ...lane,
@@ -160,13 +202,20 @@ export function main() {
         latestCommonStable: latest,
         resolvedAt: new Date().toISOString(),
       },
-      fixedPeers: {
-        "@opentui/core": OPENTUI_VERSION,
-        "@opentui/keymap": OPENTUI_VERSION,
-        "@opentui/solid": OPENTUI_VERSION,
+      testedPeers: {
+        "@opentui/core": [OPENTUI_FLOOR, OPENTUI_CURRENT],
+        "@opentui/keymap": [OPENTUI_FLOOR, OPENTUI_CURRENT],
+        "@opentui/solid": [OPENTUI_FLOOR, OPENTUI_CURRENT],
         "solid-js": SOLID_VERSION,
       },
       lanes: results,
+      negativeLanes: [runUnsupportedPeerLane({
+        version: latest,
+        packageName: packageJSON.name,
+        artifact,
+        root,
+        env,
+      })],
     };
     console.log(JSON.stringify(report, null, 2));
     return report;
@@ -175,7 +224,7 @@ export function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
+if (process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename) {
   try { main(); } catch (error) {
     console.error(`Packed TUI consumer matrix failed: ${error.message}`);
     process.exitCode = 1;

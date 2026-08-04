@@ -683,7 +683,6 @@ test("CALIBRATION: 20 offline syntheses meet yolo thresholds only at 18 valid re
   const synthesesObserved = corpus.length;
   const successRate = results.filter((result, index) => result.ok && corpus[index].criticScore >= 0.75).length / synthesesObserved;
   const calibration = { synthesesObserved, successes: successRate * synthesesObserved, successRate, duplicates, duplicateCollapseRate, privacyPasses, privacyPassRate, scopeCorrect, scopeCorrectnessRate, proposalQualityProxy };
-  console.log(`CALIBRATION ${JSON.stringify(calibration)}`);
   assert.equal(synthesesObserved >= 10, true);
   assert.equal(successRate >= 0.8, true);
   assert.equal(successRate, 18 / 20);

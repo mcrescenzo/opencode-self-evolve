@@ -17,6 +17,8 @@ import test from "node:test";
 import { buildUiProjection } from "../self-evolve-projection.js";
 import {
   makeAuditEvent,
+  makeCircuitBreaker,
+  makeDecision,
   makeEligibilityExplanation,
   makeEvidenceCluster,
   makeGlobalSettings,
@@ -28,7 +30,7 @@ import { hashContent, openStore } from "../self-evolve-store.js";
 
 const PROJECT = "a".repeat(64);
 const ROOT_IDENTITY = "b".repeat(64);
-const NOW = 1_000_000;
+const NOW = 4_000_000;
 const CURRENT = "---\nname: demo\n---\n# Current\n";
 const PROPOSED = "---\nname: demo\n---\n# Proposed\n";
 const CURRENT_HASH = hashContent(CURRENT);
@@ -174,6 +176,65 @@ function build(f, options = {}) {
   });
 }
 
+test("fresh manual projection guides first-run setup without bundling excerpt consent", (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-projection-first-run-"));
+  const store = openStore(root, {
+    projectName: "projection-first-run",
+    projectFingerprint: PROJECT,
+    now: () => NOW,
+  });
+  t.after(() => {
+    try { store.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  });
+  const project = (snapshot) => buildUiProjection(snapshot, {
+    stateRootIdentity: ROOT_IDENTITY,
+    now: NOW,
+    targetReader: () => ({ exists: false, content: null, hash: null }),
+    inventory: [],
+  });
+
+  const first = project(store.readProjectionSnapshot());
+  assert.deepEqual(first.dashboard.blockers.map((blocker) => blocker.code), ["first-run"]);
+  assert.equal(first.dashboard.settings.consent.sanitizedExcerpts, false);
+
+  const current = store.getSettings();
+  const changed = store.updateGlobalSettings((global) => makeGlobalSettings({
+    ...global,
+    updatedAt: global.updatedAt + 1,
+  }));
+  assert.equal(changed.ok, true);
+  const afterDecision = project(store.readProjectionSnapshot());
+  assert.equal(afterDecision.dashboard.blockers.some((blocker) => blocker.code === "first-run"), false);
+  assert.equal(current.global.consent.sanitizedExcerpts, false);
+});
+
+test("approved skill folders block automatic apply but not automatic recommendations", (t) => {
+  const f = fixture(t, { mode: "auto" });
+  const current = f.store.getSettings();
+  assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
+    ...current.global,
+    mode: "auto",
+    allowedSkillRoots: [],
+    consent: {
+      ...current.global.consent,
+      passiveCalls: true,
+      durableObservations: true,
+    },
+    updatedAt: NOW + 1,
+  })).mode, "auto");
+  const auto = build(f);
+  assert.equal(auto.dashboard.blockers.some((blocker) => blocker.code === "approved-skill-folders"), false);
+
+  assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
+    ...f.store.getSettings().global,
+    mode: "yolo",
+    updatedAt: NOW + 2,
+  })).mode, "yolo");
+  const yolo = build(f);
+  assert.equal(yolo.dashboard.blockers.some((blocker) => blocker.code === "approved-skill-folders"), true);
+});
+
 function treeSnapshot(root) {
   const output = [];
   const visit = (directory) => {
@@ -201,6 +262,14 @@ test("pending projections render bounded diff, evidence, eligibility, budgets, a
   assert.equal(result.index.status.state, "ready");
   assert.equal(result.index.status.storedMode, "auto");
   assert.equal(result.index.status.effectiveMode, "auto");
+  assert.equal(result.dashboard.indexHash, result.index.projectionHash);
+  assert.equal(result.dashboard.generation, result.index.generation);
+  assert.equal(result.dashboard.automation.state, "setup-required");
+  assert.equal(result.dashboard.settings.globalMode, "auto");
+  assert.equal(result.dashboard.usage.storage.usedBytes > 0, true);
+  assert.equal(result.index.capabilities.includes("control-repo-mode-v1"), false);
+  assert.equal(result.dashboard.capabilities.includes("control-repo-mode-v1"), true);
+  assert.equal(result.dashboard.supportedControls.includes("set-repo-mode"), true);
   assert.equal(result.index.reviews.length, 1);
   assert.equal(result.details.length, 1);
   assert.equal(result.publicationDetails.length, 1);
@@ -308,6 +377,21 @@ test("corrupt, terminal, startup, and unavailable health states are explicit and
   }
 });
 
+test("automatic mode reports when background analysis awaits restart", (t) => {
+  const f = fixture(t, { mode: "auto" });
+  const result = build(f, { health: { passiveEventHookInstalled: false } });
+  assert.equal(result.index.status.state, "setup-required");
+  assert.equal(result.index.status.reason, "restart-required");
+  assert.deepEqual(
+    result.dashboard.blockers.filter((blocker) => blocker.code === "restart-required"),
+    [{
+      code: "restart-required",
+      summary: "Background analysis is awaiting an OpenCode restart before it can activate.",
+      destination: "settings",
+    }],
+  );
+});
+
 test("operation grants bind the exact project, root, and target-derived generation without circular store hashes", (t) => {
   const f = fixture(t);
   const item = proposal(f.skillRoot);
@@ -353,8 +437,230 @@ test("operation grants bind the exact project, root, and target-derived generati
     nonce: hash("pause"),
     expiresAt: NOW + 30_000,
   }, NOW - 2_000));
+  append(f.store, "audit-event", audit("decision", null, {
+    action: "ui-operation-nonce",
+    projectFingerprint: PROJECT,
+    stateRootIdentity: ROOT_IDENTITY,
+    generation: second.generation,
+    uiAction: "retry-bootstrap",
+    capability: "operation-retry-bootstrap-v1",
+    nonce: hash("retry"),
+    expiresAt: NOW + 30_000,
+  }, NOW - 1_900));
   const third = build(f);
   assert.deepEqual(third.index.allowedActions.map((action) => action.action), ["set-paused"]);
+});
+
+test("dashboard activity is allowlisted and usage-only audits do not churn the core generation", (t) => {
+  const f = fixture(t);
+  const item = proposal(f.skillRoot);
+  append(f.store, "proposal", item);
+  seedContent(f.store, item);
+  const firstSnapshot = f.store.readProjectionSnapshot();
+  const first = build(f);
+
+  append(f.store, "audit-event", makeAuditEvent({
+    id: hash("passive-budget"),
+    kind: "decision",
+    actor: "self-evolve-scheduler",
+    timestamp: NOW - 500,
+    payloadHash: hash("passive-budget-payload"),
+    details: {
+      action: "scheduler-budget",
+      budgetType: "passive",
+      reservationId: hash("reservation"),
+      slotIndex: 0,
+      slotCount: 1,
+      rootSessionIDHash: hash("root-session"),
+    },
+  }), NOW - 500);
+  append(f.store, "audit-event", makeAuditEvent({
+    id: hash("passive-budget-window-boundary"),
+    kind: "decision",
+    actor: "self-evolve-scheduler",
+    timestamp: NOW - 60 * 60 * 1000,
+    payloadHash: hash("passive-budget-window-boundary-payload"),
+    details: {
+      action: "scheduler-budget",
+      budgetType: "passive",
+      reservationId: hash("boundary-reservation"),
+      slotIndex: 0,
+      slotCount: 1,
+      rootSessionIDHash: hash("boundary-root-session"),
+    },
+  }), NOW - 60 * 60 * 1000);
+  const usageSnapshot = f.store.readProjectionSnapshot();
+  assert.equal(usageSnapshot.generation, firstSnapshot.generation);
+  assert.equal(usageSnapshot.usage.passive.used, 2);
+  assert.equal(usageSnapshot.usage.passive.remaining, 4);
+  assert.equal(usageSnapshot.usage.passive.resetAt, NOW);
+
+  append(f.store, "audit-event", audit("decision", item.id, {
+    action: "cycle-outcome",
+    outcome: "valid-no-change",
+    triggerClass: "idle",
+    mode: "auto",
+    observationCount: 3,
+    eligibilityCount: 1,
+    occurredAt: NOW - 400,
+    reason: "no-change",
+  }, NOW - 400));
+  append(f.store, "audit-event", audit("decision", null, {
+    action: "arbitrary-private-audit",
+    detail: "secret-value ses_private_session",
+  }, NOW - 300));
+  const second = build(f);
+  assert.equal(second.dashboard.usage.passive.used, 2);
+  assert.notEqual(second.dashboard.dashboardHash, first.dashboard.dashboardHash);
+  assert.equal(second.dashboard.lastCycle.outcome, "valid-no-change");
+  assert.deepEqual(second.dashboard.activity.map((entry) => entry.outcome), ["valid-no-change"]);
+  assert.doesNotMatch(JSON.stringify(second.dashboard), /secret-value|ses_private_session|root-session/u);
+});
+
+test("dashboard activity narrates lifecycle, controls, maintenance, recovery, and failures without raw audit detail", (t) => {
+  const f = fixture(t);
+  const item = proposal(f.skillRoot);
+  append(f.store, "proposal", item);
+  seedContent(f.store, item);
+  append(f.store, "decision", makeDecision({
+    proposalId: item.id,
+    targetHash: item.skillTarget.currentHash,
+    proposedContentHash: item.proposedContentHash,
+    decisionVersion: 1,
+    actor: "self-evolve-tui",
+    timestamp: NOW - 1_900,
+    nonce: hash("semantic-approval"),
+    priorState: "pending",
+    newState: "approved",
+  }), NOW - 1_900);
+  const events = [
+    audit("decision", item.id, {
+      action: "cycle-outcome",
+      outcome: "not-eligible",
+      triggerClass: "idle",
+      mode: "auto",
+      observationCount: 3,
+      eligibilityCount: 0,
+      occurredAt: NOW - 1_850,
+      reason: "insufficient-evidence",
+    }, NOW - 1_850),
+    audit("decision", item.id, {
+      action: "snooze",
+      snoozedUntil: NOW + 60_000,
+      privatePath: "/never/projected/private/SKILL.md",
+    }, NOW - 1_800),
+    audit("mode-change", null, { action: "pause", privateSession: "ses_private" }, NOW - 1_700),
+    audit("mode-change", null, { action: "resume" }, NOW - 1_600),
+    audit("mode-change", null, { action: "exclude" }, NOW - 1_500),
+    audit("mode-change", null, { action: "include" }, NOW - 1_400),
+    audit("kill-switch", null, { action: "on" }, NOW - 1_300),
+    audit("kill-switch", null, { action: "off" }, NOW - 1_200),
+    audit("decision", null, {
+      action: "ui-operation-complete",
+      uiAction: "export-data",
+      accepted: true,
+      privateArtifactPath: "/never/projected/export.json",
+    }, NOW - 1_100),
+    audit("decision", null, {
+      action: "ui-operation-complete",
+      uiAction: "purge-scope",
+      accepted: true,
+    }, NOW - 1_000),
+    audit("decision", null, {
+      action: "ui-operation-complete",
+      uiAction: "purge-all",
+      accepted: true,
+    }, NOW - 900),
+    audit("decision", null, {
+      action: "boot",
+      hostVersion: "1.18.3",
+      recovered: 0,
+    }, NOW - 800),
+    audit("decision", null, {
+      action: "boot",
+      hostVersion: "1.18.3",
+      recovered: 2,
+    }, NOW - 700),
+    audit("apply", item.id, {
+      "readback-verified": true,
+      privateBackupPath: "/never/projected/backup",
+    }, NOW - 650),
+    audit("rollback", item.id, {
+      "readback-verified": true,
+      privateBackupPath: "/never/projected/backup",
+    }, NOW - 625),
+  ];
+  for (const event of events) append(f.store, "audit-event", event, event.timestamp);
+  for (const [reason, timestamp] of [
+    ["quiet-period", NOW - 610],
+    ["budget-exhausted", NOW - 605],
+  ]) {
+    const details = { action: "schedule-suppressed", reason };
+    append(f.store, "audit-event", makeAuditEvent({
+      id: hash(JSON.stringify(["scheduler", details, timestamp])),
+      kind: "decision",
+      actor: "self-evolve-scheduler",
+      timestamp,
+      payloadHash: hash(JSON.stringify(details)),
+      details,
+    }), timestamp);
+  }
+  const failureDetails = {
+    action: "work-failure",
+    backoffUntil: NOW + 30_000,
+    privateError: "token=never-project-this",
+  };
+  append(f.store, "audit-event", makeAuditEvent({
+    id: hash(JSON.stringify(["scheduler", failureDetails])),
+    kind: "decision",
+    actor: "self-evolve-scheduler",
+    timestamp: NOW - 601,
+    payloadHash: hash(JSON.stringify(failureDetails)),
+    details: failureDetails,
+  }), NOW - 601);
+  append(f.store, "circuit-breaker", makeCircuitBreaker({
+    open: true,
+    openedAt: NOW - 600,
+    reason: "three bounded failures",
+    tripCount: 3,
+  }), NOW - 600);
+  append(f.store, "circuit-breaker", makeCircuitBreaker({
+    open: false,
+    tripCount: 3,
+  }), NOW - 590);
+
+  const result = build(f);
+  const outcomes = new Set(result.dashboard.activity.map((entry) => entry.outcome));
+  for (const outcome of [
+    "recommendation-approved",
+    "recommendation-snoozed",
+    "not-eligible",
+    "applied",
+    "rolled-back",
+    "deferred",
+    "failed",
+    "paused",
+    "resumed",
+    "project-excluded",
+    "project-included",
+    "emergency-stop-enabled",
+    "emergency-stop-disabled",
+    "export-completed",
+    "purge-completed",
+    "purge-all-accepted",
+    "bootstrap-completed",
+    "recovery-completed",
+    "breaker-open",
+    "breaker-recovered",
+  ]) assert.equal(outcomes.has(outcome), true, `missing semantic outcome ${outcome}`);
+  for (const entry of result.dashboard.activity) {
+    assert.match(entry.summary, /\S/u);
+    assert.equal(typeof entry.occurredAt, "number");
+  }
+  assert.doesNotMatch(
+    JSON.stringify(result.dashboard.activity),
+    /never\/projected|ses_private|token=|privateArtifactPath|privateSession|privatePath|privateError/u,
+  );
 });
 
 test("index bounds are deterministic, report exact overflow, and filter cross-project records", (t) => {

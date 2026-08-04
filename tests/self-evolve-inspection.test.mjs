@@ -66,6 +66,11 @@ test("bounded inspection exposes sanitized summaries without identifiers or muta
   assert.doesNotMatch(serialized, new RegExp(observation.id, "u"));
   assert.doesNotMatch(serialized, new RegExp(observation.sessionLineageHash, "u"));
   assert.doesNotMatch(serialized, new RegExp(eligibility.clusterId, "u"));
+  assert.deepEqual(readBoundedInspection(root, PROJECT, { limit: 0 }), {
+    observations: [],
+    eligibility: [],
+    overflow: { observations: 1, eligibility: 1 },
+  });
 });
 
 test("inspection bounds and cross-project partition fail closed", (t) => {

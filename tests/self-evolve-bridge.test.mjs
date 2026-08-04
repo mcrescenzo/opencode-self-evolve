@@ -7,7 +7,9 @@ import { SCHEMA_VERSION, makeRepoSettings } from "../self-evolve-schemas.js";
 import { stateRootIdentity } from "../self-evolve-state-root.js";
 import { openStore } from "../self-evolve-store.js";
 import {
+  BRIDGE_FEEDBACK_REQUEST_FIELDS,
   BRIDGE_REQUEST_FIELDS,
+  DECISION_FEEDBACK_VERSION,
   CONTROL_REQUEST_FIELDS,
   TUI_HOST_HEALTH_FIELDS,
   TUI_HOST_HEALTH_TTL_MS,
@@ -82,6 +84,61 @@ test("request envelopes are exact, bounded, hash-bound, and reject stale or cros
   assert.throws(() => makeBridgeRequest({ ...request, projectFingerprint: "e".repeat(64) }, { projectFingerprint: PROJECT }), /cross-project/u);
   assert.throws(() => makeBridgeRequest({ ...request, timestamp: Date.now() - 86_400_001 }, { now: Date.now() }), /stale-request/u);
   assert.throws(() => makeBridgeRequest({ ...request, targetHash: "wrong" }), /invalid-target-hash/u);
+});
+
+test("structured rejection feedback is optional, versioned, closed, and legacy-shape compatible", () => {
+  const legacy = createDecisionRequest({
+    projectFingerprint: PROJECT,
+    proposal: proposal(),
+    newState: "rejected",
+    timestamp: Date.now(),
+    requestId: "legacy-rejection",
+  });
+  assert.deepEqual(Object.keys(legacy), BRIDGE_REQUEST_FIELDS);
+  const enhanced = createDecisionRequest({
+    projectFingerprint: PROJECT,
+    proposal: proposal(),
+    newState: "rejected",
+    feedback: { reason: "wrong-scope", text: null },
+    timestamp: Date.now(),
+    requestId: "enhanced-rejection",
+  });
+  assert.deepEqual(Object.keys(enhanced), BRIDGE_FEEDBACK_REQUEST_FIELDS);
+  assert.equal(enhanced.feedbackVersion, DECISION_FEEDBACK_VERSION);
+  assert.deepEqual(enhanced.feedback, { reason: "wrong-scope", text: null });
+  const other = createDecisionRequest({
+    projectFingerprint: PROJECT,
+    proposal: proposal(),
+    newState: "rejected",
+    feedback: { reason: "other", text: "The bounded rationale is not useful here." },
+    timestamp: Date.now(),
+  });
+  assert.equal(other.feedback.text, "The bounded rationale is not useful here.");
+  for (const feedback of [
+    { reason: "unknown", text: null },
+    { reason: "wrong-scope", text: "unexpected text" },
+    { reason: "other", text: "" },
+    { reason: "other", text: "x".repeat(513) },
+  ]) {
+    assert.throws(() => createDecisionRequest({
+      projectFingerprint: PROJECT,
+      proposal: proposal(),
+      newState: "rejected",
+      feedback,
+      timestamp: Date.now(),
+    }), /decision-feedback/u);
+  }
+  assert.throws(() => createDecisionRequest({
+    projectFingerprint: PROJECT,
+    proposal: proposal(),
+    newState: "approved",
+    feedback: { reason: "wrong-scope", text: null },
+    timestamp: Date.now(),
+  }), /decision-feedback/u);
+  assert.throws(() => makeBridgeRequest({
+    ...enhanced,
+    feedbackVersion: 2,
+  }), /unsupported-decision-feedback-version/u);
 });
 
 test("a new-skill decision request accepts the must-not-exist target hash sentinel", () => {
@@ -366,6 +423,35 @@ test("control envelopes use a separate exact namespace and strict action payload
   assert.throws(() => createControlRequest({ controlState: state, action: "unknown", payload: {}, timestamp: state.issuedAt }), /unknown-control-action/u);
   assert.throws(() => createControlRequest({ controlState: state, action: "set-mode", payload: { mode: "yolo", allowlist: [], confirmation: "ENABLE YOLO" }, timestamp: state.issuedAt }), /allowlist/u);
   assert.throws(() => createControlRequest({ controlState: state, action: "update-allowlist", payload: { allowlist: ["/skills"], confirmation: "yes" }, timestamp: state.issuedAt }), /confirmation/u);
+  const repoMode = createControlRequest({
+    controlState: state,
+    action: "set-repo-mode",
+    payload: { mode: "inherit" },
+    timestamp: state.issuedAt,
+    requestId: "control-repo-mode",
+  });
+  assert.deepEqual(repoMode.payload, { mode: "inherit" });
+  for (const mode of ["manual", "auto", "yolo"]) {
+    assert.equal(createControlRequest({
+      controlState: state,
+      action: "set-repo-mode",
+      payload: { mode },
+      timestamp: state.issuedAt,
+      requestId: `control-repo-${mode}`,
+    }).payload.mode, mode);
+  }
+  assert.throws(() => createControlRequest({
+    controlState: state,
+    action: "set-repo-mode",
+    payload: { mode: "automatic" },
+    timestamp: state.issuedAt,
+  }), /repository-mode/u);
+  assert.throws(() => createControlRequest({
+    controlState: state,
+    action: "set-repo-mode",
+    payload: { mode: "auto", confirmation: "yes" },
+    timestamp: state.issuedAt,
+  }), /unknown-field/u);
   const submitted = submitControlRequest(root, request);
   assert.match(submitted.path, /control-requests/u);
   const consumed = await consumeDecisionRequests({ stateRoot: root, projectFingerprint: PROJECT, validateAndControl: async () => ({ ok: true }) });

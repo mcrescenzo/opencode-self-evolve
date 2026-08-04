@@ -30,6 +30,7 @@ import {
   stateRootIdentity,
 } from "./self-evolve-state-root.js";
 import { readTuiHostHealth } from "./self-evolve-bridge.js";
+import { errorReasonCode } from "./self-evolve-schemas.js";
 import {
   cleanupSession,
   createSession,
@@ -231,19 +232,23 @@ function now(options) {
   return typeof options?.now === "function" ? options.now() : Date.now();
 }
 
+function internDurableObject(value) {
+  let id = durableHostObjectIDs.get(value);
+  if (!id) {
+    id = nextDurableHostObjectID;
+    nextDurableHostObjectID += 1;
+    durableHostObjectIDs.set(value, id);
+  }
+  return id;
+}
+
 function durableHostIdentity(ctx) {
   try {
     return `origin:${new URL(officialGlobalHealthUrl(ctx?.serverUrl)).origin}`;
   } catch {
     const hostObject = ctx?.client && typeof ctx.client === "object" ? ctx.client : ctx;
     if (!hostObject || (typeof hostObject !== "object" && typeof hostObject !== "function")) return "host:unavailable";
-    let id = durableHostObjectIDs.get(hostObject);
-    if (!id) {
-      id = nextDurableHostObjectID;
-      nextDurableHostObjectID += 1;
-      durableHostObjectIDs.set(hostObject, id);
-    }
-    return `object:${id}`;
+    return `object:${internDurableObject(hostObject)}`;
   }
 }
 
@@ -251,13 +256,7 @@ function durableOptionIdentity(value) {
   if (value === null) return "null";
   if (value === undefined) return "undefined";
   if (typeof value !== "object" && typeof value !== "function") return `${typeof value}:${String(value)}`;
-  let id = durableHostObjectIDs.get(value);
-  if (!id) {
-    id = nextDurableHostObjectID;
-    nextDurableHostObjectID += 1;
-    durableHostObjectIDs.set(value, id);
-  }
-  return `reference:${id}`;
+  return `reference:${internDurableObject(value)}`;
 }
 
 function lateDurableRecoveryKey(ctx, options, selection) {
@@ -975,12 +974,19 @@ async function provisionalStartupMode(stateRoot, identity, options = {}, compati
   try {
     const schemas = await import("./self-evolve-schemas.js");
     const global = schemas.makeGlobalSettings(JSON.parse(readFileSync(path.join(stateRoot, "self-evolve", "global", "settings.json"), "utf8")));
-    const repo = schemas.makeRepoSettings(JSON.parse(readFileSync(path.join(stateRoot, "self-evolve", identity.projectFingerprint, "settings.json"), "utf8")));
-    return schemas.resolveMode(global.mode, repo.mode, {
+    let repo = null;
+    let repoSource;
+    try {
+      repoSource = readFileSync(path.join(stateRoot, "self-evolve", identity.projectFingerprint, "settings.json"), "utf8");
+    } catch {}
+    if (repoSource !== undefined) {
+      try { repo = schemas.makeRepoSettings(JSON.parse(repoSource)); } catch { return "manual"; }
+    }
+    return schemas.resolveMode(global.mode, repo?.mode ?? "inherit", {
       killSwitchActive: process.env.SELF_EVOLVE_KILL === "1" || process.env.SELF_EVOLVE_KILL === "true" || global.killSwitchActive,
       paused: global.paused,
-      processExcluded: options.processExcluded === true || repo.projectFingerprint !== identity.projectFingerprint,
-      repoOptOut: repo.excluded || options.repoOptOut === true,
+      processExcluded: options.processExcluded === true || (repo !== null && repo.projectFingerprint !== identity.projectFingerprint),
+      repoOptOut: repo?.excluded === true || options.repoOptOut === true,
       hostSupported: compatibility.supported,
     });
   } catch {
@@ -1039,7 +1045,12 @@ async function createDurablePipeline(ctx, options, selectedStateRoot, compatibil
     const privacy = privacyModule.createPrivacyGuard({ consent: settings.global.consent, projectFingerprint, retentionDays: settings.global.retentionDays, storageQuotaMiB: settings.global.budgets.storageQuotaMiB, store: durableStore, now: options.now });
     const roots = inventoryModule.loadAllowlist({ globalSkillRoots: settings.global.allowedSkillRoots }).canonicalRoots;
     const records = inventoryModule.discoverSkills(roots);
-    const applier = applierModule.createApplier({ store: durableStore, inventory: { records, canonicalRoots: roots }, privacy, now: options.now });
+    const applier = applierModule.createApplier({
+      store: durableStore,
+      inventory: { records, canonicalRoots: roots, discoverSkills: inventoryModule.discoverSkills },
+      privacy,
+      now: options.now,
+    });
     const integration = integrationModule.createIntegration({ store: durableStore, inventory: inventoryModule, privacy, synthesisModule, applier, commands: commandsModule, pipeline: pipelineModule, scheduler: schedulerModule, schemas: schemasModule, observation: observationModule, options: { ...options, hostVersion: compatibility?.hostVersion ?? "unknown", hostVersionSource: compatibility?.diagnostic === "tui-app-version" ? "tui-app-version" : "global-health", hostSupported: compatibility?.supported === true, stateRoot, projectFingerprint, ctx }, now: options.now });
     return { integration, identity };
   } catch (error) {
@@ -1155,7 +1166,10 @@ async function SelfEvolvePlugin(ctx, options = {}) {
         ? await validateOfficialRootAfterStartup(ctx, initialSelection.stateRoot, instancePluginOptions)
         : initialSelection?.stateRoot ?? await resolveStateRoot(ctx, instancePluginOptions);
       if (sharedRecoveryCancelled()) return null;
-      runtime = await createDurablePipeline(ctx, instancePluginOptions, selectedRoot, runningHostCompatibility);
+      runtime = await createDurablePipeline(ctx, {
+        ...instancePluginOptions,
+        passiveEventHookInstalled: startupMode !== "manual",
+      }, selectedRoot, runningHostCompatibility);
       if (!runtime?.integration) throw new Error("durable-initialization-failed");
       if (typeof runtime.integration.boot === "function") {
         const boot = await runtime.integration.boot({ ctx, hostVersion: runningHostCompatibility.hostVersion, hostVersionSource: runningHostCompatibility.diagnostic === "tui-app-version" ? "tui-app-version" : "global-health", recoverHostSessions: false });
@@ -1169,7 +1183,7 @@ async function SelfEvolvePlugin(ctx, options = {}) {
       return runtime;
     } catch (error) {
       try { await (runtime?.integration?.shutdown?.() ?? runtime?.integration?.close?.()); } catch {}
-      durableUnavailableReason = String(error?.message ?? error ?? "startup-validation-failed").split(":", 1)[0];
+      durableUnavailableReason = errorReasonCode(error, "startup-validation-failed");
       return null;
     }
   };
@@ -1481,6 +1495,7 @@ SelfEvolvePlugin.__test = {
   handleCommand,
   humanizeScanReason,
   proposalNotification,
+  provisionalStartupMode,
   replaceParts,
   resolveStateRoot,
   runAnalysis,

@@ -17,10 +17,6 @@ const INJECTION_PATTERNS = [
   ["apply-authority-escalation", /\byou must now apply\b/iu],
   ["mode-authority-escalation", /\byou are now in (?:auto|yolo) mode\b/iu],
 ];
-const OVERLAP_STOP_WORDS = new Set([
-  "about", "after", "against", "also", "before", "from", "into", "only", "opencode", "skill", "skills",
-  "that", "the", "their", "this", "when", "where", "with", "your",
-]);
 const rootScopes = new WeakMap();
 const inventoryScopes = new WeakMap();
 
@@ -363,21 +359,4 @@ export function validateProposalTarget(proposal, inventory) {
   if (!growth.withinBudget) errors.push(`proposal exceeds growth budget (${growth.deltaBytes} byte delta, ${growth.afterBytes} byte file)`);
   if (errors.length || !canonicalTarget) return { ok: false, errors, canonicalTarget: null };
   return { ok: true, errors: [], canonicalTarget };
-}
-
-function overlapTokens(value) {
-  return new Set((String(value ?? "").toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/gu) ?? []).filter((token) => !OVERLAP_STOP_WORDS.has(token)));
-}
-
-export function findOverlappingSkills(target, inventory) {
-  const targetName = String(target?.logicalName ?? target?.parsedFrontmatter?.name ?? target?.name ?? "").toLowerCase();
-  const targetDescription = target?.parsedFrontmatter?.description ?? target?.description ?? "";
-  const targetTokens = overlapTokens(targetDescription);
-  return inventory.filter((record) => {
-    if (record === target || (target?.canonicalRoot === record.canonicalRoot && target?.relativePath === record.relativePath)) return false;
-    if (targetName && record.logicalName.toLowerCase() === targetName) return true;
-    const candidateTokens = overlapTokens(record.parsedFrontmatter?.description);
-    const shared = [...targetTokens].filter((token) => candidateTokens.has(token)).length;
-    return shared >= 2 && shared / Math.min(targetTokens.size || 1, candidateTokens.size || 1) >= 0.5;
-  });
 }

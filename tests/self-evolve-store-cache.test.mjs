@@ -12,13 +12,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { makeAuditEvent, wrapRecord } from "../self-evolve-schemas.js";
 import { openStore } from "../self-evolve-store.js";
 
 const PROJECT = "a".repeat(64);
-const WRITER = fileURLToPath(new URL("./fixtures/store-cache-writer.mjs", import.meta.url));
+const WRITER = path.join(import.meta.dirname, "fixtures", "store-cache-writer.mjs");
 const FIXED_TIME = 1_700_000_000_000;
 
 function hash(value) {

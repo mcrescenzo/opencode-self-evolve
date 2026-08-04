@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   assertEligibility,
+  deepFreeze,
   makeEligibilityExplanation,
   makeEvidenceCluster,
   makeObservation,
@@ -24,14 +25,6 @@ const AUTOMATION_KINDS = new Set(["control", "display"]);
 export const ROOT_LINEAGE_MAX_DEPTH = 16;
 const HIDDEN_ANALYZER_AGENTS = new Set(["self-evolve-analyzer", "self-evolve-synthesizer", "self-evolve-critic"]);
 const clusterMetadata = new WeakMap();
-
-function deepFreeze(value) {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const child of Object.values(value)) deepFreeze(child);
-  }
-  return value;
-}
 
 export const EXTRACT_RULES = deepFreeze({
   maxMessages: 256,
@@ -236,12 +229,18 @@ function countBySignature(items, type) {
 function repeatedProcedures(actions) {
   const procedures = new Map();
   for (let length = Math.floor(actions.length / 2); length >= EXTRACT_RULES["repeated-manual-procedure"].minimumSteps; length -= 1) {
-    for (let start = 0; start + length * 2 <= actions.length; start += 1) {
+    const windows = new Map();
+    for (let start = 0; start + length <= actions.length; start += 1) {
       const candidate = actions.slice(start, start + length).join("\n");
-      let occurrences = 1;
-      for (let other = start + length; other + length <= actions.length; other += 1) {
-        if (actions.slice(other, other + length).join("\n") === candidate) occurrences += 1;
-      }
+      const current = windows.get(candidate) ?? { count: 0, positions: [] };
+      current.count += 1;
+      current.positions.push(start);
+      windows.set(candidate, current);
+    }
+    for (const [candidate, current] of windows) {
+      if (current.count < 2) continue;
+      const first = current.positions[0];
+      const occurrences = 1 + current.positions.filter((position) => position >= first + length).length;
       if (occurrences < 2) continue;
       const key = signature("procedure", candidate);
       if (!procedures.has(key)) procedures.set(key, { count: occurrences, length });
