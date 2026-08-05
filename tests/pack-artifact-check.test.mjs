@@ -89,6 +89,10 @@ test("generated TUI inventory rejects bundled runtimes and stale content", () =>
     () => assertGeneratedTuiArtifact(`${generated}\nfunction createScheduler() {}`),
     /bundled prohibited runtime content/u,
   );
+  assert.throws(
+    () => assertGeneratedTuiArtifact(`${generated}\nconst legacy = jsxDEV("text", {});`),
+    /supported OpenTUI Solid transform/u,
+  );
 });
 
 test("TUI matrix resolver selects only the latest exact common stable 1.18.x patch", () => {

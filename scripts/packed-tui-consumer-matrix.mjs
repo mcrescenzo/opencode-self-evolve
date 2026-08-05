@@ -76,6 +76,7 @@ function packArtifact(root, env) {
 
 function runLane({ label, version, opentuiVersion, packageName, artifact, root, env }) {
   const consumer = path.join(root, `consumer-${label}`);
+  const renderSmokePath = path.join(consumer, "tui-render-smoke.mjs");
   mkdirSync(consumer);
   writeFileSync(path.join(consumer, "package.json"), `${JSON.stringify({
     private: true,
@@ -118,7 +119,16 @@ function runLane({ label, version, opentuiVersion, packageName, artifact, root, 
     process.stdout.write(JSON.stringify(observed));
   `;
   const observed = JSON.parse(run("bun", ["--eval", smoke], { cwd: consumer, env }));
-  return { label, requestedVersion: version, observed, ok: true };
+  writeFileSync(
+    renderSmokePath,
+    readFileSync(path.join(repoRoot, "scripts", "tui-render-smoke.mjs"), "utf8"),
+  );
+  const renderSmoke = JSON.parse(run("bun", [
+    "--conditions=browser",
+    renderSmokePath,
+    `${packageName}/tui`,
+  ], { cwd: consumer, env }));
+  return { label, requestedVersion: version, observed, renderSmoke, ok: true };
 }
 
 function runUnsupportedPeerLane({ version, packageName, artifact, root, env }) {

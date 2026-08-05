@@ -582,35 +582,41 @@ function ControlCenter(props: {
               </box>
             </Show>
             <Show when={home().lastCycle}>
-              <box flexDirection="column">
-                <text><b>Last cycle</b></text>
-                <text wrapMode="word">{home().lastCycle!.outcome.replaceAll("-", " ")} · {home().lastCycle!.observationCount} observations · {home().lastCycle!.eligibilityCount} eligible</text>
-              </box>
+              {(lastCycle) => (
+                <box flexDirection="column">
+                  <text><b>Last cycle</b></text>
+                  <text wrapMode="word">{lastCycle().outcome.replaceAll("-", " ")} · {lastCycle().observationCount} observations · {lastCycle().eligibilityCount} eligible</text>
+                </box>
+              )}
             </Show>
             <Show when={home().attention}>
-              <box
-                focusable
-                border
-                borderColor={props.api.theme.current.warning}
-                paddingLeft={1}
-                paddingRight={1}
-                onMouseUp={() => navigate(home().attention!.destination)}
-                onKeyDown={(event: KeyEvent) => {
-                  if (!isActivationKey(event)) return
-                  event.preventDefault()
-                  navigate(home().attention!.destination)
-                }}
-              >
-                <text>{home().attention!.count} {home().attention!.kind === "applied" ? "applied change" : "recommendation"} needs attention</text>
-              </box>
+              {(attention) => (
+                <box
+                  focusable
+                  border
+                  borderColor={props.api.theme.current.warning}
+                  paddingLeft={1}
+                  paddingRight={1}
+                  onMouseUp={() => navigate(attention().destination)}
+                  onKeyDown={(event: KeyEvent) => {
+                    if (!isActivationKey(event)) return
+                    event.preventDefault()
+                    navigate(attention().destination)
+                  }}
+                >
+                  <text>{attention().count} {attention().kind === "applied" ? "applied change" : "recommendation"} needs attention</text>
+                </box>
+              )}
             </Show>
             <Show when={home().usage}>
-              <box flexDirection="column">
-                <text><b>Actual usage</b></text>
-                <text>Background analysis: {home().usage!.passive.used} / {home().usage!.passive.limit}</text>
-                <text>Recommendation synthesis: {home().usage!.synthesis.used} / {home().usage!.synthesis.limit}</text>
-                <text>Storage: {home().usage!.storage.usedBytes} / {home().usage!.storage.limitBytes} bytes</text>
-              </box>
+              {(usage) => (
+                <box flexDirection="column">
+                  <text><b>Actual usage</b></text>
+                  <text>Background analysis: {usage().passive.used} / {usage().passive.limit}</text>
+                  <text>Recommendation synthesis: {usage().synthesis.used} / {usage().synthesis.limit}</text>
+                  <text>Storage: {usage().storage.usedBytes} / {usage().storage.limitBytes} bytes</text>
+                </box>
+              )}
             </Show>
             <Show when={home().recentActivity.length}>
               <box flexDirection="column">
@@ -619,10 +625,12 @@ function ControlCenter(props: {
               </box>
             </Show>
             <Show when={home().emptyState}>
-              <box flexDirection="column">
-                <text><b>{home().emptyState!.heading}</b></text>
-                <text wrapMode="word">{home().emptyState!.explanation}</text>
-              </box>
+              {(emptyState) => (
+                <box flexDirection="column">
+                  <text><b>{emptyState().heading}</b></text>
+                  <text wrapMode="word">{emptyState().explanation}</text>
+                </box>
+              )}
             </Show>
             <text fg={props.api.theme.current.textMuted} wrapMode="word">{home().manualFallback}</text>
           </box>
@@ -694,69 +702,74 @@ function ControlCenter(props: {
               </box>
             ))}
             <Show when={recommendations().selected}>
-              <box border borderColor={props.api.theme.current.borderActive} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
-                <text><b>{recommendations().selected!.target}</b></text>
-                <Show when={recommendations().selected!.loading}>
+              {(selected) => (
+                <box border borderColor={props.api.theme.current.borderActive} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
+                <text><b>{selected().target}</b></text>
+                <Show when={selected().loading}>
                   <text>Loading authoritative recommendation detail…</text>
                 </Show>
-                <Show when={recommendations().selected!.summary}>
-                  <box flexDirection="column">
-                    <text><b>Why this was suggested</b></text>
-                    <text wrapMode="word">{recommendations().selected!.summary!.rationale}</text>
-                  </box>
-                  <box flexDirection="column">
-                    <text><b>Proposed change</b></text>
-                    {() => recommendations().selected!.diff?.lines.map((line) => <text wrapMode="word">{line}</text>) ?? []}
-                    <Show when={recommendations().selected!.diff?.overflow?.truncated}>
-                      <text fg={props.api.theme.current.warning}>The proposed change was truncated by the bounded projection.</text>
-                    </Show>
-                  </box>
-                  <box flexDirection="column">
-                    <text><b>Evidence</b></text>
-                    {() => recommendations().selected!.evidence.map((entry) =>
-                      <text wrapMode="word">{entry.kind}: {entry.summary}{entry.redacted ? " [redacted]" : ""}</text>)}
-                    <Show when={!recommendations().selected!.evidence.length}><text>No bounded evidence detail is loaded.</text></Show>
-                  </box>
-                  <box flexDirection="column">
-                    <text><b>Safety checks</b></text>
-                    <text>Critic: {recommendations().selected!.summary!.criticPassed ? "Passed" : "Not passed"}</text>
-                    <text>Deterministic checks: {recommendations().selected!.summary!.validDeterministic ? "Passed" : "Not passed"}</text>
-                    <text>Injection scan: {recommendations().selected!.summary!.injectionFlagged ? "Flagged" : "Clear"}</text>
-                    {() => recommendations().selected!.summary!.eligibility.checks.map((check) =>
-                      <text wrapMode="word">[{check.met ? "Passed" : "Blocked"}] {check.name}: {check.actual} / {check.required}</text>)}
-                  </box>
-                  <box flexDirection="column">
-                    <text><b>Token impact</b></text>
-                    <text>{recommendations().selected!.summary!.tokenImpact.estimatedTokens} estimated / {recommendations().selected!.summary!.tokenImpact.budgetTokens} budgeted tokens</text>
-                  </box>
-                  <box flexDirection="column">
-                    <text><b>Rollback</b></text>
-                    <text>{recommendations().selected!.summary!.rollback.eligible ? "Undo is currently eligible." : `Unavailable: ${recommendations().selected!.summary!.rollback.reason ?? "not offered"}`}</text>
-                  </box>
-                  <box
-                    focusable
-                    border
-                    borderColor={technicalExpanded() ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
-                    paddingLeft={1}
-                    paddingRight={1}
-                    onMouseUp={() => setTechnicalExpanded((value) => !value)}
-                    onKeyDown={(event: KeyEvent) => {
-                      if (!isActivationKey(event)) return
-                      event.preventDefault()
-                      setTechnicalExpanded((value) => !value)
-                    }}
-                  >
-                    <text>Technical details {technicalExpanded() ? "▲" : "▼"}</text>
-                  </box>
-                  <Show when={technicalExpanded()}>
-                    <text>State: {recommendations().selected!.summary!.state}</text>
-                    <text>Effective mode: {recommendations().selected!.summary!.effectiveMode}</text>
-                    <text>Operation: {recommendations().selected!.summary!.operation.status}</text>
-                    {() => recommendations().selected!.audit.map((entry) =>
-                      <text wrapMode="word">{entry.kind}: {entry.summary}</text>)}
-                  </Show>
+                <Show when={selected().summary}>
+                  {(summary) => (
+                    <>
+                      <box flexDirection="column">
+                        <text><b>Why this was suggested</b></text>
+                        <text wrapMode="word">{summary().rationale}</text>
+                      </box>
+                      <box flexDirection="column">
+                        <text><b>Proposed change</b></text>
+                        {() => selected().diff?.lines.map((line) => <text wrapMode="word">{line}</text>) ?? []}
+                        <Show when={selected().diff?.overflow?.truncated}>
+                          <text fg={props.api.theme.current.warning}>The proposed change was truncated by the bounded projection.</text>
+                        </Show>
+                      </box>
+                      <box flexDirection="column">
+                        <text><b>Evidence</b></text>
+                        {() => selected().evidence.map((entry) =>
+                          <text wrapMode="word">{entry.kind}: {entry.summary}{entry.redacted ? " [redacted]" : ""}</text>)}
+                        <Show when={!selected().evidence.length}><text>No bounded evidence detail is loaded.</text></Show>
+                      </box>
+                      <box flexDirection="column">
+                        <text><b>Safety checks</b></text>
+                        <text>Critic: {summary().criticPassed ? "Passed" : "Not passed"}</text>
+                        <text>Deterministic checks: {summary().validDeterministic ? "Passed" : "Not passed"}</text>
+                        <text>Injection scan: {summary().injectionFlagged ? "Flagged" : "Clear"}</text>
+                        {() => summary().eligibility.checks.map((check) =>
+                          <text wrapMode="word">[{check.met ? "Passed" : "Blocked"}] {check.name}: {check.actual} / {check.required}</text>)}
+                      </box>
+                      <box flexDirection="column">
+                        <text><b>Token impact</b></text>
+                        <text>{summary().tokenImpact.estimatedTokens} estimated / {summary().tokenImpact.budgetTokens} budgeted tokens</text>
+                      </box>
+                      <box flexDirection="column">
+                        <text><b>Rollback</b></text>
+                        <text>{summary().rollback.eligible ? "Undo is currently eligible." : `Unavailable: ${summary().rollback.reason ?? "not offered"}`}</text>
+                      </box>
+                      <box
+                        focusable
+                        border
+                        borderColor={technicalExpanded() ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
+                        paddingLeft={1}
+                        paddingRight={1}
+                        onMouseUp={() => setTechnicalExpanded((value) => !value)}
+                        onKeyDown={(event: KeyEvent) => {
+                          if (!isActivationKey(event)) return
+                          event.preventDefault()
+                          setTechnicalExpanded((value) => !value)
+                        }}
+                      >
+                        <text>Technical details {technicalExpanded() ? "▲" : "▼"}</text>
+                      </box>
+                      <Show when={technicalExpanded()}>
+                        <text>State: {summary().state}</text>
+                        <text>Effective mode: {summary().effectiveMode}</text>
+                        <text>Operation: {summary().operation.status}</text>
+                        {() => selected().audit.map((entry) =>
+                          <text wrapMode="word">{entry.kind}: {entry.summary}</text>)}
+                      </Show>
+                    </>
+                  )}
                 </Show>
-                <Show when={recommendations().selected!.actions.some((action) =>
+                <Show when={selected().actions.some((action) =>
                   action.action === "reject-proposal" && action.feedbackSupported)}>
                   <box flexDirection="column">
                     <text fg={props.api.theme.current.textMuted}>Optional rejection feedback (audit-only)</text>
@@ -789,7 +802,7 @@ function ControlCenter(props: {
                   </box>
                 </Show>
                 <box flexDirection="row" gap={1} flexWrap="wrap">
-                  {() => recommendations().selected!.actions.flatMap((action) => {
+                  {() => selected().actions.flatMap((action) => {
                     const choices = action.action === "snooze-proposal"
                       ? [
                         { label: "Snooze 1 hour", delay: 3_600_000 },
@@ -844,7 +857,8 @@ function ControlCenter(props: {
                 <Show when={pendingRecommendation()}>
                   <text fg={props.api.theme.current.info}>Request pending server validation…</text>
                 </Show>
-              </box>
+                </box>
+              )}
             </Show>
           </box>
         </Show>
@@ -907,7 +921,7 @@ function ControlCenter(props: {
                   <text fg={props.api.theme.current.textMuted}>Category: {entry.technical.category}</text>
                   <text fg={props.api.theme.current.textMuted}>Outcome: {entry.technical.outcome.replaceAll("-", " ")}</text>
                   <Show when={entry.technical.reason}>
-                    <text fg={props.api.theme.current.textMuted}>Reason: {entry.technical.reason!.replaceAll("-", " ")}</text>
+                    {(reason) => <text fg={props.api.theme.current.textMuted}>Reason: {reason().replaceAll("-", " ")}</text>}
                   </Show>
                   <Show when={entry.destination?.section === "recommendations"}>
                     <box
@@ -959,23 +973,33 @@ function ControlCenter(props: {
                 <text wrapMode="word">Refresh watcher: {activity().diagnostics.watcherStatus}</text>
                 <text wrapMode="word">Circuit breaker: {activity().diagnostics.breakerStatus}</text>
                 <Show when={activity().diagnostics.automation}>
-                  <text wrapMode="word">Scheduler: {activity().diagnostics.automation!.state.replaceAll("-", " ")}</text>
+                  {(automation) => <text wrapMode="word">Scheduler: {automation().state.replaceAll("-", " ")}</text>}
                 </Show>
                 <Show when={activity().diagnostics.backoffUntil}>
-                  <text wrapMode="word">Backoff ends: {new Date(activity().diagnostics.backoffUntil!).toISOString()}</text>
+                  {(backoffUntil) => <text wrapMode="word">Backoff ends: {new Date(backoffUntil()).toISOString()}</text>}
                 </Show>
                 <Show when={activity().diagnostics.nextEligibleAt}>
-                  <text wrapMode="word">Next eligible: {new Date(activity().diagnostics.nextEligibleAt!).toISOString()}</text>
+                  {(nextEligibleAt) => <text wrapMode="word">Next eligible: {new Date(nextEligibleAt()).toISOString()}</text>}
                 </Show>
                 <Show when={activity().diagnostics.usage}>
-                  <text wrapMode="word">Background analysis used/remaining: {activity().diagnostics.usage!.passive.used} / {activity().diagnostics.usage!.passive.remaining}</text>
-                  <text wrapMode="word">Background analysis resets: {new Date(activity().diagnostics.budgetResetAt!.passive).toISOString()}</text>
-                  <text wrapMode="word">Recommendation synthesis used/remaining: {activity().diagnostics.usage!.synthesis.used} / {activity().diagnostics.usage!.synthesis.remaining}</text>
-                  <text wrapMode="word">Recommendation synthesis resets: {new Date(activity().diagnostics.budgetResetAt!.synthesis).toISOString()}</text>
-                  <text wrapMode="word">Storage used/quota: {activity().diagnostics.usage!.storage.usedBytes} / {activity().diagnostics.usage!.storage.limitBytes} bytes</text>
+                  {(usage) => (
+                    <>
+                      <text wrapMode="word">Background analysis used/remaining: {usage().passive.used} / {usage().passive.remaining}</text>
+                      <text wrapMode="word">Recommendation synthesis used/remaining: {usage().synthesis.used} / {usage().synthesis.remaining}</text>
+                      <text wrapMode="word">Storage used/quota: {usage().storage.usedBytes} / {usage().storage.limitBytes} bytes</text>
+                      <Show when={activity().diagnostics.budgetResetAt}>
+                        {(budgetResetAt) => (
+                          <>
+                            <text wrapMode="word">Background analysis resets: {new Date(budgetResetAt().passive).toISOString()}</text>
+                            <text wrapMode="word">Recommendation synthesis resets: {new Date(budgetResetAt().synthesis).toISOString()}</text>
+                          </>
+                        )}
+                      </Show>
+                    </>
+                  )}
                 </Show>
                 <Show when={activity().diagnostics.lastError}>
-                  <text wrapMode="word">Last bounded error: {activity().diagnostics.lastError!.summary}</text>
+                  {(lastError) => <text wrapMode="word">Last bounded error: {lastError().summary}</text>}
                 </Show>
               </box>
             </Show>
@@ -985,9 +1009,11 @@ function ControlCenter(props: {
           <box flexDirection="column" gap={1}>
             <text><b>Settings</b></text>
             <Show when={settingsAnchor()}>
-              <text fg={props.api.theme.current.info} wrapMode="word">
-                Opened at {settingsAnchor()!.replaceAll("-", " ")} settings.
-              </text>
+              {(anchor) => (
+                <text fg={props.api.theme.current.info} wrapMode="word">
+                  Opened at {anchor().replaceAll("-", " ")} settings.
+                </text>
+              )}
             </Show>
             <Show when={settings().limited}>
               <text fg={props.api.theme.current.warning} wrapMode="word">
@@ -1151,26 +1177,28 @@ function ControlCenter(props: {
               <text fg={props.api.theme.current.warning} wrapMode="word">{folderError()}</text>
             </Show>
             <Show when={folderDraft()}>
-              <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
-                <text><b>Exact replacement</b></text>
-                <Show when={folderDraft()!.length}>
-                  {() => folderDraft()!.map((folder) => <text wrapMode="word">• {folder}</text>)}
-                </Show>
-                <Show when={folderDraft()!.length === 0}><text>(empty)</text></Show>
-                <text>Type exactly: UPDATE ALLOWLIST</text>
-                <input
-                  value={folderConfirmation()}
-                  placeholder="UPDATE ALLOWLIST"
-                  onInput={(value: string) => setFolderConfirmation(value.slice(0, 64))}
-                />
-                <box flexDirection="row" flexWrap="wrap" gap={1}>
-                  {localActionButton("Replace approved folders", () => void submitFolderList(), true)}
-                  {localActionButton("Cancel", () => {
-                    setFolderDraft(null)
-                    setFolderConfirmation("")
-                  })}
+              {(draft) => (
+                <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
+                  <text><b>Exact replacement</b></text>
+                  <Show when={draft().length}>
+                    {() => draft().map((folder) => <text wrapMode="word">• {folder}</text>)}
+                  </Show>
+                  <Show when={draft().length === 0}><text>(empty)</text></Show>
+                  <text>Type exactly: UPDATE ALLOWLIST</text>
+                  <input
+                    value={folderConfirmation()}
+                    placeholder="UPDATE ALLOWLIST"
+                    onInput={(value: string) => setFolderConfirmation(value.slice(0, 64))}
+                  />
+                  <box flexDirection="row" flexWrap="wrap" gap={1}>
+                    {localActionButton("Replace approved folders", () => void submitFolderList(), true)}
+                    {localActionButton("Cancel", () => {
+                      setFolderDraft(null)
+                      setFolderConfirmation("")
+                    })}
+                  </box>
                 </box>
-              </box>
+              )}
             </Show>
 
             <text><b>Limits and retention</b></text>
@@ -1180,16 +1208,20 @@ function ControlCenter(props: {
                 <text><b>{limit.label}</b></text>
                 <text wrapMode="word">Actual: {limit.actual}</text>
                 <text wrapMode="word">Configured limit: {limit.configured}</text>
-                <Show when={limit.resetAt}><text wrapMode="word">Resets: {new Date(limit.resetAt!).toISOString()}</text></Show>
+                <Show when={limit.resetAt}>
+                  {(resetAt) => <text wrapMode="word">Resets: {new Date(resetAt()).toISOString()}</text>}
+                </Show>
                 <text fg={props.api.theme.current.textMuted} wrapMode="word">{limit.explanation}</text>
               </box>
             ))}
             <Show when={settings().rolloutProgress}>
-              <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
-                <text><b>Automatic-apply rollout evidence</b>: {settings().rolloutProgress!.ready ? "Ready" : "Not ready"}</text>
-                <text wrapMode="word">Actual: {settings().rolloutProgress!.actual}</text>
-                <text wrapMode="word">Configured requirement: {settings().rolloutProgress!.configured}</text>
-              </box>
+              {(rolloutProgress) => (
+                <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
+                  <text><b>Automatic-apply rollout evidence</b>: {rolloutProgress().ready ? "Ready" : "Not ready"}</text>
+                  <text wrapMode="word">Actual: {rolloutProgress().actual}</text>
+                  <text wrapMode="word">Configured requirement: {rolloutProgress().configured}</text>
+                </box>
+              )}
             </Show>
 
             <text><b>Maintenance</b></text>
@@ -1265,14 +1297,16 @@ function ControlCenter(props: {
               </box>
             </Show>
             <Show when={settings().latestExport}>
-              <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
-                <text><b>Latest private export</b></text>
-                <text wrapMode="word">Scope: {settings().latestExport!.scope}</text>
-                <text wrapMode="word">Private path: {settings().latestExport!.path}</text>
-                <text wrapMode="word">Size: {settings().latestExport!.bytes} bytes</text>
-                <text wrapMode="word">SHA-256: {settings().latestExport!.sha256}</text>
-                <text wrapMode="word">Expires: {new Date(settings().latestExport!.expiresAt).toISOString()}</text>
-              </box>
+              {(latestExport) => (
+                <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
+                  <text><b>Latest private export</b></text>
+                  <text wrapMode="word">Scope: {latestExport().scope}</text>
+                  <text wrapMode="word">Private path: {latestExport().path}</text>
+                  <text wrapMode="word">Size: {latestExport().bytes} bytes</text>
+                  <text wrapMode="word">SHA-256: {latestExport().sha256}</text>
+                  <text wrapMode="word">Expires: {new Date(latestExport().expiresAt).toISOString()}</text>
+                </box>
+              )}
             </Show>
 
             <text fg={props.api.theme.current.textMuted} wrapMode="word">
@@ -1316,11 +1350,14 @@ const tui: TuiPlugin = async (api, options, meta) => {
     if (!releaseWithNativeCleanup) surfaceOwnership.release?.()
   })
   let projectStore: ProjectStore | undefined
+  const projectStoreFactory = (options as {
+    __testTuiStoreFactory?: (input: Parameters<typeof acquireProjectTuiStore>[0]) => ProjectStore
+  } | undefined)?.__testTuiStoreFactory ?? acquireProjectTuiStore
   const compatibilityOptions = {
     ...(options ?? {}),
     __nativeSidebar: true,
     __testTuiStoreFactory(input: Parameters<typeof acquireProjectTuiStore>[0]) {
-      projectStore = acquireProjectTuiStore(input)
+      projectStore = projectStoreFactory(input)
       return projectStore
     },
   }

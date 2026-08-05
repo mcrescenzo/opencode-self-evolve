@@ -7,6 +7,7 @@ This project follows semantic versioning after the first public release.
 
 ## Unreleased
 
+- Fixed native control-center crashes when optional dashboard fields such as the last-cycle outcome are absent. The deterministic prebuilt target now uses OpenTUI's supported Solid transform, guards nullable branches, and is exercised as a real reactive render in both local regression coverage and every supported packed-consumer lane.
 - Replaced the public raw-TSX TUI export with a deterministic prebuilt JavaScript artifact generated before pack. Host-owned OpenTUI, Solid, and OpenCode TUI modules remain external; repeated builds are byte-identical; stale or bundled artifacts fail package checks; consumer install hooks remain absent.
 - Led installation guidance with OpenCode's native `opencode plugin` installer and corrected manual TUI registration to use the bare package or source package root. Legacy `/tui`, raw TSX, and helper-file registrations require an explicit one-entry migration; Self-Evolve does not silently edit external configuration.
 - Added a packed compatibility matrix for OpenCode 1.18.3, 1.18.4, and the latest common 1.18.x host across OpenTUI 0.4.5 and 0.5.0, with an explicit 0.6.x peer rejection, plus a wrapper for the no-witness two-plugin OpenCode Workflows coexistence gate.

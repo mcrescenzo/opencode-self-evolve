@@ -158,7 +158,7 @@ Headless hosts load the server target without `@opentui/*`. Pending reviews rema
 - Node.js `>=22.11.0`.
 - OpenCode `>=1.18.3 <1.19.0` and `@opencode-ai/plugin ~1.18.3`; package gates keep exact 1.18.3 and 1.18.4 lanes and resolve the latest common stable aligned 1.18.x pair when the compatibility matrix runs.
 - Plain Node ESM for the server/shared target plus one deterministic prebuilt JavaScript TUI artifact; there is no preinstall, install, postinstall, or consumer build.
-- The TUI-only optional peers are `@opencode-ai/plugin ~1.18.3`, `@opentui/core >=0.4.5 <0.6.0`, `@opentui/keymap >=0.4.5 <0.6.0`, `@opentui/solid >=0.4.5 <0.6.0`, and `solid-js 1.9.12`. The package root reaches none of them. The packed-artifact check imports only the server root from a fresh consumer with all optional peers omitted; the separate packed-TUI matrix loads `./tui` through Bun against both the 0.4.5 floor and 0.5.0 current peers without bypassing npm peer resolution.
+- The TUI-only optional peers are `@opencode-ai/plugin ~1.18.3`, `@opentui/core >=0.4.5 <0.6.0`, `@opentui/keymap >=0.4.5 <0.6.0`, `@opentui/solid >=0.4.5 <0.6.0`, and `solid-js 1.9.12`. The package root reaches none of them. The packed-artifact check imports only the server root from a fresh consumer with all optional peers omitted; the separate packed-TUI matrix loads and reactively renders `./tui` through Bun against both the 0.4.5 floor and 0.5.0 current peers without bypassing npm peer resolution.
 
 ## Native UX Migration And Rollback
 

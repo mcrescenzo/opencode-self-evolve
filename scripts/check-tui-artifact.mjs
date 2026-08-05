@@ -9,12 +9,13 @@ export const TUI_SOURCE_FILE = "self-evolve-tui.tsx";
 export const GENERATED_TUI_FILE = "self-evolve-tui.generated.js";
 const EXPECTED_EXPORT = `./${GENERATED_TUI_FILE}`;
 const EXTERNAL_IMPORTS = new Set([
-  "@opentui/solid/jsx-dev-runtime",
+  "@opentui/solid",
   "solid-js",
-  "node:timers/promises",
+  "timers/promises",
   "./self-evolve-tui.js",
   "./self-evolve-tui-store.js",
 ]);
+const TUI_COMPILER_FILE = path.join(repoRoot, "scripts", "compile-tui-artifact.mjs");
 const MODULE_SPECIFIER_RE = /\bfrom\s*["']([^"']+)["']/gu;
 
 function fail(message, detail = "") {
@@ -23,18 +24,11 @@ function fail(message, detail = "") {
 
 export function compileTuiArtifact(output, { root = repoRoot } = {}) {
   const entry = path.join(root, TUI_SOURCE_FILE);
-  const result = spawnSync("bun", [
-    "build",
-    "--no-bundle",
-    "--target=bun",
-    "--format=esm",
-    "--sourcemap=none",
-    `--outfile=${output}`,
-    entry,
-  ], { cwd: root, encoding: "utf8" });
-  if (result.error) fail(`bun build could not run (${result.error.code ?? "spawn-error"})`, result.error.message);
-  if (result.signal) fail(`bun build terminated by ${result.signal}`);
-  if (result.status !== 0) fail(`bun build exited with ${result.status}`, `${result.stdout}\n${result.stderr}`.trim());
+  const result = spawnSync("bun", [TUI_COMPILER_FILE, entry, output], { cwd: root, encoding: "utf8" });
+  if (result.error) fail(`OpenTUI Solid compiler could not run (${result.error.code ?? "spawn-error"})`, result.error.message);
+  if (result.signal) fail(`OpenTUI Solid compiler terminated by ${result.signal}`);
+  if (result.status !== 0) fail(`OpenTUI Solid compiler exited with ${result.status}`, `${result.stdout}\n${result.stderr}`.trim());
+  if (!existsSync(output)) fail(`OpenTUI Solid compiler omitted its output: ${output}`);
   return readFileSync(output, "utf8");
 }
 
@@ -94,6 +88,9 @@ export function assertGeneratedTuiArtifact(source) {
   if (source.includes("sourceMappingURL") || source.includes("@jsxImportSource") || /\bimport\s+type\b/u.test(source)) {
     fail("generated TUI artifact retains source-map or TypeScript-only syntax");
   }
+  if (/\bjsxDEV\b|@opentui\/solid\/jsx-(?:dev-)?runtime/u.test(source)) {
+    fail("generated TUI artifact bypassed the supported OpenTUI Solid transform");
+  }
   const imports = [...source.matchAll(MODULE_SPECIFIER_RE)].map((match) => match[1]);
   const unexpected = imports.filter((specifier) => !EXTERNAL_IMPORTS.has(specifier));
   const missing = [...EXTERNAL_IMPORTS].filter((specifier) => !imports.includes(specifier));
@@ -113,7 +110,13 @@ export function assertGeneratedTuiArtifact(source) {
   ]) {
     if (source.includes(prohibited)) fail(`generated TUI artifact bundled prohibited runtime content: ${prohibited}`);
   }
-  if (!source.includes('id: "mcrescenzo.self-evolve"') || !source.includes("export default SelfEvolveTuiModule")) {
+  const exportStatements = source.match(/\bexport\s+(?:default\b|\{)/gu)?.length ?? 0;
+  const exactDefaultExport = /\bexport\s+default\s+[A-Za-z_$][\w$]*\s*;?\s*$/u.test(source)
+    || /\bexport\s*\{\s*[A-Za-z_$][\w$]*\s+as\s+default\s*\}\s*;?\s*$/u.test(source);
+  if (!source.includes('id: "mcrescenzo.self-evolve"')
+      || exportStatements !== 1
+      || !exactDefaultExport
+      || /\bexport\s+(?:const|let|var|function|class)\b/u.test(source)) {
     fail("generated TUI artifact omitted its stable default module contract");
   }
   return true;
