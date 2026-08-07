@@ -9,7 +9,7 @@ This plugin is intentionally conservative:
 - Keep the server root headless-safe and the deterministic built TUI target-exclusive. The TSX authoring source remains typechecked, while consumers load only the generated JavaScript export. The normal Release B UX is the persistent sidebar plus the Home, Recommendations, Activity, and Settings control center opened by `mcrescenzo.self-evolve.control-center`; slash commands remain a documented headless/compatibility fallback.
 - Legacy compatibility state remains session-local and in-memory. Durable autonomy state never enters the legacy registry.
 
-Local validation requires Node.js 22.11 or newer and Bun 1.3.x. Run the
+Local validation requires Node.js 22.11.0 or newer and Bun 1.3.8 or newer. Run the
 validation commands before proposing changes:
 
 ```sh

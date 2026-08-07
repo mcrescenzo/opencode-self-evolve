@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,7 +100,7 @@ export function assertServerEntryContract(source) {
   }
 }
 
-function parsePackResult(stdout) {
+export function parsePackResult(stdout) {
   if (typeof stdout !== "string" || !stdout.trim()) fail("npm pack returned empty output");
   let result;
   try {
@@ -111,6 +111,91 @@ function parsePackResult(stdout) {
   const pack = Array.isArray(result) ? result[0] : result;
   if (!pack?.filename || !Array.isArray(pack.files)) fail("npm pack JSON omitted filename or file inventory", stdout);
   return pack;
+}
+
+export function artifactProvenance(packed, tarball, commit) {
+  const inventory = packed.files
+    .map(({ path: file, size, mode }) => ({ path: file, size, mode }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    commit,
+    filename: packed.filename,
+    sha256: createHash("sha256").update(readFileSync(tarball)).digest("hex"),
+    inventory,
+    inventorySha256: createHash("sha256").update(JSON.stringify(inventory)).digest("hex"),
+  };
+}
+
+function linkTuiPeers(repoRoot, consumerDir, packageJSON) {
+  for (const name of Object.keys(packageJSON.peerDependencies)) {
+    const source = path.join(repoRoot, "node_modules", ...name.split("/"));
+    if (!existsSync(source)) fail(`Release validation requires the locked development peer: ${name}`);
+    const destination = path.join(consumerDir, "node_modules", ...name.split("/"));
+    mkdirSync(path.dirname(destination), { recursive: true });
+    symlinkSync(source, destination, "dir");
+  }
+}
+
+export function validatePackedArtifact({ repoRoot, packed, tarball, tempRoot, npmEnv }) {
+  const packageJSON = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+  const files = assertExactArtifactFiles(packed.files.map((file) => file.path), packageJSON);
+  if (!existsSync(tarball)) fail(`Expected npm pack output was not created: ${tarball}`);
+
+  const extractDir = path.join(tempRoot, "extract");
+  mkdirSync(extractDir);
+  run("tar", ["-xzf", tarball, "-C", extractDir], { cwd: tempRoot });
+  for (const file of files) {
+    if (!file.endsWith(".js")) continue;
+    assertNoForbiddenImports(file, readFileSync(path.join(extractDir, "package", file), "utf8"));
+  }
+  assertServerEntryContract(readFileSync(path.join(extractDir, "package", "self-evolve.js"), "utf8"));
+  assertApprovedTuiPackageContract(packageJSON, readFileSync(path.join(extractDir, "package", TUI_SOURCE_FILE), "utf8"));
+  assertGeneratedTuiArtifact(readFileSync(path.join(extractDir, "package", GENERATED_TUI_FILE), "utf8"));
+
+  const installArgs = [
+    "install",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--no-package-lock",
+    "--omit=optional",
+    "--omit=peer",
+    tarball,
+  ];
+  const serverConsumer = path.join(tempRoot, "server-consumer");
+  mkdirSync(serverConsumer);
+  writeFileSync(path.join(serverConsumer, "package.json"), `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`);
+  run("npm", installArgs, { cwd: serverConsumer, env: npmEnv });
+  if (existsSync(path.join(serverConsumer, "node_modules", "@opencode-ai", "plugin"))) {
+    fail("Fresh server consumer unexpectedly installed the optional @opencode-ai/plugin peer");
+  }
+  if (existsSync(path.join(serverConsumer, "node_modules", "@opentui"))) {
+    fail("Fresh server consumer unexpectedly installed @opentui peers");
+  }
+  if (existsSync(path.join(serverConsumer, "node_modules", "solid-js"))) {
+    fail("Fresh server consumer unexpectedly installed the optional solid-js peer");
+  }
+  const serverSmoke = [
+    `const server = await import(${JSON.stringify(packageJSON.name)});`,
+    `const explicitServer = await import(${JSON.stringify(`${packageJSON.name}/server`)});`,
+    `if (typeof server.default !== "function") throw new Error("server default export is not a Plugin factory");`,
+    `if (Object.keys(server).join(",") !== "default") throw new Error("server target exposes named exports");`,
+    `if (explicitServer.default !== server.default || Object.keys(explicitServer).join(",") !== "default") throw new Error("explicit server target diverged from package root");`,
+  ].join("\n");
+  run(process.execPath, ["--input-type=module", "--eval", serverSmoke], { cwd: serverConsumer });
+
+  const tuiConsumer = path.join(tempRoot, "tui-consumer");
+  mkdirSync(tuiConsumer);
+  writeFileSync(path.join(tuiConsumer, "package.json"), `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`);
+  run("npm", installArgs, { cwd: tuiConsumer, env: npmEnv });
+  linkTuiPeers(repoRoot, tuiConsumer, packageJSON);
+  const tuiSmoke = [
+    `const tui = await import(${JSON.stringify(`${packageJSON.name}/tui`)});`,
+    `if (Object.keys(tui).join(",") !== "default") throw new Error("TUI target exposes named exports");`,
+    `if (tui.default?.id !== "mcrescenzo.self-evolve" || typeof tui.default?.tui !== "function") throw new Error("TUI target is not a TuiPluginModule");`,
+  ].join("\n");
+  run("bun", ["--conditions=browser", "--eval", tuiSmoke], { cwd: tuiConsumer, env: npmEnv });
+  return { files, packageJSON };
 }
 
 export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? defaultRepoRoot } = {}) {
@@ -126,51 +211,14 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
     assertCurrentTuiArtifact(rebuilt, generated);
     const npmEnv = { ...process.env, npm_config_cache: path.join(tempRoot, "npm-cache") };
     const packed = parsePackResult(run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", tempRoot], { cwd: repoRoot, env: npmEnv }).stdout);
-    const files = assertExactArtifactFiles(packed.files.map((file) => file.path), packageJSON);
     const tarball = path.join(tempRoot, packed.filename);
-    if (!existsSync(tarball)) fail(`Expected npm pack output was not created: ${tarball}`);
-    const inventory = packed.files
-      .map(({ path: file, size, mode }) => ({ path: file, size, mode }))
-      .sort((left, right) => left.path.localeCompare(right.path));
-    const tarballSha256 = createHash("sha256").update(readFileSync(tarball)).digest("hex");
-    const inventorySha256 = createHash("sha256").update(JSON.stringify(inventory)).digest("hex");
-
-    const extractDir = path.join(tempRoot, "extract");
-    mkdirSync(extractDir);
-    run("tar", ["-xzf", tarball, "-C", extractDir], { cwd: tempRoot });
-    for (const file of files) {
-      if (!file.endsWith(".js")) continue;
-      assertNoForbiddenImports(file, readFileSync(path.join(extractDir, "package", file), "utf8"));
-    }
-    assertServerEntryContract(readFileSync(path.join(extractDir, "package", "self-evolve.js"), "utf8"));
-    assertApprovedTuiPackageContract(packageJSON, readFileSync(path.join(extractDir, "package", TUI_SOURCE_FILE), "utf8"));
-    assertGeneratedTuiArtifact(readFileSync(path.join(extractDir, "package", GENERATED_TUI_FILE), "utf8"));
-
-    const consumerDir = path.join(tempRoot, "consumer");
-    mkdirSync(consumerDir);
-    writeFileSync(path.join(consumerDir, "package.json"), `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`);
-    run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--omit=optional", "--omit=peer", tarball], { cwd: consumerDir, env: npmEnv });
-    if (existsSync(path.join(consumerDir, "node_modules", "@opencode-ai", "plugin"))) {
-      fail("Fresh consumer unexpectedly installed the optional @opencode-ai/plugin peer");
-    }
-    const opentuiScope = path.join(consumerDir, "node_modules", "@opentui");
-    if (existsSync(opentuiScope)) fail("Headless consumer unexpectedly installed @opentui peers");
-    if (existsSync(path.join(consumerDir, "node_modules", "solid-js"))) {
-      fail("Headless consumer unexpectedly installed the optional solid-js peer");
-    }
-
-    const smoke = [
-      `const server = await import(${JSON.stringify(packageJSON.name)});`,
-      `const explicitServer = await import(${JSON.stringify(`${packageJSON.name}/server`)});`,
-      `if (typeof server.default !== "function") throw new Error("server default export is not a Plugin factory");`,
-      `if (Object.keys(server).join(",") !== "default") throw new Error("server target exposes named exports");`,
-      `if (explicitServer.default !== server.default || Object.keys(explicitServer).join(",") !== "default") throw new Error("explicit server target diverged from package root");`,
-    ].join("\n");
-    run(process.execPath, ["--input-type=module", "--eval", smoke], { cwd: consumerDir });
+    const { files } = validatePackedArtifact({ repoRoot, packed, tarball, tempRoot, npmEnv });
+    const provenance = artifactProvenance(packed, tarball, null);
 
     console.log(`Pack artifact check passed: ${files.size} exact files; deterministic built TUI target validated and root plus explicit server targets imported from a fresh peerless consumer.`);
-    console.log(`Packed artifact SHA-256: ${tarballSha256}`);
-    console.log(`Packed inventory SHA-256: ${inventorySha256}`);
+    console.log("The TUI target also imported as a TuiPluginModule from the same tarball in a separate fresh consumer with the locked peers.");
+    console.log(`Packed artifact SHA-256: ${provenance.sha256}`);
+    console.log(`Packed inventory SHA-256: ${provenance.inventorySha256}`);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }

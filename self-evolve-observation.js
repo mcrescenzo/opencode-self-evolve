@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import {
+  asTargetLogicalName,
   assertEligibility,
+  canonicalize,
   deepFreeze,
   makeEligibilityExplanation,
   makeEvidenceCluster,
@@ -23,8 +25,11 @@ const AUTOMATION_PROVENANCE_SCHEMA = "automation-provenance/v1";
 const AUTOMATION_PROVENANCE_MAX_BYTES = 1024;
 const AUTOMATION_KINDS = new Set(["control", "display"]);
 export const ROOT_LINEAGE_MAX_DEPTH = 16;
-const HIDDEN_ANALYZER_AGENTS = new Set(["self-evolve-analyzer", "self-evolve-synthesizer", "self-evolve-critic"]);
 const clusterMetadata = new WeakMap();
+
+function compareCodepoints(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 
 export const EXTRACT_RULES = deepFreeze({
   maxMessages: 256,
@@ -113,6 +118,24 @@ function evidenceParts(message) {
   return Array.isArray(parts) ? parts : null;
 }
 
+export function extractTargetLogicalNames(messages) {
+  if (!Array.isArray(messages)) return [];
+  const names = new Set();
+  for (const message of messages) {
+    for (const part of evidenceParts(message) ?? []) {
+      if (!part || typeof part !== "object" || Array.isArray(part) || part.type !== "tool") continue;
+      const toolName = part.tool ?? part.name;
+      const input = part.state?.input;
+      if (toolName !== "skill" || !input || typeof input !== "object" || Array.isArray(input)) continue;
+      try {
+        const name = asTargetLogicalName(input.name);
+        if (name !== null) names.add(name);
+      } catch {}
+    }
+  }
+  return [...names].sort();
+}
+
 function messageIsExcludedFromEvidence(message) {
   if (partIsExcludedFromEvidence(message)) return true;
   const parts = evidenceParts(message);
@@ -133,12 +156,10 @@ function lineageSignal(value, projectFingerprint) {
   const sessionID = firstDefined(event, [["properties", "sessionID"], ["properties", "session", "id"], ["sessionID"], ["session", "id"]]);
   const parentID = firstDefined(event, [["properties", "parentID"], ["properties", "session", "parentID"], ["parentID"], ["session", "parentID"]]);
   const fingerprint = firstDefined(event, [["properties", "projectFingerprint"], ["properties", "session", "projectFingerprint"], ["projectFingerprint"], ["session", "projectFingerprint"]]) ?? projectFingerprint;
-  const hidden = firstDefined(event, [["properties", "hidden"], ["properties", "session", "hidden"], ["hidden"], ["session", "hidden"]]);
-  const agent = firstDefined(event, [["properties", "agent"], ["properties", "session", "agent"], ["agent"], ["session", "agent"]]);
-  const createdBy = firstDefined(event, [["properties", "session", "createdBy"], ["session", "createdBy"]]);
-  const anonymous = firstDefined(event, [["properties", "session", "anonymous"], ["session", "anonymous"]]);
+  const owned = firstDefined(event, [["properties", "session", "owned"], ["session", "owned"], ["owned"]]);
+  const trustworthy = firstDefined(event, [["properties", "session", "trustworthy"], ["session", "trustworthy"], ["trustworthy"]]);
   const reused = event?.reused === true;
-  return { sessionID, parentID, projectFingerprint: fingerprint, hidden, agent, createdBy, anonymous, reused };
+  return { sessionID, parentID, projectFingerprint: fingerprint, owned, trustworthy, reused };
 }
 
 function unresolvedRoot(reason) {
@@ -146,12 +167,9 @@ function unresolvedRoot(reason) {
 }
 
 function rootOriginKind(signal) {
-  if (signal.hidden === true || HIDDEN_ANALYZER_AGENTS.has(signal.agent)) return "hidden";
-  if (signal.createdBy === "plugin" || signal.createdBy === "self-evolve-plugin" || signal.agent === "self-evolve-plugin") return "plugin-created";
-  if (signal.anonymous === true || signal.agent === "anonymous") return "anonymous";
-  if (signal.hidden !== undefined && typeof signal.hidden !== "boolean") return "unknown";
-  if (signal.agent !== undefined && (typeof signal.agent !== "string" || !signal.agent)) return "unknown";
-  if (signal.createdBy !== undefined && !["user", "host"].includes(signal.createdBy)) return "unknown";
+  if (signal.owned === true) return "plugin-created";
+  if (signal.trustworthy !== true) return "unknown";
+  if (signal.owned !== undefined && typeof signal.owned !== "boolean") return "unknown";
   return "user";
 }
 
@@ -208,7 +226,8 @@ export function hashMessageCursor(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) throw new TypeError("message-required");
   const hostID = message.id ?? message.info?.id ?? message.message?.id;
   if (typeof hostID === "string" && hostID) return hashSignature(`self-evolve-message-id-v1\n${hostID}`);
-  return hashSignature(`self-evolve-message-fallback-v1\n${JSON.stringify(message)}`);
+  const jsonValue = JSON.parse(JSON.stringify(message));
+  return hashSignature(`self-evolve-message-fallback-v1\n${canonicalize(jsonValue)}`);
 }
 
 function signature(kind, value) {
@@ -261,6 +280,7 @@ function receipt(type, signatureHash, occurrences, episode, options) {
     lastSeenAt,
     projectFingerprint: options.projectFingerprint,
     scopeFingerprint: options.scopeFingerprint,
+    targetLogicalName: options.targetLogicalName,
   });
 }
 
@@ -271,6 +291,8 @@ export function extractReceipts(episode, { projectFingerprint, scopeFingerprint,
     && typeof message === "object"
     && !message.isSelfEvolveOutput
     && !messageIsExcludedFromEvidence(message));
+  const targetNames = extractTargetLogicalNames(usable);
+  const targetLogicalName = targetNames.length === 1 ? targetNames[0] : null;
   const commands = usable
     .filter((message) => message.role === "user" && typeof message.commandName === "string" && message.commandName.trim())
     .map((message) => ({ value: message.commandName }));
@@ -288,24 +310,24 @@ export function extractReceipts(episode, { projectFingerprint, scopeFingerprint,
   const output = [];
 
   for (const [key, group] of countBySignature(commands, "command")) {
-    if (group.count >= EXTRACT_RULES["repeated-command"].minimumOccurrences) output.push(receipt("repeated-command", key, group.count, episode, { projectFingerprint, scopeFingerprint, now }));
+    if (group.count >= EXTRACT_RULES["repeated-command"].minimumOccurrences) output.push(receipt("repeated-command", key, group.count, episode, { projectFingerprint, scopeFingerprint, targetLogicalName, now }));
   }
   for (const [key, group] of countBySignature(errors, "tool-error")) {
-    if (group.count >= EXTRACT_RULES["repeated-tool-error"].minimumOccurrences) output.push(receipt("repeated-tool-error", key, group.count, episode, { projectFingerprint, scopeFingerprint, now }));
+    if (group.count >= EXTRACT_RULES["repeated-tool-error"].minimumOccurrences) output.push(receipt("repeated-tool-error", key, group.count, episode, { projectFingerprint, scopeFingerprint, targetLogicalName, now }));
   }
   for (const [key, group] of repeatedProcedures(actions)) {
-    output.push(receipt("repeated-manual-procedure", key, group.count, episode, { projectFingerprint, scopeFingerprint, now }));
+    output.push(receipt("repeated-manual-procedure", key, group.count, episode, { projectFingerprint, scopeFingerprint, targetLogicalName, now }));
   }
   for (let index = 0; index < clarifications.length - 1; index += 1) {
     const first = clarifications[index];
     const second = clarifications[index + 1];
     if (second.index - first.index > EXTRACT_RULES["repeated-clarification"].windowMessages) continue;
     const normalized = [first.message.content, second.message.content].map(normalizeForSignature).sort().join("\n");
-    output.push(receipt("repeated-clarification", hashSignature(normalized), 2, episode, { projectFingerprint, scopeFingerprint, now }));
+    output.push(receipt("repeated-clarification", hashSignature(normalized), 2, episode, { projectFingerprint, scopeFingerprint, targetLogicalName, now }));
     break;
   }
 
-  return output.sort((left, right) => left.receiptType.localeCompare(right.receiptType) || left.signatureHash.localeCompare(right.signatureHash));
+  return output.sort((left, right) => compareCodepoints(left.receiptType, right.receiptType) || compareCodepoints(left.signatureHash, right.signatureHash));
 }
 
 export function isSelfReference(observation) {
@@ -343,7 +365,9 @@ function observationInput(value, signatureHash, incidentId) {
   });
 }
 
-function incidentRoot(observation) {
+function underlyingIncidentId(observation) {
+  // Parent/child work on one task, quoted summaries, and observer retries are one
+  // underlying incident by contract; session/root lineage is evaluated separately.
   return observation.childSessionParentID || observation.quotedIncidentId || observation.incidentId;
 }
 
@@ -356,9 +380,10 @@ export function correlateObservations(observations) {
     if (!Array.isArray(signatureHashes) || !signatureHashes.length) continue;
     for (const signatureHash of [...new Set(signatureHashes)]) {
       if (value.quotedSignatureHash === signatureHash) continue;
-      const root = incidentRoot(value);
+      const root = underlyingIncidentId(value);
       const observation = observationInput(value, signatureHash, root);
-      const key = [observation.structuredFields.receiptType, observation.projectFingerprint, observation.structuredFields.scopeFingerprint, signatureHash].join("\n");
+      const targetLogicalName = observation.structuredFields.targetLogicalName ?? null;
+      const key = [observation.structuredFields.receiptType, observation.projectFingerprint, observation.structuredFields.scopeFingerprint, targetLogicalName ?? "<untargeted>", signatureHash].join("\n");
       let group = groups.get(key);
       if (!group) {
         group = {
@@ -368,6 +393,7 @@ export function correlateObservations(observations) {
             projectFingerprint: observation.projectFingerprint,
             incidentIds: [],
             scopeFingerprint: observation.structuredFields.scopeFingerprint,
+            targetLogicalName,
             occurrencesSum: 0,
             firstSeenAt: observation.createdAt,
             lastSeenAt: observation.createdAt,
@@ -376,20 +402,24 @@ export function correlateObservations(observations) {
           contradiction: false,
           injectionFlagged: false,
           outOfOrder: false,
+          correlationFailure: false,
           lastCreatedAt: null,
           lastPolarity: undefined,
         };
         groups.set(key, group);
       }
       if (group.incidents.has(root)) continue;
+      const recorded = recordIncident(group.cluster, observation, Math.max(group.cluster.lastSeenAt, observation.createdAt));
+      if (!recorded.ok) {
+        group.correlationFailure = true;
+        continue;
+      }
       if (group.lastCreatedAt !== null && observation.createdAt < group.lastCreatedAt) group.outOfOrder = true;
       group.lastCreatedAt = observation.createdAt;
       const polarity = observation.structuredFields.deterministicOutcome;
       if (typeof polarity === "boolean" && typeof group.lastPolarity === "boolean" && polarity !== group.lastPolarity) group.contradiction = true;
       if (typeof polarity === "boolean") group.lastPolarity = polarity;
       group.injectionFlagged ||= observation.injectionFlagged;
-      const recorded = recordIncident(group.cluster, observation, Math.max(group.cluster.lastSeenAt, observation.createdAt));
-      if (!recorded.ok) throw new TypeError(recorded.error);
       group.cluster = recorded.state;
       group.incidents.set(root, {
         createdAt: observation.createdAt,
@@ -406,10 +436,11 @@ export function correlateObservations(observations) {
       contradiction: group.contradiction,
       injectionFlagged: group.injectionFlagged,
       outOfOrder: group.outOfOrder,
+      correlationFailure: group.correlationFailure,
     });
     return group.cluster;
   });
-  return output.sort((left, right) => left.id.localeCompare(right.id));
+  return output.sort((left, right) => compareCodepoints(left.id, right.id));
 }
 
 function thresholdTarget(target, actual) {
@@ -456,6 +487,7 @@ export function evaluateEligibility(clusters, thresholds = {}) {
       place(!metadata.contradiction, "noContradictions", true, "contradicting-observations");
       place(!metadata.injectionFlagged, "noInjectionFlags", true, "injection-flagged");
       place(!metadata.outOfOrder, "chronologicalObservations", true, "out-of-order-observations");
+      place(!metadata.correlationFailure, "correlationIntegrity", true, "correlation-failure");
     }
     if (scope === "global") {
       place(thresholds.explicitGlobalDesignation === true, "explicitGlobalDesignation", true, "global-designation-required");

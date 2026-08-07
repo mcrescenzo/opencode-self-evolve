@@ -159,7 +159,10 @@ test("a stat-token cache is provably unsafe on this filesystem — do not substi
 test("separate store instances and a real child append are immediately fresh", async (t) => {
   const { root, store } = fixture(t);
   const second = openStore(root, { projectName: "cache-test", projectFingerprint: PROJECT, now: () => 2_000 });
-  t.after(() => { try { second.close(); } catch {} });
+  t.after(() => {
+    try { second.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  });
 
   assert.equal(store.appendRecord(auditRecord(1)).ok, true);
   assert.deepEqual(second.readRecords("audit-event").map((record) => record.id), [auditRecord(1).id]);
@@ -183,6 +186,9 @@ test("cache lifetime is store-scoped and a reopened store reparses current bytes
   assert.equal((await waitForFile(resultPath)).ok, true);
 
   const reopened = openStore(root, { projectName: "cache-test", projectFingerprint: PROJECT, now: () => 2_000 });
-  t.after(() => { try { reopened.close(); } catch {} });
+  t.after(() => {
+    try { reopened.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  });
   assert.deepEqual(reopened.readRecords("audit-event").map((record) => record.id), [auditRecord(1).id, auditRecord(2).id]);
 });

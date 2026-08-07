@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
+import { isActiveProposalChainRecord, isActiveProposalState } from "./self-evolve-store.js";
+import { containsPrivateMaterial } from "./self-evolve-projection.js";
 import {
   SCHEMA_VERSION,
   ConsentState,
@@ -182,6 +184,12 @@ export function createPrivacyGuard({
     catch { return makeConsentState(); }
   }
 
+  function freshRetentionDays() {
+    const current = store?.getSettings ? durableSettings().global.retentionDays : retentionDays;
+    if (!Number.isSafeInteger(current) || current < 1) throw new TypeError("invalid-retention");
+    return current;
+  }
+
   function successfulObservation(sanitized) {
     const result = { ...sanitized };
     Object.defineProperties(result, {
@@ -197,10 +205,11 @@ export function createPrivacyGuard({
     return { ok: issues.length === 0, issues };
   }
 
-  function scrubObservation(observation) {
+  function scrubObservationForProject(observation, expectedProjectFingerprint) {
     if (!observation || typeof observation !== "object" || Array.isArray(observation)) return { ok: false, reason: "invalid-observation" };
     if (!observation.projectFingerprint) return { ok: false, reason: "project-fingerprint-required" };
-    if (observation.projectFingerprint !== projectFingerprint) return { ok: false, reason: "project-partition-mismatch" };
+    if (observation.projectFingerprint !== expectedProjectFingerprint) return { ok: false, reason: "project-partition-mismatch" };
+    const globalScope = observation.scope === "global" || observation.structuredFields?.scope === "global";
     let rejected = null;
     walk(observation, (value, key) => {
       if (rejected) return;
@@ -209,10 +218,14 @@ export function createPrivacyGuard({
         const scan = scanForForbiddenContent(value);
         if (scan.issues.includes("control-characters") || scan.issues.includes("nul-byte")) rejected = "control-characters";
         else if (scan.issues.includes("provider-token") || scan.issues.includes("private-key")) rejected = "secret-marker";
+        else if (scan.issues.length > 0
+          && !(globalScope && scan.issues.every((issue) => issue === "absolute-path" || issue === "blocked-repository-identifier"))) {
+          rejected = "unsafe-content";
+        }
       }
     });
     if (rejected) return { ok: false, reason: rejected };
-    if (observation.scope === "global" || observation.structuredFields?.scope === "global") {
+    if (globalScope) {
       const consentNow = freshConsent();
       const global = assertSafeGlobalClaim(observation, { blockedNames });
       if (!global.ok || !consentNow.sanitizedExcerpts || !consentNow.crossRepoAggregation) {
@@ -225,6 +238,27 @@ export function createPrivacyGuard({
     } catch (error) {
       return { ok: false, reason: errorReasonCode(error, "privacy-failed") };
     }
+  }
+
+  function scrubObservation(observation) {
+    return scrubObservationForProject(observation, projectFingerprint);
+  }
+
+  function scrubExportRecords(records, expectedProjectFingerprint) {
+    const privateProposalIds = new Set(records.flatMap((record) => {
+      if (record.kind !== "proposal-content") return [];
+      let content;
+      try { content = Buffer.from(record.payload.content, "base64").toString("utf8"); }
+      catch { return [record.payload.proposalId]; }
+      return containsPrivateMaterial(content) ? [record.payload.proposalId] : [];
+    }));
+    return records.flatMap((record) => {
+      if (record.kind === "proposal-content" && privateProposalIds.has(record.payload.proposalId)) return [];
+      if (record.kind !== "observation") return [record];
+      const result = scrubObservationForProject(record.payload, expectedProjectFingerprint);
+      if (!result.ok) throw new Error(`unsafe-observation:${result.reason}`);
+      return [{ ...record, payload: result.sanitized }];
+    });
   }
 
   /** Returns heuristic redaction only; "redacted" is not a secrecy guarantee. */
@@ -294,7 +328,7 @@ export function createPrivacyGuard({
         firstSeenDay,
         lastSeenDay,
         createdAt,
-        expiresAt: createdAt + retentionDays * DAY_MS,
+        expiresAt: createdAt + freshRetentionDays() * DAY_MS,
       });
       const safe = assertSafeGlobalClaim(record, { blockedNames });
       if (!safe.ok) return { ok: false, reason: safe.reason };
@@ -324,15 +358,14 @@ export function createPrivacyGuard({
   }
 
   function checkRetention(nowMs = now()) {
-    durableSettings();
+    const currentRetentionDays = freshRetentionDays();
     const archive = requireStore(store).exportProject();
     const latest = new Map();
     for (const record of archive.records) if (record.kind === "proposal") latest.set(record.payload.id, record.payload);
-    const active = new Set([...latest].filter(([, proposal]) => ["pending", "approved", "applied"].includes(proposal.state)).map(([id]) => id));
+    const active = new Set([...latest].filter(([, proposal]) => isActiveProposalState(proposal.state)).map(([id]) => id));
     return archive.records.flatMap((record) => {
-      const proposalId = record.kind === "proposal" ? record.payload.id : record.payload?.proposalId;
-      if (proposalId && active.has(proposalId) && ["proposal", "decision", "audit-event"].includes(record.kind)) return [];
-      const expiresAt = expirationFor(record, retentionDays);
+      if (isActiveProposalChainRecord(record, active)) return [];
+      const expiresAt = expirationFor(record, currentRetentionDays);
       return expiresAt !== null && isExpired(expiresAt, nowMs) ? [{ kind: record.kind, id: logicalId(record), expiresAt }] : [];
     });
   }
@@ -369,22 +402,30 @@ export function createPrivacyGuard({
     durableSettings();
     const archive = requireStore(store).exportProject();
     if (archive.projectFingerprint !== fingerprint) return { ...archive, projectName: "", projectFingerprint: fingerprint, records: [] };
-    const records = [];
-    for (const record of scopedRecords(archive, fingerprint)) {
-      if (record.kind !== "observation") {
-        records.push(record);
-        continue;
-      }
-      const result = scrubObservation(record.payload);
-      if (!result.ok) throw new Error(`unsafe-observation:${result.reason}`);
-      records.push({ ...record, payload: result.sanitized });
-    }
+    const records = scrubExportRecords(scopedRecords(archive, fingerprint), fingerprint);
     return { ...archive, records };
   }
 
   function exportAll() {
     durableSettings();
-    return requireStore(store).exportAll();
+    if (!freshConsent().crossRepoAggregation) {
+      return {
+        ...exportScope(projectFingerprint),
+        exportScope: "all",
+        classification: "sensitive-self-evolve-archive",
+      };
+    }
+    const archive = requireStore(store).exportAll();
+    const projects = archive.projects.map((project) => ({
+      ...project,
+      records: scrubExportRecords(project.records, project.projectFingerprint),
+    }));
+    const currentProject = projects.find((project) => project.projectFingerprint === projectFingerprint);
+    return {
+      ...archive,
+      records: currentProject?.records ?? scrubExportRecords(archive.records, projectFingerprint),
+      projects,
+    };
   }
 
   function purgeScope({ scope, projectFingerprint: requestedProject } = {}) {

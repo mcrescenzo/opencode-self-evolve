@@ -52,11 +52,46 @@ function parsed(verb, fields = {}) {
 function splitInput(input) {
   let text = String(input ?? "").trim();
   if (/^\/self-evolve(?:\s|$)/i.test(text)) text = text.replace(/^\/self-evolve(?:\s+|$)/i, "");
-  return text.trim() ? text.trim().split(/\s+/) : [];
+  text = text.trim();
+  if (!text) return { tokens: [] };
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  let tokenStarted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === "\\") {
+      if (index + 1 >= text.length) return { error: "Malformed command: trailing escape." };
+      token += text[index + 1];
+      tokenStarted = true;
+      index += 1;
+    } else if (quote) {
+      if (character === quote) quote = null;
+      else token += character;
+      tokenStarted = true;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+      tokenStarted = true;
+    } else if (/\s/u.test(character)) {
+      if (tokenStarted) {
+        tokens.push(token);
+        token = "";
+        tokenStarted = false;
+      }
+    } else {
+      token += character;
+      tokenStarted = true;
+    }
+  }
+  if (quote) return { error: "Malformed command: unterminated quote." };
+  if (tokenStarted) tokens.push(token);
+  return { tokens };
 }
 
 export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
-  const tokens = splitInput(input);
+  const tokenized = splitInput(input);
+  if (tokenized.error) return error(tokenized.error);
+  const tokens = tokenized.tokens;
   if (tokens.length === 0) return parsed(legacy ? "scan" : "default");
   const [rawVerb, ...args] = tokens;
   const verb = rawVerb.toLowerCase();

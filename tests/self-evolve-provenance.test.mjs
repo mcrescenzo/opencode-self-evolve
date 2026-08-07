@@ -167,7 +167,6 @@ test("pipeline normalization excludes control parts before records and eligibili
     privacy,
     synthesis: {
       runSynthesis() { throw new Error("control evidence reached synthesis"); },
-      disposeSynthesis() {},
     },
     applier: { close() {} },
     commands: {},

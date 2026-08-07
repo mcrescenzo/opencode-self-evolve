@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import {
+  BRIDGE_SCHEMA_VERSION,
   BRIDGE_REQUEST_FIELDS,
   BRIDGE_RESPONSE_FIELDS,
   CONTROL_REQUEST_FIELDS,
@@ -18,6 +19,7 @@ import {
   UI_CAPABILITIES,
   UI_ACTION_CAPABILITIES,
   UI_DASHBOARD_CAPABILITIES,
+  UI_DASHBOARD_BLOCKER_DESTINATIONS,
   UI_DASHBOARD_FIELDS,
   UI_DASHBOARD_VERSION,
   UI_OPERATION_ACTIONS,
@@ -494,6 +496,35 @@ test("capability negotiation is strict and mixed-version peers remain legacy-onl
   assert.throws(() => makeUiProtocolOffer({ ...server, capabilities: [...server.capabilities].reverse() }), /capabilities-not-sorted/u);
 });
 
+test("Release A core offer and index bytes stay literal while Release B remains a sidecar", () => {
+  const offer = makeUiProtocolOffer({
+    projectionVersions: [1],
+    operationProtocolVersions: [1],
+    capabilities: UI_CAPABILITIES,
+  });
+  assert.equal(
+    `${JSON.stringify(offer)}\n`,
+    '{"projectionVersions":[1],"operationProtocolVersions":[1],"capabilities":["legacy-control-v1","legacy-decision-v1","operation-export-v1","operation-kill-switch-v1","operation-pause-v1","operation-purge-all-v1","operation-purge-scope-v1","operation-retry-bootstrap-v1","operation-rollback-v1","operation-snooze-v1","projection-index-v1","projection-review-detail-v1"]}\n',
+  );
+
+  const coreIndex = makeUiProjectionIndex(projectionIndex({
+    reviews: [],
+    operations: [],
+    allowedActions: [],
+    overflow: {
+      reviews: overflow(0),
+      operations: overflow(0),
+      allowedActions: overflow(0),
+    },
+  }), projectionContext());
+  assert.equal(
+    `${JSON.stringify(coreIndex)}\n`,
+    '{"projectionVersion":1,"projectFingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stateRootIdentity":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","issuedAt":999000,"expiresAt":1060000,"capabilities":["legacy-control-v1","legacy-decision-v1","operation-export-v1","operation-kill-switch-v1","operation-pause-v1","operation-purge-all-v1","operation-purge-scope-v1","operation-retry-bootstrap-v1","operation-rollback-v1","operation-snooze-v1","projection-index-v1","projection-review-detail-v1"],"status":{"state":"ready","reason":null,"storedMode":"auto","effectiveMode":"auto","paused":false,"killSwitchActive":false,"repoExcluded":false,"circuitBreakerOpen":false},"budgets":{"passiveCallsPerHour":6,"synthesisPerDay":24,"tokensPerSynthesis":8000,"concurrentObservationsPerProject":1,"concurrentSynthesesGlobal":1,"idleDebounceMs":1500,"storageQuotaMiB":8},"reviews":[],"operations":[],"allowedActions":[],"overflow":{"reviews":{"truncated":false,"includedCount":0,"omittedCount":0,"omittedBytes":0,"reason":"none"},"operations":{"truncated":false,"includedCount":0,"omittedCount":0,"omittedBytes":0,"reason":"none"},"allowedActions":{"truncated":false,"includedCount":0,"omittedCount":0,"omittedBytes":0,"reason":"none"}},"projectionHash":"f35d83607018928e7c61eb04108529518c159483ff15f5fa2dd1dd9aa78f348c"}\n',
+  );
+  assert.equal("dashboardVersion" in coreIndex, false);
+  assert.equal(offer.capabilities.some((capability) => UI_DASHBOARD_CAPABILITIES.includes(capability)), false);
+});
+
 test("projection indexes are exact, hash-bound, project/root-bound, fresh, and deeply frozen", () => {
   const value = makeUiProjectionIndex(projectionIndex(), projectionContext());
   assert.deepEqual(Object.keys(value), UI_PROJECTION_INDEX_FIELDS);
@@ -629,7 +660,7 @@ test("projection indexes enforce collection, reason, ordering, capability, overf
   assert.throws(() => makeUiProjectionIndex(oversized, projectionContext()), /projection-index-footprint-exceeded/u);
 });
 
-test("dashboard-v1 is exact, hash-bound to the core index, bounded, and deeply frozen", () => {
+test("current dashboard is exact, hash-bound to the core index, bounded, and deeply frozen", () => {
   const value = dashboard();
   const clean = makeUiDashboard(value, dashboardContext(value));
   assert.deepEqual(Object.keys(clean), UI_DASHBOARD_FIELDS);
@@ -666,9 +697,21 @@ test("dashboard-v1 is exact, hash-bound to the core index, bounded, and deeply f
     () => makeUiDashboard(dashboard({ capabilities: ["unknown-dashboard-v1"] }), dashboardContext(value)),
     /unknown-dashboard-capability/u,
   );
+  const mismatchedBlocker = dashboard({
+    blockers: [{
+      code: "first-run",
+      summary: "Automatic recommendations have not been set up yet.",
+      destination: "settings",
+    }],
+  });
+  assert.equal(UI_DASHBOARD_BLOCKER_DESTINATIONS["first-run"].dashboard, "home");
+  assert.throws(
+    () => makeUiDashboard(mismatchedBlocker, dashboardContext(mismatchedBlocker)),
+    /dashboard-blocker-destination-mismatch/u,
+  );
 });
 
-test("dashboard-v1 rejects inconsistent usage, rollout, activity, and in-flight state", () => {
+test("current dashboard rejects inconsistent usage, rollout, activity, and in-flight state", () => {
   const value = dashboard();
   const invalidUsage = dashboard({
     usage: {
@@ -709,6 +752,76 @@ test("dashboard-v1 rejects inconsistent usage, rollout, activity, and in-flight 
     activity: [{ ...value.activity[0], reason: "raw-provider-message" }],
   });
   assert.throws(() => makeUiDashboard(arbitraryReason, dashboardContext(arbitraryReason)), /invalid-activity-reason/u);
+});
+
+test("dashboard-v2 accepts the full derived retention range and rejects invalid edges", () => {
+  for (const retention of [
+    { observationsDays: 1, operationalDays: 3 },
+    { observationsDays: 3_650, operationalDays: 10_950 },
+  ]) {
+    const value = dashboard({ retention });
+    assert.deepEqual(makeUiDashboard(value, dashboardContext(value)).retention, retention);
+  }
+
+  for (const retention of [
+    { observationsDays: 0, operationalDays: 3 },
+    { observationsDays: 3_651, operationalDays: 10_950 },
+    { observationsDays: 1, operationalDays: 2 },
+    { observationsDays: 3_650, operationalDays: 10_951 },
+  ]) {
+    const value = dashboard({ retention });
+    assert.throws(
+      () => makeUiDashboard(value, dashboardContext(value)),
+      /dashboard-(?:observation|operational)-retention-out-of-bounds/u,
+    );
+  }
+
+  const mismatched = dashboard({ retention: { observationsDays: 10, operationalDays: 31 } });
+  assert.throws(
+    () => makeUiDashboard(mismatched, dashboardContext(mismatched)),
+    /dashboard-retention-mismatch/u,
+  );
+});
+
+test("dashboard-v1 preserves its independent retention fields while v2 requires the exact derived pair", () => {
+  for (const retention of [
+    { observationsDays: 10, operationalDays: 90 },
+    { observationsDays: 3_650, operationalDays: 3_650 },
+  ]) {
+    const value = dashboard({ dashboardVersion: 1, retention });
+    const clean = makeUiDashboard(value, dashboardContext(value));
+    assert.equal(clean.dashboardVersion, 1);
+    assert.deepEqual(clean.retention, retention);
+  }
+
+  const oldNonDefault = dashboard({
+    dashboardVersion: 1,
+    retention: { observationsDays: 10, operationalDays: 90 },
+  });
+  assert.doesNotThrow(() => makeUiDashboard(oldNonDefault, dashboardContext(oldNonDefault)));
+
+  const samePairAsV2 = dashboard({
+    retention: { observationsDays: 10, operationalDays: 90 },
+  });
+  assert.throws(
+    () => makeUiDashboard(samePairAsV2, dashboardContext(samePairAsV2)),
+    /dashboard-retention-mismatch/u,
+  );
+});
+
+test("dashboard-v1 canonical and published wire compatibility bytes remain literal", () => {
+  const value = dashboard({
+    dashboardVersion: 1,
+    retention: { observationsDays: 10, operationalDays: 90 },
+  });
+  const clean = makeUiDashboard(value, dashboardContext(value));
+  const { dashboardHash, ...body } = clean;
+  const expectedCanonical = '{"activity":[{"audience":"default","category":"cycle","id":"9999999999999999999999999999999999999999999999999999999999999999","occurredAt":999000,"outcome":"valid-no-change","proposalId":null,"reason":"no-change","summary":"Analysis completed successfully and found no useful safe change."}],"automation":{"reason":null,"state":"ready"},"blockers":[],"capabilities":["control-repo-mode-v1","decision-feedback-v1"],"dashboardVersion":1,"generatedAt":999500,"generation":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","inFlight":{"active":false,"count":0,"stage":null,"startedAt":null},"indexHash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","lastCycle":{"eligibilityCount":1,"mode":"auto","observationCount":2,"occurredAt":999000,"outcome":"valid-no-change","proposalId":null,"reason":"no-change","triggerClass":"idle"},"nextEligibleAt":null,"overflow":{"activity":{"includedCount":1,"omittedBytes":0,"omittedCount":0,"reason":"none","truncated":false}},"projectFingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","retention":{"observationsDays":10,"operationalDays":90},"rollout":{"minSuccessRateBasisPoints":8000,"minSynthesesObserved":10,"ready":true,"successRateBasisPoints":9000,"synthesesObserved":10},"settings":{"approvedSkillFolderCount":1,"consent":{"crossRepoAggregation":false,"durableObservations":true,"passiveCalls":true,"sanitizedExcerpts":false},"effectiveMode":"auto","globalMode":"auto","killSwitchActive":false,"paused":false,"repositoryExcluded":false,"repositoryMode":"inherit"},"stateRootIdentity":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","supportedControls":["set-paused"],"usage":{"passive":{"limit":6,"remaining":4,"resetAt":1030000,"used":2},"storage":{"limitBytes":8388608,"remainingBytes":8384512,"usedBytes":4096},"synthesis":{"limit":24,"remaining":20,"resetAt":1060000,"used":4}}}';
+  assert.equal(canonicalUiJson(body), expectedCanonical);
+  assert.equal(dashboardHash, "16eb998c483f1309cba8f28fe5c7b127e10f2bfdb69c0eecd7992cf7e33af3af");
+  assert.equal(hashUiProtocol("dashboard", body), dashboardHash);
+  const expectedWire = '{"dashboardVersion":1,"projectFingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stateRootIdentity":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","indexHash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","generatedAt":999500,"capabilities":["control-repo-mode-v1","decision-feedback-v1"],"automation":{"state":"ready","reason":null},"blockers":[],"inFlight":{"active":false,"count":0,"stage":null,"startedAt":null},"lastCycle":{"outcome":"valid-no-change","triggerClass":"idle","mode":"auto","observationCount":2,"eligibilityCount":1,"proposalId":null,"occurredAt":999000,"reason":"no-change"},"nextEligibleAt":null,"usage":{"passive":{"used":2,"limit":6,"remaining":4,"resetAt":1030000},"synthesis":{"used":4,"limit":24,"remaining":20,"resetAt":1060000},"storage":{"usedBytes":4096,"limitBytes":8388608,"remainingBytes":8384512}},"rollout":{"ready":true,"synthesesObserved":10,"minSynthesesObserved":10,"successRateBasisPoints":9000,"minSuccessRateBasisPoints":8000},"settings":{"globalMode":"auto","repositoryMode":"inherit","effectiveMode":"auto","paused":false,"killSwitchActive":false,"repositoryExcluded":false,"consent":{"passiveCalls":true,"durableObservations":true,"sanitizedExcerpts":false,"crossRepoAggregation":false},"approvedSkillFolderCount":1},"retention":{"observationsDays":10,"operationalDays":90},"supportedControls":["set-paused"],"activity":[{"id":"9999999999999999999999999999999999999999999999999999999999999999","category":"cycle","audience":"default","outcome":"valid-no-change","summary":"Analysis completed successfully and found no useful safe change.","occurredAt":999000,"proposalId":null,"reason":"no-change"}],"overflow":{"activity":{"truncated":false,"includedCount":1,"omittedCount":0,"omittedBytes":0,"reason":"none"}},"dashboardHash":"16eb998c483f1309cba8f28fe5c7b127e10f2bfdb69c0eecd7992cf7e33af3af"}\n';
+  assert.equal(`${JSON.stringify(clean)}\n`, expectedWire);
 });
 
 test("review details are exact, hash/revision/generation-bound, fresh, and privacy-safe", () => {
@@ -1061,6 +1174,8 @@ test("the aggregate projection footprint rejects individually valid artifacts ab
 });
 
 test("new UI protocols do not change legacy Decision, decision-request, or control wire bytes", () => {
+  assert.equal(SCHEMA_VERSION, "0.2.2");
+  assert.equal(BRIDGE_SCHEMA_VERSION, "0.2.1");
   const decision = makeDecision({
     proposalId: "proposal-1",
     targetHash: H("1"),
@@ -1082,7 +1197,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
     projectFingerprint: PROJECT,
     ...decision,
   }, { now: NOW, projectFingerprint: PROJECT });
-  const requestBytes = `{"schemaVersion":"${SCHEMA_VERSION}","requestId":"request-1","projectFingerprint":"${PROJECT}","proposalId":"proposal-1","targetHash":"${H("1")}","proposedContentHash":"${H("2")}","decisionVersion":3,"priorState":"pending","newState":"approved","actor":"self-evolve-tui","timestamp":${NOW},"nonce":"decision-nonce"}\n`;
+  const requestBytes = `{"schemaVersion":"0.2.1","requestId":"request-1","projectFingerprint":"${PROJECT}","proposalId":"proposal-1","targetHash":"${H("1")}","proposedContentHash":"${H("2")}","decisionVersion":3,"priorState":"pending","newState":"approved","actor":"self-evolve-tui","timestamp":${NOW},"nonce":"decision-nonce"}\n`;
   assert.deepEqual(Object.keys(request), BRIDGE_REQUEST_FIELDS);
   assert.equal(`${JSON.stringify(request)}\n`, requestBytes);
 
@@ -1101,7 +1216,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   assert.deepEqual(Object.keys(controlRequest), CONTROL_REQUEST_FIELDS);
   assert.equal(
     `${JSON.stringify(controlRequest)}\n`,
-    `{"schemaVersion":"${SCHEMA_VERSION}","requestId":"control-1","projectFingerprint":"${PROJECT}","actor":"self-evolve-tui","timestamp":${NOW},"settingsUpdatedAt":${NOW - 1},"settingsVersion":"${H("3")}","nonce":"control-nonce","action":"set-mode","payload":{"mode":"manual"}}\n`,
+    `{"schemaVersion":"0.2.1","requestId":"control-1","projectFingerprint":"${PROJECT}","actor":"self-evolve-tui","timestamp":${NOW},"settingsUpdatedAt":${NOW - 1},"settingsVersion":"${H("3")}","nonce":"control-nonce","action":"set-mode","payload":{"mode":"manual"}}\n`,
   );
 
   const controlState = makeControlState({
@@ -1123,7 +1238,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   assert.deepEqual(Object.keys(controlState), CONTROL_STATE_FIELDS);
   assert.equal(
     `${JSON.stringify(controlState)}\n`,
-    `{"schemaVersion":"${SCHEMA_VERSION}","projectFingerprint":"${PROJECT}","actor":"self-evolve-integration","issuedAt":${NOW},"expiresAt":${NOW + 60_000},"settingsUpdatedAt":${NOW - 1},"settingsVersion":"${H("3")}","stateRootIdentity":"${ROOT}","nonce":"state-nonce","mode":"manual","effectiveMode":"manual","allowedSkillRoots":[],"consent":{"passiveCalls":false,"durableObservations":false,"sanitizedExcerpts":false,"crossRepoAggregation":false},"repoExcluded":false}\n`,
+    `{"schemaVersion":"0.2.1","projectFingerprint":"${PROJECT}","actor":"self-evolve-integration","issuedAt":${NOW},"expiresAt":${NOW + 60_000},"settingsUpdatedAt":${NOW - 1},"settingsVersion":"${H("3")}","stateRootIdentity":"${ROOT}","nonce":"state-nonce","mode":"manual","effectiveMode":"manual","allowedSkillRoots":[],"consent":{"passiveCalls":false,"durableObservations":false,"sanitizedExcerpts":false,"crossRepoAggregation":false},"repoExcluded":false}\n`,
   );
 
   const bridgeResponse = makeBridgeResponse({
@@ -1140,7 +1255,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   assert.deepEqual(Object.keys(bridgeResponse), BRIDGE_RESPONSE_FIELDS);
   assert.equal(
     `${JSON.stringify(bridgeResponse)}\n`,
-    `{"schemaVersion":"${SCHEMA_VERSION}","requestId":"request-1","projectFingerprint":"${PROJECT}","proposalId":"proposal-1","ok":false,"status":"rejected","processedAt":${NOW},"reason":"stale-decision-version","recovered":false}\n`,
+    `{"schemaVersion":"0.2.1","requestId":"request-1","projectFingerprint":"${PROJECT}","proposalId":"proposal-1","ok":false,"status":"rejected","processedAt":${NOW},"reason":"stale-decision-version","recovered":false}\n`,
   );
 
   const controlResponse = makeControlResponse({
@@ -1155,6 +1270,17 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   assert.deepEqual(Object.keys(controlResponse), CONTROL_RESPONSE_FIELDS);
   assert.equal(
     `${JSON.stringify(controlResponse)}\n`,
-    `{"schemaVersion":"${SCHEMA_VERSION}","requestId":"control-1","projectFingerprint":"${PROJECT}","ok":true,"status":"accepted","processedAt":${NOW},"reason":null}\n`,
+    `{"schemaVersion":"0.2.1","requestId":"control-1","projectFingerprint":"${PROJECT}","ok":true,"status":"accepted","processedAt":${NOW},"reason":null}\n`,
   );
+
+  for (const unsupported of ["0.2.0", "0.2.3"]) {
+    assert.throws(() => makeBridgeRequest({ ...request, schemaVersion: unsupported }, {
+      now: NOW,
+      projectFingerprint: PROJECT,
+    }), /unsupported-schema-version/u);
+    assert.throws(() => makeControlState({ ...controlState, schemaVersion: unsupported }, {
+      now: NOW,
+      projectFingerprint: PROJECT,
+    }), /unsupported-schema-version/u);
+  }
 });

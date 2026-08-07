@@ -4,31 +4,6 @@ import path from "node:path";
 import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
 
-// Reference measurement captured after the combined fix. Updated by the
-// verification Bead with both Node and Bun results from a copied real
-// partition; it is descriptive evidence, not a machine-independent limit.
-export const REFERENCE_BASELINE = Object.freeze({
-  capturedAt: "2026-07-28",
-  fixture: Object.freeze({
-    auditBytesBefore: 1_847_649,
-    parsedRecordsBefore: 3_458,
-    busyDiagnosticsRemoved: 3_386,
-    auditBytesAfter: 39_033,
-  }),
-  node: Object.freeze({
-    runtime: "v25.6.1",
-    preDrain: Object.freeze({ medianMs: 11.0336, p95Ms: 12.0647, dutyCycle: 0.0221, lockAcquisitions: 4, bootMs: 94.2593 }),
-    postDrain: Object.freeze({ medianMs: 9.1232, p95Ms: 9.3323, dutyCycle: 0.0182, lockAcquisitions: 4, bootMs: 60.4775 }),
-    growth: Object.freeze({ msPerThousandRecords: 0.6237, msPerDay: 0.0072 }),
-  }),
-  bun: Object.freeze({
-    runtime: "1.3.8",
-    preDrain: Object.freeze({ medianMs: 10.6437, p95Ms: 11.8757, dutyCycle: 0.0213, lockAcquisitions: 4, bootMs: 102.6423 }),
-    postDrain: Object.freeze({ medianMs: 8.8668, p95Ms: 9.353, dutyCycle: 0.0177, lockAcquisitions: 4, bootMs: 59.6921 }),
-    growth: Object.freeze({ msPerThousandRecords: 0.6777, msPerDay: 0.0079 }),
-  }),
-});
-
 const originalReadFileSync = fs.readFileSync;
 const originalOpenSync = fs.openSync;
 let activeIo = null;

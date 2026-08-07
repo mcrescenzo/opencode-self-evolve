@@ -8,18 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  validation:
-    name: Node ${{ matrix.node-version }}
+  canonical-validation:
+    name: Canonical Node 22.11.0 / Bun 1.3.8
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version:
-          - "22"
-          - "24"
-        opencode-plugin-version:
-          - "1.18.3"
-          - "1.18.4"
 
     steps:
       - name: Check out repository
@@ -28,17 +19,29 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: "22.11.0"
           package-manager-cache: false
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.8"
 
-      - name: Install package dependencies
-        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Assert canonical toolchain
+        run: |
+          node_version="$(node --version)"
+          bun_version="$(bun --version)"
+          printf 'Node.js: %s\nBun: %s\n' "$node_version" "$bun_version"
+          test "$node_version" = "v22.11.0"
+          test "$bun_version" = "1.3.8"
 
-      - name: Select OpenCode contract version
-        run: npm install --ignore-scripts --no-audit --no-fund --no-save @opencode-ai/plugin@${{ matrix.opencode-plugin-version }}
+      - name: Install locked dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Assert and print resolved dependency graph
+        run: |
+          bun pm ls --all
+          git diff --exit-code -- package.json bun.lock
 
       - name: Unit tests
         run: npm test
@@ -52,6 +55,79 @@ jobs:
       - name: Package dry run
         run: npm pack --dry-run --json --ignore-scripts
 
+  node-compatibility:
+    name: Node 24 compatibility
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.8"
+
+      - name: Install locked dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Syntax checks
+        run: npm run check
+
+  opencode-contract-compatibility:
+    name: OpenCode plugin ${{ matrix.opencode-plugin-version }} compatibility
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        opencode-plugin-version:
+          - "1.18.3"
+          - "1.18.4"
+
+    steps:
+      - name: Check out isolated compatibility workspace
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.11.0"
+          package-manager-cache: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.8"
+
+      - name: Install locked dependency graph
+        run: bun install --frozen-lockfile
+
+      - name: Select isolated OpenCode contract version
+        run: npm install --ignore-scripts --no-audit --no-fund --no-save --package-lock=false @opencode-ai/plugin@${{ matrix.opencode-plugin-version }}
+
+      - name: Assert selected OpenCode contract version
+        env:
+          EXPECTED_OPENCODE_PLUGIN_VERSION: ${{ matrix.opencode-plugin-version }}
+        run: |
+          resolved_version="$(node -p "require('./node_modules/@opencode-ai/plugin/package.json').version")"
+          printf '@opencode-ai/plugin: %s\n' "$resolved_version"
+          test "$resolved_version" = "$EXPECTED_OPENCODE_PLUGIN_VERSION"
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Syntax checks
+        run: npm run check
+
   packed-tui-compatibility:
     name: Packed TUI OpenCode floor/latest and OpenTUI 0.4/0.5
     runs-on: ubuntu-latest
@@ -63,14 +139,16 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "22.11.0"
           package-manager-cache: false
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.8"
 
-      - name: Install package dependencies
-        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Install locked dependency graph
+        run: bun install --frozen-lockfile
 
       - name: Test aligned packed TUI consumers
         run: npm run test:tui-matrix

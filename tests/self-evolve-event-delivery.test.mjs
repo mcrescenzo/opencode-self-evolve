@@ -182,6 +182,38 @@ test("duplicate factories coordinate semantic delivery across independent hook w
   assert.equal(calls, 1);
 });
 
+test("duplicate factories deliver a new busy-to-idle episode within the replay window", async (t) => {
+  const f = durableFixture(t);
+  const received = [];
+  const sharedIntegration = integration({
+    async handleEvent(event) {
+      received.push(event.type === "session.idle" ? "idle" : event.properties.status.type);
+    },
+  });
+  const options = { now: () => 10_000, pipelineFactory: async () => sharedIntegration };
+  const first = await SelfEvolvePlugin(f.ctx, options);
+  const second = await SelfEvolvePlugin(f.ctx, options);
+  t.after(async () => {
+    await first.dispose();
+    await second.dispose();
+  });
+  await Promise.all([waitForStartup(first), waitForStartup(second)]);
+
+  const deliverToBoth = (event) => {
+    first.event(structuredClone(event));
+    second.event({ event: structuredClone(event) });
+  };
+  deliverToBoth(hostEvent({ id: undefined, properties: { sessionID: "episode-session" } }));
+  deliverToBoth({
+    type: "session.status",
+    properties: { sessionID: "episode-session", status: { type: "busy" } },
+  });
+  deliverToBoth(hostEvent({ id: undefined, properties: { sessionID: "episode-session" } }));
+  await settleDelivery();
+
+  assert.deepEqual(received, ["idle", "busy", "idle"]);
+});
+
 test("queued delivery drops after dispose and queue saturation remains bounded", async (t) => {
   const disposedFixture = durableFixture(t);
   let disposedCalls = 0;

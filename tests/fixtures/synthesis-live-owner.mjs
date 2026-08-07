@@ -55,5 +55,5 @@ for (let index = 1; index <= 3; index += 1) {
   messages.set(sessionID, Array.from({ length: 3 }, (_, item) => ({ role: "user", parts: [{ type: "text", text: `/verify-owner ${index}-${item}` }] })));
   result = await pipeline.runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint: inventory.hashSkillContent("synthesis-owner-scope"), trigger: "process-fixture", mode: "manual", options: { inventoryRecords: records, targetSkill: records[0], currentContent: current } });
 }
-process.stdout.write(`${JSON.stringify({ result: result?.result })}\n`);
+fs.writeFileSync(process.stdout.fd, `${JSON.stringify({ result: result?.result })}\n`);
 pipeline.close();

@@ -64,7 +64,7 @@ export function boundedHostCall(invoke, {
   });
 }
 
-async function invokeCompatible(attempts, {
+async function invokeReadCompatible(attempts, {
   timeoutMs = DEFAULT_TIMEOUT_MS,
   label,
   signal,
@@ -93,9 +93,20 @@ async function invokeCompatible(attempts, {
   throw new Error(errorMessage(lastError, `${label} failed.`));
 }
 
-function omitKeys(value, keys) {
-  const omitted = new Set(keys);
-  return Object.fromEntries(Object.entries(value ?? {}).filter(([key]) => !omitted.has(key)));
+async function invokeOnce(invoke, {
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  label,
+  signal,
+  onLateResolve,
+} = {}) {
+  const result = await boundedHostCall(invoke, {
+    timeoutMs,
+    label,
+    signal,
+    onLateResolve,
+  });
+  if (result?.error) throw new Error(errorMessage(result.error, `${label} failed.`));
+  return result;
 }
 
 export function createdSessionID(result) {
@@ -148,43 +159,29 @@ export async function createSession(ctx, body, options = {}) {
   const session = ctx?.client?.session;
   const method = session?.create;
   if (typeof method !== "function") throw new Error("OpenCode session.create is unavailable.");
-  const bodies = [
-    body,
-    omitKeys(body, ["permission"]),
-    omitKeys(body, ["permission", "parentID"]),
-  ];
-  const attempts = [];
-  const seen = new Set();
-  for (const candidate of bodies) {
-    const key = JSON.stringify(candidate);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    attempts.push(
-      () => method.call(session, { body: candidate, query: { directory: ctx.directory } }),
-      () => method.call(session, { directory: ctx.directory, ...candidate }),
-    );
-  }
-  return invokeCompatible(attempts, {
-    timeoutMs: options.timeoutMs,
-    signal: options.signal,
-    label: options.label ?? "OpenCode session.create",
-    onLateResolve: options.onLateResolve,
-  });
+  return invokeOnce(
+    () => method.call(session, { body, query: { directory: ctx.directory } }),
+    {
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
+      label: options.label ?? "OpenCode session.create",
+      onLateResolve: options.onLateResolve,
+    },
+  );
 }
 
 export async function promptSession(ctx, sessionID, body, options = {}) {
   const session = ctx?.client?.session;
   const method = session?.prompt;
   if (typeof method !== "function") throw new Error("OpenCode session.prompt is unavailable.");
-  return invokeCompatible([
+  return invokeOnce(
     () => method.call(session, { path: { id: sessionID }, query: { directory: ctx.directory }, body }),
-    () => method.call(session, { path: { sessionID }, query: { directory: ctx.directory }, body }),
-    () => method.call(session, { sessionID, directory: ctx.directory, ...body }),
-  ], {
-    timeoutMs: options.timeoutMs,
-    signal: options.signal,
-    label: options.label ?? "OpenCode session.prompt",
-  });
+    {
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
+      label: options.label ?? "OpenCode session.prompt",
+    },
+  );
 }
 
 export async function readSessionMessages(ctx, sessionID, limit, options = {}) {
@@ -192,7 +189,7 @@ export async function readSessionMessages(ctx, sessionID, limit, options = {}) {
   const method = session?.messages;
   if (typeof method !== "function") throw new Error("OpenCode session.messages is unavailable.");
   const boundedLimit = Number.isSafeInteger(limit) && limit > 0 ? limit : 0;
-  const result = await invokeCompatible([
+  const result = await invokeReadCompatible([
     () => method.call(session, { path: { id: sessionID }, query: { directory: ctx.directory, limit: boundedLimit } }),
     () => method.call(session, { path: { sessionID }, query: { directory: ctx.directory, limit: boundedLimit } }),
     () => method.call(session, { sessionID, directory: ctx.directory, limit: boundedLimit }),
@@ -215,24 +212,21 @@ export async function cleanupSession(ctx, sessionID, options = {}) {
     throw new Error("OpenCode session cleanup is unavailable.");
   }
   const method = session[methodName];
-  return invokeCompatible([
+  return invokeOnce(
     () => method.call(session, { path: { id: sessionID }, query: { directory: ctx.directory } }),
-    () => method.call(session, { path: { sessionID }, query: { directory: ctx.directory } }),
-    () => method.call(session, { sessionID, directory: ctx.directory }),
-    () => method.call(session, { id: sessionID }),
-    () => method.call(session, sessionID),
-  ], {
-    timeoutMs: options.timeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS,
-    signal: options.signal,
-    label: options.label ?? `OpenCode session.${methodName} cleanup`,
-  });
+    {
+      timeoutMs: options.timeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS,
+      signal: options.signal,
+      label: options.label ?? `OpenCode session.${methodName} cleanup`,
+    },
+  );
 }
 
 export async function listSessions(ctx, options = {}) {
   const session = ctx?.client?.session;
   const method = session?.list;
   if (typeof method !== "function") return [];
-  const result = await invokeCompatible([
+  const result = await invokeReadCompatible([
     () => method.call(session, { query: { directory: ctx.directory } }),
     () => method.call(session, { directory: ctx.directory }),
   ], {

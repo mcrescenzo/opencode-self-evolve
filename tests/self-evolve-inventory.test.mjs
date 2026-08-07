@@ -11,6 +11,7 @@ import {
   loadAllowlist,
   parseSkillFrontmatter,
   rejectSymlinked,
+  resolveSkillTarget,
   scanForSecretCanaries,
   scanForUnsafeContent,
   validateProposalTarget,
@@ -108,6 +109,89 @@ test("discovery identifies existing skills and hashes exact bytes", (t) => {
   });
 });
 
+test("discovery order uses codepoints without consulting the process locale", (t) => {
+  const temp = tempTree(t);
+  const root = path.join(temp, "skills");
+  fs.mkdirSync(root);
+  writeSkill(root, "zeta");
+  writeSkill(root, "alpha");
+  const original = String.prototype.localeCompare;
+  String.prototype.localeCompare = () => { throw new Error("locale-dependent-ordering"); };
+  try {
+    assert.deepEqual(discoverSkills(loadAllowlist({ globalSkillRoots: [root] }).canonicalRoots).map((item) => item.logicalName), ["alpha", "zeta"]);
+  } finally {
+    String.prototype.localeCompare = original;
+  }
+});
+
+test("target resolution is order-independent and requires one valid hash-current exact match", (t) => {
+  const temp = tempTree(t);
+  const firstRoot = path.join(temp, "first-skills");
+  const secondRoot = path.join(temp, "second-skills");
+  fs.mkdirSync(firstRoot);
+  fs.mkdirSync(secondRoot);
+  writeSkill(firstRoot, "other");
+  const targetPath = writeSkill(secondRoot, "reviewer");
+  const inventory = discoverSkills(loadAllowlist({ globalSkillRoots: [firstRoot, secondRoot] }).canonicalRoots);
+  const reversed = [...inventory].reverse();
+
+  for (const records of [inventory, reversed]) {
+    const resolved = resolveSkillTarget("reviewer", records);
+    assert.equal(resolved.ok, true, resolved.reason);
+    assert.equal(resolved.target.absolutePath, targetPath);
+    assert.equal(resolved.target.currentHash, hashSkillContent(fs.readFileSync(targetPath)));
+  }
+
+  const duplicate = resolveSkillTarget("reviewer", [...inventory, { ...inventory.find((item) => item.logicalName === "reviewer") }]);
+  assert.deepEqual(duplicate, { ok: false, reason: "target-inventory-match-ambiguous", target: null, inventory: null });
+
+  const malformed = inventory.map((record) => record.logicalName === "reviewer" ? { ...record, frontmatterErrors: ["invalid"] } : record);
+  assert.equal(resolveSkillTarget("reviewer", malformed).reason, "target-inventory-record-invalid");
+
+  fs.writeFileSync(targetPath, skillContent("reviewer", "Changed after target discovery."));
+  assert.equal(resolveSkillTarget("reviewer", inventory).reason, "target-inventory-hash-stale");
+});
+
+test("target resolution constructs only one collision-free repository-local absent target", (t) => {
+  const temp = tempTree(t);
+  const project = path.join(temp, "project");
+  const repoRoot = path.join(project, ".opencode", "skills");
+  const globalRoot = path.join(temp, "global-skills");
+  fs.mkdirSync(repoRoot, { recursive: true });
+  fs.mkdirSync(globalRoot);
+  const roots = loadAllowlist({ globalSkillRoots: [globalRoot], repoSkillRoots: [repoRoot], projectRoot: project }).canonicalRoots;
+  const inventory = discoverSkills(roots);
+  const resolved = resolveSkillTarget("new-reviewer", inventory);
+  assert.equal(resolved.ok, true, resolved.reason);
+  assert.deepEqual(resolved.target, {
+    canonicalRoot: repoRoot,
+    relativePath: "new-reviewer/SKILL.md",
+    logicalName: "new-reviewer",
+    absolutePath: path.join(repoRoot, "new-reviewer", "SKILL.md"),
+    exists: false,
+    currentHash: "must-not-exist",
+    sizeBytes: 0,
+    parsedFrontmatter: null,
+    frontmatterErrors: [],
+  });
+  assert.equal(resolved.inventory.at(-1), resolved.target);
+
+  assert.equal(resolveSkillTarget("global-only", discoverSkills(loadAllowlist({ globalSkillRoots: [globalRoot] }).canonicalRoots)).reason, "target-repository-root-unavailable");
+
+  const secondRepoRoot = path.join(project, ".agents", "skills");
+  fs.mkdirSync(secondRepoRoot, { recursive: true });
+  const multiple = discoverSkills(loadAllowlist({ repoSkillRoots: [repoRoot, secondRepoRoot], projectRoot: project }).canonicalRoots);
+  assert.equal(resolveSkillTarget("ambiguous-root", multiple).reason, "target-repository-root-ambiguous");
+
+  fs.mkdirSync(path.join(repoRoot, "colliding"));
+  assert.equal(resolveSkillTarget("colliding", inventory).reason, "target-absent-path-collision");
+
+  const outside = path.join(temp, "outside");
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(repoRoot, "linked"), "dir");
+  assert.equal(resolveSkillTarget("linked", inventory).reason, "target-absent-path-symlinked");
+});
+
 test("existing and new proposals bind to one exact canonical target", (t) => {
   const temp = tempTree(t);
   const root = path.join(temp, "skills");
@@ -128,7 +212,7 @@ test("existing and new proposals bind to one exact canonical target", (t) => {
   }, inventory);
   assert.equal(newResult.ok, true, newResult.errors.join("\n"));
   assert.equal(newResult.canonicalTarget.exists, false);
-  assert.equal(newResult.canonicalTarget.currentHash, null);
+  assert.equal(newResult.canonicalTarget.currentHash, "must-not-exist");
   assert.equal(newResult.canonicalTarget.absolutePath, path.join(root, "new-skill", "SKILL.md"));
 });
 

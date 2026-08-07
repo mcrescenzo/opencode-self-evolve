@@ -146,6 +146,15 @@ corrupt, or the host version is unsupported.
   and cluster fingerprints, target hash, `admittedAt`, and state `admitted`.
   Admission failure prevents the provider call. Prompts and model content are
   never part of this record.
+- Immediately before each synthesizer or critic call, the current repository and
+  global settings are reread. The supported OpenCode `chat.params` hook caps
+  `maxOutputTokens` to that fresh `tokensPerSynthesis` value only when the session
+  has a live package-owned host-owner record and the hook input matches both the
+  canonical session ID and canonical synthesizer/critic agent. User sessions,
+  analyzer sessions, foreign agents, and mismatched IDs are unchanged. The hook
+  never raises a lower provider cap. Deterministic raw-response byte and structured
+  field limits reject oversized output after return as a provider-independent
+  second guard.
 
 ### 2.5 Validate
 
@@ -578,16 +587,18 @@ Redaction is **not** a secrecy guarantee. The plugin must disclose this in
   - `/self-evolve purge --all` — entire `self-evolve/` state subtree, including
     global settings, global aggregates, all project partitions, and bridge data.
 - Native purge-all validates exact confirmation, publishes an authenticated
-  `accepted-terminal` acknowledgement, stops all integration work, and then
-  removes the subtree. The TUI never treats disappearance alone as confirmed
-  success and instructs restart and health verification.
+  `accepted-terminal` acknowledgement, stops new admission, aborts and drains
+  admitted work without releasing its leases early, and only then removes the
+  subtree. The TUI never treats disappearance alone as confirmed success and
+  instructs restart and health verification. Headless purge-all performs the
+  same drain before deletion and before returning its terminal result.
 - Native export operations stream a private `0600` artifact under the state
   root and report path, size, SHA-256, and expiry. One job runs per project;
   temporary bytes have a separate bounded quota; startup/expiry cleanup and
   every purge remove artifacts; nothing is opened automatically.
 - Headless export operations produce a JSON archive of the same scope.
 - `export all` is state-root-wide rather than an alias for the current project. Its bounded JSON schema contains global settings and aggregate claims, every project partition with settings/records/indexes, decision requests/responses, control requests/responses, operation requests/responses, the current control-state projection, active proposal-content chunks, and rollback snapshots required for restoration. Every bridge class carries an explicit sensitive-metadata classification and per-file byte count; requests and control state are limited to 8 KiB, responses to 4 KiB. Strict envelope, filename, and project binding validation rejects unrelated fields. Snapshot bodies are Base64 and explicitly classified `sensitive-skill-snapshot`; the archive is sensitive. Terminal/purged proposal content, locks, temporary files, raw quarantine corruption, unrelated OpenCode state, transcripts, and raw messages are excluded; symlinks, hard links, or file replacement in the exported subtree fail closed.
-- Purge-all is terminal for the current store/integration instance. Before returning it stops scheduler, mailbox, and retention timers; subsequent commands/events return `restart-required-after-purge-all`; shutdown must not recreate state. Only a fresh OpenCode process may initialize the subtree again. Project purge remains non-terminal and reinitializes only that project.
+- Purge-all is terminal for the current store/integration instance. On acceptance it stops scheduler admission, mailbox, and retention timers; subsequent commands/events return `restart-required-after-purge-all`; shutdown must not recreate state. Only a fresh OpenCode process may initialize the subtree again. Project purge remains non-terminal and reinitializes only that project.
 
 ## 9. Budgets and concurrency
 
@@ -604,7 +615,14 @@ Redaction is **not** a secrecy guarantee. The plugin must disclose this in
 Exceeding any budget fails closed (no write, no call). Budgets are
 configurable; defaults are conservative.
 
-The storage budget is one total cap for each project-associated partition, including repository settings, all record files, indexes, snapshots, leases, quarantine artifacts, and bridge files. Current usage and pending replacement bytes are evaluated while the shared cross-process mutation lock is held, without following symlinks. TUI decision, control, and operation publishers share at most 64 pending request files and a conservative mailbox sub-budget of the smaller of 512 KiB or one eighth of the project quota; pending requests reserve their maximum 4 KiB response and admission also reserves one absent control-state projection. Growing request publications preserve up to 64 KiB (or one eighth of a smaller quota) for later store mutations. A bounded mandatory settings audit envelope of at most 4 KiB may cross an already exhausted cap so a safety control outcome remains durable; ordinary records and recursive failure audits receive no bypass. The legacy `notificationsPerHour` setting is retained only for durable-state compatibility and has no current scheduling or UI effect.
+The global `synthesisPerDay` setting is the authoritative aggregate process
+ceiling across project stores. A repository override remains an additional
+project-local durable admission constraint and cannot raise the process-wide
+limit. The process arbiter retains only admission timestamps and one active
+flag, survives individual project-store disposal, and resets on process
+restart.
+
+The storage budget is one total cap for each project-associated partition, including repository settings, all record files, indexes, snapshots, leases, quarantine artifacts, and bridge files. Current usage and pending replacement bytes are evaluated while the shared cross-process mutation lock is held, without following symlinks. TUI decision, control, and operation publishers share at most 64 pending request files and a conservative mailbox sub-budget of the smaller of 512 KiB or one eighth of the project quota; pending requests reserve their maximum 4 KiB response and admission also reserves one absent control-state projection. Growing request publications preserve up to 64 KiB (or one eighth of a smaller quota) for later store mutations. Global corruption evidence is content-addressed under a separate fixed 512 KiB fail-closed cap because malformed global settings cannot safely define that cap themselves. A bounded mandatory settings audit envelope of at most 4 KiB may cross an already exhausted cap so a safety control outcome remains durable; ordinary records and recursive failure audits receive no bypass. The legacy `notificationsPerHour` setting is retained only for durable-state compatibility and has no current scheduling or UI effect.
 
 Quiet hours use local wall-clock time and the canonical shape
 `{ "from": "22:00", "to": "07:00" }`. Equal endpoints disable that period;
@@ -647,6 +665,13 @@ an overnight range wraps across midnight.
   backoff/breaker state, or scheduling a continuation. Early downgrade may
   settle that owner; its later promise result is then a side-effect-free
   duplicate. An older lease can never settle or release newer work.
+- **Shutdown during autonomous work**: shutdown stops new scheduler admission,
+  aborts owned host calls, and gives admitted work 10 seconds to reach terminal
+  settlement before reporting `autonomous-work-draining`. A timed-out drain
+  keeps scheduler, applier, store, and replacement-runtime authority fenced;
+  cleanup continues in the background, and the final close occurs only after
+  every admitted promise settles. Hidden-session cleanup uses its independent
+  bounded abort and retains durable ownership when host cleanup fails.
 - **Corrupt state**: plugin refuses to start autonomous work; `/self-evolve
   status` reports the corruption; only `purge` commands are accepted until
   resolved.
@@ -678,15 +703,18 @@ an overnight range wraps across midnight.
 
 - Release B keeps the sidebar as a persistent entry point but makes its state an
   exact deep link into Home, Recommendations, Activity, or Settings.
-- A strict optional `dashboard-v1` derived artifact adds bounded operational
-  state, actual usage, and privacy-safe semantic activity beside the unchanged
-  v1 review index. It also advertises the closed Release B feature capabilities
-  without changing the strict v1 offer or index vocabulary. It does not migrate
-  durable records or grant authority.
+- Strict optional `dashboard-v2` plus a `dashboard-v1` compatibility artifact
+  add bounded operational state, actual usage, and privacy-safe semantic
+  activity beside the unchanged v1 review index. Current readers prefer v2 and
+  fall back to v1; older dashboard readers continue to consume v1. The
+  sidecars advertise the closed Release B feature capabilities without changing
+  the strict v1 offer or index vocabulary. They do not migrate durable records
+  or grant authority.
 - The state-dependent normal ReviewDialog is retired only after Recommendations
   proves equivalent or better queue, detail, action, focus, and outcome behavior.
-- New-TUI/old-server shows an explicit limited view; old-TUI/new-server ignores
-  the additive dashboard. Neither combination gains write authority.
+- New-TUI/old-server uses a valid v1 dashboard when present and otherwise shows
+  an explicit limited view; old-TUI/new-server uses the v1 compatibility
+  dashboard when supported. Neither combination gains write authority.
 - `docs/control-center-ux.md` is the normative Release B native presentation and
   interaction contract.
 

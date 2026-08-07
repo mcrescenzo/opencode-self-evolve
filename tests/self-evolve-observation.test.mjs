@@ -79,7 +79,29 @@ test("session lineage and message cursors are stable domain-separated hashes", (
   assert.match(hashSessionLineage("host-session"), /^[a-f0-9]{64}$/u);
   assert.notEqual(hashSessionLineage("host-session"), hashMessageCursor({ id: "host-session" }));
   assert.equal(hashMessageCursor(legacy), hashMessageCursor(structuredClone(legacy)));
+  assert.equal(
+    hashMessageCursor({ role: "user", metadata: { b: 2, a: 1 } }),
+    hashMessageCursor({ metadata: { a: 1, b: 2 }, role: "user" }),
+    "fallback cursors canonicalize object key order",
+  );
   assert.doesNotMatch(hashMessageCursor(legacy), /private|mocked|message/u);
+});
+
+test("receipt and cluster ordering never depends on localeCompare", () => {
+  const original = String.prototype.localeCompare;
+  String.prototype.localeCompare = () => { throw new Error("locale-dependent-ordering"); };
+  try {
+    assert.doesNotThrow(() => extractReceipts(episode([
+      { role: "user", commandName: "/check" },
+      { role: "user", commandName: "/check" },
+    ]), { projectFingerprint: PROJECT_A, scopeFingerprint: SCOPE, now: NOW }));
+    assert.doesNotThrow(() => correlateObservations([
+      observation({ incidentId: "first", signatureHash: H("e") }),
+      observation({ incidentId: "second", signatureHash: H("c") }),
+    ]));
+  } finally {
+    String.prototype.localeCompare = original;
+  }
 });
 
 test("extractor recognizes repeated commands, tool errors, procedures, and clarifications", () => {
@@ -126,6 +148,40 @@ test("secret-canary normalization removes provider tokens and raw text from rece
   assert.equal(JSON.stringify(receipts).includes(secret), false);
 });
 
+test("target names come only from unambiguous structured skill tool inputs", () => {
+  const options = { projectFingerprint: PROJECT_A, scopeFingerprint: SCOPE, now: NOW };
+  const messages = [
+    { role: "assistant", content: "skill({ name: 'text-decoy' })", toolName: "skill", commandName: "/skill generic-decoy", path: "/skills/path-decoy" },
+    { role: "assistant", parts: [{ type: "tool", tool: "read", state: { input: { name: "tool-decoy" } } }] },
+    { role: "assistant", parts: [{ type: "tool", name: "skill", state: { input: { name: "durable-review" } } }] },
+    { role: "user", commandName: "/check" },
+    { role: "user", commandName: "/check" },
+  ];
+  const receipts = extractReceipts(episode(messages), options);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].targetLogicalName, "durable-review");
+  assert.deepEqual(Object.keys(receipts[0]).sort(), [
+    "firstSeenAt", "lastSeenAt", "occurrences", "projectFingerprint", "receiptType",
+    "scopeFingerprint", "signatureHash", "targetLogicalName",
+  ]);
+  assert.doesNotMatch(JSON.stringify(receipts), /text-decoy|generic-decoy|path-decoy|tool-decoy/u);
+
+  const invalid = extractReceipts(episode([
+    { role: "assistant", parts: [{ type: "tool", tool: "skill", state: { input: { name: "../private" } } }] },
+    { role: "user", commandName: "/check" },
+    { role: "user", commandName: "/check" },
+  ]), options);
+  assert.equal(invalid[0].targetLogicalName, null);
+
+  const ambiguous = extractReceipts(episode([
+    { role: "assistant", parts: [{ type: "tool", tool: "skill", state: { input: { name: "durable-review" } } }] },
+    { role: "assistant", parts: [{ type: "tool", tool: "skill", state: { input: { name: "other-skill" } } }] },
+    { role: "user", commandName: "/check" },
+    { role: "user", commandName: "/check" },
+  ]), options);
+  assert.equal(ambiguous[0].targetLogicalName, null);
+});
+
 test("separate incidents in one session remain incidents but share one lineage", () => {
   const duplicate = observation();
   const clusters = correlateObservations([
@@ -149,15 +205,46 @@ test("wrong-scope observations form separate project clusters", () => {
   assert.deepEqual(new Set(clusters.map((item) => item.projectFingerprint)), new Set([PROJECT_A, PROJECT_B]));
 });
 
+test("different target names form different clusters and legacy observations remain readable", () => {
+  const clusters = correlateObservations([
+    observation({ incidentId: "legacy" }),
+    observation({ incidentId: "durable", structuredFields: { targetLogicalName: "durable-review" } }),
+    observation({ incidentId: "other", structuredFields: { targetLogicalName: "other-skill" } }),
+  ]);
+  assert.equal(clusters.length, 3);
+  assert.deepEqual(new Set(clusters.map((item) => item.targetLogicalName)), new Set([null, "durable-review", "other-skill"]));
+  assert.equal(new Set(clusters.map((item) => item.id)).size, 3);
+});
+
 test("compaction-summary quotes and child sessions dedupe to parent ancestry", () => {
   const parent = observation({ incidentId: "episode-parent", sessionID: "episode-parent" });
   const clusters = correlateObservations([
     parent,
     observation({ incidentId: "summary-copy", sessionID: "parent", childSessionParentID: "episode-parent", quotedSignatureHash: H("d"), structuredFields: { eventKind: "compaction-summary" } }),
     observation({ incidentId: "child-copy", sessionID: "child", childSessionParentID: "episode-parent" }),
+    observation({ incidentId: "sibling-copy", sessionID: "sibling", childSessionParentID: "episode-parent" }),
   ]);
   assert.deepEqual(clusters[0].incidentIds, ["episode-parent"]);
   assert.equal(clusters[0].occurrencesSum, 1);
+});
+
+test("one over-cap incident is dropped and makes correlation ineligible instead of aborting the batch", () => {
+  const values = Array.from({ length: 257 }, (_, index) => observation({
+    id: hashSignature(`over-cap:${index}`),
+    incidentId: `incident-${index}`,
+    createdAt: NOW + index,
+  }));
+  const [cluster] = correlateObservations(values);
+  assert.equal(cluster.incidentIds.length, 256);
+  const [eligibility] = evaluateEligibility([cluster], {
+    now: NOW + 256,
+    minIndependentIncidents: 1,
+    minOccurrencesSum: 1,
+    minDistinctSessions: 1,
+  });
+  assert.equal(eligibility.eligible, false);
+  assert.equal(eligibility.thresholdsMissed.correlationIntegrity, true);
+  assert.ok(eligibility.reasons.includes("correlation-failure"));
 });
 
 test("a duplicate incident with conflicting metadata does not poison its deduplicated cluster", () => {

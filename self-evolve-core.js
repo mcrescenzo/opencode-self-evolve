@@ -177,6 +177,8 @@ export function currentStatus(state, nowMs = Date.now()) {
 }
 
 export function syncStatus(state, nowMs = Date.now()) {
+  // State-transition helper: callers intentionally refresh the LRU timestamp
+  // when they mutate or reserve work. Read-only status uses currentStatus.
   state.status = currentStatus(state, nowMs);
   state.updatedAt = nowMs;
   return state.status;
@@ -594,7 +596,7 @@ export function applyControlCommand(state, command, nowMs = Date.now(), options 
 
 export function statusText(state, nowMs = Date.now()) {
   if (!state) return "Self-evolve has no state for this session yet.";
-  const status = syncStatus(state, nowMs);
+  const status = currentStatus(state, nowMs);
   const lines = [
     `Self-evolve status: ${status}.`,
     `Analyzer runs: ${state.analyzerRuns}/${state.options.maxAnalyzerRuns}. Failures: ${state.analyzerFailures}/${state.options.maxAnalyzerFailures}.`,

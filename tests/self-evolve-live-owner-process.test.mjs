@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import { createApplier } from "../self-evolve-applier.js";
 import { createCommandPolicy } from "../self-evolve-commands.js";
-import { createIntegration } from "../self-evolve-integration.js";
+import { createIntegration, recoverOrphanedAnalyzerSessions } from "../self-evolve-integration.js";
 import * as inventory from "../self-evolve-inventory.js";
 import * as observation from "../self-evolve-observation.js";
 import { createPipeline } from "../self-evolve-pipeline.js";
@@ -18,6 +18,7 @@ import * as synthesis from "../self-evolve-synthesis.js";
 
 const CHILD = path.join(import.meta.dirname, "fixtures", "apply-live-owner.mjs");
 const SYNTHESIS_CHILD = path.join(import.meta.dirname, "fixtures", "synthesis-live-owner.mjs");
+const CLEANUP_FAILURE_CHILD = path.join(import.meta.dirname, "fixtures", "hidden-cleanup-failure.mjs");
 const PROJECT = inventory.hashSkillContent("live-owner-project");
 const CURRENT = "---\nname: live-owner\ndescription: Handles process lease recovery safely.\n---\n# Live Owner\nKeep the current instruction.\n";
 const PROPOSED = `${CURRENT}Verify ownership before recovery.\n`;
@@ -137,4 +138,48 @@ test("live synthesis provider owner defers boot recovery and completes one accep
   pipeline = createPipeline({ store, inventory, privacy: {}, synthesis: {}, applier: { close() {} }, commands: {}, schemas, observation, now: () => Date.now() });
   assert.deepEqual(pipeline.recoverSynthesisAttempts(), []);
   pipeline.close();
+});
+
+test("failed child cleanup leaves one durable owner for one concurrent recovery claimant", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-hidden-cleanup-"));
+  let store;
+  t.after(() => {
+    try { store?.close(); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const child = spawnSync(process.execPath, [CLEANUP_FAILURE_CHILD, root, PROJECT], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(child.status, 0, child.stderr);
+  const created = JSON.parse(child.stdout.trim());
+  assert.equal(created.ok, true);
+  assert.equal(created.classification, "live-owner");
+
+  store = openStore(root, { projectFingerprint: PROJECT, now: () => Date.now(), staleLockMs: 20 });
+  const owner = store.hostOwnerStatus(created.sessionId, { projectFingerprint: PROJECT, rootIdentity: store.rootIdentity, now: Date.now() });
+  assert.equal(owner.classification, "abortable");
+  assert.equal(owner.nonce, created.nonce);
+  let aborts = 0;
+  let markStarted;
+  let finishAbort;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const finished = new Promise((resolve) => { finishAbort = resolve; });
+  const client = { session: {
+    list: async () => ({ data: [{ id: created.sessionId, agent: synthesis.SYNTHESIS_AGENT_NAME, state: "running" }] }),
+    abort: async () => {
+      aborts += 1;
+      markStarted();
+      await finished;
+      return { data: {} };
+    },
+  } };
+  const options = { store, projectFingerprint: PROJECT, rootIdentity: store.rootIdentity, now: Date.now() };
+  const first = recoverOrphanedAnalyzerSessions(client, root, options);
+  await started;
+  const second = await recoverOrphanedAnalyzerSessions(client, root, options);
+  finishAbort();
+  const completed = await first;
+
+  assert.equal(aborts, 1);
+  assert.equal(completed[0].action, "aborted");
+  assert.equal(second[0].action, "deferred");
+  assert.equal(store.hostOwnerStatus(created.sessionId, options).classification, "unknown");
 });

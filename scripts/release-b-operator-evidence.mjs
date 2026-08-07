@@ -80,7 +80,7 @@ const STAGES = Object.freeze([
       "noAmbientUiBeforeActivation",
       "productionTuiEntryActive",
       "productionTuiPackedArtifactPath",
-      "spaceOpenedSettingsDeepLink",
+      "spaceOpenedExactSettingsDeepLink",
       "waitingStateRendered",
       "failureStateRendered",
       "newTuiOldServerLimitedWithoutAuthority",

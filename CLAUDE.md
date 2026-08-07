@@ -38,7 +38,7 @@ Run `npm test`, `npm run check`, and `npm run pack:check`. Run `npm run smoke:li
 - Dual target: server `.` must not import `./tui`, `@opencode-ai/plugin/tui`, or `@opentui/*`; TUI is available only from `./tui`; shared helpers import neither target.
 - Single export: `self-evolve.js` exports only `default SelfEvolvePlugin`. Test seams stay on `SelfEvolvePlugin.__test`.
 - Single registry: preserve the module-scoped `const registry`; factory calls update options in place and never replace session state.
-- Trigger gate: durable v0.2 is the default; `durableAutonomy: false` is explicit legacy compatibility. Passive `event` exists only after successful durable boot with persisted effective auto/yolo mode. Never register passive `chat.message`. Manual analysis remains command-driven.
+- Trigger gate: durable v0.2 is the default; `durableAutonomy: false` is explicit legacy compatibility. Persisted auto/yolo configuration may register a provisional authority-free `event` hook before official state-root validation; that hook must perform no integration, provider call, persistence, or effect until validated boot. Never register passive `chat.message`. Manual analysis remains command-driven.
 - State split: the legacy registry is in-memory and cleared on dispose. Durable autonomy uses only the OpenCode state-root store.
 - Authority: the applier is the only skill writer and all model output remains advisory until deterministic policy authorizes it.
 - Public helper policy: `AGENTS.md` and this file ship as public guidance and must not contain private paths or internal tooling references.

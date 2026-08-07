@@ -6,6 +6,7 @@ import {
   UI_CAPABILITIES,
   UI_DASHBOARD_CAPABILITIES,
   UI_DASHBOARD_AUTOMATION_STATES,
+  UI_DASHBOARD_BLOCKER_DESTINATIONS,
   UI_DASHBOARD_BLOCKER_CODES,
   UI_DASHBOARD_OUTCOMES,
   UI_DASHBOARD_REASON_CODES,
@@ -21,12 +22,13 @@ import {
   makeUiReviewDetail,
 } from "./self-evolve-ui-protocol.js";
 
-const REVIEWABLE_STATES = new Set(["critic-pending", "pending", "approved", "applied", "failed-closed"]);
+const REVIEWABLE_STATES = new Set(["pending", "approved", "applied", "failed-closed"]);
 const HASH_RE = /^[a-f0-9]{64}$/u;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u;
 const REASON_CODE_RE = /^[a-z0-9][a-z0-9.-]{0,127}$/u;
 const CHECK_NAME_RE = /^[A-Za-z][A-Za-z0-9.-]{0,63}$/u;
 const PRIVATE_ID_RE = /\b(?:msg|message|ses|session)_[A-Za-z0-9_-]{4,}\b/u;
+const PRIVATE_PROPOSAL_ID_RE = /^(?:msg|message|ses|session)_/u;
 const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu;
 const MAX_DETAIL_REVISION = 1_000_000;
 const CYCLE_OUTCOMES = new Set(UI_DASHBOARD_OUTCOMES.slice(0, 9));
@@ -54,11 +56,19 @@ function safeText(value, fallback = "Unavailable.", maxBytes = UI_PROTOCOL_LIMIT
   return truncateUtf8(clean || fallback, maxBytes);
 }
 
-function containsPrivateMaterial(value) {
+export function containsPrivateMaterial(value) {
   const source = String(value ?? "");
   return PRIVATE_ID_RE.test(source)
     || scanForSecretCanaries(source).flagged
     || scanForUnsafeContent(source).flagged;
+}
+
+function sanitizeProposalId(value) {
+  return typeof value === "string"
+    && ID_RE.test(value)
+    && !PRIVATE_PROPOSAL_ID_RE.test(value)
+    ? value
+    : null;
 }
 
 function canonicalBytes(value) {
@@ -617,11 +627,7 @@ function cycleAuditValue(record) {
     mode: details.mode,
     observationCount: details.observationCount,
     eligibilityCount: details.eligibilityCount,
-    proposalId: typeof event.proposalId === "string"
-      && ID_RE.test(event.proposalId)
-      && !PRIVATE_ID_RE.test(event.proposalId)
-      ? event.proposalId
-      : null,
+    proposalId: sanitizeProposalId(event.proposalId),
     occurredAt: event.timestamp,
     reason: details.reason,
   };
@@ -678,11 +684,7 @@ function semanticActivity(records) {
             ? "A recommendation was dismissed without changing skill files."
             : "A recommendation was approved for rollback.",
         occurredAt: event.timestamp,
-        proposalId: typeof event.proposalId === "string"
-          && ID_RE.test(event.proposalId)
-          && !PRIVATE_ID_RE.test(event.proposalId)
-          ? event.proposalId
-          : null,
+        proposalId: sanitizeProposalId(event.proposalId),
         reason: null,
       });
       continue;
@@ -697,7 +699,7 @@ function semanticActivity(records) {
         outcome: "applied",
         summary: "A Self-evolve change was applied and readback was verified.",
         occurredAt: event.timestamp,
-        proposalId: typeof event.proposalId === "string" && ID_RE.test(event.proposalId) ? event.proposalId : null,
+        proposalId: sanitizeProposalId(event.proposalId),
         reason: null,
       });
       continue;
@@ -713,11 +715,7 @@ function semanticActivity(records) {
         outcome: "recommendation-snoozed",
         summary: "A recommendation remains pending and was snoozed until the requested time.",
         occurredAt: event.timestamp,
-        proposalId: typeof event.proposalId === "string"
-          && ID_RE.test(event.proposalId)
-          && !PRIVATE_ID_RE.test(event.proposalId)
-          ? event.proposalId
-          : null,
+        proposalId: sanitizeProposalId(event.proposalId),
         reason: null,
       });
       continue;
@@ -814,7 +812,7 @@ function semanticActivity(records) {
         outcome: "rolled-back",
         summary: "A Self-evolve change was rolled back and readback was verified.",
         occurredAt: event.timestamp,
-        proposalId: typeof event.proposalId === "string" && ID_RE.test(event.proposalId) ? event.proposalId : null,
+        proposalId: sanitizeProposalId(event.proposalId),
         reason: null,
       });
       continue;
@@ -913,7 +911,11 @@ function rolloutSummary(records, health) {
 
 function dashboardBlockers(snapshot, health, breakerOpen, effectiveMode) {
   const output = [];
-  const add = (code, summary, destination = "settings") => output.push({ code, summary, destination });
+  const add = (code, summary) => output.push({
+    code,
+    summary,
+    destination: UI_DASHBOARD_BLOCKER_DESTINATIONS[code].dashboard,
+  });
   const globalSettings = snapshot.settings.global;
   const consent = globalSettings.consent;
   const firstRun = effectiveMode === "manual"
@@ -923,17 +925,17 @@ function dashboardBlockers(snapshot, health, breakerOpen, effectiveMode) {
     && consent.durableObservations === false
     && consent.sanitizedExcerpts === false
     && consent.crossRepoAggregation === false;
-  if (health.corrupt === true) add("corrupt-state", "Stored state could not be validated.", "activity-errors");
+  if (health.corrupt === true) add("corrupt-state", "Stored state could not be validated.");
   if (health.hostSupported === false) add("unsupported-host", "This OpenCode host version is not supported.");
   if (health.stateRootReady === false) add("state-root", "The official OpenCode state root is not validated.");
   if (health.providerReady === false) add("provider", "Background analysis has no usable provider.");
   if (snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true) {
     add("emergency-stop", "Emergency stop disables automatic provider and write authority.");
   }
-  if (breakerOpen) add("circuit-breaker", "Repeated failures paused automatic work.", "activity-errors");
-  if (snapshot.settings.global.paused) add("paused", "Automatic work is paused.", "home");
+  if (breakerOpen) add("circuit-breaker", "Repeated failures paused automatic work.");
+  if (snapshot.settings.global.paused) add("paused", "Automatic work is paused.");
   if (snapshot.settings.repo.excluded) add("repository-excluded", "This project is excluded from automatic work.");
-  if (firstRun) add("first-run", "Automatic recommendations have not been set up yet.", "home");
+  if (firstRun) add("first-run", "Automatic recommendations have not been set up yet.");
   if (health.passiveEventHookInstalled === false && effectiveMode !== "manual") {
     add("restart-required", "Background analysis is awaiting an OpenCode restart before it can activate.");
   }
@@ -998,6 +1000,8 @@ function buildDashboard(snapshot, {
   health,
   supportedCapabilities,
   dashboardCapabilities,
+  hiddenProposalIds,
+  dashboardVersion,
 }) {
   const records = snapshot.records ?? [];
   const blockers = dashboardBlockers(snapshot, health, breakerOpen, effectiveMode);
@@ -1011,9 +1015,14 @@ function buildDashboard(snapshot, {
     blockers,
     backoffUntil,
   });
-  const activities = semanticActivity(records);
+  const hideCriticPendingLink = (entry) => entry?.proposalId && hiddenProposalIds.has(entry.proposalId)
+    ? { ...entry, proposalId: null }
+    : entry;
+  const activities = semanticActivity(records).map(hideCriticPendingLink);
   const boundedActivity = bounded(activities, UI_PROTOCOL_LIMITS.activityEntries);
-  const lastCycleRecord = [...records].reverse().map(cycleAuditValue).find(Boolean) ?? null;
+  const lastCycleRecord = hideCriticPendingLink(
+    [...records].reverse().map(cycleAuditValue).find(Boolean) ?? null,
+  );
   const inFlightCount = Math.max(0, Math.min(1_000, Number.isSafeInteger(health.inFlightCount) ? health.inFlightCount : 0));
   const inFlightStartedAt = inFlightCount > 0 && Number.isSafeInteger(health.inFlightStartedAt)
     ? health.inFlightStartedAt
@@ -1026,7 +1035,7 @@ function buildDashboard(snapshot, {
     Number.isSafeInteger(health.nextEligibleAt) ? health.nextEligibleAt : 0,
   ) || null;
   const body = {
-    dashboardVersion: UI_DASHBOARD_VERSION,
+    dashboardVersion,
     projectFingerprint: snapshot.projectFingerprint,
     stateRootIdentity,
     generation: index.generation,
@@ -1057,7 +1066,7 @@ function buildDashboard(snapshot, {
     },
     retention: {
       observationsDays: snapshot.settings.global.retentionDays,
-      operationalDays: 90,
+      operationalDays: dashboardVersion === 1 ? 90 : snapshot.settings.global.retentionDays * 3,
     },
     supportedControls: Object.entries(UI_ACTION_CAPABILITIES)
       .filter(([, capability]) => (
@@ -1103,11 +1112,15 @@ export function buildUiProjection(snapshot, {
   const supportedDashboardCapabilities = [...new Set(dashboardCapabilities)].sort();
   const byKind = recordsByKind(snapshot);
   const latestProposals = latestPayloads(byKind.get("proposal"), (proposal) => proposal.id);
+  const hiddenProposalIds = new Set([...latestProposals.values()]
+    .filter((entry) => entry.payload.projectFingerprint === snapshot.projectFingerprint
+      && entry.payload.state === "critic-pending")
+    .map((entry) => entry.payload.id));
   const proposals = [...latestProposals.values()]
     .map((entry) => entry.payload)
     .filter((proposal) => proposal.projectFingerprint === snapshot.projectFingerprint
       && REVIEWABLE_STATES.has(proposal.state)
-      && !PRIVATE_ID_RE.test(proposal.id)
+      && sanitizeProposalId(proposal.id) === proposal.id
       && !PRIVATE_ID_RE.test(proposal.skillTarget.relativePath))
     .sort((left, right) => left.id.localeCompare(right.id));
   const firstTargets = readTargets(proposals, targetReader);
@@ -1286,7 +1299,7 @@ export function buildUiProjection(snapshot, {
     now,
     supportedCapabilities,
   });
-  const dashboard = buildDashboard(snapshot, {
+  const dashboardOptions = {
     index,
     stateRootIdentity,
     now,
@@ -1296,13 +1309,24 @@ export function buildUiProjection(snapshot, {
     health,
     supportedCapabilities,
     dashboardCapabilities: supportedDashboardCapabilities,
+    hiddenProposalIds,
+  };
+  const dashboard = buildDashboard(snapshot, {
+    ...dashboardOptions,
+    dashboardVersion: UI_DASHBOARD_VERSION,
+  });
+  const dashboardV1 = buildDashboard(snapshot, {
+    ...dashboardOptions,
+    dashboardVersion: 1,
   });
   const requested = [...new Set(detailProposalIds)].slice(0, UI_PROTOCOL_LIMITS.residentDetails);
   const detailById = new Map(detailCandidates.map((candidate) => [candidate.proposal.id, candidate.detail]));
   const publicationDetails = boundedReviews.included.map((review) => detailById.get(review.proposalId));
   const details = requested.map((proposalId) => detailById.get(proposalId)).filter(Boolean);
   let footprint;
-  const unavailableDetailIds = requested.filter((proposalId) => !detailById.has(proposalId));
+  const unavailableDetailIds = requested.filter((proposalId) => (
+    !hiddenProposalIds.has(proposalId) && !detailById.has(proposalId)
+  ));
   while (true) {
     try {
       footprint = assertUiProjectionFootprint(index, details, {
@@ -1322,6 +1346,7 @@ export function buildUiProjection(snapshot, {
     generation,
     index: footprint.index,
     dashboard,
+    dashboardV1,
     publicationDetails,
     details: footprint.details,
     unavailableDetailIds: unavailableDetailIds.sort(),

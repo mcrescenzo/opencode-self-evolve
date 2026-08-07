@@ -13,7 +13,6 @@ export const TIMEOUT_ENV = "SELF_EVOLVE_TUI_HOST_SPIKE_TIMEOUT_MS";
 export const CANDIDATE_VERSION = "0.2.0-tui-host-spike.0";
 export const RECEIPT_SCHEMA_VERSION = 1;
 export const PRODUCT_PLUGIN_ID = "mcrescenzo.self-evolve-host-spike";
-export const WITNESS_PLUGIN_ID = "mcrescenzo.self-evolve-host-spike-witness";
 export const PRODUCT_COMMAND_ID = "self-evolve.control-center";
 export const PRODUCT_ROUTE_ID = "self-evolve.control-center.route";
 

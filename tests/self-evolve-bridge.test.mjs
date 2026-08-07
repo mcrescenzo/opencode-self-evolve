@@ -3,11 +3,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { SCHEMA_VERSION, makeRepoSettings } from "../self-evolve-schemas.js";
+import { SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, makeRepoSettings } from "../self-evolve-schemas.js";
 import { stateRootIdentity } from "../self-evolve-state-root.js";
 import { openStore } from "../self-evolve-store.js";
 import {
+  UI_ACTION_CAPABILITIES,
+  UI_OPERATION_PROTOCOL_VERSION,
+  hashUiProtocol,
+} from "../self-evolve-ui-protocol.js";
+import {
   BRIDGE_FEEDBACK_REQUEST_FIELDS,
+  BRIDGE_MAILBOX_DESCRIPTORS,
   BRIDGE_REQUEST_FIELDS,
   DECISION_FEEDBACK_VERSION,
   CONTROL_REQUEST_FIELDS,
@@ -22,6 +28,7 @@ import {
   makeTuiHostHealth,
   pollDecisionResponse,
   pollControlResponse,
+  pollUiOperationResponse,
   publishControlState,
   publishTuiHostHealth,
   readControlState,
@@ -30,6 +37,8 @@ import {
   revokeTuiHostHealth,
   submitControlRequest,
   submitDecisionRequest,
+  submitUiOperationRequest,
+  validateBridgeExportMetadata,
 } from "../self-evolve-bridge.js";
 
 const PROJECT = "a".repeat(64);
@@ -75,6 +84,95 @@ function controlState(overrides = {}) {
     ...overrides,
   };
 }
+
+function operationRequest(requestId, timestamp = Date.now()) {
+  const body = {
+    operationProtocolVersion: UI_OPERATION_PROTOCOL_VERSION,
+    requestId,
+    projectFingerprint: PROJECT,
+    stateRootIdentity: "1".repeat(64),
+    generation: "2".repeat(64),
+    projectionHash: "3".repeat(64),
+    action: "snooze-proposal",
+    capability: UI_ACTION_CAPABILITIES["snooze-proposal"],
+    actor: "self-evolve-tui",
+    issuedAt: timestamp,
+    expiresAt: timestamp + 30_000,
+    nonce: `nonce-${requestId}`,
+    payload: {
+      proposalId: "proposal-bridge",
+      targetHash: TARGET,
+      proposedContentHash: PROPOSED,
+      decisionVersion: 1,
+      snoozedUntil: timestamp + 60_000,
+    },
+  };
+  return { ...body, operationHash: hashUiProtocol("operation-request", body) };
+}
+
+function operationResponse(request, processedAt = request.issuedAt) {
+  const body = {
+    operationProtocolVersion: UI_OPERATION_PROTOCOL_VERSION,
+    requestId: request.requestId,
+    projectFingerprint: request.projectFingerprint,
+    stateRootIdentity: request.stateRootIdentity,
+    action: request.action,
+    requestHash: request.operationHash,
+    ok: true,
+    status: "accepted",
+    processedAt,
+    reason: null,
+  };
+  return { ...body, responseHash: hashUiProtocol("operation-response", body) };
+}
+
+function addAtomicPublicationResidue(filePath, nonce = "0123456789abcdef") {
+  const temporary = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${nonce}.tmp`);
+  fs.linkSync(filePath, temporary);
+  assert.equal(fs.statSync(filePath).nlink, 2);
+  return temporary;
+}
+
+test("mailbox descriptors are a closed registry for every request and response class", () => {
+  assert.equal(Object.isFrozen(BRIDGE_MAILBOX_DESCRIPTORS), true);
+  assert.deepEqual(BRIDGE_MAILBOX_DESCRIPTORS.map((descriptor) => descriptor.type), [
+    "decision-request",
+    "decision-response",
+    "control-request",
+    "control-response",
+    "operation-request",
+    "operation-response",
+  ]);
+  assert.equal(BRIDGE_MAILBOX_DESCRIPTORS.every(Object.isFrozen), true);
+  assert.equal(new Set(BRIDGE_MAILBOX_DESCRIPTORS.map((descriptor) => descriptor.directoryName)).size, 6);
+});
+
+test("operation export envelopes are strict and response metadata is request-bound", () => {
+  const request = operationRequest("operation-export", 10_000);
+  const response = operationResponse(request, 10_001);
+  assert.deepEqual(validateBridgeExportMetadata("operation-request", request, {
+    projectFingerprint: PROJECT,
+    requestId: request.requestId,
+  }), request);
+  assert.deepEqual(validateBridgeExportMetadata("operation-response", response, {
+    projectFingerprint: PROJECT,
+    requestId: request.requestId,
+    request,
+  }), response);
+  assert.throws(() => validateBridgeExportMetadata("operation-request", {
+    ...request,
+    projectFingerprint: "9".repeat(64),
+  }, { projectFingerprint: PROJECT, requestId: request.requestId }), /cross-project/u);
+  assert.throws(() => validateBridgeExportMetadata("operation-response", {
+    ...response,
+    extra: true,
+  }, { projectFingerprint: PROJECT, requestId: request.requestId, request }), /unknown-field/u);
+  assert.throws(() => validateBridgeExportMetadata("operation-response", response, {
+    projectFingerprint: PROJECT,
+    requestId: request.requestId,
+    request: { ...request, operationHash: "9".repeat(64) },
+  }), /hash|binding|mismatch/u);
+});
 
 test("request envelopes are exact, bounded, hash-bound, and reject stale or cross-project input", () => {
   const request = createDecisionRequest({ projectFingerprint: PROJECT, proposal: proposal(), newState: "approved", timestamp: Date.now(), requestId: "request-1" });
@@ -171,6 +269,87 @@ test("TUI host-health runtime report is exact, root-bound, short-lived, and secu
   assert.equal(revokeTuiHostHealth(root, PROJECT, { nonce: "different-nonce", stateRootIdentity: identity }), false);
   assert.equal(revokeTuiHostHealth(root, PROJECT, { nonce: health.nonce, stateRootIdentity: identity }), true);
   assert.equal(fs.existsSync(filePath), false);
+});
+
+test("TUI host-health publication reads supported legacy repository settings before server migration", (t) => {
+  const root = fixture(t);
+  const projectDir = path.join(root, "self-evolve", PROJECT);
+  const settingsPath = path.join(projectDir, "settings.json");
+  fs.mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+  for (const schemaVersion of SUPPORTED_SCHEMA_VERSIONS.filter((value) => value !== SCHEMA_VERSION)) {
+    const legacySettings = {
+      ...makeRepoSettings({ projectFingerprint: PROJECT }),
+      schemaVersion,
+      consent: {
+        passiveCalls: false,
+        durableObservations: false,
+        sanitizedExcerpts: false,
+        crossRepoAggregation: false,
+      },
+    };
+    const source = `${JSON.stringify(legacySettings)}\n`;
+    fs.writeFileSync(settingsPath, source, { mode: 0o600 });
+
+    const issuedAt = Date.now();
+    const identity = stateRootIdentity(root);
+    const health = publishTuiHostHealth(root, {
+      projectFingerprint: PROJECT,
+      stateRootIdentity: identity,
+      hostVersion: "1.18.14",
+      issuedAt,
+      nonce: `legacy-settings-health-${schemaVersion.replaceAll(".", "-")}`,
+    });
+
+    assert.equal(health.hostVersion, "1.18.14");
+    assert.equal(readTuiHostHealth(root, PROJECT, { now: issuedAt, stateRootIdentity: identity }).nonce, health.nonce);
+    assert.equal(fs.readFileSync(settingsPath, "utf8"), source, "the TUI publisher must remain read-only for settings");
+  }
+});
+
+test("TUI host-health publication does not relax current repository settings", (t) => {
+  const root = fixture(t);
+  const projectDir = path.join(root, "self-evolve", PROJECT);
+  fs.mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(projectDir, "settings.json"), `${JSON.stringify({
+    ...makeRepoSettings({ projectFingerprint: PROJECT }),
+    consent: {},
+  })}\n`, { mode: 0o600 });
+
+  assert.throws(() => publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: stateRootIdentity(root),
+    hostVersion: "1.18.14",
+    nonce: "current-settings-remain-strict",
+  }), /unexpected field consent/u);
+
+  fs.writeFileSync(path.join(projectDir, "settings.json"), `${JSON.stringify({
+    schemaVersion: "9.0.0",
+    repo: makeRepoSettings({ projectFingerprint: PROJECT }),
+  })}\n`, { mode: 0o600 });
+  assert.throws(() => publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: stateRootIdentity(root),
+    hostVersion: "1.18.14",
+    nonce: "future-wrapper-remains-strict",
+  }), /unsupported-version/u);
+});
+
+test("legacy bridge quota normalization preserves repository storage overrides", (t) => {
+  const root = fixture(t);
+  const projectDir = path.join(root, "self-evolve", PROJECT);
+  fs.mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(projectDir, "settings.json"), `${JSON.stringify({
+    ...makeRepoSettings({ projectFingerprint: PROJECT, budgets: { storageQuotaMiB: 0 } }),
+    schemaVersion: SUPPORTED_SCHEMA_VERSIONS.find((value) => value !== SCHEMA_VERSION),
+    consent: {},
+  })}\n`, { mode: 0o600 });
+
+  assert.throws(() => publishTuiHostHealth(root, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: stateRootIdentity(root),
+    hostVersion: "1.18.14",
+    nonce: "legacy-zero-quota",
+  }), /mailbox-byte-quota-exceeded/u);
 });
 
 test("TUI host-health rejects dead publishers and stale revocation cannot delete a newer generation", (t) => {
@@ -306,6 +485,184 @@ test("request publication and responses are restrictive, atomic, replay-safe fil
   const responsePath = path.join(root, "self-evolve", "bridge", PROJECT, "responses", `${request.requestId}.json`);
   assert.equal(fs.statSync(responsePath).mode & 0o777, 0o600);
   assert.equal("proposedContent" in response, false);
+});
+
+test("owned post-link request residues converge for decision, control, and operation mailboxes", async (t) => {
+  const root = fixture(t);
+  const timestamp = Date.now();
+  const decision = createDecisionRequest({
+    projectFingerprint: PROJECT,
+    proposal: proposal(),
+    newState: "rejected",
+    timestamp,
+    requestId: "residue-decision-request",
+  });
+  const state = controlState({ issuedAt: timestamp, settingsUpdatedAt: timestamp });
+  const control = createControlRequest({
+    controlState: state,
+    action: "set-mode",
+    payload: { mode: "manual" },
+    timestamp,
+    requestId: "residue-control-request",
+  });
+  const operation = operationRequest("residue-operation-request", timestamp);
+  const submitted = [
+    submitDecisionRequest(root, decision),
+    submitControlRequest(root, control),
+    submitUiOperationRequest(root, operation),
+  ];
+  const temporaries = submitted.map(({ path: filePath }, index) => addAtomicPublicationResidue(
+    filePath,
+    `${index + 1}`.repeat(16),
+  ));
+  const effects = { decision: 0, control: 0, operation: 0 };
+  const consumed = await consumeDecisionRequests({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    now: () => timestamp,
+    validateAndDecide: async () => { effects.decision += 1; return { ok: true }; },
+    validateAndControl: async () => { effects.control += 1; return { ok: true }; },
+    validateAndOperate: async () => { effects.operation += 1; return { ok: true }; },
+  });
+  assert.deepEqual(effects, { decision: 1, control: 1, operation: 1 });
+  assert.deepEqual([consumed.processed.length, consumed.controls.length, consumed.operations.length], [1, 1, 1]);
+  for (const temporary of temporaries) assert.equal(fs.existsSync(temporary), false);
+  for (const { path: filePath } of submitted) assert.equal(fs.existsSync(filePath), false);
+  const bridgeRoot = path.join(root, "self-evolve", "bridge", PROJECT);
+  for (const [directory, requestId] of [
+    ["responses", decision.requestId],
+    ["control-responses", control.requestId],
+    ["operation-responses", operation.requestId],
+  ]) assert.equal(fs.statSync(path.join(bridgeRoot, directory, `${requestId}.json`)).nlink, 1);
+});
+
+test("owned response residues are completion markers and never repeat mailbox effects", async (t) => {
+  const root = fixture(t);
+  const timestamp = Date.now();
+  const decision = createDecisionRequest({ projectFingerprint: PROJECT, proposal: proposal(), newState: "rejected", timestamp, requestId: "residue-decision-response" });
+  const state = controlState({ issuedAt: timestamp, settingsUpdatedAt: timestamp });
+  const control = createControlRequest({ controlState: state, action: "set-mode", payload: { mode: "manual" }, timestamp, requestId: "residue-control-response" });
+  const operation = operationRequest("residue-operation-response", timestamp);
+  const requests = [
+    submitDecisionRequest(root, decision),
+    submitControlRequest(root, control),
+    submitUiOperationRequest(root, operation),
+  ];
+  const bridgeRoot = path.join(root, "self-evolve", "bridge", PROJECT);
+  const responseValues = [
+    ["responses", decision.requestId, {
+      schemaVersion: SCHEMA_VERSION,
+      requestId: decision.requestId,
+      projectFingerprint: PROJECT,
+      proposalId: decision.proposalId,
+      ok: true,
+      status: "accepted",
+      processedAt: timestamp,
+      reason: null,
+      recovered: false,
+    }],
+    ["control-responses", control.requestId, {
+      schemaVersion: SCHEMA_VERSION,
+      requestId: control.requestId,
+      projectFingerprint: PROJECT,
+      ok: true,
+      status: "accepted",
+      processedAt: timestamp,
+      reason: null,
+    }],
+    ["operation-responses", operation.requestId, operationResponse(operation, timestamp)],
+  ];
+  const temporaries = responseValues.map(([directory, requestId, value], index) => {
+    const responsePath = path.join(bridgeRoot, directory, `${requestId}.json`);
+    fs.writeFileSync(responsePath, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: "wx" });
+    return addAtomicPublicationResidue(responsePath, `${index + 4}`.repeat(16));
+  });
+  const effects = { decision: 0, control: 0, operation: 0 };
+  const consumed = await consumeDecisionRequests({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    now: () => timestamp,
+    validateAndDecide: async () => { effects.decision += 1; return { ok: true }; },
+    validateAndControl: async () => { effects.control += 1; return { ok: true }; },
+    validateAndOperate: async () => { effects.operation += 1; return { ok: true }; },
+  });
+  assert.deepEqual(effects, { decision: 0, control: 0, operation: 0 });
+  assert.deepEqual([consumed.processed.length, consumed.controls.length, consumed.operations.length], [1, 1, 1]);
+  for (const temporary of temporaries) assert.equal(fs.existsSync(temporary), false);
+  for (const { path: filePath } of requests) assert.equal(fs.existsSync(filePath), false);
+  for (const [directory, requestId] of responseValues) {
+    assert.equal(fs.statSync(path.join(bridgeRoot, directory, `${requestId}.json`)).nlink, 1);
+  }
+  assert.equal(pollDecisionResponse(root, PROJECT, decision.requestId).ok, true);
+  assert.equal(pollControlResponse(root, PROJECT, control.requestId).ok, true);
+  assert.equal(pollUiOperationResponse(root, operation, { now: timestamp }).ok, true);
+});
+
+test("owned orphan temps are reclaimed, while unmatched foreign hard links remain fail-closed", async (t) => {
+  const root = fixture(t);
+  const timestamp = Date.now();
+  const decision = createDecisionRequest({ projectFingerprint: PROJECT, proposal: proposal(), newState: "rejected", timestamp, requestId: "orphan-temp-request" });
+  const first = submitDecisionRequest(root, decision);
+  const orphan = path.join(path.dirname(first.path), `.${path.basename(first.path)}.${process.pid}.abcdef0123456789.tmp`);
+  fs.renameSync(first.path, orphan);
+  assert.equal(fs.statSync(orphan).nlink, 1);
+  const retried = submitDecisionRequest(root, decision);
+  assert.equal(fs.existsSync(orphan), false);
+  assert.equal(fs.statSync(retried.path).nlink, 1);
+
+  const foreign = path.join(root, "foreign-request-link");
+  fs.linkSync(retried.path, foreign);
+  let effects = 0;
+  await assert.rejects(consumeDecisionRequests({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    validateAndDecide: async () => { effects += 1; return { ok: true }; },
+  }), /request-replaced/u);
+  assert.equal(effects, 0);
+  assert.equal(fs.statSync(retried.path).nlink, 2);
+  assert.equal(fs.statSync(foreign).nlink, 2);
+
+  const secondRoot = fixture(t);
+  const seed = submitDecisionRequest(secondRoot, { ...decision, requestId: "foreign-owned-name" });
+  const source = path.join(secondRoot, "foreign-source");
+  fs.renameSync(seed.path, source);
+  const disguised = path.join(
+    path.dirname(seed.path),
+    `.${path.basename(seed.path)}.${process.pid}.0123456789abcdef.tmp`,
+  );
+  fs.linkSync(source, disguised);
+  await assert.rejects(consumeDecisionRequests({
+    stateRoot: secondRoot,
+    projectFingerprint: PROJECT,
+    validateAndDecide: async () => ({ ok: true }),
+  }), /temporary-hardlink-rejected/u);
+  assert.equal(fs.statSync(source).nlink, 2);
+  assert.equal(fs.statSync(disguised).nlink, 2);
+});
+
+test("owned post-link consumer-lock residue converges before handler entry", async (t) => {
+  const root = fixture(t);
+  const timestamp = Date.now();
+  const request = createDecisionRequest({ projectFingerprint: PROJECT, proposal: proposal(), newState: "rejected", timestamp, requestId: "lock-residue-request" });
+  submitDecisionRequest(root, request);
+  const bridgeRoot = path.join(root, "self-evolve", "bridge", PROJECT);
+  const lockPath = path.join(bridgeRoot, "consumer.lock");
+  fs.writeFileSync(lockPath, `${JSON.stringify({ pid: 2_147_483_647, acquiredAt: 1, expiresAt: 2, nonce: "dead-lock-residue" })}\n`, { mode: 0o600, flag: "wx" });
+  const temporary = addAtomicPublicationResidue(lockPath, "fedcba9876543210");
+  const consumed = await consumeDecisionRequests({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    now: () => timestamp,
+    lockTtlMs: 1,
+    validateAndDecide: async () => {
+      assert.equal(fs.statSync(lockPath).nlink, 1);
+      assert.equal(fs.existsSync(temporary), false);
+      return { ok: true };
+    },
+  });
+  assert.equal(consumed.processed.length, 1);
+  assert.equal(fs.existsSync(lockPath), false);
+  assert.equal(fs.existsSync(temporary), false);
 });
 
 test("a post-handler publication fault leaves the request queued for outcome-safe retry", async (t) => {
@@ -463,6 +820,7 @@ test("decision and control publishers share bounded mailbox bytes and file count
   const root = fixture(t);
   const store = openStore(root, { projectFingerprint: PROJECT });
   t.after(() => store.close());
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   assert.equal(store.updateRepoSettings((repo) => makeRepoSettings({
     ...repo,
     budgets: { ...repo.budgets, storageQuotaMiB: 1 },

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -22,7 +22,9 @@ function fixture(t, { alive = false } = {}) {
     now: () => NOW,
     processIsAlive: () => ownerAlive,
   });
-  t.after(() => store.close());
+  t.after(() => {
+    try { store.close(); } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   return { root, store, setAlive(value) { ownerAlive = value; } };
 }
 
@@ -147,6 +149,29 @@ test("release is nonce-bound, idempotent, and process-generation cleanup is scop
   assert.equal(status(f.store, "owned-two").classification, "abortable");
   assert.deepEqual(f.store.releaseHostOwner("owned-one", first.nonce), { ok: true, absent: true });
   assert.deepEqual(f.store.releaseHostOwner("owned-two", second.nonce), { ok: true });
+});
+
+test("store close releases every host owner acquired by that store", (t) => {
+  const f = fixture(t);
+  assert.equal(acquire(f.store, "close-owned-one").ok, true);
+  assert.equal(acquire(f.store, "close-owned-two", { generation: 2 }).ok, true);
+  assert.equal(existsSync(ownerPath(f.store, "close-owned-one")), true);
+  assert.equal(existsSync(ownerPath(f.store, "close-owned-two")), true);
+
+  assert.deepEqual(f.store.close(), { ok: true, released: 2 });
+  assert.equal(existsSync(ownerPath(f.store, "close-owned-one")), false);
+  assert.equal(existsSync(ownerPath(f.store, "close-owned-two")), false);
+});
+
+test("store close preserves a host owner whose nonce no longer belongs to it", (t) => {
+  const f = fixture(t);
+  assert.equal(acquire(f.store, "close-replaced").ok, true);
+  writeOwner(f.store, "close-replaced", { nonce: "cd".repeat(24) });
+
+  const result = f.store.close();
+  assert.equal(result.ok, false);
+  assert.equal(result.failures.some((failure) => failure.reason === "nonce-mismatch"), true);
+  assert.equal(existsSync(ownerPath(f.store, "close-replaced")), true);
 });
 
 test("expired host owners are reclaimed only after their process is dead", (t) => {

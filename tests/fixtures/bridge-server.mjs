@@ -73,7 +73,12 @@ const integration = createIntegration({
   commands,
   pipeline,
   scheduler,
-  options: { stateRoot, projectFingerprint, mailboxPollMs: 25 },
+  options: {
+    stateRoot,
+    projectFingerprint,
+    mailboxPollMs: 25,
+    rolloutGates: { yoloEnablementThreshold: { minSynthesesObserved: 0, minSuccessRate: 0 } },
+  },
 });
 
 await integration.boot({ hostVersion: "1.18.3" });

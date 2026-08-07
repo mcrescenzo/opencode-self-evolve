@@ -138,6 +138,31 @@ test("one admitted episode uses one settings snapshot", async (t) => {
   scheduler.dispose();
 });
 
+test("a post-acquisition episode reservation failure releases its lease", async (t) => {
+  const cursor = {
+    sessionIDHash: hashSessionLineage("reservation-failure"),
+    lastIdleAt: 0,
+    lastObservedMessageHash: null,
+    leaseNonce: null,
+  };
+  const records = new Map([["episode-cursor", [{ payload: cursor }]]]);
+  const { scheduler, store, leases, calls } = fixture(t, { records, budgets: { idleDebounceMs: 0 } });
+  const acquireLease = store.acquireLease.bind(store);
+  store.acquireLease = (...args) => {
+    const lease = acquireLease(...args);
+    cursor.lastIdleAt = 1_000_001;
+    return lease;
+  };
+
+  await scheduler.handleEvent(idle("reservation-failure"));
+  await waitFor(() => calls.release.length === 1, "failed reservation lease release");
+
+  assert.equal(leases.size, 0);
+  assert.equal(actions(records, "scheduler-failure").length, 1);
+  assert.match(actions(records, "scheduler-failure")[0].payload.details.reason, /out-of-order/u);
+  scheduler.dispose();
+});
+
 test("an older explicit epoch cannot replace newer idle work", async (t) => {
   const { scheduler, work, records } = fixture(t);
   await scheduler.handleEvent(idle("epoch", { epoch: 8 }));
@@ -209,6 +234,31 @@ test("scheduler cycles do not consume passive provider slots", async (t) => {
     record.payload.details.action === "scheduler-budget" && record.payload.details.budgetType === "passive");
   assert.equal(passive.length, 0);
   assert.equal(scheduler.runBudgetCheck().passiveCallsRemainingThisHour, 6);
+  scheduler.dispose();
+});
+
+test("more than a day-cap of no-eligible episodes consume no synthesis budget", async (t) => {
+  let completed = 0;
+  const { scheduler, records } = fixture(t, {
+    budgets: { synthesisPerDay: 24 },
+    enqueueWork() {
+      completed += 1;
+      return { ok: true, result: "no-eligible-cluster" };
+    },
+  });
+
+  for (let index = 0; index < 25; index += 1) {
+    await scheduler.handleEvent(idle(`no-eligible-${index}`));
+    await waitFor(() => completed === index + 1, `no-eligible episode ${index + 1}`);
+  }
+
+  const synthesisAudits = (records.get("audit-event") ?? []).filter((record) => (
+    record.payload.details.action === "scheduler-budget"
+    && record.payload.details.budgetType === "synthesis"
+  ));
+  assert.equal(completed, 25);
+  assert.equal(synthesisAudits.length, 0);
+  assert.equal(scheduler.runBudgetCheck().synthesesRemainingToday, 24);
   scheduler.dispose();
 });
 
@@ -437,6 +487,32 @@ test("the scheduler settles a fulfilled work promise exactly once", async (t) =>
   scheduler.dispose();
 });
 
+test("stopAdmission retains an admitted lease until drain settles the work promise", async (t) => {
+  let finish;
+  let drained = false;
+  const work = [];
+  const { scheduler, calls } = fixture(t, {
+    enqueueWork(item) {
+      work.push(item);
+      return new Promise((resolve) => { finish = resolve; });
+    },
+  });
+  await scheduler.handleEvent(idle("drain-owned-work"));
+  await waitFor(() => work.length === 1, "drain work admission");
+
+  scheduler.stopAdmission("shutdown");
+  const draining = scheduler.drain().then(() => { drained = true; });
+  await wait(5);
+  assert.equal(drained, false);
+  assert.equal(calls.release.length, 0);
+
+  finish({ ok: true });
+  await draining;
+  assert.equal(calls.release.length, 1);
+  scheduler.dispose();
+  assert.equal(calls.release.length, 1);
+});
+
 test("a rejected work promise produces one failure settlement", async (t) => {
   const work = [];
   const { scheduler, calls, records } = fixture(t, {
@@ -484,6 +560,23 @@ test("a failed work-lease release is retained so dispose can retry it", async (t
   scheduler.dispose();
   assert.equal(disposeRetry, 1, "dispose retries a work-lease release that previously failed");
 });
+
+for (const terminalReason of ["nonce-mismatch", "lease-corrupt"]) {
+  test(`a ${terminalReason} work-lease release is not retried during dispose`, async (t) => {
+    const { scheduler, work, store, calls } = fixture(t, { budgets: { idleDebounceMs: 0 } });
+    await scheduler.handleEvent(idle(`release-${terminalReason}`));
+    await waitFor(() => work.length === 1, `${terminalReason} work`);
+    store.releaseLease = (key, nonce) => {
+      calls.release.push({ key, nonce });
+      return { ok: false, reason: terminalReason };
+    };
+
+    scheduler.recordWorkResult(work[0], { ok: true });
+    assert.equal(calls.release.length, 1);
+    scheduler.dispose();
+    assert.equal(calls.release.length, 1);
+  });
+}
 
 test("failure backoff uses stable root lineage, doubles, and survives restart", async (t) => {
   const clock = { value: 3_000_000 };

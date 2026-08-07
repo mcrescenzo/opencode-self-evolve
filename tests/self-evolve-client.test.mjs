@@ -31,7 +31,7 @@ test("OpenCode client adapter uses 1.18.3 request shapes and normalizes response
   assert.deepEqual(calls[1][1], { path: { id: "root" }, query: { directory: "/workspace/project", limit: 10 } });
 });
 
-test("compatibility fallback occurs after rejection but never after timeout", async () => {
+test("read-only compatibility fallback occurs after rejection but never after timeout", async () => {
   const rejectedCalls = [];
   const rejected = context({
     async messages(input) {
@@ -55,6 +55,44 @@ test("compatibility fallback occurs after rejection but never after timeout", as
     /session\.messages timed out/u,
   );
   assert.equal(timeoutCalls.length, 1);
+});
+
+test("session mutations use one request shape and preserve permissions on host errors", async (t) => {
+  const permission = [{ permission: "*", pattern: "*", action: "deny" }];
+  const failures = [
+    ["auth", async () => { throw new Error("authentication failed"); }, /authentication failed/u],
+    ["transport", async () => { throw new Error("transport failed"); }, /transport failed/u],
+    ["provider", async () => ({ error: { message: "provider failed" } }), /provider failed/u],
+    ["result", async () => ({ error: { message: "result failed" } }), /result failed/u],
+  ];
+
+  for (const [name, fail, expected] of failures) {
+    await t.test(`create ${name} error invokes once`, async () => {
+      const calls = [];
+      const ctx = context({
+        async create(input) { calls.push(input); return fail(); },
+      });
+      const body = { title: "hidden", permission };
+      await assert.rejects(createSession(ctx, body), expected);
+      assert.deepEqual(calls, [{ body, query: { directory: "/workspace/project" } }]);
+      assert.strictEqual(calls[0].body.permission, permission);
+    });
+
+    await t.test(`prompt ${name} error invokes once`, async () => {
+      const calls = [];
+      const ctx = context({
+        async prompt(input) { calls.push(input); return fail(); },
+      });
+      const body = { parts: [], permission };
+      await assert.rejects(promptSession(ctx, "hidden", body), expected);
+      assert.deepEqual(calls, [{
+        path: { id: "hidden" },
+        query: { directory: "/workspace/project" },
+        body,
+      }]);
+      assert.strictEqual(calls[0].body.permission, permission);
+    });
+  }
 });
 
 test("hanging prompt and cleanup are bounded and late rejection is handled", async () => {
@@ -94,6 +132,18 @@ test("cleanup falls back to interrupt only when abort is unavailable", async () 
     async interrupt(input) { calls.push(input); return { data: {} }; },
   });
   await cleanupSession(ctx, "hidden");
+  assert.deepEqual(calls, [{ path: { id: "hidden" }, query: { directory: "/workspace/project" } }]);
+});
+
+test("known-session cleanup is bounded and does not retry host errors", async () => {
+  const calls = [];
+  const ctx = context({
+    async abort(input) {
+      calls.push(input);
+      return { error: { message: "abort rejected" } };
+    },
+  });
+  await assert.rejects(cleanupSession(ctx, "hidden", { timeoutMs: 20 }), /abort rejected/u);
   assert.deepEqual(calls, [{ path: { id: "hidden" }, query: { directory: "/workspace/project" } }]);
 });
 

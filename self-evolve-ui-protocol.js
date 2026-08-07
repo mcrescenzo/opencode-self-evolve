@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { deepFreeze } from "./self-evolve-schemas.js";
 
 export const UI_PROJECTION_VERSION = 1;
-export const UI_DASHBOARD_VERSION = 1;
+export const UI_DASHBOARD_VERSION = 2;
+export const UI_DASHBOARD_VERSIONS = Object.freeze([1, UI_DASHBOARD_VERSION]);
 export const UI_OPERATION_PROTOCOL_VERSION = 1;
 export const UI_CAPABILITIES = Object.freeze([
   "legacy-control-v1",
@@ -182,10 +183,28 @@ export const UI_DASHBOARD_AUTOMATION_STATES = Object.freeze([
   "terminal", "corrupt", "emergency-stop", "circuit-breaker", "paused", "excluded",
   "on-demand", "setup-required", "running", "backoff", "budget", "quiet-period", "ready",
 ]);
-export const UI_DASHBOARD_BLOCKER_CODES = Object.freeze([
-  "unsupported-host", "state-root", "provider", "first-run", "restart-required", "passive-consent", "observation-consent",
-  "approved-skill-folders", "yolo-rollout", "corrupt-state", "emergency-stop",
-  "circuit-breaker", "paused", "repository-excluded",
+export const UI_DASHBOARD_BLOCKER_DESTINATIONS = deepFreeze({
+  "unsupported-host": { dashboard: "settings", section: "settings", anchor: "unsupported-host" },
+  "state-root": { dashboard: "settings", section: "settings", anchor: "state-root" },
+  "provider": { dashboard: "settings", section: "settings", anchor: "provider" },
+  "first-run": { dashboard: "home", section: "home" },
+  "restart-required": { dashboard: "settings", section: "settings", anchor: "restart-required" },
+  "passive-consent": { dashboard: "settings", section: "settings", anchor: "passive-consent" },
+  "observation-consent": { dashboard: "settings", section: "settings", anchor: "observation-consent" },
+  "approved-skill-folders": { dashboard: "settings", section: "settings", anchor: "approved-skill-folders" },
+  "yolo-rollout": { dashboard: "settings", section: "settings", anchor: "yolo-rollout" },
+  "corrupt-state": { dashboard: "activity-errors", section: "activity", filter: "errors" },
+  "emergency-stop": { dashboard: "settings", section: "settings", anchor: "emergency-stop" },
+  "circuit-breaker": { dashboard: "activity-errors", section: "activity", filter: "errors" },
+  "paused": { dashboard: "home", section: "home" },
+  "repository-excluded": { dashboard: "settings", section: "settings", anchor: "project-scope" },
+});
+export const UI_DASHBOARD_BLOCKER_CODES = Object.freeze(Object.keys(UI_DASHBOARD_BLOCKER_DESTINATIONS));
+export const UI_CONTROL_CENTER_SETTINGS_ANCHORS = Object.freeze([
+  "setup", "modes", "privacy", "limits", "maintenance",
+  ...new Set(Object.values(UI_DASHBOARD_BLOCKER_DESTINATIONS)
+    .filter((entry) => entry.section === "settings")
+    .map((entry) => entry.anchor)),
 ]);
 export const UI_DASHBOARD_OUTCOMES = Object.freeze([
   "cursor-unchanged", "no-observations", "not-eligible", "valid-no-change",
@@ -232,6 +251,7 @@ const AUDIT_KINDS = Object.freeze([
 const HASH_DOMAINS = Object.freeze({
   "projection-index": "self-evolve-ui-projection-index-v1",
   dashboard: "self-evolve-ui-dashboard-v1",
+  "dashboard-v2": "self-evolve-ui-dashboard-v2",
   "review-detail": "self-evolve-ui-review-detail-v1",
   "operation-request": "self-evolve-ui-operation-request-v1",
   "operation-response": "self-evolve-ui-operation-response-v1",
@@ -386,7 +406,9 @@ export function canonicalUiJson(value) {
 }
 
 export function hashUiProtocol(kind, value) {
-  const domain = HASH_DOMAINS[kind];
+  const domain = kind === "dashboard" && value?.dashboardVersion === 2
+    ? HASH_DOMAINS["dashboard-v2"]
+    : HASH_DOMAINS[kind];
   if (!domain) fail("unknown-ui-protocol-kind", String(kind));
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("canonical-object");
   const omittedField = kind === "projection-index"
@@ -613,8 +635,13 @@ function makeDashboardContext(value) {
 }
 
 export function makeUiDashboard(value, expectedValue) {
-  assertEnvelopeVersion(value, "dashboardVersion", UI_DASHBOARD_VERSION, "dashboard", "ui-dashboard");
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail("ui-dashboard-malformed");
+  if (!Object.hasOwn(value, "dashboardVersion")) fail("ui-dashboard-missing-field", "dashboardVersion");
+  if (!UI_DASHBOARD_VERSIONS.includes(value.dashboardVersion)) {
+    fail("unsupported-dashboard-version", String(value.dashboardVersion));
+  }
   exactKeys(value, UI_DASHBOARD_FIELDS, "ui-dashboard");
+  const dashboardVersion = value.dashboardVersion;
   const expected = makeDashboardContext(expectedValue);
   const projectFingerprint = asHash(value.projectFingerprint, "project-fingerprint");
   const stateRootIdentity = asHash(value.stateRootIdentity, "state-root-identity");
@@ -642,11 +669,15 @@ export function makeUiDashboard(value, expectedValue) {
   if (!Array.isArray(value.blockers) || value.blockers.length > UI_DASHBOARD_BLOCKER_CODES.length) fail("dashboard-blockers-out-of-bounds");
   const blockers = value.blockers.map((blocker) => {
     exactKeys(blocker, DASHBOARD_BLOCKER_FIELDS, "dashboard-blocker");
-    return {
+    const output = {
       code: asEnum(blocker.code, UI_DASHBOARD_BLOCKER_CODES, "dashboard-blocker-code"),
       summary: asText(blocker.summary, "dashboard-blocker-summary", UI_PROTOCOL_LIMITS.dashboardSummaryBytes),
       destination: asEnum(blocker.destination, ["home", "recommendations", "activity-errors", "settings"], "dashboard-destination"),
     };
+    if (UI_DASHBOARD_BLOCKER_DESTINATIONS[output.code].dashboard !== output.destination) {
+      fail("dashboard-blocker-destination-mismatch");
+    }
+    return output;
   });
   if (new Set(blockers.map((blocker) => blocker.code)).size !== blockers.length) fail("dashboard-blocker-duplicate");
   exactKeys(value.inFlight, DASHBOARD_IN_FLIGHT_FIELDS, "dashboard-in-flight");
@@ -692,10 +723,18 @@ export function makeUiDashboard(value, expectedValue) {
     approvedSkillFolderCount: asInt(value.settings.approvedSkillFolderCount, "dashboard-approved-skill-folder-count", { max: 1_000_000 }),
   };
   exactKeys(value.retention, DASHBOARD_RETENTION_FIELDS, "dashboard-retention");
-  const retention = {
-    observationsDays: asInt(value.retention.observationsDays, "dashboard-observation-retention", { min: 1, max: 3_650 }),
-    operationalDays: asInt(value.retention.operationalDays, "dashboard-operational-retention", { min: 1, max: 3_650 }),
-  };
+  const retention = dashboardVersion === 1
+    ? {
+        observationsDays: asInt(value.retention.observationsDays, "dashboard-observation-retention", { min: 1, max: 3_650 }),
+        operationalDays: asInt(value.retention.operationalDays, "dashboard-operational-retention", { min: 1, max: 3_650 }),
+      }
+    : {
+        observationsDays: asInt(value.retention.observationsDays, "dashboard-observation-retention", { min: 1, max: 3_650 }),
+        operationalDays: asInt(value.retention.operationalDays, "dashboard-operational-retention", { min: 3, max: 10_950 }),
+      };
+  if (dashboardVersion === 2 && retention.operationalDays !== retention.observationsDays * 3) {
+    fail("dashboard-retention-mismatch");
+  }
   const supportedControls = exactSortedList(
     value.supportedControls,
     "dashboard-supported-controls",
@@ -716,7 +755,7 @@ export function makeUiDashboard(value, expectedValue) {
   exactKeys(value.overflow, DASHBOARD_OVERFLOW_FIELDS, "dashboard-overflow");
   const overflow = { activity: makeOverflow(value.overflow.activity, activity.length, "dashboard-activity") };
   const clean = {
-    dashboardVersion: assertVersion(value.dashboardVersion, UI_DASHBOARD_VERSION, "dashboard"),
+    dashboardVersion,
     projectFingerprint,
     stateRootIdentity,
     generation,

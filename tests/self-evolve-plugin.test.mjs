@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, test } from "node:test";
 import { ANALYZER_TOOLS } from "../analyzer-prompt.js";
-import { SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SOURCE } from "../self-evolve-core.js";
+import {
+  SELF_EVOLVE_ANALYZER_AGENT,
+  SELF_EVOLVE_CRITIC_AGENT,
+  SELF_EVOLVE_SOURCE,
+  SELF_EVOLVE_SYNTHESIZER_AGENT,
+} from "../self-evolve-core.js";
 import { publishTuiHostHealth } from "../self-evolve-bridge.js";
 import DefaultSelfEvolvePlugin from "../self-evolve.js";
 import { makeGlobalSettings } from "../self-evolve-schemas.js";
@@ -15,6 +20,11 @@ const SelfEvolvePlugin = Object.assign(
   (ctx, options = {}) => DefaultSelfEvolvePlugin(ctx, { ...options, durableAutonomy: false }),
   { __test: DefaultSelfEvolvePlugin.__test },
 );
+
+test("public trigger guidance preserves the provisional event-hook boundary", () => {
+  const guidance = fs.readFileSync(new URL("../CLAUDE.md", import.meta.url), "utf8");
+  assert.match(guidance, /Persisted auto\/yolo configuration may register a provisional authority-free `event` hook before official state-root validation; that hook must perform no integration, provider call, persistence, or effect until validated boot\./u);
+});
 
 function proposalPayload(overrides = {}) {
   return {
@@ -129,22 +139,101 @@ beforeEach(() => {
   SelfEvolvePlugin.__test.__resetRegistryForTests();
 });
 
-test("config hook registers hidden deny-tool analyzer agent", async () => {
+test("config hook collision-safely registers all hidden deny-tool provider agents", async () => {
   const { ctx } = createMockContext();
   const hooks = await SelfEvolvePlugin(ctx);
   const cfg = { model: "openai/gpt-5.5", agent: {} };
   await hooks.config(cfg);
-  const agent = cfg.agent[SELF_EVOLVE_ANALYZER_AGENT];
   const expectedPermissions = ["*", ...Object.keys(ANALYZER_TOOLS), "external_directory"].sort();
-  assert.equal(agent.hidden, true);
-  assert.equal(agent.mode, "primary");
-  assert.equal(agent.model, "openai/gpt-5.5");
-  assert.equal(agent.temperature, 0);
-  assert.deepEqual(Object.keys(agent.permission).sort(), expectedPermissions);
+  for (const agentName of [SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
+    const agent = cfg.agent[agentName];
+    assert.equal(agent.hidden, true);
+    assert.equal(agent.mode, "primary");
+    assert.equal(agent.model, "openai/gpt-5.5");
+    assert.equal(agent.temperature, 0);
+    assert.equal(agent.steps, 1);
+    assert.deepEqual(Object.keys(agent.permission).sort(), expectedPermissions);
+    assert.equal(agent.permission.edit, "deny");
+    assert.equal(agent.permission.bash, "deny");
+    assert.equal(agent.permission.todowrite, "deny");
+  }
   assert.deepEqual(SelfEvolvePlugin.__test.analyzerPermissionNames().sort(), expectedPermissions);
-  assert.equal(agent.permission.edit, "deny");
-  assert.equal(agent.permission.bash, "deny");
-  assert.equal(agent.permission.todowrite, "deny");
+});
+
+test("chat.params caps only canonical package-owned session and agent claims", async () => {
+  const { ctx } = createMockContext();
+  const hooks = await SelfEvolvePlugin(ctx);
+  const cfg = { model: "openai/gpt-5.5", agent: {} };
+  await hooks.config(cfg);
+  const registrations = SelfEvolvePlugin.__test.registerHiddenAgents(cfg);
+  const guard = SelfEvolvePlugin.__test.createHiddenAgentRegistration(() => registrations, () => cfg);
+  const nonce = guard.claimSession(SELF_EVOLVE_SYNTHESIZER_AGENT, "owned-synthesis", 1234);
+
+  for (const input of [
+    { sessionID: "user-session", agent: "build" },
+    { sessionID: "owned-synthesis", agent: "build" },
+    { sessionID: "user-session", agent: SELF_EVOLVE_SYNTHESIZER_AGENT },
+    { sessionID: "owned-synthesis", agent: SELF_EVOLVE_CRITIC_AGENT },
+    { sessionID: "owned-synthesis", agent: SELF_EVOLVE_ANALYZER_AGENT },
+  ]) {
+    const output = { maxOutputTokens: 9000 };
+    guard.capChatParams(input, output);
+    assert.equal(output.maxOutputTokens, 9000);
+  }
+
+  const uncapped = { maxOutputTokens: undefined };
+  guard.capChatParams({ sessionID: "owned-synthesis", agent: SELF_EVOLVE_SYNTHESIZER_AGENT }, uncapped);
+  assert.equal(uncapped.maxOutputTokens, 1234);
+  const lower = { maxOutputTokens: 512 };
+  guard.capChatParams({ sessionID: "owned-synthesis", agent: SELF_EVOLVE_SYNTHESIZER_AGENT }, lower);
+  assert.equal(lower.maxOutputTokens, 512);
+
+  guard.releaseSession(SELF_EVOLVE_SYNTHESIZER_AGENT, "owned-synthesis", nonce);
+  const released = { maxOutputTokens: undefined };
+  guard.capChatParams({ sessionID: "owned-synthesis", agent: SELF_EVOLVE_SYNTHESIZER_AGENT }, released);
+  assert.equal(released.maxOutputTokens, undefined);
+});
+
+test("plugin chat.params hook leaves unclaimed user sessions unchanged", async () => {
+  const { ctx } = createMockContext();
+  const hooks = await SelfEvolvePlugin(ctx);
+  await hooks.config({ model: "openai/gpt-5.5", agent: {} });
+  const output = { maxOutputTokens: 777 };
+  await hooks["chat.params"]({ sessionID: "working-session", agent: "build" }, output);
+  assert.equal(output.maxOutputTokens, 777);
+});
+
+test("analyzer collision fails closed before hidden-session or provider dispatch", async () => {
+  const { ctx, calls } = createMockContext();
+  const hooks = await SelfEvolvePlugin(ctx, { now: () => 900 });
+  const foreign = { description: "foreign", prompt: "foreign", permission: { "*": "allow" } };
+  const cfg = { model: "openai/gpt-5.5", agent: { [SELF_EVOLVE_ANALYZER_AGENT]: foreign } };
+  await hooks.config(cfg);
+
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "collision", arguments: "scan" }, output);
+
+  assert.equal(cfg.agent[SELF_EVOLVE_ANALYZER_AGENT], foreign);
+  assert.equal(calls.create.length, 0);
+  assert.equal(calls.prompt.length, 0);
+  assert.equal(calls.abort.length, 0);
+  assert.match(output.parts.at(-1).text, /hidden-agent-unavailable.*foreign-agent-definition/u);
+});
+
+test("analyzer definition replacement is detected immediately before dispatch", async () => {
+  const { ctx, calls } = createMockContext();
+  const hooks = await SelfEvolvePlugin(ctx, { now: () => 901 });
+  const cfg = { model: "openai/gpt-5.5", agent: {} };
+  await hooks.config(cfg);
+  cfg.agent[SELF_EVOLVE_ANALYZER_AGENT] = { description: "replacement", prompt: "foreign" };
+
+  const output = { parts: [] };
+  await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "replacement", arguments: "scan" }, output);
+
+  assert.equal(calls.create.length, 0);
+  assert.equal(calls.prompt.length, 0);
+  assert.equal(calls.abort.length, 0);
+  assert.match(output.parts.at(-1).text, /hidden-agent-unavailable.*definition-replaced/u);
 });
 
 test("commands mutate output.parts in place and handle status pause resume dismiss disable", async () => {
@@ -192,10 +281,15 @@ test("bare self-evolve command isolates analyzer prompt and returns advisory out
   assert.equal(calls.create[0].body.agent, SELF_EVOLVE_ANALYZER_AGENT);
   assert.deepEqual(calls.create[0].body.model, { providerID: "openai", modelID: "gpt-5.5" });
   assert.ok(calls.create[0].body.permission.some((rule) => rule.permission === "*" && rule.action === "deny"));
+  assert.equal(calls.create[0].body.mode, undefined);
+  assert.equal(calls.create[0].body.hidden, undefined);
+  assert.equal(calls.create[0].body.temperature, undefined);
+  assert.equal(calls.create[0].body.steps, undefined);
   assert.deepEqual(calls.create[0].body.permission.map((rule) => rule.permission).sort(), ["*", ...Object.keys(ANALYZER_TOOLS), "external_directory"].sort());
   assert.equal(calls.prompt.length, 1);
   assert.deepEqual(calls.prompt[0].path, { id: "analyzer-1" });
   assert.notDeepEqual(calls.prompt[0].path, { id: "session-a" });
+  assert.equal(calls.prompt.some((call) => call.path?.id === "session-a"), false);
   assert.equal(calls.prompt[0].body.agent, SELF_EVOLVE_ANALYZER_AGENT);
   assert.equal(calls.prompt[0].body.parts[0].metadata.source, SELF_EVOLVE_SOURCE);
   assert.deepEqual(calls.prompt[0].body.model, { providerID: "openai", modelID: "gpt-5.5" });
@@ -334,7 +428,10 @@ test("session create failure fails closed without active-session analyzer prompt
   await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "create-fails", arguments: "scan" }, output);
 
   const state = SelfEvolvePlugin.__test.registry.getOrCreate("create-fails", 5200);
-  assert.equal(calls.create.length, 6, "permission and parentID fallbacks try both v1 and direct create shapes");
+  assert.equal(calls.create.length, 1, "session creation must not retry after a host result error");
+  assert.deepEqual(calls.create[0].query, { directory: "/workspace/project" });
+  assert.equal(calls.create[0].body.parentID, "create-fails");
+  assert.ok(calls.create[0].body.permission.some((rule) => rule.permission === "*" && rule.action === "deny"));
   assert.equal(calls.prompt.length, 0, "analyzer must not fallback to prompting the active session");
   assert.equal(calls.promptAsync.length, 0);
   assert.equal(calls.abort.length, 0);
@@ -355,12 +452,11 @@ test("temporary analyzer prompt failure aborts the analyzer session and fails cl
 
   const state = SelfEvolvePlugin.__test.registry.getOrCreate("prompt-fails", 5300);
   assert.equal(calls.create.length, 1);
-  assert.equal(calls.prompt.length, 3);
-  assert.equal(calls.prompt[0].path.id, "analyzer-1");
-  assert.equal(calls.prompt[1].path.sessionID, "analyzer-1");
-  assert.equal(calls.prompt[2].sessionID, "analyzer-1");
+  assert.equal(calls.prompt.length, 1, "analyzer prompting must not retry after a transport error");
+  assert.deepEqual(calls.prompt[0].path, { id: "analyzer-1" });
+  assert.deepEqual(calls.prompt[0].query, { directory: "/workspace/project" });
   assert.equal(calls.abort.length, 1);
-  assert.equal(calls.abort[0].path.id, "analyzer-1");
+  assert.deepEqual(calls.abort[0].path, { id: "analyzer-1" });
   assert.equal(calls.promptAsync.length, 0);
   assert.equal(state.analyzerFailures, 1);
   assert.match(output.parts.at(-1).text, /prompt exploded/);
@@ -378,7 +474,8 @@ test("cleanup failure after a valid analyzer result preserves the accepted propo
   const state = SelfEvolvePlugin.__test.registry.getOrCreate("cleanup-fails", 5400);
   assert.equal(calls.create.length, 1);
   assert.equal(calls.prompt.length, 1);
-  assert.equal(calls.abort.length, 5);
+  assert.equal(calls.abort.length, 1, "known-session cleanup must not retry after a host result error");
+  assert.deepEqual(calls.abort[0], { path: { id: "analyzer-1" }, query: { directory: "/workspace/project" } });
   assert.equal(calls.promptAsync.length, 0);
   assert.equal(state.disabled, false);
   assert.equal(state.analyzerFailures, 0);
@@ -694,28 +791,26 @@ test("pause cancels an in-flight analyzer failure without incrementing failures"
   assert.match(state.lastReason, /state changed/i);
 });
 
-test("analyzer lifecycle falls back to direct session SDK shape", async () => {
+test("analyzer lifecycle uses one permission-preserving 1.18.3 shape per mutation", async () => {
   const { ctx, calls } = createMockContext({
     createImpl: async (args) => {
-      if (args.body) return { error: { message: "unsupported shape" } };
-      assert.equal(args.directory, "/workspace/project");
-      assert.equal(args.parentID, "v2");
-      assert.equal(args.agent, SELF_EVOLVE_ANALYZER_AGENT);
-      assert.deepEqual(args.model, { providerID: "openai", modelID: "gpt-5.5" });
+      assert.deepEqual(args.query, { directory: "/workspace/project" });
+      assert.equal(args.body.parentID, "v2");
+      assert.equal(args.body.agent, SELF_EVOLVE_ANALYZER_AGENT);
+      assert.deepEqual(args.body.model, { providerID: "openai", modelID: "gpt-5.5" });
+      assert.ok(args.body.permission.some((rule) => rule.permission === "*" && rule.action === "deny"));
       return { data: { id: "analyzer-v2" } };
     },
     promptImpl: async (args) => {
-      if (args.path) return { error: { message: "unsupported shape" } };
-      assert.equal(args.sessionID, "analyzer-v2");
-      assert.equal(args.directory, "/workspace/project");
-      assert.equal(args.agent, SELF_EVOLVE_ANALYZER_AGENT);
-      assert.deepEqual(args.model, { providerID: "openai", modelID: "gpt-5.5" });
+      assert.deepEqual(args.path, { id: "analyzer-v2" });
+      assert.deepEqual(args.query, { directory: "/workspace/project" });
+      assert.equal(args.body.agent, SELF_EVOLVE_ANALYZER_AGENT);
+      assert.deepEqual(args.body.model, { providerID: "openai", modelID: "gpt-5.5" });
       return { data: { parts: [{ type: "text", text: JSON.stringify(proposalPayload()) }] } };
     },
     abortImpl: async (args) => {
-      if (args.path) return { error: { message: "unsupported shape" } };
-      assert.equal(args.sessionID, "analyzer-v2");
-      assert.equal(args.directory, "/workspace/project");
+      assert.deepEqual(args.path, { id: "analyzer-v2" });
+      assert.deepEqual(args.query, { directory: "/workspace/project" });
       return { data: {} };
     },
   });
@@ -724,20 +819,18 @@ test("analyzer lifecycle falls back to direct session SDK shape", async () => {
 
   await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "v2", arguments: "scan" }, { parts: [] });
 
-  assert.equal(calls.create.length, 2);
-  assert.equal(calls.create[1].parentID, "v2");
-  assert.equal(calls.prompt.length, 3);
+  assert.equal(calls.create.length, 1);
+  assert.equal(calls.prompt.length, 1);
   assert.equal(calls.promptAsync.length, 0);
-  assert.equal(calls.abort.length, 3);
-  assert.equal(calls.prompt[2].sessionID, "analyzer-v2");
-  assert.equal(calls.abort[2].sessionID, "analyzer-v2");
+  assert.equal(calls.abort.length, 1);
 });
 
-test("plugin registers no passive event or chat analysis hooks", async () => {
+test("plugin registers no passive event or chat message analysis hooks", async () => {
   const { ctx } = createMockContext();
   const hooks = await SelfEvolvePlugin(ctx, { now: () => 14000 });
   assert.equal(hooks.event, undefined);
   assert.equal(hooks["chat.message"], undefined);
+  assert.equal(typeof hooks["chat.params"], "function");
   assert.equal(SelfEvolvePlugin.__test.registry.map.size, 0);
 });
 
@@ -1172,7 +1265,9 @@ test("transient startup health failure retries until the official host becomes a
     __testHostHealthRetryWindowMs: 100,
     __testHostHealthRetryDelayMs: 1,
   });
-  t.after(async () => hooks.dispose());
+  t.after(async () => {
+    try { await hooks.dispose(); } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
   await waitForDurableStartup(hooks, "startup-transient-health");
   const output = { parts: [] };
   await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "health-transient", arguments: "health" }, output);
@@ -1199,7 +1294,9 @@ test("a command recovers durable startup after the TUI host becomes reachable la
     __testHostHealthRetryWindowMs: 30,
     __testHostHealthRetryDelayMs: 1,
   });
-  t.after(async () => hooks.dispose());
+  t.after(async () => {
+    try { await hooks.dispose(); } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
   await new Promise((resolve) => setTimeout(resolve, 50));
   const startupCalls = healthCalls;
   assert.ok(startupCalls > 0);
@@ -1225,7 +1322,9 @@ test("late command recovery remains fail-closed while official health is unavail
     __testHostHealthRetryWindowMs: 20,
     __testHostHealthRetryDelayMs: 1,
   });
-  t.after(async () => hooks.dispose());
+  t.after(async () => {
+    try { await hooks.dispose(); } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   const output = { parts: [] };
@@ -1532,15 +1631,17 @@ test("a new factory waits for final shared-runtime shutdown before joining", asy
         async shutdown() {
           if (ordinal === 1) {
             firstShutdownStarted = true;
-            await firstShutdownGate;
+            return { ok: false, reason: "autonomous-work-draining", completion: firstShutdownGate.then(() => ({ ok: true })) };
           }
+          return { ok: true };
         },
       };
     },
   };
   const first = await DefaultSelfEvolvePlugin(f.ctx, options);
   await waitForDurableStartup(first, "closing-race-first");
-  const firstDispose = first.dispose();
+  let firstDisposeResolved = false;
+  const firstDispose = first.dispose().then(() => { firstDisposeResolved = true; });
   const deadline = Date.now() + 500;
   while (!firstShutdownStarted && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(firstShutdownStarted, true);
@@ -1551,6 +1652,7 @@ test("a new factory waits for final shared-runtime shutdown before joining", asy
     return hooks;
   });
   await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(firstDisposeResolved, true, "dispose returns after the bounded shutdown result while full close remains fenced");
   assert.equal(secondResolved, false, "a new factory must not adopt a runtime that is closing");
   releaseFirstShutdown();
   await firstDispose;
@@ -1736,7 +1838,9 @@ test("a rejected generated SDK health call falls back to official serverUrl heal
     return { ok: true, async json() { return { healthy: true, version: "1.18.3" }; } };
   };
   const hooks = await DefaultSelfEvolvePlugin(f.ctx);
-  t.after(async () => hooks.dispose());
+  t.after(async () => {
+    try { await hooks.dispose(); } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
   await waitForDurableStartup(hooks, "sdk-to-server-url-fallback");
   const output = { parts: [] };
   await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "sdk-to-fallback", arguments: "health" }, output);
@@ -1762,7 +1866,9 @@ test("fresh official TUI app-version runtime report recovers an embedded host wi
     __testHostHealthRetryWindowMs: 20,
     __testHostHealthRetryDelayMs: 1,
   });
-  t.after(async () => hooks.dispose());
+  t.after(async () => {
+    try { await hooks.dispose(); } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
   await waitForDurableStartup(hooks, "tui-app-version-runtime-report");
   const output = { parts: [] };
   await hooks["command.execute.before"]({ command: "self-evolve", sessionID: "tui-app-version", arguments: "health" }, output);

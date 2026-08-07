@@ -2,11 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import {
+  burnNonce,
   evaluateApplyAuthority,
   errorReasonCode,
   makeAuditEvent,
   makeCircuitBreaker,
   makeDecision,
+  makeProposal,
   makeRollbackRecord,
   stripUndefined,
   transitionProposalState,
@@ -97,6 +99,18 @@ function writeTemp(target, content, nonce) {
     throw readbackError;
   }
   return temporary;
+}
+
+function verifiedNewSkillTemp(temporary, target, expectedHash) {
+  if (typeof temporary !== "string" || temporary === "none"
+      || path.dirname(temporary) !== path.dirname(target)
+      || !path.basename(temporary).startsWith(`.${path.basename(target)}.self-evolve-tmp-`)) return false;
+  try {
+    return hashSkillContent(fs.readFileSync(temporary)) === expectedHash;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export function createApplier({ store, inventory, privacy, now = () => Date.now(), faultInjection } = {}) {
@@ -216,24 +230,42 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
   function decisionApproved(proposal, decision) {
     if (!decision) return false;
     if (proposal.state === "approved") {
-      if (proposal.skillTarget.currentHash === MUST_NOT_EXIST) {
-        return decision.proposalId === proposal.id
-          && decision.targetHash === MUST_NOT_EXIST
-          && decision.proposedContentHash === proposal.proposedContentHash
-          && decision.newState === "approved"
-          && typeof decision.actor === "string" && decision.actor.length > 0
-          && typeof decision.nonce === "string" && decision.nonce.length > 0
-          && Number.isSafeInteger(decision.decisionVersion)
-          && Number.isSafeInteger(decision.timestamp);
-      }
       try {
         const clean = makeDecision(decision);
-        return clean.proposalId === proposal.id
-          && clean.targetHash === proposal.skillTarget.currentHash
-          && clean.proposedContentHash === proposal.proposedContentHash
-          && clean.newState === "approved";
+        const schemaProposal = Object.fromEntries([
+          "id", "projectFingerprint", "clusterId", "skillTarget", "proposedContentHash", "rationaleText",
+          "synthesizedAt", "synthesizerModelId", "criticScore", "criticPassed", "validDeterministic",
+          "state", "injectionFlagged", "decisionVersion", "burnedNonceHashes",
+        ].filter((key) => proposal[key] !== undefined).map((key) => [key, proposal[key]]));
+        const approved = makeProposal(schemaProposal);
+        const nonceHash = burnNonce(clean);
+        const burnedNonceHashes = [...approved.burnedNonceHashes];
+        const burnedIndex = burnedNonceHashes.lastIndexOf(nonceHash);
+        if (burnedIndex >= 0) burnedNonceHashes.splice(burnedIndex, 1);
+        const prior = makeProposal({
+          ...approved,
+          state: "pending",
+          decisionVersion: approved.decisionVersion - 1,
+          burnedNonceHashes,
+        });
+        const transitioned = transitionProposalState(prior, clean, clean.timestamp);
+        return transitioned.ok
+          && transitioned.state.state === "approved"
+          && transitioned.state.decisionVersion === approved.decisionVersion
+          && transitioned.state.skillTarget.currentHash === approved.skillTarget.currentHash;
       } catch {
-        return false;
+        if (proposal.skillTarget.currentHash === MUST_NOT_EXIST) return false;
+        try {
+          const clean = makeDecision(decision);
+          return clean.proposalId === proposal.id
+            && clean.targetHash === proposal.skillTarget.currentHash
+            && clean.proposedContentHash === proposal.proposedContentHash
+            && clean.decisionVersion === proposal.decisionVersion
+            && clean.priorState === "pending"
+            && clean.newState === "approved";
+        } catch {
+          return false;
+        }
       }
     }
     const schemaProposal = Object.fromEntries([
@@ -309,6 +341,8 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         if (hashSkillContent(priorContent) !== proposal.skillTarget.currentHash) throw new Error("stale-hash");
       }
 
+      injectFault("apply-before-temp-parent-check");
+      assertSafeParent(target, proposal.skillTarget.canonicalRoot);
       temporary = writeTemp(target, proposal.proposedContent, acquired.nonce);
       injectFault("apply-after-temp-write");
       appliedHash = hashSkillContent(proposal.proposedContent);
@@ -334,6 +368,7 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
       pendingAuditId = appendAudit("apply", proposal.id, {
         state: "applied",
         target,
+        canonicalRoot: proposal.skillTarget.canonicalRoot,
         priorHash: isNew ? MUST_NOT_EXIST : proposal.skillTarget.currentHash,
         appliedHash,
         actor: String(actor),
@@ -348,12 +383,14 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
       assertSafeParent(target, proposal.skillTarget.canonicalRoot);
       if (isNew) {
         fs.linkSync(temporary, target);
+        renamed = true;
+        injectFault("apply-after-new-target-link");
         fs.unlinkSync(temporary);
       } else {
         fs.renameSync(temporary, target);
+        renamed = true;
       }
       temporary = undefined;
-      renamed = true;
       injectFault("apply-after-publication");
 
       const readback = fs.readFileSync(target);
@@ -361,19 +398,21 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         const rolledBack = rollbackFromAudit({
           proposalId: proposal.id,
           target,
+          canonicalRoot: proposal.skillTarget.canonicalRoot,
           appliedHash,
           priorHash: isNew ? MUST_NOT_EXIST : proposal.skillTarget.currentHash,
           snapshot: snapshot ?? "none",
           actor: ACTOR,
           reason: "readback-mismatch",
         });
-        if (!rolledBack.ok) tripCritical(proposal.id, rolledBack.reason, { target, appliedHash });
+        if (!rolledBack.ok && !rolledBack.rollbackCompleted) tripCritical(proposal.id, rolledBack.reason, { target, appliedHash });
         outcome = { ok: false, reason: "readback-mismatch", auditId: pendingAuditId };
         return outcome;
       }
       const auditId = appendAudit("apply", proposal.id, {
         state: "readback-verified",
         target,
+        canonicalRoot: proposal.skillTarget.canonicalRoot,
         priorHash: isNew ? MUST_NOT_EXIST : proposal.skillTarget.currentHash,
         appliedHash,
         actor: String(actor),
@@ -393,13 +432,15 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         const rolledBack = rollbackFromAudit({
           proposalId: proposal.id,
           target,
+          canonicalRoot: proposal.skillTarget.canonicalRoot,
           appliedHash,
           priorHash: isNew ? MUST_NOT_EXIST : proposal.skillTarget.currentHash,
           snapshot: snapshot ?? "none",
           actor: ACTOR,
           reason,
         });
-        if (!rolledBack.ok) tripCritical(proposal.id, rolledBack.reason, { target, appliedHash });
+        if (!rolledBack.ok && !rolledBack.rollbackCompleted) tripCritical(proposal.id, rolledBack.reason, { target, appliedHash });
+        else pendingAuditId = rolledBack.auditId;
       }
       outcome = { ok: false, reason, auditId: pendingAuditId ?? auditFailure(proposal, reason, { target }) };
       return outcome;
@@ -420,11 +461,37 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     return null;
   }
 
-  function rollbackFromAudit({ proposalId, target, appliedHash, priorHash, snapshot, actor, reason }) {
+  function persistRollbackCompletion({ proposalId, target, appliedHash, rolledBackHash, snapshot, actor, reason }) {
+    const auditId = appendAudit("rollback", proposalId, {
+      state: "rolled-back",
+      target,
+      appliedHash,
+      rolledBackHash,
+      actor: String(actor),
+      reason,
+      "readback-verified": true,
+    });
+    const rollback = makeRollbackRecord({ proposalId, appliedHash, rolledBackAt: now(), reason });
+    const recorded = store.appendRecord(wrapRecord("rollback-record", rollback, now()));
+    if (!recorded?.ok) throw new Error(recorded?.reason ?? "rollback-record-write-failed");
+    if (snapshot && snapshot !== "none") fs.rmSync(snapshot, { force: true });
+    return { ok: true, rolledBackHash, auditId };
+  }
+
+  function reconcileCompletedRollback({ proposalId, target, appliedHash, priorHash, snapshot, actor, reason }, rolledBackHash) {
+    try {
+      return persistRollbackCompletion({ proposalId, target, appliedHash, rolledBackHash, snapshot, actor, reason });
+    } catch (error) {
+      return { ok: false, reason: errorReason(error, "rollback-failed"), rollbackCompleted: true, rolledBackHash };
+    }
+  }
+
+  function rollbackFromAudit({ proposalId, target, canonicalRoot, appliedHash, priorHash, snapshot, actor, reason }) {
+    let rolledBackHash;
+    let rollbackCompleted = false;
     try {
       const current = fs.readFileSync(target);
       if (hashSkillContent(current) !== appliedHash) return { ok: false, reason: "hash-drift" };
-      let rolledBackHash;
       if (priorHash === MUST_NOT_EXIST) {
         fs.unlinkSync(target);
         rolledBackHash = MUST_NOT_EXIST;
@@ -432,21 +499,17 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         if (!snapshot || snapshot === "none" || !fs.existsSync(snapshot)) throw new Error("snapshot-missing");
         const prior = fs.readFileSync(snapshot);
         if (hashSkillContent(prior) !== priorHash) throw new Error("snapshot-hash-mismatch");
-        assertSafeParent(target, path.dirname(path.dirname(target)));
+        assertSafeParent(target, canonicalRoot ?? path.dirname(path.dirname(target)));
         const temporary = writeTemp(target, prior, randomBytes(12).toString("hex"));
         try { fs.renameSync(temporary, target); } finally { fs.rmSync(temporary, { force: true }); }
         rolledBackHash = hashSkillContent(fs.readFileSync(target));
         if (rolledBackHash !== priorHash) throw new Error("rollback-readback-mismatch");
-        fs.rmSync(snapshot, { force: true });
       }
-      appendAudit("rollback", proposalId, { state: "rolled-back", target, appliedHash, rolledBackHash, actor: String(actor), reason, "readback-verified": true });
-      const rollback = makeRollbackRecord({ proposalId, appliedHash, rolledBackAt: now(), reason });
-      const recorded = store.appendRecord(wrapRecord("rollback-record", rollback, now()));
-      if (!recorded?.ok) throw new Error(recorded?.reason ?? "rollback-record-write-failed");
-      return { ok: true, rolledBackHash };
+      rollbackCompleted = true;
+      return persistRollbackCompletion({ proposalId, target, appliedHash, rolledBackHash, snapshot, actor, reason });
     } catch (error) {
       const failure = errorReason(error, "rollback-failed");
-      return { ok: false, reason: failure };
+      return { ok: false, reason: failure, ...(rollbackCompleted ? { rollbackCompleted: true, rolledBackHash } : {}) };
     }
   }
 
@@ -470,6 +533,10 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
       try {
         const currentHash = hashSkillContent(fs.readFileSync(audit.details.target));
         if (currentHash !== audit.details.appliedHash) {
+          if (currentHash === audit.details.priorHash) {
+            outcome = reconcileCompletedRollback({ proposalId, actor, reason, ...audit.details }, currentHash);
+            return outcome;
+          }
           appendAudit("rollback", proposalId, {
             state: "refused",
             target: audit.details.target,
@@ -483,13 +550,17 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
           return outcome;
         }
       } catch (error) {
+        if (error?.code === "ENOENT" && audit.details.priorHash === MUST_NOT_EXIST) {
+          outcome = reconcileCompletedRollback({ proposalId, actor, reason, ...audit.details }, MUST_NOT_EXIST);
+          return outcome;
+        }
         const failure = errorReason(error, "rollback-failed");
         tripCritical(proposalId, failure, { target: audit.details.target, appliedHash: audit.details.appliedHash });
         outcome = { ok: false, reason: failure };
         return outcome;
       }
       outcome = rollbackFromAudit({ proposalId, actor, reason, ...audit.details });
-      if (!outcome.ok) tripCritical(proposalId, outcome.reason, { target: audit.details.target, appliedHash: audit.details.appliedHash });
+      if (!outcome.ok && !outcome.rollbackCompleted) tripCritical(proposalId, outcome.reason, { target: audit.details.target, appliedHash: audit.details.appliedHash });
       return outcome;
     } finally {
       if (acquiredHere) {
@@ -520,16 +591,32 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
         catch (error) {
           if (error?.code !== "ENOENT" || details.priorHash !== MUST_NOT_EXIST) throw error;
           const temporary = details.temporary;
-          if (typeof temporary === "string" && temporary !== "none" && path.dirname(temporary) === path.dirname(details.target)
-            && path.basename(temporary).startsWith(`.${path.basename(details.target)}.self-evolve-tmp-`) && fs.existsSync(temporary)
-            && hashSkillContent(fs.readFileSync(temporary)) === details.temporaryHash) fs.unlinkSync(temporary);
+          if (verifiedNewSkillTemp(temporary, details.target, details.temporaryHash)) fs.unlinkSync(temporary);
           const auditId = appendAudit("rollback", audit.proposalId, { ...details, state: "rolled-back", rolledBackHash: MUST_NOT_EXIST, reason: "recovery-found-target-absent", "readback-verified": true });
           outcome = { ok: false, proposalId: audit.proposalId, reason: "apply-not-published", rolledBackHash: MUST_NOT_EXIST, auditId };
           outcomes.push(outcome);
           continue;
         }
         if (currentHash === details.appliedHash) {
-          const auditId = appendAudit("apply", audit.proposalId, { ...details, state: "readback-verified", "readback-verified": true, recovery: true });
+          if (details.priorHash === MUST_NOT_EXIST && verifiedNewSkillTemp(details.temporary, details.target, details.temporaryHash)) {
+            try {
+              fs.unlinkSync(details.temporary);
+            } catch (error) {
+              const reason = errorReason(error, "temporary-unlink-failed");
+              const rollback = rollbackFromAudit({ proposalId: audit.proposalId, actor: ACTOR, ...details, reason });
+              if (!rollback.ok && !rollback.rollbackCompleted) throw new Error(rollback.reason);
+              if (!rollback.ok) {
+                outcome = { ok: false, proposalId: audit.proposalId, reason: rollback.reason, rolledBackHash: rollback.rolledBackHash };
+                outcomes.push(outcome);
+                continue;
+              }
+              fs.rmSync(details.temporary, { force: true });
+              outcome = { ok: false, proposalId: audit.proposalId, reason, rolledBackHash: rollback.rolledBackHash, auditId: rollback.auditId };
+              outcomes.push(outcome);
+              continue;
+            }
+          }
+          const auditId = appendAudit("apply", audit.proposalId, { ...details, state: "readback-verified", temporary: "none", "readback-verified": true, recovery: true });
           outcome = { ok: true, proposalId: audit.proposalId, appliedHash: currentHash, auditId };
           outcomes.push(outcome);
         } else if (currentHash === details.priorHash) {
@@ -543,7 +630,7 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
           outcomes.push(outcome);
         } else {
           const rollback = rollbackFromAudit({ proposalId: audit.proposalId, actor: ACTOR, reason: "startup-recovery", ...details });
-          if (!rollback.ok) tripCritical(audit.proposalId, rollback.reason, { target: details.target, appliedHash: details.appliedHash });
+          if (!rollback.ok && !rollback.rollbackCompleted) tripCritical(audit.proposalId, rollback.reason, { target: details.target, appliedHash: details.appliedHash });
           outcome = { ok: false, proposalId: audit.proposalId, reason: rollback.reason };
           outcomes.push(outcome);
         }

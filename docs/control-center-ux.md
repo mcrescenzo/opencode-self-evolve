@@ -51,7 +51,10 @@ analysis, no new observations, or evidence that is not eligible yet.
 
 The sidebar, header, and Home use the same pure operational view model. The
 first matching row wins. They may vary in detail but must not disagree about
-state, explanation, destination, or primary next action.
+state, explanation, or primary next action. The operational destination follows
+the table below. The sidebar entry destination follows the Sidebar contract;
+only on-demand entry differs, opening Home while its explicit mode-setting
+action remains in Settings.
 
 | Priority | State | Primary copy | Explanation | Destination | Primary next action |
 |---:|---|---|---|---|---|
@@ -94,7 +97,7 @@ The card contains, in order:
 - one bounded explanation or relevant count/time;
 - one explicit action hint, such as `Open Home` or `Review recommendation`.
 
-Click and focused Enter open the exact destination from the operational model:
+Click and focused Enter open the exact sidebar entry destination:
 
 - setup opens **Settings** at the first unmet prerequisite;
 - recommendation or applied attention opens **Recommendations** with the item
@@ -103,6 +106,10 @@ Click and focused Enter open the exact destination from the operational model:
   **Errors**;
 - healthy, startup, in-flight, paused, budget, quiet-period, and on-demand
   states open **Home**.
+
+For on-demand state, this Home deep link applies equally to pointer click and
+focused Enter or Space. Explicit actions that change global or repository mode
+continue to open **Settings** at the mode controls.
 
 The normal path never opens a separate state-dependent review dialog. The
 Release A dialog was retained only until Recommendations reached equivalent
@@ -193,7 +200,7 @@ Reject, Snooze, Acknowledge, Undo, and Open in Activity. Pending, accepted,
 completed, stale, and failed states replace or disable the affected action
 inline without dismissing the detail.
 
-If `dashboard-v1` advertises `decision-feedback-v1`, Reject may add one reason:
+If the selected dashboard sidecar advertises `decision-feedback-v1`, Reject may add one reason:
 **Incorrect evidence**, **Already covered**, **Wrong scope**, **Too specific**,
 **Not worth the token cost**, or **Other** with bounded optional text. Feedback
 is audit-only and never becomes evidence. Without the capability, Reject uses
@@ -370,14 +377,14 @@ records.
 
 ## Compatibility
 
-- `dashboard-v1` is optional and additive beside the unchanged v1 review index.
+- `dashboard-v2` and its `dashboard-v1` compatibility sidecar are optional and additive beside the unchanged v1 review index.
 - The v1 offer and index retain the exact Release A capability vocabulary.
   Release B capabilities are exact fields inside the dashboard sidecar.
-- A new TUI with an old server labels Home, Activity, and actual usage as a
-  **Limited view**, continues to use valid legacy review data, and emits no new
-  request shape or authority.
-- An old TUI with a new server ignores `dashboard-v1`; the existing v1 review,
-  grant, mailbox, headless, and recovery contracts continue unchanged.
+- A current TUI prefers v2 and falls back to an old server's v1 sidecar without
+  rejecting independently bounded v1 retention values.
+- An older dashboard TUI with a current server continues to read the v1
+  compatibility sidecar; the existing review, grant, mailbox, headless, and
+  recovery contracts remain unchanged.
 - A missing dashboard is compatible. A malformed, newer, stale, wrong-project,
   wrong-root, wrong-generation, or wrong-index dashboard is rejected for
   enhanced presentation without invalidating an otherwise valid core review

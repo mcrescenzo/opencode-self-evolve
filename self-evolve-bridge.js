@@ -19,16 +19,21 @@ import {
 import path from "node:path";
 import {
   DEFAULT_BUDGETS,
-  SCHEMA_VERSION,
   assertRecord,
   errorReasonCode,
   makeDecision,
   makeGlobalSettings,
+  migrateSettings,
   makeProposal,
   makeRepoSettings,
 } from "./self-evolve-schemas.js";
 import { processIsAlive, withStateMutationLock } from "./self-evolve-lock.js";
-import { stateRootIdentity as computeStateRootIdentity } from "./self-evolve-state-root.js";
+import {
+  revalidateStateRootBoundary,
+  stateRootIdentity as computeStateRootIdentity,
+  validateStateRootBoundary,
+  walkStateRootDirectories,
+} from "./self-evolve-state-root.js";
 import {
   UI_CAPABILITIES,
   UI_OPERATION_PROTOCOL_VERSION,
@@ -45,6 +50,7 @@ import {
 } from "./self-evolve-ui-protocol.js";
 
 export const BRIDGE_TTL_MS = 24 * 60 * 60 * 1000;
+export const BRIDGE_SCHEMA_VERSION = "0.2.1";
 export const TUI_HOST_HEALTH_TTL_MS = 60 * 1000;
 export const BRIDGE_ACTOR = "self-evolve-tui";
 export const BRIDGE_SERVER_ACTOR = "self-evolve-integration";
@@ -95,14 +101,73 @@ const MAX_SETTINGS_BYTES = 64 * 1024;
 const MAX_MAILBOX_BYTES = 512 * 1024;
 const MAX_MAILBOX_FILES = 64;
 const MAX_STORE_RESERVE_BYTES = 64 * 1024;
-const MAX_UI_PROJECTION_FILES = 3 + UI_PROTOCOL_LIMITS.reviewIndexEntries;
+const MAX_UI_PROJECTION_FILES = 4 + UI_PROTOCOL_LIMITS.reviewIndexEntries;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const HOST_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/u;
 const CONSENT_KEYS = new Set(["passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation"]);
 const NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) && constants.O_NOFOLLOW !== 0 ? constants.O_NOFOLLOW : null;
+const validatedStateBoundaries = new Map();
 export const BRIDGE_RESPONSE_RESERVE_BYTES = MAX_RESPONSE_BYTES;
 export const BRIDGE_CONTROL_STATE_RESERVE_BYTES = MAX_CONTROL_STATE_BYTES;
+
+function mailboxDescriptor(value) {
+  return Object.freeze(value);
+}
+
+export const BRIDGE_MAILBOX_DESCRIPTORS = Object.freeze([
+  mailboxDescriptor({
+    type: "decision-request", role: "request", pathKey: "requests", directoryName: "requests",
+    exportField: "requests", classification: "sensitive-decision-request-metadata",
+    maxBytes: MAX_REQUEST_BYTES, responseType: "decision-response", responseMaxBytes: MAX_RESPONSE_BYTES,
+    validate: (value, context) => makeBridgeRequest(value, {
+      now: context.now ?? value?.timestamp,
+      maxAgeMs: BRIDGE_TTL_MS,
+      projectFingerprint: context.projectFingerprint,
+    }),
+  }),
+  mailboxDescriptor({
+    type: "decision-response", role: "response", pathKey: "responses", directoryName: "responses",
+    exportField: "responses", classification: "sensitive-decision-response-metadata",
+    maxBytes: MAX_RESPONSE_BYTES, requestType: "decision-request",
+    validate: (value) => makeBridgeResponse(value),
+  }),
+  mailboxDescriptor({
+    type: "control-request", role: "request", pathKey: "controlRequests", directoryName: "control-requests",
+    exportField: "controlRequests", classification: "sensitive-control-request-metadata",
+    maxBytes: MAX_REQUEST_BYTES, responseType: "control-response", responseMaxBytes: MAX_RESPONSE_BYTES,
+    validate: (value, context) => makeControlRequest(value, {
+      now: context.now ?? value?.timestamp,
+      maxAgeMs: BRIDGE_TTL_MS,
+      projectFingerprint: context.projectFingerprint,
+    }),
+  }),
+  mailboxDescriptor({
+    type: "control-response", role: "response", pathKey: "controlResponses", directoryName: "control-responses",
+    exportField: "controlResponses", classification: "sensitive-control-response-metadata",
+    maxBytes: MAX_RESPONSE_BYTES, requestType: "control-request",
+    validate: (value) => makeControlResponse(value),
+  }),
+  mailboxDescriptor({
+    type: "operation-request", role: "request", pathKey: "operationRequests", directoryName: "operation-requests",
+    exportField: "operationRequests", classification: "sensitive-operation-request-metadata",
+    maxBytes: UI_PROTOCOL_LIMITS.operationBytes, responseType: "operation-response",
+    responseMaxBytes: UI_PROTOCOL_LIMITS.responseBytes,
+    validate: (value, context) => validateOperationRequestEnvelope(value, {
+      now: context.now ?? value?.issuedAt,
+      projectFingerprint: context.projectFingerprint,
+    }),
+  }),
+  mailboxDescriptor({
+    type: "operation-response", role: "response", pathKey: "operationResponses", directoryName: "operation-responses",
+    exportField: "operationResponses", classification: "sensitive-operation-response-metadata",
+    maxBytes: UI_PROTOCOL_LIMITS.responseBytes, requestType: "operation-request",
+    validate: (value, context) => validateOperationResponseEnvelope(value, context),
+  }),
+]);
+
+const MAILBOX_BY_TYPE = new Map(BRIDGE_MAILBOX_DESCRIPTORS.map((descriptor) => [descriptor.type, descriptor]));
+const REQUEST_MAILBOXES = BRIDGE_MAILBOX_DESCRIPTORS.filter((descriptor) => descriptor.role === "request");
 
 function exactKeys(value, fields, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`${label}-malformed`);
@@ -126,6 +191,14 @@ function validHash(value, label) {
 function validTimestamp(value, label = "timestamp") {
   if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`invalid-${label}`);
   return value;
+}
+
+function bridgeSchemaVersion(value) {
+  // Durable 0.2.2 callers normalize to the frozen Release A wire contract.
+  if (value !== BRIDGE_SCHEMA_VERSION && value !== "0.2.2") {
+    throw new TypeError("unsupported-schema-version");
+  }
+  return BRIDGE_SCHEMA_VERSION;
 }
 
 function canonicalRoots(value, { nonEmpty = false } = {}) {
@@ -159,33 +232,20 @@ function assertInside(boundary, candidate) {
 }
 
 function stateBoundary(stateRoot) {
-  const requested = path.resolve(String(stateRoot ?? ""));
-  const entry = lstatOptional(requested);
-  if (!entry || !entry.isDirectory() || entry.isSymbolicLink()) throw new Error("state-root-boundary-rejected");
-  const canonical = realpathSync(requested);
-  if (canonical !== requested) throw new Error("state-root-boundary-rejected");
-  return canonical;
+  const boundary = validateStateRootBoundary(stateRoot);
+  validatedStateBoundaries.set(boundary.path, boundary);
+  return boundary.path;
 }
 
 function walkDirectories(boundary, components, { create = false } = {}) {
-  let current = boundary;
-  for (const component of components) {
-    if (!component || component === "." || component === ".." || component.includes(path.sep)) throw new Error("bridge-component-rejected");
-    const next = path.join(current, component);
-    assertInside(boundary, next);
-    let entry = lstatOptional(next);
-    if (!entry && create) {
-      try { mkdirSync(next, { mode: DIR_MODE }); } catch (error) { if (error?.code !== "EEXIST") throw error; }
-      entry = lstatOptional(next);
-    }
-    if (!entry) return null;
-    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("bridge-ancestor-rejected");
-    const canonical = realpathSync(next);
-    assertInside(boundary, canonical);
-    if (canonical !== next) throw new Error("bridge-ancestor-rejected");
-    current = next;
+  let validated = validatedStateBoundaries.get(boundary);
+  if (!validated) {
+    validated = validateStateRootBoundary(boundary);
+    validatedStateBoundaries.set(validated.path, validated);
+  } else {
+    revalidateStateRootBoundary(validated);
   }
-  return current;
+  return walkStateRootDirectories(validated, components, { create });
 }
 
 function bridgePaths(stateRoot, projectFingerprint, { create = false } = {}) {
@@ -193,16 +253,13 @@ function bridgePaths(stateRoot, projectFingerprint, { create = false } = {}) {
   const boundary = stateBoundary(stateRoot);
   const root = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint], { create });
   if (!root) return null;
-  const requests = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "requests"], { create });
-  const responses = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "responses"], { create });
-  const controlRequests = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "control-requests"], { create });
-  const controlResponses = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "control-responses"], { create });
-  const operationRequests = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "operation-requests"], { create });
-  const operationResponses = walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, "operation-responses"], { create });
-  if (![requests, responses, controlRequests, controlResponses, operationRequests, operationResponses].every(Boolean)) return null;
+  const mailboxPaths = Object.fromEntries(BRIDGE_MAILBOX_DESCRIPTORS.map((descriptor) => [
+    descriptor.pathKey,
+    walkDirectories(boundary, ["self-evolve", "bridge", fingerprint, descriptor.directoryName], { create }),
+  ]));
+  if (!Object.values(mailboxPaths).every(Boolean)) return null;
   return {
-    boundary, fingerprint, root, requests, responses, controlRequests, controlResponses,
-    operationRequests, operationResponses,
+    boundary, fingerprint, root, ...mailboxPaths,
     lock: path.join(root, "consumer.lock"),
     controlState: path.join(root, "control-state.json"),
     tuiHostHealth: path.join(root, "tui-host-health.json"),
@@ -240,6 +297,7 @@ function uiProjectionPaths(paths, { create = false, generation } = {}) {
     offer: path.join(root, "protocol-offer.json"),
     index: path.join(root, "index.json"),
     dashboard: generationRoot ? path.join(generationRoot, "dashboard-v1.json") : null,
+    dashboardV2: generationRoot ? path.join(generationRoot, "dashboard-v2.json") : null,
   };
 }
 
@@ -268,24 +326,26 @@ function sameInode(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function secureRead(paths, filePath, maxBytes, label) {
+function secureRead(paths, filePath, maxBytes, label, { expectedLinks = 1 } = {}) {
   if (NOFOLLOW === null) throw new Error("bridge-no-follow-unsupported");
   const parent = path.dirname(filePath);
   revalidateDirectory(paths.boundary, parent);
   const before = lstatOptional(filePath);
   if (!before) return null;
-  assertRegularSingleLink(before, label);
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error(`${label}-path-rejected`);
+  if (before.nlink !== expectedLinks) throw new Error(`${label}-hardlink-rejected`);
   let descriptor;
   try {
     descriptor = openSync(filePath, constants.O_RDONLY | NOFOLLOW);
     const opened = fstatSync(descriptor);
-    assertRegularSingleLink(opened, label);
+    if (!opened.isFile() || opened.isSymbolicLink()) throw new Error(`${label}-path-rejected`);
+    if (opened.nlink !== expectedLinks) throw new Error(`${label}-hardlink-rejected`);
     if (!sameInode(before, opened)) throw new Error(`${label}-replaced`);
     if (opened.size > maxBytes) throw new Error(`${label}-oversized`);
     const source = readFileSync(descriptor, "utf8");
     if (Buffer.byteLength(source) > maxBytes) throw new Error(`${label}-oversized`);
     const after = lstatOptional(filePath);
-    if (!after || !sameInode(opened, after) || after.nlink !== 1) throw new Error(`${label}-replaced`);
+    if (!after || !sameInode(opened, after) || after.nlink !== expectedLinks) throw new Error(`${label}-replaced`);
     revalidateDirectory(paths.boundary, parent);
     return { source, stat: opened };
   } finally {
@@ -420,6 +480,15 @@ function safeTreeUsage(paths, directory) {
   return { bytes: files.reduce((sum, file) => sum + file.size, 0), files };
 }
 
+function repoSettingsForBridgeQuota(raw) {
+  const migrated = migrateSettings(raw);
+  if (!migrated) throw new TypeError("unsupported-version");
+  // The TUI health relay must publish before the server can open the store and
+  // rewrite legacy repository settings. Reuse the store's pure normalization
+  // read-only here so quota admission cannot deadlock migration.
+  return makeRepoSettings(migrated?.repo ?? migrated);
+}
+
 function quotaBytesFor(paths) {
   const globalPath = path.join(paths.boundary, "self-evolve", "global", "settings.json");
   const repoPath = path.join(paths.boundary, "self-evolve", paths.fingerprint, "settings.json");
@@ -431,7 +500,7 @@ function quotaBytesFor(paths) {
   let quotaMiB = globalQuotaMiB;
   if (lstatOptional(repoPath)) {
     const read = secureRead(paths, repoPath, MAX_SETTINGS_BYTES, "repo-settings");
-    const repo = makeRepoSettings(JSON.parse(read.source));
+    const repo = repoSettingsForBridgeQuota(JSON.parse(read.source));
     if (repo.projectFingerprint !== paths.fingerprint) throw new Error("project-partition-mismatch");
     quotaMiB = repo.budgets.storageQuotaMiB ?? globalQuotaMiB;
   }
@@ -439,7 +508,7 @@ function quotaBytesFor(paths) {
 }
 
 function pendingRequestCount(paths, files) {
-  const requestRoots = new Set([paths.requests, paths.controlRequests, paths.operationRequests]);
+  const requestRoots = new Set(REQUEST_MAILBOXES.map((descriptor) => paths[descriptor.pathKey]));
   return files.filter((file) => requestRoots.has(path.dirname(file.filePath)) && file.filePath.endsWith(".json")).length;
 }
 
@@ -455,11 +524,8 @@ function assertMailboxPublication(paths, target, source, { request = false, remo
   const sourceBytes = Buffer.byteLength(source, "utf8");
   const existingBytes = existing?.size ?? 0;
   const removedBytes = removed?.size ?? 0;
-  const removingPending = removed && [
-    paths.requests,
-    paths.controlRequests,
-    paths.operationRequests,
-  ].includes(path.dirname(removePath)) ? 1 : 0;
+  const removingPending = removed && REQUEST_MAILBOXES
+    .some((descriptor) => paths[descriptor.pathKey] === path.dirname(removePath)) ? 1 : 0;
   const pending = pendingRequestCount(paths, bridgeUsage.files) - removingPending + (request && !existing ? 1 : 0);
   const controlStateReserve = pending > 0 && !lstatOptional(paths.controlState) ? MAX_CONTROL_STATE_BYTES : 0;
   const projectedProjectBytes = stateUsage.bytes + bridgeUsage.bytes - existingBytes - removedBytes + sourceBytes + controlStateReserve;
@@ -470,7 +536,15 @@ function assertMailboxPublication(paths, target, source, { request = false, remo
     throw new Error("mailbox-byte-quota-exceeded");
   }
 
-  const projectedMailboxBytes = bridgeUsage.bytes - existingBytes - removedBytes + sourceBytes + pending * MAX_RESPONSE_BYTES + controlStateReserve;
+  const responseReserveByDirectory = new Map(REQUEST_MAILBOXES.map((descriptor) => [
+    paths[descriptor.pathKey],
+    descriptor.responseMaxBytes,
+  ]));
+  const pendingResponseReserve = bridgeUsage.files.reduce((sum, file) => {
+    if (!file.filePath.endsWith(".json") || file.filePath === removePath) return sum;
+    return sum + (responseReserveByDirectory.get(path.dirname(file.filePath)) ?? 0);
+  }, request && !existing ? responseReserveByDirectory.get(path.dirname(target)) ?? 0 : 0);
+  const projectedMailboxBytes = bridgeUsage.bytes - existingBytes - removedBytes + sourceBytes + pendingResponseReserve + controlStateReserve;
   const mailboxQuotaBytes = Math.min(MAX_MAILBOX_BYTES, Math.floor(quotaBytes / 8));
   if (growing && projectedMailboxBytes > mailboxQuotaBytes) throw new Error("mailbox-byte-quota-exceeded");
   if (request && pending > MAX_MAILBOX_FILES) throw new Error("mailbox-file-count-exceeded");
@@ -517,6 +591,42 @@ function secureUnlink(paths, filePath, expected, { allowSymlink = false, expecte
   return true;
 }
 
+function atomicTemporaryTargetName(name) {
+  const match = /^\.(.+)\.([1-9][0-9]*)\.([a-f0-9]{16})\.tmp$/u.exec(name);
+  return match?.[1] ?? null;
+}
+
+function reconcileAtomicWriteResidues(paths, directory, {
+  acceptsTarget,
+  maxBytes,
+  label,
+  validate,
+}) {
+  revalidateDirectory(paths.boundary, directory);
+  let removed = 0;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const targetName = atomicTemporaryTargetName(entry.name);
+    if (!targetName || !acceptsTarget(targetName)) continue;
+    const temporaryPath = path.join(directory, entry.name);
+    const targetPath = path.join(directory, targetName);
+    const temporary = lstatOptional(temporaryPath);
+    if (!temporary || !temporary.isFile() || temporary.isSymbolicLink() || (temporary.mode & 0o777) !== FILE_MODE) {
+      throw new Error(`${label}-temporary-rejected`);
+    }
+    const target = lstatOptional(targetPath);
+    const linkedPublication = target && sameInode(temporary, target);
+    const expectedLinks = linkedPublication ? 2 : 1;
+    if (temporary.nlink !== expectedLinks
+        || (linkedPublication && (!target.isFile() || target.isSymbolicLink() || target.nlink !== 2))) {
+      throw new Error(`${label}-temporary-hardlink-rejected`);
+    }
+    const read = secureRead(paths, temporaryPath, maxBytes, `${label}-temporary`, { expectedLinks });
+    validate(read.source, targetName);
+    if (secureUnlink(paths, temporaryPath, read.stat, { expectedLinks })) removed += 1;
+  }
+  return removed;
+}
+
 function removePrivateProjectionTree(paths, directory) {
   assertInside(paths.root, directory);
   const stat = lstatOptional(directory);
@@ -550,7 +660,41 @@ function removePrivateProjectionTree(paths, directory) {
   return removed;
 }
 
-function atomicWrite(paths, filePath, source, { exclusive = false } = {}) {
+function fsyncDirectory(paths, directory) {
+  revalidateDirectory(paths.boundary, directory);
+  const before = lstatSync(directory);
+  if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("bridge-directory-path-rejected");
+  const directoryFlag = Number.isInteger(constants.O_DIRECTORY) ? constants.O_DIRECTORY : 0;
+  let descriptor;
+  try {
+    descriptor = openSync(directory, constants.O_RDONLY | directoryFlag | NOFOLLOW);
+    const opened = fstatSync(descriptor);
+    if (!opened.isDirectory() || !sameInode(before, opened)) throw new Error("bridge-directory-replaced");
+    fsyncSync(descriptor);
+    revalidateDirectory(paths.boundary, directory);
+    const after = lstatSync(directory);
+    if (!after.isDirectory() || after.isSymbolicLink() || !sameInode(opened, after)) {
+      throw new Error("bridge-directory-replaced");
+    }
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function fsyncDirectoryChain(paths, leaf, afterDirectoryFsync) {
+  let directory = path.resolve(leaf);
+  while (true) {
+    assertInside(paths.boundary, directory);
+    fsyncDirectory(paths, directory);
+    afterDirectoryFsync?.({ directory });
+    if (directory === paths.boundary) return;
+    const parent = path.dirname(directory);
+    if (parent === directory) throw new Error("bridge-directory-chain-escape");
+    directory = parent;
+  }
+}
+
+function atomicWrite(paths, filePath, source, { exclusive = false, afterDirectoryFsync } = {}) {
   if (NOFOLLOW === null) throw new Error("bridge-no-follow-unsupported");
   const parent = path.dirname(filePath);
   revalidateDirectory(paths.boundary, parent);
@@ -586,6 +730,8 @@ function atomicWrite(paths, filePath, source, { exclusive = false } = {}) {
       if (!sameInode(temporaryStat, published) || published.nlink !== 1) throw new Error("bridge-publication-replaced");
     }
     revalidateDirectory(paths.boundary, parent);
+    fsyncDirectory(paths, parent);
+    afterDirectoryFsync?.({ filePath, parent });
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
     try {
@@ -604,7 +750,7 @@ export function makeBridgeRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_T
   const hasFeedbackFields = Object.hasOwn(value ?? {}, "feedbackVersion")
     || Object.hasOwn(value ?? {}, "feedback");
   exactKeys(value, hasFeedbackFields ? BRIDGE_FEEDBACK_REQUEST_FIELDS : BRIDGE_REQUEST_FIELDS, "bridge-request");
-  if (value.schemaVersion !== SCHEMA_VERSION) throw new TypeError("unsupported-schema-version");
+  const schemaVersion = bridgeSchemaVersion(value.schemaVersion);
   let feedback;
   if (hasFeedbackFields) {
     if (value.feedbackVersion !== DECISION_FEEDBACK_VERSION) throw new TypeError("unsupported-decision-feedback-version");
@@ -625,7 +771,7 @@ export function makeBridgeRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_T
     feedback = Object.freeze({ reason: value.feedback.reason, text: value.feedback.text });
   }
   const request = Object.freeze({
-    schemaVersion: value.schemaVersion,
+    schemaVersion,
     requestId: validId(value.requestId, "request-id"),
     projectFingerprint: validHash(value.projectFingerprint, "project-fingerprint"),
     proposalId: validId(value.proposalId, "proposal-id"),
@@ -663,9 +809,9 @@ export function makeBridgeRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_T
 export function makeBridgeResponse(value) {
   const normalized = { ...value, reason: value.reason ?? null, recovered: value.recovered === true };
   exactKeys(normalized, BRIDGE_RESPONSE_FIELDS, "bridge-response");
-  if (normalized.schemaVersion !== SCHEMA_VERSION) throw new TypeError("unsupported-schema-version");
+  const schemaVersion = bridgeSchemaVersion(normalized.schemaVersion);
   const response = Object.freeze({
-    schemaVersion: normalized.schemaVersion,
+    schemaVersion,
     requestId: validId(normalized.requestId, "request-id"),
     projectFingerprint: validHash(normalized.projectFingerprint, "project-fingerprint"),
     proposalId: validId(normalized.proposalId, "proposal-id"),
@@ -716,11 +862,11 @@ function controlPayload(action, value) {
 
 export function makeControlRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_TTL_MS, projectFingerprint } = {}) {
   exactKeys(value, CONTROL_REQUEST_FIELDS, "control-request");
-  if (value.schemaVersion !== SCHEMA_VERSION) throw new TypeError("unsupported-schema-version");
+  const schemaVersion = bridgeSchemaVersion(value.schemaVersion);
   const action = String(value.action ?? "");
   if (!CONTROL_ACTIONS.includes(action)) throw new TypeError("unknown-control-action");
   const request = Object.freeze({
-    schemaVersion: value.schemaVersion,
+    schemaVersion,
     requestId: validId(value.requestId, "request-id"),
     projectFingerprint: validHash(value.projectFingerprint, "project-fingerprint"),
     actor: value.actor,
@@ -741,7 +887,7 @@ export function makeControlRequest(value, { now = Date.now(), maxAgeMs = BRIDGE_
 export function createControlRequest({ controlState, action, payload, timestamp = Date.now(), requestId = randomBytes(16).toString("hex") } = {}) {
   const state = makeControlState(controlState, { now: timestamp });
   return makeControlRequest({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     requestId,
     projectFingerprint: state.projectFingerprint,
     actor: BRIDGE_ACTOR,
@@ -757,9 +903,9 @@ export function createControlRequest({ controlState, action, payload, timestamp 
 export function makeControlResponse(value) {
   const normalized = { ...value, reason: value.reason ?? null };
   exactKeys(normalized, CONTROL_RESPONSE_FIELDS, "control-response");
-  if (normalized.schemaVersion !== SCHEMA_VERSION) throw new TypeError("unsupported-schema-version");
+  const schemaVersion = bridgeSchemaVersion(normalized.schemaVersion);
   const response = Object.freeze({
-    schemaVersion: normalized.schemaVersion,
+    schemaVersion,
     requestId: validId(normalized.requestId, "request-id"),
     projectFingerprint: validHash(normalized.projectFingerprint, "project-fingerprint"),
     ok: normalized.ok === true,
@@ -773,9 +919,9 @@ export function makeControlResponse(value) {
 
 export function makeControlState(value, { now = Date.now(), projectFingerprint } = {}) {
   exactKeys(value, CONTROL_STATE_FIELDS, "control-state");
-  if (value.schemaVersion !== SCHEMA_VERSION) throw new TypeError("unsupported-schema-version");
+  const schemaVersion = bridgeSchemaVersion(value.schemaVersion);
   const state = Object.freeze({
-    schemaVersion: value.schemaVersion,
+    schemaVersion,
     projectFingerprint: validHash(value.projectFingerprint, "project-fingerprint"),
     actor: value.actor,
     issuedAt: validTimestamp(value.issuedAt, "issued-at"),
@@ -807,11 +953,11 @@ export function makeControlState(value, { now = Date.now(), projectFingerprint }
 
 export function makeTuiHostHealth(value, { now = Date.now(), projectFingerprint, stateRootIdentity } = {}) {
   exactKeys(value, TUI_HOST_HEALTH_FIELDS, "tui-host-health");
-  if (value.schemaVersion !== SCHEMA_VERSION) throw new TypeError("unsupported-schema-version");
+  const schemaVersion = bridgeSchemaVersion(value.schemaVersion);
   const hostVersion = String(value.hostVersion ?? "");
   if (!HOST_VERSION_PATTERN.test(hostVersion)) throw new TypeError("invalid-host-version");
   const health = Object.freeze({
-    schemaVersion: value.schemaVersion,
+    schemaVersion,
     projectFingerprint: validHash(value.projectFingerprint, "project-fingerprint"),
     actor: value.actor,
     issuedAt: validTimestamp(value.issuedAt, "issued-at"),
@@ -831,36 +977,13 @@ export function makeTuiHostHealth(value, { now = Date.now(), projectFingerprint,
   return health;
 }
 
-export function validateBridgeExportMetadata(type, value, { projectFingerprint, requestId } = {}) {
+export function validateBridgeExportMetadata(type, value, { projectFingerprint, requestId, request } = {}) {
   let clean;
-  if (type === "decision-request") {
-    clean = makeBridgeRequest(value, { now: value?.timestamp, maxAgeMs: BRIDGE_TTL_MS, projectFingerprint });
-  } else if (type === "decision-response") {
-    clean = makeBridgeResponse(value);
-  } else if (type === "control-request") {
-    clean = makeControlRequest(value, { now: value?.timestamp, maxAgeMs: BRIDGE_TTL_MS, projectFingerprint });
-  } else if (type === "control-response") {
-    clean = makeControlResponse(value);
-  } else if (type === "control-state") {
+  if (type === "control-state") {
     clean = makeControlState(value, { now: value?.issuedAt, projectFingerprint });
-  } else if (type === "operation-request") {
-    clean = validateOperationRequestEnvelope(value, {
-      now: value?.issuedAt,
-      projectFingerprint,
-    });
-  } else if (type === "operation-response") {
-    clean = makeUiOperationResponse(value, {
-      projectFingerprint,
-      stateRootIdentity: value?.stateRootIdentity,
-      requestId: value?.requestId,
-      action: value?.action,
-      requestHash: value?.requestHash,
-      requestIssuedAt: Math.min(value?.processedAt ?? 0, value?.processedAt ?? 0),
-      requestExpiresAt: (value?.processedAt ?? 0) + UI_PROTOCOL_LIMITS.operationTtlMs,
-      now: value?.processedAt,
-    });
   } else {
-    throw new TypeError("unknown-bridge-export-class");
+    if (!MAILBOX_BY_TYPE.has(type)) throw new TypeError("unknown-bridge-export-class");
+    clean = validateMailboxEnvelope(type, value, { projectFingerprint, requestId, request });
   }
   if (clean.projectFingerprint !== projectFingerprint) throw new TypeError("cross-project-bridge-export");
   if (requestId !== undefined && clean.requestId !== requestId) throw new TypeError("request-id-path-mismatch");
@@ -877,7 +1000,7 @@ export function createDecisionRequest({
   requestId = randomBytes(16).toString("hex"),
 } = {}) {
   return makeBridgeRequest({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     requestId,
     projectFingerprint,
     proposalId: proposal?.id,
@@ -899,12 +1022,44 @@ export function createDecisionRequest({
   }, { now: timestamp, projectFingerprint });
 }
 
+function mailboxRequestId(targetName) {
+  if (!targetName.endsWith(".json")) return null;
+  const requestId = targetName.slice(0, -5);
+  return ID_PATTERN.test(requestId) ? requestId : null;
+}
+
+function reconcileMailboxResidues(paths, projectFingerprint, { directories } = {}) {
+  let removed = 0;
+  for (const descriptor of BRIDGE_MAILBOX_DESCRIPTORS) {
+    const directory = paths[descriptor.pathKey];
+    if (directories && !directories.includes(directory)) continue;
+    removed += reconcileAtomicWriteResidues(paths, directory, {
+      acceptsTarget: (name) => mailboxRequestId(name) !== null,
+      maxBytes: descriptor.maxBytes,
+      label: descriptor.type,
+      validate(source, targetName) {
+        const requestId = mailboxRequestId(targetName);
+        const clean = validateMailboxEnvelope(descriptor.type, JSON.parse(source), {
+          projectFingerprint,
+          requestId,
+          allowUnbound: descriptor.type === "operation-response",
+        });
+        if (clean.projectFingerprint !== projectFingerprint || clean.requestId !== requestId) {
+          throw new Error(`${descriptor.type}-temporary-binding-rejected`);
+        }
+      },
+    });
+  }
+  return removed;
+}
+
 export function submitDecisionRequest(stateRoot, request) {
   const clean = makeBridgeRequest(request, { now: Date.now(), projectFingerprint: request.projectFingerprint });
   const source = boundedJson(clean, MAX_REQUEST_BYTES, "bridge-request");
   const boundary = stateBoundary(stateRoot);
   return withStateMutationLock(boundary, () => {
     const paths = bridgePaths(boundary, clean.projectFingerprint, { create: true });
+    reconcileMailboxResidues(paths, clean.projectFingerprint);
     const target = path.join(paths.requests, `${clean.requestId}.json`);
     assertMailboxPublication(paths, target, source, { request: true });
     atomicWrite(paths, target, source, { exclusive: true });
@@ -918,6 +1073,7 @@ export function submitControlRequest(stateRoot, request) {
   const boundary = stateBoundary(stateRoot);
   return withStateMutationLock(boundary, () => {
     const paths = bridgePaths(boundary, clean.projectFingerprint, { create: true });
+    reconcileMailboxResidues(paths, clean.projectFingerprint);
     const target = path.join(paths.controlRequests, `${clean.requestId}.json`);
     assertMailboxPublication(paths, target, source, { request: true });
     atomicWrite(paths, target, source, { exclusive: true });
@@ -943,9 +1099,44 @@ function operationRequestContext(value, nowValue = Date.now()) {
 }
 
 function validateOperationRequestEnvelope(value, { now = Date.now(), projectFingerprint } = {}) {
+  if (projectFingerprint && value?.projectFingerprint !== projectFingerprint) throw new TypeError("cross-project-request");
   const clean = makeUiOperationRequest(value, operationRequestContext(value, now));
-  if (projectFingerprint && clean.projectFingerprint !== projectFingerprint) throw new TypeError("cross-project-request");
   return clean;
+}
+
+function validateOperationResponseEnvelope(value, {
+  projectFingerprint,
+  requestId,
+  request,
+  allowUnbound = true,
+  now = value?.processedAt,
+} = {}) {
+  let expectedRequest = request;
+  if (expectedRequest) {
+    expectedRequest = validateOperationRequestEnvelope(expectedRequest, {
+      now: expectedRequest?.issuedAt,
+      projectFingerprint,
+    });
+    if (requestId !== undefined && expectedRequest.requestId !== requestId) throw new TypeError("operation-response-request-binding-mismatch");
+  } else if (!allowUnbound) {
+    throw new TypeError("operation-response-request-required");
+  }
+  return makeUiOperationResponse(value, {
+    projectFingerprint,
+    stateRootIdentity: expectedRequest?.stateRootIdentity ?? value?.stateRootIdentity,
+    requestId: expectedRequest?.requestId ?? requestId ?? value?.requestId,
+    action: expectedRequest?.action ?? value?.action,
+    requestHash: expectedRequest?.operationHash ?? value?.requestHash,
+    requestIssuedAt: expectedRequest?.issuedAt ?? value?.processedAt,
+    requestExpiresAt: expectedRequest?.expiresAt ?? ((value?.processedAt ?? 0) + UI_PROTOCOL_LIMITS.operationTtlMs),
+    now,
+  });
+}
+
+function validateMailboxEnvelope(type, value, context = {}) {
+  const descriptor = MAILBOX_BY_TYPE.get(type);
+  if (!descriptor) throw new TypeError("unknown-mailbox-class");
+  return descriptor.validate(value, context);
 }
 
 export function createUiOperationRequest({
@@ -993,6 +1184,7 @@ export function submitUiOperationRequest(stateRoot, request) {
   const boundary = stateBoundary(stateRoot);
   return withStateMutationLock(boundary, () => {
     const paths = bridgePaths(boundary, clean.projectFingerprint, { create: true });
+    reconcileMailboxResidues(paths, clean.projectFingerprint);
     const target = path.join(paths.operationRequests, `${clean.requestId}.json`);
     if (lstatOptional(path.join(paths.operationResponses, `${clean.requestId}.json`))) {
       throw new Error("operation-response-already-exists");
@@ -1004,13 +1196,19 @@ export function submitUiOperationRequest(stateRoot, request) {
 }
 
 function pollResponse(stateRoot, projectFingerprint, requestId, type) {
-  const paths = bridgePaths(stateRoot, projectFingerprint);
+  const boundary = stateBoundary(stateRoot);
+  const paths = bridgePaths(boundary, projectFingerprint);
   if (!paths) return null;
   const id = validId(requestId, "request-id");
   const directory = type === "control" ? paths.controlResponses : paths.responses;
   const filePath = path.join(directory, `${id}.json`);
   let read;
-  try { read = secureRead(paths, filePath, MAX_RESPONSE_BYTES, `${type}-response`); }
+  try {
+    read = withStateMutationLock(boundary, () => {
+      reconcileMailboxResidues(paths, projectFingerprint, { directories: [directory] });
+      return secureRead(paths, filePath, MAX_RESPONSE_BYTES, `${type}-response`);
+    });
+  }
   catch (error) { if (/hardlink-rejected$/u.test(errorReasonCode(error, "bridge-error"))) return null; throw error; }
   if (!read) return null;
   const response = type === "control" ? makeControlResponse(JSON.parse(read.source)) : makeBridgeResponse(JSON.parse(read.source));
@@ -1031,10 +1229,14 @@ export function pollUiOperationResponse(stateRoot, request, { now = Date.now() }
     now: Math.min(now, request?.expiresAt - 1),
     projectFingerprint: request?.projectFingerprint,
   });
-  const paths = bridgePaths(stateRoot, cleanRequest.projectFingerprint);
+  const boundary = stateBoundary(stateRoot);
+  const paths = bridgePaths(boundary, cleanRequest.projectFingerprint);
   if (!paths) return null;
   const filePath = path.join(paths.operationResponses, `${cleanRequest.requestId}.json`);
-  const read = secureRead(paths, filePath, UI_PROTOCOL_LIMITS.responseBytes, "operation-response");
+  const read = withStateMutationLock(boundary, () => {
+    reconcileMailboxResidues(paths, cleanRequest.projectFingerprint, { directories: [paths.operationResponses] });
+    return secureRead(paths, filePath, UI_PROTOCOL_LIMITS.responseBytes, "operation-response");
+  });
   if (!read) return null;
   return makeUiOperationResponse(JSON.parse(read.source), {
     projectFingerprint: cleanRequest.projectFingerprint,
@@ -1072,6 +1274,7 @@ function validateUiProjectionBundle({
   index: indexValue,
   details: detailValues,
   dashboard: dashboardValue,
+  dashboardV1: dashboardV1Value,
   offer: offerValue,
   projectFingerprint,
   stateRootIdentity,
@@ -1120,16 +1323,33 @@ function validateUiProjectionBundle({
     return detail;
   }).sort((left, right) => left.proposalId.localeCompare(right.proposalId));
   if (seen.size !== reviews.size) throw new Error("ui-projection-detail-set-incomplete");
-  const dashboard = dashboardValue === undefined || dashboardValue === null
-    ? null
-    : makeUiDashboard(dashboardValue, {
-        projectFingerprint,
-        stateRootIdentity,
-        generation: index.generation,
-        indexHash: index.projectionHash,
-        now,
-      });
-  return Object.freeze({ offer, index, details: Object.freeze(details), dashboard });
+  const dashboardContext = {
+    projectFingerprint,
+    stateRootIdentity,
+    generation: index.generation,
+    indexHash: index.projectionHash,
+    now,
+  };
+  const dashboards = new Map();
+  for (const [label, value] of [["dashboard", dashboardValue], ["dashboard-v1", dashboardV1Value]]) {
+    if (value === undefined || value === null) continue;
+    const clean = makeUiDashboard(value, dashboardContext);
+    if (label === "dashboard-v1" && clean.dashboardVersion !== 1) {
+      throw new Error("ui-dashboard-v1-version-mismatch");
+    }
+    if (dashboards.has(clean.dashboardVersion)) throw new Error("ui-dashboard-version-duplicate");
+    dashboards.set(clean.dashboardVersion, clean);
+  }
+  const dashboardV1 = dashboards.get(1) ?? null;
+  const dashboardV2 = dashboards.get(2) ?? null;
+  return Object.freeze({
+    offer,
+    index,
+    details: Object.freeze(details),
+    dashboard: dashboardV2 ?? dashboardV1,
+    dashboardV1,
+    dashboardV2,
+  });
 }
 
 function cleanupStaleUiGenerationsUnlocked(paths, activeGeneration) {
@@ -1174,9 +1394,12 @@ export function publishUiProjection(stateRoot, {
   index,
   details,
   dashboard,
+  dashboardV1,
   offer,
   now = Date.now(),
   __testFaultInjection,
+  __testAfterDirectoryFsync,
+  __testAfterDirectoryChainFsync,
 } = {}) {
   const boundary = stateBoundary(stateRoot);
   assertUiProjectionBoundary(boundary);
@@ -1186,6 +1409,7 @@ export function publishUiProjection(stateRoot, {
     index,
     details,
     dashboard,
+    dashboardV1,
     offer,
     projectFingerprint,
     stateRootIdentity: expectedRootIdentity,
@@ -1199,8 +1423,11 @@ export function publishUiProjection(stateRoot, {
     let removed = cleanupUiProjectionTempsUnlocked(paths, projection.root);
     const offerSource = boundedJson(clean.offer, MAX_REQUEST_BYTES, "ui-protocol-offer");
     const indexSource = boundedJson(clean.index, UI_PROTOCOL_LIMITS.indexBytes, "ui-projection-index");
-    const dashboardSource = clean.dashboard
-      ? boundedJson(clean.dashboard, UI_PROTOCOL_LIMITS.dashboardBytes, "ui-dashboard")
+    const dashboardV1Source = clean.dashboardV1
+      ? boundedJson(clean.dashboardV1, UI_PROTOCOL_LIMITS.dashboardBytes, "ui-dashboard-v1")
+      : null;
+    const dashboardV2Source = clean.dashboardV2
+      ? boundedJson(clean.dashboardV2, UI_PROTOCOL_LIMITS.dashboardBytes, "ui-dashboard-v2")
       : null;
     const detailSources = new Map(clean.details.map((detail) => [
       projectionDetailPath(projection, detail.proposalId),
@@ -1209,17 +1436,23 @@ export function publishUiProjection(stateRoot, {
     const planned = new Map([
       [projection.offer, offerSource],
       [projection.index, indexSource],
-      ...(dashboardSource ? [[projection.dashboard, dashboardSource]] : []),
+      ...(dashboardV1Source ? [[projection.dashboard, dashboardV1Source]] : []),
+      ...(dashboardV2Source ? [[projection.dashboardV2, dashboardV2Source]] : []),
       ...detailSources,
     ]);
     assertUiProjectionPublication(paths, planned);
-    for (const [filePath, source] of detailSources) atomicWrite(paths, filePath, source);
+    const writeProjectionFile = (filePath, source) => atomicWrite(paths, filePath, source, {
+      afterDirectoryFsync: __testAfterDirectoryFsync,
+    });
+    for (const [filePath, source] of detailSources) writeProjectionFile(filePath, source);
     __testFaultInjection?.("ui-projection-after-details", { generation: clean.index.generation });
-    if (dashboardSource) atomicWrite(paths, projection.dashboard, dashboardSource);
+    if (dashboardV1Source) writeProjectionFile(projection.dashboard, dashboardV1Source);
+    if (dashboardV2Source) writeProjectionFile(projection.dashboardV2, dashboardV2Source);
     __testFaultInjection?.("ui-projection-after-dashboard", { generation: clean.index.generation });
-    atomicWrite(paths, projection.offer, offerSource);
+    fsyncDirectoryChain(paths, projection.details, __testAfterDirectoryChainFsync);
+    writeProjectionFile(projection.offer, offerSource);
     __testFaultInjection?.("ui-projection-before-index", { generation: clean.index.generation });
-    atomicWrite(paths, projection.index, indexSource);
+    writeProjectionFile(projection.index, indexSource);
     __testFaultInjection?.("ui-projection-after-index", { generation: clean.index.generation });
     removed += cleanupStaleUiGenerationsUnlocked(paths, clean.index.generation);
     return Object.freeze({
@@ -1227,6 +1460,8 @@ export function publishUiProjection(stateRoot, {
       index: clean.index,
       details: clean.details,
       dashboard: clean.dashboard,
+      dashboardV1: clean.dashboardV1,
+      dashboardV2: clean.dashboardV2,
       staleFilesRemoved: removed,
     });
   });
@@ -1299,27 +1534,36 @@ export function readUiProjection(stateRoot, projectFingerprint, {
   let dashboard = null;
   let dashboardError = null;
   let dashboardRead = null;
-  try {
-    dashboardRead = secureProjectionRead(
-      paths,
-      generationPaths.dashboard,
-      UI_PROTOCOL_LIMITS.dashboardBytes,
-      "ui-dashboard",
-      { effectiveUid: __testEffectiveUid },
-    );
-    if (dashboardRead) {
-      dashboard = makeUiDashboard(JSON.parse(dashboardRead.source), {
+  let dashboardPath = null;
+  for (const [version, candidatePath] of [[2, generationPaths.dashboardV2], [1, generationPaths.dashboard]]) {
+    try {
+      const candidateRead = secureProjectionRead(
+        paths,
+        candidatePath,
+        UI_PROTOCOL_LIMITS.dashboardBytes,
+        `ui-dashboard-v${version}`,
+        { effectiveUid: __testEffectiveUid },
+      );
+      if (!candidateRead) continue;
+      const candidate = makeUiDashboard(JSON.parse(candidateRead.source), {
         projectFingerprint: fingerprint,
         stateRootIdentity: expectedRootIdentity,
         generation: index.generation,
         indexHash: index.projectionHash,
         now,
       });
+      if (candidate.dashboardVersion !== version) throw new Error(`ui-dashboard-v${version}-version-mismatch`);
+      dashboard = candidate;
+      dashboardRead = candidateRead;
+      dashboardPath = candidatePath;
+      dashboardError = null;
+      break;
+    } catch (error) {
+      const code = errorReasonCode(error, "ui-dashboard-malformed");
+      if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(code)) throw error;
+      dashboardError = code || "ui-dashboard-malformed";
+      if (version === 2) break;
     }
-  } catch (error) {
-    const code = errorReasonCode(error, "ui-dashboard-malformed");
-    if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(code)) throw error;
-    dashboardError = code || "ui-dashboard-malformed";
   }
   const details = detailProposalIds.map((proposalId) => {
     const review = reviews.get(proposalId);
@@ -1363,7 +1607,7 @@ export function readUiProjection(stateRoot, projectFingerprint, {
   if (dashboard && dashboardRead) {
     const dashboardReadback = secureProjectionRead(
       paths,
-      generationPaths.dashboard,
+      dashboardPath,
       UI_PROTOCOL_LIMITS.dashboardBytes,
       "ui-dashboard",
       { effectiveUid: __testEffectiveUid },
@@ -1400,7 +1644,7 @@ export function publishTuiHostHealth(stateRoot, {
   nonce = randomBytes(16).toString("hex"),
 } = {}) {
   const clean = makeTuiHostHealth({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     projectFingerprint,
     actor: BRIDGE_ACTOR,
     issuedAt,
@@ -1574,6 +1818,22 @@ export function readBoundedInspection(stateRoot, projectFingerprint, { limit = 3
 
 function acquireConsumerLock(paths, now, ttlMs) {
   const lease = { pid: process.pid, acquiredAt: now, expiresAt: now + ttlMs, nonce: randomBytes(16).toString("hex") };
+  reconcileAtomicWriteResidues(paths, paths.root, {
+    acceptsTarget: (name) => name === path.basename(paths.lock),
+    maxBytes: 1024,
+    label: "bridge-lock",
+    validate(source, targetName) {
+      if (targetName !== path.basename(paths.lock)) throw new Error("bridge-lock-temporary-binding-rejected");
+      const value = JSON.parse(source);
+      exactKeys(value, ["pid", "acquiredAt", "expiresAt", "nonce"], "bridge-lock");
+      if (!Number.isSafeInteger(value.pid) || value.pid <= 0
+          || !Number.isSafeInteger(value.acquiredAt) || value.acquiredAt < 0
+          || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= value.acquiredAt) {
+        throw new Error("bridge-lock-malformed");
+      }
+      validId(value.nonce, "bridge-lock-nonce");
+    },
+  });
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       atomicWrite(paths, paths.lock, boundedJson(lease, 1024, "bridge-lock"), { exclusive: true });
@@ -1641,6 +1901,7 @@ async function consumeType({ paths, projectFingerprint, now, maxRequests, type, 
     let request;
     let result;
     let read;
+    const responsePath = path.join(responseDirectory, `${item.requestId}.json`);
     try {
       beforeRead?.({ type, filePath: item.filePath, requestId: item.requestId });
       read = secureRead(paths, item.filePath, MAX_REQUEST_BYTES, `${type}-request`);
@@ -1649,13 +1910,33 @@ async function consumeType({ paths, projectFingerprint, now, maxRequests, type, 
         ? makeControlRequest(JSON.parse(read.source), { now: now(), projectFingerprint })
         : makeBridgeRequest(JSON.parse(read.source), { now: now(), projectFingerprint });
       if (request.requestId !== item.requestId) throw new Error("request-id-path-mismatch");
-      result = await handler(request);
     } catch (error) {
       result = { ok: false, reason: errorReasonCode(error, "bridge-error") };
     }
+    if (request) {
+      const existingRead = secureRead(paths, responsePath, MAX_RESPONSE_BYTES, `${type}-response`);
+      if (existingRead) {
+        const existing = type === "control"
+          ? makeControlResponse(JSON.parse(existingRead.source))
+          : makeBridgeResponse(JSON.parse(existingRead.source));
+        if (existing.projectFingerprint !== projectFingerprint || existing.requestId !== item.requestId
+            || (type === "decision" && existing.proposalId !== request.proposalId)) {
+          throw new Error(`${type}-response-binding-rejected`);
+        }
+        withStateMutationLock(paths.boundary, () => {
+          const current = lstatOptional(item.filePath);
+          if (current && !sameInode(current, read.stat)) throw new Error(`${type}-request-replaced`);
+          if (current) secureUnlink(paths, item.filePath, read.stat);
+        });
+        processed.push(existing);
+        continue;
+      }
+      try { result = await handler(request); }
+      catch (error) { result = { ok: false, reason: errorReasonCode(error, "bridge-error") }; }
+    }
     await afterHandled?.({ type, request, result, filePath: item.filePath, requestId: item.requestId });
     const common = {
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: BRIDGE_SCHEMA_VERSION,
       requestId: item.requestId,
       projectFingerprint,
       ok: result?.ok === true,
@@ -1666,7 +1947,6 @@ async function consumeType({ paths, projectFingerprint, now, maxRequests, type, 
     const response = type === "control"
       ? makeControlResponse(common)
       : makeBridgeResponse({ ...common, proposalId: request?.proposalId ?? "invalid-request", recovered: result?.recovered === true });
-    const responsePath = path.join(responseDirectory, `${item.requestId}.json`);
     const responseSource = boundedJson(response, MAX_RESPONSE_BYTES, `${type}-response`);
     withStateMutationLock(paths.boundary, () => {
       const current = lstatOptional(item.filePath);
@@ -1704,9 +1984,33 @@ async function consumeOperationType({
       const value = JSON.parse(read.source);
       request = validateOperationRequestEnvelope(value, { now: now(), projectFingerprint });
       if (request.requestId !== item.requestId) throw new Error("request-id-path-mismatch");
-      result = await handler(request);
     } catch (error) {
       result = { ok: false, reason: errorReasonCode(error, "bridge-error") };
+    }
+    const responsePath = path.join(paths.operationResponses, `${item.requestId}.json`);
+    if (request) {
+      const existingRead = secureRead(paths, responsePath, UI_PROTOCOL_LIMITS.responseBytes, "operation-response");
+      if (existingRead) {
+        const existing = makeUiOperationResponse(JSON.parse(existingRead.source), {
+          projectFingerprint,
+          stateRootIdentity: request.stateRootIdentity,
+          requestId: request.requestId,
+          action: request.action,
+          requestHash: request.operationHash,
+          requestIssuedAt: request.issuedAt,
+          requestExpiresAt: request.expiresAt,
+          now: Math.max(request.issuedAt, Math.min(now(), request.expiresAt - 1)),
+        });
+        withStateMutationLock(paths.boundary, () => {
+          const current = lstatOptional(item.filePath);
+          if (current && !sameInode(current, read.stat)) throw new Error("operation-request-replaced");
+          if (current) secureUnlink(paths, item.filePath, read.stat);
+        });
+        processed.push(existing);
+        continue;
+      }
+      try { result = await handler(request); }
+      catch (error) { result = { ok: false, reason: errorReasonCode(error, "bridge-error") }; }
     }
     await afterHandled?.({
       type: "operation",
@@ -1751,7 +2055,6 @@ async function consumeOperationType({
       const current = lstatOptional(item.filePath);
       if (current && (!read || !sameInode(current, read.stat))) throw new Error("operation-request-replaced");
       if (response) {
-        const responsePath = path.join(paths.operationResponses, `${item.requestId}.json`);
         const source = boundedJson(response, UI_PROTOCOL_LIMITS.responseBytes, "operation-response");
         if (!lstatOptional(responsePath)) {
           assertMailboxPublication(paths, responsePath, source, {
@@ -1789,6 +2092,7 @@ export async function consumeDecisionRequests({
   }
   const timestamp = now();
   const paths = bridgePaths(stateRoot, projectFingerprint, { create: true });
+  withStateMutationLock(paths.boundary, () => reconcileMailboxResidues(paths, projectFingerprint));
   if (requestFiles(paths, paths.requests).length === 0
       && requestFiles(paths, paths.controlRequests).length === 0
       && requestFiles(paths, paths.operationRequests).length === 0) {
@@ -1797,6 +2101,7 @@ export async function consumeDecisionRequests({
   const lock = withStateMutationLock(paths.boundary, () => acquireConsumerLock(paths, timestamp, lockTtlMs));
   if (!lock) return { ok: false, reason: "bridge-lease-busy", processed: [], controls: [], operations: [] };
   try {
+    withStateMutationLock(paths.boundary, () => reconcileMailboxResidues(paths, projectFingerprint));
     const processed = await consumeType({ paths, projectFingerprint, now, maxRequests, type: "decision", handler: validateAndDecide, beforeRead: __testBeforeRequestRead, afterHandled: __testAfterRequestHandled });
     const controls = await consumeType({ paths, projectFingerprint, now, maxRequests, type: "control", handler: validateAndControl, beforeRead: __testBeforeRequestRead, afterHandled: __testAfterRequestHandled });
     const operations = await consumeOperationType({
@@ -1814,7 +2119,8 @@ export async function consumeDecisionRequests({
   }
 }
 
-function cleanupDirectory(paths, directory, type, projectFingerprint, now) {
+function cleanupDirectory(paths, descriptor, projectFingerprint, now) {
+  const directory = paths[descriptor.pathKey];
   let removed = 0;
   revalidateDirectory(paths.boundary, directory);
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -1831,31 +2137,18 @@ function cleanupDirectory(paths, directory, type, projectFingerprint, now) {
       continue;
     }
     try {
-      const read = secureRead(paths, filePath, type.includes("request") ? MAX_REQUEST_BYTES : MAX_RESPONSE_BYTES, type);
+      const read = secureRead(paths, filePath, descriptor.maxBytes, descriptor.type);
       const value = JSON.parse(read.source);
-      const clean = type === "decision-request"
-        ? makeBridgeRequest(value, { now, maxAgeMs: BRIDGE_TTL_MS, projectFingerprint })
-        : type === "control-request"
-          ? makeControlRequest(value, { now, maxAgeMs: BRIDGE_TTL_MS, projectFingerprint })
-          : type === "operation-request"
-            ? validateOperationRequestEnvelope(value, { now, projectFingerprint })
-            : type === "decision-response"
-              ? makeBridgeResponse(value)
-              : type === "control-response"
-                ? makeControlResponse(value)
-                : makeUiOperationResponse(value, {
-                  projectFingerprint,
-                  stateRootIdentity: value?.stateRootIdentity,
-                  requestId: value?.requestId,
-                  action: value?.action,
-                  requestHash: value?.requestHash,
-                  requestIssuedAt: value?.processedAt,
-                  requestExpiresAt: (value?.processedAt ?? 0) + UI_PROTOCOL_LIMITS.operationTtlMs,
-                  now,
-                });
-      const timestamp = type === "decision-request" || type === "control-request"
+      const clean = validateMailboxEnvelope(descriptor.type, value, {
+        now,
+        projectFingerprint,
+        requestId: mailboxRequestId(entry.name),
+        allowUnbound: descriptor.type === "operation-response",
+      });
+      if (clean.projectFingerprint !== projectFingerprint) throw new Error("cross-project-envelope");
+      const timestamp = descriptor.role === "request" && descriptor.type !== "operation-request"
         ? clean.timestamp
-        : type === "operation-request"
+        : descriptor.type === "operation-request"
           ? clean.issuedAt
           : clean.processedAt;
       if (timestamp > now + 30_000 || timestamp + BRIDGE_TTL_MS <= now) throw new Error("expired-or-future-envelope");
@@ -1888,25 +2181,27 @@ function cleanupUiProjectionUnlocked(paths, projectFingerprint, now) {
     const generation = uiProjectionPaths(paths, { generation: index.generation });
     if (!generation) throw new Error("ui-projection-generation-unavailable");
     let removedDashboard = 0;
-    const dashboardRead = secureProjectionRead(
-      paths,
-      generation.dashboard,
-      UI_PROTOCOL_LIMITS.dashboardBytes,
-      "ui-dashboard",
-    );
-    if (dashboardRead) {
+    for (const [version, dashboardPath] of [[1, generation.dashboard], [2, generation.dashboardV2]]) {
+      const dashboardRead = secureProjectionRead(
+        paths,
+        dashboardPath,
+        UI_PROTOCOL_LIMITS.dashboardBytes,
+        `ui-dashboard-v${version}`,
+      );
+      if (!dashboardRead) continue;
       try {
-        makeUiDashboard(JSON.parse(dashboardRead.source), {
+        const dashboard = makeUiDashboard(JSON.parse(dashboardRead.source), {
           projectFingerprint,
           stateRootIdentity: index.stateRootIdentity,
           generation: index.generation,
           indexHash: index.projectionHash,
           now,
         });
+        if (dashboard.dashboardVersion !== version) throw new Error(`ui-dashboard-v${version}-version-mismatch`);
       } catch (error) {
         if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(errorReasonCode(error, "bridge-error"))) throw error;
-        const current = lstatOptional(generation.dashboard);
-        if (current && secureUnlink(paths, generation.dashboard, current)) removedDashboard += 1;
+        const current = lstatOptional(dashboardPath);
+        if (current && secureUnlink(paths, dashboardPath, current)) removedDashboard += 1;
       }
     }
     for (const review of index.reviews) {
@@ -1946,12 +2241,10 @@ export function cleanupBridge(stateRoot, projectFingerprint, { now = Date.now(),
   let removed = 0;
   try {
     withStateMutationLock(paths.boundary, () => {
-      removed += cleanupDirectory(paths, paths.requests, "decision-request", projectFingerprint, now);
-      removed += cleanupDirectory(paths, paths.responses, "decision-response", projectFingerprint, now);
-      removed += cleanupDirectory(paths, paths.controlRequests, "control-request", projectFingerprint, now);
-      removed += cleanupDirectory(paths, paths.controlResponses, "control-response", projectFingerprint, now);
-      removed += cleanupDirectory(paths, paths.operationRequests, "operation-request", projectFingerprint, now);
-      removed += cleanupDirectory(paths, paths.operationResponses, "operation-response", projectFingerprint, now);
+      removed += reconcileMailboxResidues(paths, projectFingerprint);
+      for (const descriptor of BRIDGE_MAILBOX_DESCRIPTORS) {
+        removed += cleanupDirectory(paths, descriptor, projectFingerprint, now);
+      }
       try {
         const read = secureRead(paths, paths.controlState, MAX_CONTROL_STATE_BYTES, "control-state");
         if (read) makeControlState(JSON.parse(read.source), { now, projectFingerprint });

@@ -7,6 +7,12 @@ import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { openStore } from "../self-evolve-store.js";
+import {
+  consumeDecisionRequests,
+  createDecisionRequest,
+  pollDecisionResponse,
+} from "../self-evolve-bridge.js";
+import { SCHEMA_VERSION } from "../self-evolve-schemas.js";
 
 const execFileAsync = promisify(execFile);
 const HERE = import.meta.dirname;
@@ -14,6 +20,7 @@ const SERVER = path.join(HERE, "fixtures", "bridge-server.mjs");
 const CLIENT = path.join(HERE, "fixtures", "bridge-tui-client.mjs");
 const CONTROL_CLIENT = path.join(HERE, "fixtures", "bridge-control-client.mjs");
 const FLOOD_CLIENT = path.join(HERE, "fixtures", "bridge-flood-client.mjs");
+const HARDLINK_CRASH = path.join(HERE, "fixtures", "bridge-hardlink-crash.mjs");
 const PROJECT = "e".repeat(64);
 let resultOrdinal = 0;
 
@@ -118,6 +125,82 @@ test("production filesystem path works across processes, restart, replay, and cl
   assert.equal(fs.readdirSync(path.join(bridgeRoot, "requests")).length, 0);
 });
 
+test("a process death after hard-link publication recovers the request and response exactly once", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-bridge-hardlink-crash-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const timestamp = Date.now();
+  const request = createDecisionRequest({
+    projectFingerprint: PROJECT,
+    proposal: {
+      id: "process-crash-proposal",
+      skillTarget: { currentHash: "a".repeat(64) },
+      proposedContentHash: "b".repeat(64),
+      decisionVersion: 0,
+      state: "pending",
+      decisionNonce: "process-crash-nonce",
+    },
+    newState: "rejected",
+    timestamp,
+    requestId: "process-crash-request",
+  });
+  const bridgeRoot = path.join(root, "self-evolve", "bridge", PROJECT);
+  const requestDirectory = path.join(bridgeRoot, "requests");
+  const responseDirectory = path.join(bridgeRoot, "responses");
+  fs.mkdirSync(requestDirectory, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(responseDirectory, { recursive: true, mode: 0o700 });
+  for (const directory of ["control-requests", "control-responses", "operation-requests", "operation-responses"]) {
+    fs.mkdirSync(path.join(bridgeRoot, directory), { mode: 0o700 });
+  }
+  const requestSource = path.join(root, "request-source.json");
+  const requestPath = path.join(requestDirectory, `${request.requestId}.json`);
+  fs.writeFileSync(requestSource, `${JSON.stringify(request)}\n`, { mode: 0o600 });
+  await assert.rejects(
+    execFileAsync(process.execPath, [HARDLINK_CRASH, requestPath, requestSource]),
+    (error) => error.code === 86,
+  );
+  const requestTemp = fs.readdirSync(requestDirectory).find((name) => name.endsWith(".tmp"));
+  assert.equal(fs.statSync(requestPath).nlink, 2);
+
+  let effects = 0;
+  const first = await consumeDecisionRequests({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    now: () => timestamp,
+    validateAndDecide: async () => { effects += 1; return { ok: true }; },
+  });
+  assert.equal(first.processed.length, 1);
+  assert.equal(effects, 1);
+  assert.equal(fs.existsSync(path.join(requestDirectory, requestTemp)), false);
+
+  const responsePath = path.join(responseDirectory, `${request.requestId}.json`);
+  const response = pollDecisionResponse(root, PROJECT, request.requestId);
+  const responseSource = path.join(root, "response-source.json");
+  fs.unlinkSync(responsePath);
+  fs.writeFileSync(responseSource, `${JSON.stringify({
+    ...response,
+    schemaVersion: SCHEMA_VERSION,
+  })}\n`, { mode: 0o600 });
+  fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`, { mode: 0o600, flag: "wx" });
+  await assert.rejects(
+    execFileAsync(process.execPath, [HARDLINK_CRASH, responsePath, responseSource]),
+    (error) => error.code === 86,
+  );
+  const responseTemp = fs.readdirSync(responseDirectory).find((name) => name.endsWith(".tmp"));
+  assert.equal(fs.statSync(responsePath).nlink, 2);
+
+  const recovered = await consumeDecisionRequests({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    now: () => timestamp,
+    validateAndDecide: async () => { effects += 1; return { ok: true }; },
+  });
+  assert.equal(recovered.processed.length, 1);
+  assert.equal(effects, 1);
+  assert.equal(fs.existsSync(requestPath), false);
+  assert.equal(fs.existsSync(path.join(responseDirectory, responseTemp)), false);
+  assert.equal(fs.statSync(responsePath).nlink, 1);
+});
+
 test("fresh TUI clients use authenticated server controls and persist every allowlisted setting", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-control-process-"));
   const skillRoot = path.join(root, "skills");
@@ -132,10 +215,11 @@ test("fresh TUI clients use authenticated server controls and persist every allo
 
   assert.equal((await controlClient(root, "mode", "manual")).response.ok, true);
   assert.equal((await controlClient(root, "mode", "auto")).response.ok, true);
-  assert.equal((await controlClient(root, "mode", "yolo", skillRoot)).response.ok, true);
   for (const key of ["passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation"]) {
     assert.equal((await controlClient(root, "consent", `${key}=true`)).response.ok, true, key);
   }
+  const yolo = await controlClient(root, "mode", "yolo", skillRoot);
+  assert.equal(yolo.response.ok, true, yolo.response.reason);
   assert.equal((await controlClient(root, "exclude", "true")).response.ok, true);
   assert.equal((await controlClient(root, "exclude", "false")).response.ok, true);
   assert.equal((await controlClient(root, "repo-mode", "auto")).response.ok, true);
@@ -201,9 +285,15 @@ test("fresh TUI clients use authenticated server controls and persist every allo
 
 test("concurrent mailbox publishers cannot exceed the shared project file cap", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-bridge-flood-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = openStore(root, { projectFingerprint: PROJECT });
-  t.after(() => store.close());
+  let server;
+  t.after(async () => {
+    try {
+      if (server) await stopServer(server);
+    } finally {
+      try { store.close(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }
+  });
 
   const results = await Promise.all(Array.from({ length: 4 }, async (_, index) => {
     const output = resultFile(root, `flood-client-${index}`);
@@ -219,8 +309,7 @@ test("concurrent mailbox publishers cannot exceed the shared project file cap", 
 
   const skillRoot = path.join(root, "skills");
   fs.mkdirSync(skillRoot, { recursive: true });
-  const server = await startServer(root, skillRoot);
-  t.after(() => stopServer(server));
+  server = await startServer(root, skillRoot);
   const responseDir = path.join(root, "self-evolve", "bridge", PROJECT, "responses");
   for (let attempt = 0; attempt < 300 && fs.readdirSync(requestDir).length > 0; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 10));

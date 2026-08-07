@@ -25,9 +25,15 @@ function skill(name, body = "# Guidance\nKeep deterministic checks bounded.\n") 
   return `---\nname: ${name}\ndescription: Handles deterministic workflow checks safely.\n---\n${body}`;
 }
 
-function fixture(t, { existing = true, quota = 8, releaseLease, appendRecord } = {}) {
+function fixture(t, { existing = true, quota = 8, releaseLease, appendRecord, faultInjection } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-applier-"));
-  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  let applier;
+  let baseStore;
+  t.after(() => {
+    try { applier?.close(); } catch {}
+    try { baseStore?.close(); } catch {}
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
   const root = path.join(temp, "skills");
   fs.mkdirSync(root, { mode: 0o700 });
   let target;
@@ -41,7 +47,7 @@ function fixture(t, { existing = true, quota = 8, releaseLease, appendRecord } =
   }
   const roots = loadAllowlist({ globalSkillRoots: [root] }).canonicalRoots;
   const records = discoverSkills(roots);
-  const baseStore = openStore(path.join(temp, "state"), { projectName: "fixture", projectFingerprint: PROJECT, now: () => ++clock });
+  baseStore = openStore(path.join(temp, "state"), { projectName: "fixture", projectFingerprint: PROJECT, now: () => ++clock });
   if (quota !== 8) {
     const settings = baseStore.getSettings();
     baseStore.setRepoSettings({ ...settings.repo, budgets: { ...settings.repo.budgets, storageQuotaMiB: quota } });
@@ -60,8 +66,7 @@ function fixture(t, { existing = true, quota = 8, releaseLease, appendRecord } =
   });
   const privacy = createPrivacyGuard({ consent: {}, projectFingerprint: PROJECT, storageQuotaMiB: quota, store: baseStore, now: () => ++clock });
   const inventory = { records, canonicalRoots: roots, discoverSkills };
-  const applier = createApplier({ store, inventory, privacy, now: () => ++clock });
-  t.after(() => { applier.close(); baseStore.close(); });
+  applier = createApplier({ store, inventory, privacy, now: () => ++clock, faultInjection });
   return { temp, root, target, before, records, inventory, store, baseStore, privacy, applier, snapshots };
 }
 
@@ -112,7 +117,7 @@ function verifiedApplies(f, id) {
 
 function appendPending(f, p, details) {
   const timestamp = ++clock;
-  const clean = { state: "applied", "readback-verified": false, ...details };
+  const clean = { state: "applied", canonicalRoot: p.skillTarget.canonicalRoot, "readback-verified": false, ...details };
   const event = makeAuditEvent({
     id: hashSkillContent(`pending:${p.id}:${timestamp}`),
     kind: "apply",
@@ -197,11 +202,31 @@ test("create-exclusive creates a new skill atomically", async (t) => {
   const candidate = proposal(f, { name: "new-skill", state: "pending" });
   const { proposedContent, ...durable } = candidate;
   const p = { ...makeProposal(durable), proposedContent, state: "approved", decisionVersion: 1 };
-  const result = await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" });
+  const approved = decision(p);
+  const result = await f.applier.applyProposal({ proposal: p, decision: approved, mode: "auto" });
   const target = path.join(f.root, "new-skill", "SKILL.md");
+  assert.equal(approved.targetHash, "must-not-exist");
   assert.equal(result.ok, true);
   assert.equal(fs.readFileSync(target, "utf8"), p.proposedContent);
+  assert.equal(verifiedApplies(f, p.id)[0].payload.details.priorHash, "must-not-exist");
   assert.deepEqual(fs.readdirSync(path.dirname(target)).filter((name) => name.includes("self-evolve-tmp")), []);
+});
+
+test("new-skill approval uses full decision schema and transition validation", async (t) => {
+  for (const [label, mutate] of [
+    ["unexpected field", (approved) => ({ ...approved, extra: true })],
+    ["invalid prior state", (approved) => ({ ...approved, priorState: "approved" })],
+    ["stale decision version", (approved) => ({ ...approved, decisionVersion: approved.decisionVersion + 1 })],
+  ]) {
+    await t.test(label, async (t) => {
+      const f = fixture(t, { existing: false });
+      const p = proposal(f, { name: `new-${label.replaceAll(" ", "-")}` });
+      const result = await f.applier.applyProposal({ proposal: p, decision: mutate(decision(p)), mode: "auto" });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "decision-required");
+      assert.equal(fs.existsSync(path.join(f.root, p.skillTarget.relativePath)), false);
+    });
+  }
 });
 
 test("create-exclusive rejects an existing target", async (t) => {
@@ -235,7 +260,112 @@ test("different proposals concurrently creating one target publish exactly one c
   assert.equal(fs.readFileSync(path.join(f.root, "new-skill", "SKILL.md"), "utf8"), first.proposedContent);
 });
 
-for (const point of ["apply-after-pending-audit", "apply-after-publication", "apply-after-readback-audit"]) {
+test("a target collision after final validation fails closed at create-exclusive publication", async (t) => {
+  const f = fixture(t, { existing: false });
+  const p = proposal(f, { name: "new-skill" });
+  const target = path.join(f.root, "new-skill", "SKILL.md");
+  const competing = skill("new-skill", "# Competing writer\nKeep this content.\n");
+  const originalLink = fs.linkSync;
+  let collided = false;
+  fs.linkSync = function (from, to) {
+    if (!collided && to === target) {
+      collided = true;
+      fs.writeFileSync(target, competing, { flag: "wx" });
+    }
+    return originalLink(from, to);
+  };
+  let result;
+  try {
+    result = await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" });
+  } finally {
+    fs.linkSync = originalLink;
+  }
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "target-exists");
+  assert.equal(fs.readFileSync(target, "utf8"), competing);
+  assert.equal(verifiedApplies(f, p.id).length, 0);
+});
+
+test("new-skill temp unlink failure rolls back the published target", async (t) => {
+  const f = fixture(t, { existing: false });
+  const p = proposal(f, { name: "new-skill" });
+  const target = path.join(f.root, "new-skill", "SKILL.md");
+  const originalUnlink = fs.unlinkSync;
+  let failed = false;
+  fs.unlinkSync = function (candidate) {
+    if (!failed && String(candidate).includes(".self-evolve-tmp-")) {
+      failed = true;
+      throw Object.assign(new Error("temp-unlink-failed"), { code: "EIO" });
+    }
+    return originalUnlink(candidate);
+  };
+  let result;
+  try {
+    result = await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" });
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "temp-unlink-failed");
+  assert.equal(result.leaseStatus, "released");
+  assert.equal(fs.existsSync(target), false);
+  assert.deepEqual(fs.readdirSync(path.dirname(target)), []);
+  const rollback = f.baseStore.readRecords("audit-event").findLast((record) => record.payload.kind === "rollback" && record.payload.proposalId === p.id);
+  assert.equal(rollback.payload.details.state, "rolled-back");
+  assert.equal(rollback.payload.details.rolledBackHash, "must-not-exist");
+  assert.equal(rollback.payload.details["readback-verified"], true);
+  assert.equal(result.auditId, rollback.payload.id);
+  assert.deepEqual(f.applier.recoverPending(), []);
+});
+
+test("new-skill recovery rolls back when its verified hardlink temp cannot be unlinked", (t) => {
+  const f = fixture(t, { existing: false });
+  const p = proposal(f, { name: "new-skill" });
+  const target = path.join(f.root, "new-skill", "SKILL.md");
+  fs.mkdirSync(path.dirname(target));
+  const temporary = path.join(path.dirname(target), `.SKILL.md.self-evolve-tmp-recovery`);
+  fs.writeFileSync(temporary, p.proposedContent);
+  fs.linkSync(temporary, target);
+  appendPending(f, p, {
+    target,
+    priorHash: "must-not-exist",
+    appliedHash: p.proposedContentHash,
+    actor: "reviewer",
+    mode: "auto",
+    leaseNonce: "crashed-lease",
+    snapshot: "none",
+    temporary,
+    temporaryHash: p.proposedContentHash,
+  });
+  const originalUnlink = fs.unlinkSync;
+  let failed = false;
+  fs.unlinkSync = function (candidate) {
+    if (!failed && candidate === temporary) {
+      failed = true;
+      throw Object.assign(new Error("recovery-temp-unlink-failed"), { code: "EIO" });
+    }
+    return originalUnlink(candidate);
+  };
+  let outcome;
+  try {
+    outcome = f.applier.recoverPending().find((item) => item.proposalId === p.id);
+  } finally {
+    fs.unlinkSync = originalUnlink;
+  }
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.reason, "recovery-temp-unlink-failed");
+  assert.equal(outcome.rolledBackHash, "must-not-exist");
+  assert.equal(outcome.leaseStatus, "released");
+  assert.equal(fs.existsSync(target), false);
+  assert.deepEqual(fs.readdirSync(path.dirname(target)), []);
+  const rollback = f.baseStore.readRecords("audit-event").findLast((record) => record.payload.kind === "rollback" && record.payload.proposalId === p.id);
+  assert.equal(rollback.payload.details.state, "rolled-back");
+  assert.equal(rollback.payload.details["readback-verified"], true);
+  assert.equal(outcome.auditId, rollback.payload.id);
+  assert.deepEqual(f.applier.recoverPending(), []);
+});
+
+for (const point of ["apply-after-pending-audit", "apply-after-new-target-link", "apply-after-publication", "apply-after-readback-audit"]) {
   test(`new-skill process kill at ${point} leaves absent or complete content and recovers once`, async (t) => {
     const f = fixture(t, { existing: false });
     const content = skill("crash-skill", "# Complete\nNever publish partial content.\n");
@@ -272,15 +402,22 @@ for (const point of ["apply-after-pending-audit", "apply-after-publication", "ap
     if (point === "apply-after-pending-audit") {
       assert.equal(fs.existsSync(target), false);
       assert.equal(outcome.reason, "apply-not-published");
-    } else if (point === "apply-after-publication") {
+    } else if (point === "apply-after-new-target-link" || point === "apply-after-publication") {
       assert.equal(fs.readFileSync(target, "utf8"), content);
       assert.equal(outcome.ok, true);
     } else {
       assert.equal(fs.readFileSync(target, "utf8"), content);
       assert.equal(outcome, undefined);
     }
+    if (fs.existsSync(target)) {
+      assert.equal(hashSkillContent(fs.readFileSync(target)), pending.proposedContentHash);
+      assert.deepEqual(fs.readdirSync(path.dirname(target)), ["SKILL.md"]);
+    }
     assert.deepEqual(recoveryApplier.recoverPending(), []);
     assert.equal(verifiedApplies(f, pending.id).length, point === "apply-after-pending-audit" ? 0 : 1);
+    if (point === "apply-after-new-target-link") assert.equal(verifiedApplies(f, pending.id)[0].payload.details.temporary, "none");
+    assert.equal(recoveryApplier.getApplyLeaseStatus(pending.id).held, false);
+    assert.equal(f.baseStore.getRecord("proposal", pending.id).payload.state, "approved");
   });
 }
 
@@ -336,6 +473,28 @@ test("parent symlink race causes no write outside the allowlist", async (t) => {
   } finally {
     fs.renameSync = originalRename;
   }
+});
+
+test("existing-target apply revalidates the canonical parent before creating its temp file", async (t) => {
+  let f;
+  let moved;
+  let outside;
+  f = fixture(t, {
+    faultInjection(point) {
+      if (point !== "apply-before-temp-parent-check" || moved) return;
+      const parent = path.dirname(f.target);
+      moved = `${parent}-moved`;
+      outside = path.join(f.temp, "outside");
+      fs.mkdirSync(outside);
+      fs.renameSync(parent, moved);
+      fs.symlinkSync(outside, parent, "dir");
+    },
+  });
+  const result = await f.applier.applyProposal({ proposal: proposal(f), decision: decision(proposal(f)), mode: "auto" });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(fs.readdirSync(outside), []);
+  assert.equal(fs.readdirSync(moved).some((name) => name.includes("self-evolve-tmp")), false);
 });
 
 test("rename failure leaves the old target, releases the lease, and is recoverable", async (t) => {
@@ -553,6 +712,8 @@ test("hash-safe rollback restores the prior content and records one rollback", a
   const f = fixture(t);
   const p = proposal(f);
   assert.equal((await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" })).ok, true);
+  const applyAudit = f.baseStore.readRecords("audit-event").findLast((record) => record.payload.kind === "apply" && record.payload.details["readback-verified"]);
+  assert.equal(applyAudit.payload.details.canonicalRoot, p.skillTarget.canonicalRoot);
   const rollback = f.applier.rollbackApplied({ proposalId: p.id, actor: "reviewer", reason: "user-request" });
   assert.equal(rollback.ok, true);
   assert.equal(fs.readFileSync(f.target, "utf8"), f.before);
@@ -568,6 +729,36 @@ test("rollback reports a failed durable rollback-record write", async (t) => {
   const p = proposal(f);
   assert.equal((await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" })).ok, true);
   assert.equal(f.applier.rollbackApplied({ proposalId: p.id }).reason, "rollback-record-write-denied");
+});
+
+test("a rollback audit failure retains its snapshot without falsely tripping the breaker", async (t) => {
+  let denyRollbackAudit = false;
+  const f = fixture(t, {
+    appendRecord: (store, record, ...args) => denyRollbackAudit
+      && record?.kind === "audit-event"
+      && record?.payload?.kind === "rollback"
+      && record.payload.details?.state === "rolled-back"
+      ? { ok: false, reason: "rollback-audit-write-denied" }
+      : store.appendRecord(record, ...args),
+  });
+  const p = proposal(f);
+  assert.equal((await f.applier.applyProposal({ proposal: p, decision: decision(p), mode: "auto" })).ok, true);
+  const snapshot = f.baseStore.readRecords("audit-event")
+    .findLast((record) => record.payload.kind === "apply" && record.payload.details.state === "readback-verified")
+    .payload.details.snapshot;
+  assert.equal(fs.existsSync(snapshot), true);
+
+  denyRollbackAudit = true;
+  const rollback = f.applier.rollbackApplied({ proposalId: p.id });
+  assert.equal(rollback.reason, "rollback-audit-write-denied");
+  assert.equal(rollback.rollbackCompleted, true);
+  assert.equal(fs.readFileSync(f.target, "utf8"), f.before);
+  assert.equal(fs.existsSync(snapshot), true);
+  assert.equal(f.applier.circuitBreakerOpen(), false);
+
+  denyRollbackAudit = false;
+  assert.equal(f.applier.rollbackApplied({ proposalId: p.id, reason: "retry-recording" }).ok, true);
+  assert.equal(fs.existsSync(snapshot), false);
 });
 
 test("hash-safe rollback refuses on disk drift", async (t) => {

@@ -1,6 +1,7 @@
 import { watch as watchDirectory } from "node:fs";
 import path from "node:path";
 import {
+  BRIDGE_TTL_MS,
   createControlRequest,
   createDecisionRequest,
   createUiOperationRequest,
@@ -24,6 +25,8 @@ import {
 } from "./self-evolve-state-root.js";
 import {
   UI_CAPABILITIES,
+  UI_CONTROL_CENTER_SETTINGS_ANCHORS,
+  UI_DASHBOARD_BLOCKER_DESTINATIONS,
   UI_OPERATION_PROTOCOL_VERSION,
   UI_PROJECTION_VERSION,
 } from "./self-evolve-ui-protocol.js";
@@ -32,11 +35,10 @@ const DEFAULT_POLL_MS = 250;
 const MIN_POLL_MS = 25;
 const MAX_POLL_MS = 5_000;
 const MAX_PENDING_RESPONSES = 32;
+const MAX_COMPLETED_RESPONSES = 4;
 const MAX_RESIDENT_DETAILS = 2;
 const PATH_EVENTS = Object.freeze([
   "project.updated",
-  "route.changed",
-  "workspace.updated",
 ]);
 const CLIENT_OFFER = Object.freeze({
   projectionVersions: Object.freeze([UI_PROJECTION_VERSION]),
@@ -54,7 +56,44 @@ const BREAKER_STATUS = Object.freeze({
 });
 
 function errorReason(error) {
-  return error instanceof Error ? error.message : String(error);
+  return (error instanceof Error ? error.message : String(error)).slice(0, 240);
+}
+
+function hasNativeOperationProtocol(projection) {
+  return projection?.mode === "native"
+    && projection.operationProtocolVersion === UI_OPERATION_PROTOCOL_VERSION;
+}
+
+function hasCurrentNativeAuthority(snapshot) {
+  return snapshot?.phase === "ready" && hasNativeOperationProtocol(snapshot.projection);
+}
+
+function projectionWithoutAuthority(projection) {
+  if (!projection) return null;
+  return deepFreeze({
+    ...projection,
+    effectiveIndexActions: Object.freeze([]),
+    effectiveDetailActions: deepFreeze(Object.fromEntries(
+      Object.keys(projection.effectiveDetailActions ?? {}).map((proposalId) => [proposalId, Object.freeze([])]),
+    )),
+  });
+}
+
+function projectionWithoutFailedClosedAuthority(projection) {
+  if (!projection) return null;
+  const failedProposalIds = new Set((projection.index?.reviews ?? [])
+    .filter((review) => review.state === "failed-closed")
+    .map((review) => review.proposalId));
+  if (!failedProposalIds.size) return projection;
+  return deepFreeze({
+    ...projection,
+    effectiveDetailActions: deepFreeze(Object.fromEntries(
+      Object.entries(projection.effectiveDetailActions ?? {}).map(([proposalId, actions]) => [
+        proposalId,
+        failedProposalIds.has(proposalId) ? Object.freeze([]) : actions,
+      ]),
+    )),
+  });
 }
 
 function activityEmptyState(dashboard, activity, filter, enhancedError) {
@@ -83,27 +122,36 @@ function cleanRuntimeMetadata(value = {}) {
   });
 }
 
-function pathIdentityFor(api, context) {
+function pathIdentityFor(context) {
   return JSON.stringify([
     "self-evolve-tui-path-v1",
     context.stateRootIdentity,
     context.projectFingerprint,
     context.worktreePath,
-    api.state?.path?.directory ?? null,
   ]);
 }
 
-export function resolveTuiStoreContext(api, config = {}) {
+function nonEmptyPath(value) {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+export function resolveTuiStoreContext(api, config = {}, {
+  allowStartupStateRoot = true,
+  allowStartupWorktree = true,
+} = {}) {
   const stateRoot = initialStateRootSelection({
     explicitStateRoot: config.stateRoot,
-    hostStateRoot: api.state?.path?.state,
+    hostStateRoot: nonEmptyPath(api.state?.path?.state) ?? (allowStartupStateRoot ? config.startupStateRoot : undefined),
     environment: {},
   }).stateRoot;
   const identity = resolveProjectIdentity({
     projectFingerprint: config.projectFingerprint,
     remoteUrl: config.remoteUrl,
-    worktreePath: config.worktree ?? api.state?.path?.worktree,
-    directory: api.state?.path?.directory,
+    worktreePath: nonEmptyPath(config.worktree)
+      ?? nonEmptyPath(api.state?.path?.worktree)
+      ?? (allowStartupWorktree ? config.startupWorktree : undefined),
+    directory: nonEmptyPath(api.state?.path?.directory)
+      ?? (allowStartupWorktree ? config.startupWorktree : undefined),
   });
   const context = {
     stateRoot,
@@ -114,7 +162,7 @@ export function resolveTuiStoreContext(api, config = {}) {
   return deepFreeze({
     ...context,
     key: `${context.stateRootIdentity}:${context.projectFingerprint}`,
-    pathIdentity: pathIdentityFor(api, context),
+    pathIdentity: pathIdentityFor(context),
     watchPath: path.join(stateRoot, "self-evolve", "bridge", identity.projectFingerprint),
   });
 }
@@ -190,12 +238,51 @@ function cleanPending(value) {
     throw new TypeError("invalid-pending-request-id");
   }
   if (!["control", "decision", "operation"].includes(value.kind)) throw new TypeError("invalid-pending-request-kind");
+  if (typeof value.subject !== "string" || value.subject.length < 1 || value.subject.length > 256) {
+    throw new TypeError("invalid-pending-request-subject");
+  }
+  if (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= value.submittedAt) {
+    throw new TypeError("invalid-pending-request-expiry");
+  }
   return deepFreeze({
     requestId: value.requestId,
     kind: value.kind,
     action: typeof value.action === "string" ? value.action : null,
+    subject: value.subject,
     submittedAt: Number.isSafeInteger(value.submittedAt) && value.submittedAt >= 0 ? value.submittedAt : 0,
+    expiresAt: value.expiresAt,
     ...(value.kind === "operation" && value.request ? { request: value.request } : {}),
+  });
+}
+
+function controlSubject(action, payload = {}) {
+  if (action === "set-consent") return `consent:${String(payload.key ?? "unknown")}`;
+  if (action === "set-mode") return "global-mode";
+  if (action === "set-repo-mode") return "repository-mode";
+  if (action === "set-repo-excluded") return "project-inclusion";
+  if (action === "update-allowlist") return "approved-skill-folders";
+  return "project";
+}
+
+function operationSubject(action, payload = {}, proposalId) {
+  if (proposalId) return proposalId;
+  if (["export-data", "purge-scope"].includes(action)) return `scope:${String(payload.scope ?? "project")}`;
+  return "project";
+}
+
+function pendingMatches(entry, action, subject) {
+  return entry.action === action && entry.subject === subject;
+}
+
+function expiredPendingResponse(entry) {
+  return deepFreeze({
+    ...entry,
+    response: {
+      ok: false,
+      status: "expired",
+      processedAt: entry.expiresAt,
+      reason: "response-not-received-before-expiry",
+    },
   });
 }
 
@@ -209,7 +296,7 @@ const MODE_LABELS = Object.freeze({
   yolo: "Apply automatically (YOLO)",
 });
 const ACTIVE_OPERATION_STATES = new Set(["queued", "running", "accepted-terminal"]);
-const REVIEW_ATTENTION_STATES = new Set(["critic-pending", "pending", "approved"]);
+const REVIEW_ATTENTION_STATES = new Set(["pending", "approved"]);
 const ERROR_OUTCOMES = new Set(["failed", "failed-closed", "breaker-open"]);
 const APPLIED_OUTCOMES = new Set(["applied", "recommendation-approved"]);
 export const REJECTION_FEEDBACK_OPTIONS = Object.freeze([
@@ -231,6 +318,15 @@ function dashboardErrorFor(snapshot) {
 
 function destination(section, extra = {}) {
   return { section, ...extra };
+}
+
+function blockerDestination(blocker) {
+  const defined = UI_DASHBOARD_BLOCKER_DESTINATIONS[blocker?.code];
+  if (!defined || defined.dashboard !== blocker?.destination) return destination("home");
+  return destination(defined.section, {
+    ...(defined.filter ? { filter: defined.filter } : {}),
+    ...(defined.anchor ? { anchor: defined.anchor } : {}),
+  });
 }
 
 function operationalResult(value) {
@@ -321,7 +417,7 @@ function resultForAutomation(state, snapshot, dashboard, reviews) {
       tone: "warning",
       label: "Setup needed",
       explanation: blocker?.summary ?? "One or more automatic-work prerequisites are missing.",
-      destination: destination("settings", { anchor: blocker?.code ?? "setup" }),
+      destination: blocker ? blockerDestination(blocker) : destination("settings", { anchor: "setup" }),
       nextAction: "Complete the first missing prerequisite.",
     },
     running: {
@@ -360,6 +456,19 @@ function resultForAutomation(state, snapshot, dashboard, reviews) {
       nextAction: "Wait, or use the on-demand path.",
     },
   };
+  const failures = reviews.filter((review) => review.state === "failed-closed");
+  if (failures.length && !["terminal", "corrupt", "emergency-stop", "circuit-breaker"].includes(state)) {
+    return operationalResult({
+      state: "failure",
+      tone: "error",
+      label: "Stopped after errors",
+      explanation: `${plural(failures.length, "failed check")} needs review.`,
+      destination: destination("activity", { filter: "errors" }),
+      nextAction: "Review the bounded errors.",
+      count: failures.length,
+    });
+  }
+
   const mapped = mappings[state];
   if (mapped) return operationalResult({ state, ...mapped });
 
@@ -461,19 +570,6 @@ export function deriveOperationalView(snapshot) {
     const result = resultForAutomation(fallbackState, snapshot, null, reviews);
     return operationalResult({ ...result, limited: true });
   }
-  const failures = reviews.filter((review) => review.state === "failed-closed");
-  if (failures.length) {
-    return operationalResult({
-      state: "failure",
-      tone: "error",
-      label: "Stopped after errors",
-      explanation: `${plural(failures.length, "failed check")} needs review.`,
-      destination: destination("activity", { filter: "errors" }),
-      nextAction: "Review the bounded errors.",
-      count: failures.length,
-      limited: true,
-    });
-  }
   const attention = resultForAutomation("ready", snapshot, null, reviews);
   if (attention.state !== "ready") return operationalResult({ ...attention, limited: true });
   if (status.state === "startup-pending") {
@@ -507,6 +603,9 @@ function lastChecked(snapshot) {
 
 export function deriveSidebarCard(snapshot) {
   const operational = deriveOperationalView(snapshot);
+  const cardDestination = operational.state === "on-demand"
+    ? destination("home")
+    : operational.destination;
   const kinds = {
     recommendation: "review",
     applied: "audit",
@@ -524,12 +623,12 @@ export function deriveSidebarCard(snapshot) {
     title: "Self-evolve",
     summary: operational.state === "ready" ? "Watching this project" : operational.label,
     detail: operational.state === "ready" ? lastChecked(snapshot) : operational.explanation,
-    action: operational.destination.section === "recommendations"
+    action: cardDestination.section === "recommendations"
       ? "Review recommendation"
-      : `Open ${operational.destination.section === "activity" && operational.destination.filter === "errors"
+      : `Open ${cardDestination.section === "activity" && cardDestination.filter === "errors"
         ? "Activity errors"
-        : operational.destination.section[0].toUpperCase() + operational.destination.section.slice(1)}`,
-    destination: operational.destination,
+        : cardDestination.section[0].toUpperCase() + cardDestination.section.slice(1)}`,
+    destination: cardDestination,
     count: operational.count,
     limited: operational.limited,
   });
@@ -587,7 +686,8 @@ function modeModel(globalMode, repositoryMode, effectiveMode) {
 function safeActivityRow(entry, reviews) {
   const recommendationIndex = entry.proposalId === null
     ? -1
-    : reviews.findIndex((review) => review.proposalId === entry.proposalId);
+    : reviews.findIndex((review) => review.state !== "critic-pending"
+      && review.proposalId === entry.proposalId);
   const target = recommendationIndex >= 0 ? safeTargetLabel(reviews[recommendationIndex].target) : null;
   const marker = ERROR_OUTCOMES.has(entry.outcome)
     ? "Error"
@@ -666,9 +766,7 @@ export function buildHomeModel(snapshot) {
     blockers: (dashboard?.blockers ?? []).map((blocker) => ({
       code: blocker.code,
       summary: blocker.summary,
-      destination: blocker.destination === "activity-errors"
-        ? destination("activity", { filter: "errors" })
-        : destination(blocker.destination),
+      destination: blockerDestination(blocker),
     })),
     inFlight: dashboard?.inFlight ?? null,
     lastCycle: dashboard?.lastCycle ? {
@@ -693,6 +791,7 @@ export function buildHomeModel(snapshot) {
 }
 
 function recommendationFilterMatch(review, filter) {
+  if (review.state === "critic-pending") return false;
   if (filter === "all") return true;
   if (filter === "applied") return review.state === "applied" || review.state === "rolled-back";
   if (filter === "dismissed") return ["rejected", "superseded"].includes(review.state);
@@ -705,6 +804,7 @@ export function buildRecommendationsModel(snapshot, {
 } = {}) {
   if (!["needs-review", "applied", "dismissed", "all"].includes(filter)) filter = "needs-review";
   const projection = snapshot?.projection;
+  const native = hasCurrentNativeAuthority(snapshot);
   const reviews = projection?.index?.reviews ?? [];
   const acknowledged = new Set(snapshot?.acknowledgedAuditIds ?? []);
   const dashboard = dashboardFor(snapshot);
@@ -739,10 +839,11 @@ export function buildRecommendationsModel(snapshot, {
   const detail = sourceReview
     ? (projection?.details ?? []).find((item) => item.proposalId === sourceReview.proposalId) ?? null
     : null;
-  const actions = sourceReview
+  const actions = sourceReview && sourceReview.state !== "failed-closed" && native
     ? (projection?.effectiveDetailActions?.[sourceReview.proposalId] ?? []).map((action) => ({
       action: action.action,
       label: actionLabel(action.action),
+      pending: (snapshot?.pending ?? []).some((entry) => pendingMatches(entry, action.action, sourceReview.proposalId)),
       ...(action.action === "reject-proposal" ? {
         feedbackSupported: dashboard?.capabilities?.includes("decision-feedback-v1") === true,
       } : {}),
@@ -903,9 +1004,8 @@ export function buildSettingsModel(snapshot) {
   const observationCount = Array.isArray(inspection?.observations)
     ? inspection.observations.length + (inspection?.overflow?.observations ?? 0)
     : null;
-  const effectiveActions = snapshot?.projection?.effectiveIndexActions
-    ?? index?.allowedActions
-    ?? [];
+  const native = hasCurrentNativeAuthority(snapshot);
+  const effectiveActions = native ? (snapshot?.projection?.effectiveIndexActions ?? []) : [];
   const granted = new Set(effectiveActions.map((action) => action.action));
   return deepFreeze({
     phase: snapshot?.phase ?? "unavailable",
@@ -950,12 +1050,12 @@ export function buildSettingsModel(snapshot) {
       },
     ],
     controls: {
-      globalMode: hasControl,
-      repositoryMode: supportedControls.includes("set-repo-mode")
+      globalMode: native && hasControl,
+      repositoryMode: native && supportedControls.includes("set-repo-mode")
         && dashboard?.capabilities?.includes("control-repo-mode-v1") === true,
-      consent: hasControl,
-      projectInclusion: hasControl,
-      approvedSkillFolders: hasControl,
+      consent: native && hasControl,
+      projectInclusion: native && hasControl,
+      approvedSkillFolders: native && hasControl,
       pause: granted.has("set-paused"),
       emergencyStop: granted.has("set-kill-switch"),
     },
@@ -1109,11 +1209,7 @@ export const CONTROL_CENTER_SECTIONS = Object.freeze([
 export const ACTIVITY_FILTERS = Object.freeze([
   "all", "recommendations", "system", "errors",
 ]);
-export const SETTINGS_ANCHORS = Object.freeze([
-  "setup", "unsupported-host", "state-root", "provider", "restart-required", "passive-consent",
-  "observation-consent", "approved-skill-folders", "yolo-rollout",
-  "emergency-stop", "project-scope", "modes", "privacy", "limits", "maintenance",
-]);
+export const SETTINGS_ANCHORS = UI_CONTROL_CENTER_SETTINGS_ANCHORS;
 
 export function parseControlCenterDestination(params, snapshot) {
   if (params === undefined || params === null) return deepFreeze({ section: "home" });
@@ -1125,7 +1221,8 @@ export function parseControlCenterDestination(params, snapshot) {
   if (params.section === "recommendations" && params.recommendation !== undefined) {
     if (typeof params.recommendation !== "string") return deepFreeze({ section: "home" });
     const reviews = snapshot?.projection?.index?.reviews ?? [];
-    const selectedIndex = reviews.findIndex((review) => review.proposalId === params.recommendation);
+    const selectedIndex = reviews.findIndex((review) => review.state !== "critic-pending"
+      && review.proposalId === params.recommendation);
     if (selectedIndex < 0) return deepFreeze({ section: "home" });
     result.selectedIndex = selectedIndex;
   } else if (params.recommendation !== undefined) return deepFreeze({ section: "home" });
@@ -1145,7 +1242,8 @@ export function controlCenterRouteParams(value, snapshot) {
   if (section === "recommendations") {
     const reviews = snapshot?.projection?.index?.reviews ?? [];
     const selectedIndex = Number.isSafeInteger(value?.selectedIndex) ? value.selectedIndex : 0;
-    const recommendation = reviews[selectedIndex]?.proposalId;
+    const review = reviews[selectedIndex];
+    const recommendation = review?.state === "critic-pending" ? null : review?.proposalId;
     return deepFreeze(recommendation ? { section, recommendation } : { section });
   }
   if (section === "activity") {
@@ -1162,6 +1260,11 @@ export function controlCenterRouteParams(value, snapshot) {
 export function buildControlCenterModel(snapshot, options = {}) {
   return deepFreeze({
     phase: snapshot?.phase ?? "unavailable",
+    recovery: snapshot?.phase === "error" ? {
+      stale: snapshot?.stale === true,
+      diagnostic: String(snapshot?.error ?? "projection-refresh-failed").slice(0, 240),
+      canRetry: true,
+    } : null,
     operational: deriveOperationalView(snapshot),
     sections: {
       home: buildHomeModel(snapshot),
@@ -1193,6 +1296,7 @@ class ProjectRuntime {
     );
     this.pollMs = dependencies.pollMs;
     this.pending = new Map();
+    this.pendingReservations = new Set();
     this.responses = [];
     this.detailProposalIds = Object.freeze([]);
     this.refreshQueued = false;
@@ -1225,23 +1329,24 @@ class ProjectRuntime {
     inspection = this.snapshot?.inspection ?? null,
     error,
   }) {
+    const safeProjection = projectionWithoutFailedClosedAuthority(projection);
     return deepFreeze({
       phase,
       key: this.context.key,
       stateRootIdentity: this.context.stateRootIdentity,
       projectFingerprint: this.context.projectFingerprint,
       worktreePath: this.context.worktreePath,
-      projection,
-      dashboard: projection?.dashboard ?? null,
-      dashboardError: projection?.dashboardError ?? null,
+      projection: safeProjection,
+      dashboard: safeProjection?.dashboard ?? null,
+      dashboardError: safeProjection?.dashboardError ?? null,
       controlState,
       latestExport,
       inspection,
       runtime: {
         ...this.runtimeMetadata,
-        projectionVersion: projection?.index?.projectionVersion ?? null,
-        dashboardVersion: projection?.dashboard?.dashboardVersion ?? null,
-        projectionMode: projection?.mode ?? null,
+        projectionVersion: safeProjection?.index?.projectionVersion ?? null,
+        dashboardVersion: safeProjection?.dashboard?.dashboardVersion ?? null,
+        projectionMode: safeProjection?.mode ?? null,
       },
       acknowledgedAuditIds: this.acknowledgedAuditIds,
       pending: [...this.pending.values()],
@@ -1251,6 +1356,7 @@ class ProjectRuntime {
       revision: this.readCount,
       updatedAt: this.now(),
       error,
+      stale: phase === "error" && projection !== null,
     });
   }
 
@@ -1331,10 +1437,12 @@ class ProjectRuntime {
     return this.snapshot;
   }
 
-  trackPending(value) {
+  async trackPending(value) {
     const clean = cleanPending(value);
+    if (!this.pending.has(clean.requestId) && this.pending.size >= MAX_PENDING_RESPONSES) {
+      throw new Error("pending-request-capacity-exhausted");
+    }
     this.pending.set(clean.requestId, clean);
-    while (this.pending.size > MAX_PENDING_RESPONSES) this.pending.delete(this.pending.keys().next().value);
     this.snapshot = this.makeSnapshot({
       phase: this.snapshot.phase,
       projection: this.snapshot.projection,
@@ -1347,9 +1455,36 @@ class ProjectRuntime {
     return this.requestRefresh("pending-request");
   }
 
+  assertNotPending(action, subject) {
+    const key = JSON.stringify([action, subject]);
+    if (this.pendingReservations.has(key)
+        || [...this.pending.values()].some((entry) => pendingMatches(entry, action, subject))) {
+      throw new Error("matching-request-already-pending");
+    }
+  }
+
+  reservePending(action, subject) {
+    this.assertNotPending(action, subject);
+    if (this.pending.size + this.pendingReservations.size >= MAX_PENDING_RESPONSES) {
+      throw new Error("pending-request-capacity-exhausted");
+    }
+    const key = JSON.stringify([action, subject]);
+    this.pendingReservations.add(key);
+    return key;
+  }
+
+  releasePendingReservation(key) {
+    this.pendingReservations.delete(key);
+  }
+
   async submitDecision({ proposalId, newState, feedback }) {
     await this.requestRefresh("decision-preflight");
+    if (!hasCurrentNativeAuthority(this.snapshot)) {
+      throw new Error("native-operation-protocol-unavailable");
+    }
+    const authoritySnapshot = this.snapshot;
     const uiAction = newState === "approved" ? "apply-proposal" : "reject-proposal";
+    this.assertNotPending(uiAction, proposalId);
     if (feedback !== undefined
         && (newState !== "rejected"
           || !this.snapshot.dashboard?.capabilities?.includes("decision-feedback-v1"))) {
@@ -1358,104 +1493,155 @@ class ProjectRuntime {
     const advertised = this.snapshot.projection?.effectiveDetailActions?.[proposalId]
       ?.some((action) => action.action === uiAction);
     if (!advertised) throw new Error("decision-not-authorized-by-current-projection");
-    const inbox = await this.client.readInbox();
-    const proposal = inbox?.find?.((item) => item.id === proposalId);
-    if (!proposal) throw new Error("proposal-not-found-or-not-authorized");
-    const timestamp = this.now();
-    const request = createDecisionRequest({
-      projectFingerprint: this.context.projectFingerprint,
-      proposal,
-      newState,
-      ...(feedback !== undefined ? { feedback } : {}),
-      timestamp,
-    });
-    await this.client.submitDecision(request);
-    await this.trackPending({
-      requestId: request.requestId,
-      kind: "decision",
-      action: uiAction,
-      submittedAt: timestamp,
-    });
-    return request;
+    const reservation = this.reservePending(uiAction, proposalId);
+    try {
+      const inbox = await this.client.readInbox();
+      const proposal = inbox?.find?.((item) => item.id === proposalId);
+      if (!proposal) throw new Error("proposal-not-found-or-not-authorized");
+      this.assertAuthoritySnapshot(authoritySnapshot, uiAction, proposalId);
+      const timestamp = this.now();
+      const request = createDecisionRequest({
+        projectFingerprint: this.context.projectFingerprint,
+        proposal,
+        newState,
+        ...(feedback !== undefined ? { feedback } : {}),
+        timestamp,
+      });
+      await this.client.submitDecision(request);
+      await this.trackPending({
+        requestId: request.requestId,
+        kind: "decision",
+        action: uiAction,
+        subject: proposalId,
+        submittedAt: timestamp,
+        expiresAt: timestamp + BRIDGE_TTL_MS,
+      });
+      return request;
+    } finally {
+      this.releasePendingReservation(reservation);
+    }
   }
 
   async submitControl(action, payload) {
     await this.requestRefresh("control-preflight");
+    if (!hasCurrentNativeAuthority(this.snapshot)) {
+      throw new Error("native-operation-protocol-unavailable");
+    }
+    const authoritySnapshot = this.snapshot;
+    const subject = controlSubject(action, payload);
+    this.assertNotPending(action, subject);
     if (action === "set-repo-mode"
         && (this.snapshot.dashboard?.capabilities?.includes("control-repo-mode-v1") !== true
           || this.snapshot.dashboard?.supportedControls?.includes("set-repo-mode") !== true)) {
       throw new Error("repository-mode-control-not-supported");
     }
-    const controlState = await this.client.readControlState();
-    if (!controlState) throw new Error("control-state-unavailable");
-    const timestamp = this.now();
-    const request = createControlRequest({ controlState, action, payload, timestamp });
-    await this.client.submitControl(request);
-    await this.trackPending({
-      requestId: request.requestId,
-      kind: "control",
-      action,
-      submittedAt: timestamp,
-    });
-    return request;
+    const reservation = this.reservePending(action, subject);
+    try {
+      const controlState = await this.client.readControlState();
+      if (!controlState) throw new Error("control-state-unavailable");
+      this.assertAuthoritySnapshot(authoritySnapshot);
+      const timestamp = this.now();
+      const request = createControlRequest({ controlState, action, payload, timestamp });
+      await this.client.submitControl(request);
+      await this.trackPending({
+        requestId: request.requestId,
+        kind: "control",
+        action,
+        subject,
+        submittedAt: timestamp,
+        expiresAt: Math.min(timestamp + BRIDGE_TTL_MS, controlState.expiresAt),
+      });
+      return request;
+    } finally {
+      this.releasePendingReservation(reservation);
+    }
   }
 
   async submitOperation(action, payload = {}, { proposalId } = {}) {
     await this.requestRefresh("operation-preflight");
     const projection = this.snapshot.projection;
-    if (!projection?.index) throw new Error("operation-projection-unavailable");
+    if (!hasCurrentNativeAuthority(this.snapshot)) throw new Error("native-operation-protocol-unavailable");
+    const authoritySnapshot = this.snapshot;
+    const subject = operationSubject(action, payload, proposalId);
+    this.assertNotPending(action, subject);
+    if (!projection.index) throw new Error("operation-projection-unavailable");
     const detail = proposalId
       ? projection.details?.find((item) => item.proposalId === proposalId)
       : null;
-    const grant = (detail?.allowedActions ?? projection.index.allowedActions ?? [])
+    const effectiveActions = proposalId
+      ? projection.effectiveDetailActions?.[proposalId] ?? []
+      : projection.effectiveIndexActions ?? [];
+    const grant = effectiveActions
       .find((item) => item.action === action);
     if (!grant) throw new Error("operation-not-authorized");
-    let wirePayload = payload;
-    if (action === "snooze-proposal" || action === "rollback-proposal") {
-      const inbox = await this.client.readInbox();
-      const proposal = inbox?.find?.((item) => item.id === proposalId);
-      if (!proposal) throw new Error("proposal-not-found-or-not-authorized");
-      wirePayload = action === "snooze-proposal"
-        ? {
-          proposalId,
-          targetHash: proposal.skillTarget.currentHash,
-          proposedContentHash: proposal.proposedContentHash,
-          decisionVersion: proposal.decisionVersion + 1,
-          snoozedUntil: payload.snoozedUntil,
-        }
-        : {
-          proposalId,
-          appliedHash: detail?.summary?.rollback?.appliedHash,
-          decisionVersion: proposal.decisionVersion + 1,
-        };
-    } else if (action === "set-kill-switch" || action === "set-paused") {
-      const controlState = await this.client.readControlState();
-      if (!controlState) throw new Error("control-state-unavailable");
-      wirePayload = { ...payload, settingsVersion: controlState.settingsVersion };
+    const reservation = this.reservePending(action, subject);
+    try {
+      let wirePayload = payload;
+      if (action === "snooze-proposal" || action === "rollback-proposal") {
+        const inbox = await this.client.readInbox();
+        const proposal = inbox?.find?.((item) => item.id === proposalId);
+        if (!proposal) throw new Error("proposal-not-found-or-not-authorized");
+        wirePayload = action === "snooze-proposal"
+          ? {
+            proposalId,
+            targetHash: proposal.skillTarget.currentHash,
+            proposedContentHash: proposal.proposedContentHash,
+            decisionVersion: proposal.decisionVersion + 1,
+            snoozedUntil: payload.snoozedUntil,
+          }
+          : {
+            proposalId,
+            appliedHash: detail?.summary?.rollback?.appliedHash,
+            decisionVersion: proposal.decisionVersion + 1,
+          };
+      } else if (action === "set-kill-switch" || action === "set-paused") {
+        const controlState = await this.client.readControlState();
+        if (!controlState) throw new Error("control-state-unavailable");
+        wirePayload = { ...payload, settingsVersion: controlState.settingsVersion };
+      }
+      this.assertAuthoritySnapshot(authoritySnapshot, action, proposalId);
+      const timestamp = this.now();
+      const request = createUiOperationRequest({
+        projection: projection.index,
+        grant,
+        action,
+        payload: wirePayload,
+        timestamp,
+      });
+      await this.client.submitOperation(request);
+      await this.trackPending({
+        requestId: request.requestId,
+        kind: "operation",
+        action,
+        subject,
+        submittedAt: timestamp,
+        expiresAt: request.expiresAt,
+        request,
+      });
+      return request;
+    } finally {
+      this.releasePendingReservation(reservation);
     }
-    const timestamp = this.now();
-    const request = createUiOperationRequest({
-      projection: projection.index,
-      grant,
-      action,
-      payload: wirePayload,
-      timestamp,
-    });
-    await this.client.submitOperation(request);
-    await this.trackPending({
-      requestId: request.requestId,
-      kind: "operation",
-      action,
-      submittedAt: timestamp,
-      request,
-    });
-    return request;
+  }
+
+  assertAuthoritySnapshot(snapshot, action, proposalId) {
+    if (this.disposed || this.snapshot !== snapshot || !hasCurrentNativeAuthority(this.snapshot)) {
+      throw new Error("projection-authority-changed-before-submit");
+    }
+    if (!action) return;
+    const effectiveActions = proposalId
+      ? this.snapshot.projection.effectiveDetailActions?.[proposalId] ?? []
+      : this.snapshot.projection.effectiveIndexActions ?? [];
+    if (!effectiveActions.some((item) => item.action === action)) {
+      throw new Error("projection-authority-changed-before-submit");
+    }
   }
 
   requestRefresh() {
     if (this.disposed) return Promise.resolve(this.snapshot);
+    const minimumReadCount = this.readCount + (this.refreshInFlight ? 2 : 1);
     this.refreshQueued = true;
-    const completion = new Promise((resolve) => this.refreshWaiters.push(resolve));
+    const completion = new Promise((resolve) => this.refreshWaiters.push({ minimumReadCount, resolve }));
     if (!this.refreshInFlight && !this.refreshScheduled) {
       this.refreshScheduled = true;
       this.queueMicrotask(() => void this.runRefresh());
@@ -1463,9 +1649,10 @@ class ProjectRuntime {
     return completion;
   }
 
-  settleWaiters() {
-    const waiters = this.refreshWaiters.splice(0);
-    for (const resolve of waiters) resolve(this.snapshot);
+  settleWaiters(force = false) {
+    const settled = this.refreshWaiters.filter((waiter) => force || waiter.minimumReadCount <= this.readCount);
+    this.refreshWaiters = this.refreshWaiters.filter((waiter) => !force && waiter.minimumReadCount > this.readCount);
+    for (const waiter of settled) waiter.resolve(this.snapshot);
   }
 
   async runRefresh() {
@@ -1474,7 +1661,37 @@ class ProjectRuntime {
     this.refreshQueued = false;
     this.refreshInFlight = true;
     const lease = this.epoch;
+    let pending = [...this.pending.values()];
+    let responses = [];
     try {
+      if (pending.length) {
+        const reconciled = typeof this.client.reconcilePending === "function"
+          ? await this.client.reconcilePending(pending, { context: this.context })
+          : { pending, responses: [] };
+        const reconciledPending = new Map(
+          (Array.isArray(reconciled?.pending) ? reconciled.pending.map(cleanPending) : pending)
+            .map((entry) => [entry.requestId, entry]),
+        );
+        const reconciledResponses = new Map(
+          (Array.isArray(reconciled?.responses) ? reconciled.responses : [])
+            .map((entry) => [entry.requestId, entry]),
+        );
+        const timestamp = this.now();
+        const stillPending = [];
+        for (const entry of pending) {
+          const response = reconciledResponses.get(entry.requestId);
+          const responseWasTimely = response && Number.isSafeInteger(response.response?.processedAt)
+            && response.response.processedAt <= entry.expiresAt;
+          if (response && (timestamp < entry.expiresAt || responseWasTimely)) {
+            responses.push(response);
+          } else if (timestamp >= entry.expiresAt) {
+            responses.push(expiredPendingResponse(entry));
+          } else {
+            stillPending.push(reconciledPending.get(entry.requestId) ?? entry);
+          }
+        }
+        pending = stillPending;
+      }
       const projection = await this.client.read({
         detailProposalIds: this.detailProposalIds,
         context: this.context,
@@ -1488,19 +1705,12 @@ class ProjectRuntime {
       const inspection = typeof this.client.readInspection === "function"
         ? await this.client.readInspection()
         : null;
-      let pending = [...this.pending.values()];
-      let responses = [];
-      if (typeof this.client.reconcilePending === "function" && pending.length) {
-        const reconciled = await this.client.reconcilePending(pending, { context: this.context });
-        pending = Array.isArray(reconciled?.pending) ? reconciled.pending.map(cleanPending) : pending;
-        responses = Array.isArray(reconciled?.responses) ? reconciled.responses : [];
-      }
       if (this.disposed || lease !== this.epoch) return;
       this.acknowledgedAuditIds = Object.freeze(
         this.acknowledgements?.read?.(this.context.projectFingerprint) ?? [],
       );
       this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
-      this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_PENDING_RESPONSES));
+      this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
       this.readCount += 1;
       this.snapshot = this.makeSnapshot({
         phase: projection?.mode === "legacy" ? "legacy" : "ready",
@@ -1513,11 +1723,13 @@ class ProjectRuntime {
       this.notify();
     } catch (error) {
       if (this.disposed || lease !== this.epoch) return;
+      this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
+      this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
       this.readCount += 1;
       this.snapshot = this.makeSnapshot({
         phase: "error",
-        projection: this.snapshot.projection,
-        controlState: this.snapshot.controlState,
+        projection: projectionWithoutAuthority(this.snapshot.projection),
+        controlState: null,
         latestExport: this.snapshot.latestExport,
         inspection: this.snapshot.inspection,
         error: errorReason(error),
@@ -1541,6 +1753,7 @@ class ProjectRuntime {
     this.epoch += 1;
     this.refreshQueued = false;
     this.refreshScheduled = false;
+    this.pendingReservations.clear();
     this.closeWatcher();
     this.clearInterval(this.pollTimer);
     this.pollTimer = null;
@@ -1553,7 +1766,7 @@ class ProjectRuntime {
       inspection: this.snapshot.inspection,
       error: null,
     });
-    this.settleWaiters();
+    this.settleWaiters(true);
   }
 }
 
@@ -1575,6 +1788,9 @@ class StoreOwner {
     this.disposed = false;
     this.runtime = null;
     this.context = null;
+    this.startupStateRootEnabled = true;
+    this.startupWorktreeEnabled = true;
+    this.lifecycleUnsubscribe = null;
     this.localSnapshot = deepFreeze({
       phase: "initializing",
       projection: null,
@@ -1596,7 +1812,8 @@ class StoreOwner {
     }
     this.abort = () => this.dispose();
     api.lifecycle?.signal?.addEventListener?.("abort", this.abort, { once: true });
-    api.lifecycle?.onDispose?.(() => this.dispose());
+    const lifecycleUnsubscribe = api.lifecycle?.onDispose?.(() => this.dispose());
+    if (typeof lifecycleUnsubscribe === "function") this.lifecycleUnsubscribe = lifecycleUnsubscribe;
   }
 
   receive(snapshot) {
@@ -1610,9 +1827,14 @@ class StoreOwner {
 
   reconcileContext() {
     if (this.disposed) return false;
+    if (nonEmptyPath(this.api.state?.path?.state)) this.startupStateRootEnabled = false;
+    if (nonEmptyPath(this.api.state?.path?.worktree)) this.startupWorktreeEnabled = false;
     let context;
     try {
-      context = resolveTuiStoreContext(this.api, this.config);
+      context = resolveTuiStoreContext(this.api, this.config, {
+        allowStartupStateRoot: this.startupStateRootEnabled,
+        allowStartupWorktree: this.startupWorktreeEnabled,
+      });
     } catch (error) {
       this.runtime?.detach(this);
       this.runtime = null;
@@ -1695,6 +1917,9 @@ class StoreOwner {
     if (this.disposed) return;
     this.disposed = true;
     this.api.lifecycle?.signal?.removeEventListener?.("abort", this.abort);
+    const lifecycleUnsubscribe = this.lifecycleUnsubscribe;
+    this.lifecycleUnsubscribe = null;
+    try { lifecycleUnsubscribe?.(); } catch {}
     for (const unsubscribe of this.unsubscribers.splice(0)) {
       try { unsubscribe(); } catch {}
     }

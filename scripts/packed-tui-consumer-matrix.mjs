@@ -11,6 +11,7 @@ const OPENTUI_FLOOR = "0.4.5";
 const OPENTUI_CURRENT = "0.5.0";
 const OPENTUI_UNSUPPORTED = "0.6.0";
 const SOLID_VERSION = "1.9.12";
+const TYPESCRIPT_VERSION = "5.9.3";
 
 function fail(message, detail = "") {
   throw new Error(detail ? `${message}\n${detail}` : message);
@@ -74,6 +75,43 @@ function packArtifact(root, env) {
   };
 }
 
+function typecheckInstalledSource({ consumer, packageName, env }) {
+  const packageRoot = path.join(consumer, "node_modules", ...packageName.split("/"));
+  const runtimeDeclaration = path.join(consumer, "tui-node-runtime.d.ts");
+  const invalidPropertyFixture = path.join(consumer, "tui-invalid-property.tsx");
+  writeFileSync(runtimeDeclaration, `
+    declare module "node:timers/promises" {
+      export function setTimeout(milliseconds: number): Promise<void>;
+    }
+  `);
+  writeFileSync(invalidPropertyFixture, `
+    /** @jsxImportSource @opentui/solid */
+    export const invalidIntrinsicProperty = (
+      // @ts-expect-error actual peer BoxProps must reject this property
+      <box selfEvolveInvalidProperty="must-be-rejected" />
+    );
+  `);
+  run(process.execPath, [
+    path.join(consumer, "node_modules", "typescript", "bin", "tsc"),
+    "--noEmit",
+    "--allowJs",
+    "--checkJs", "false",
+    "--skipLibCheck",
+    "--target", "ES2022",
+    "--module", "ESNext",
+    "--moduleResolution", "Bundler",
+    "--jsx", "preserve",
+    runtimeDeclaration,
+    path.join(packageRoot, "self-evolve-tui.tsx"),
+    invalidPropertyFixture,
+  ], { cwd: consumer, env });
+  return {
+    source: true,
+    actualPeerDeclarations: true,
+    invalidPropertyRejected: true,
+  };
+}
+
 function runLane({ label, version, opentuiVersion, packageName, artifact, root, env }) {
   const consumer = path.join(root, `consumer-${label}`);
   const renderSmokePath = path.join(consumer, "tui-render-smoke.mjs");
@@ -95,6 +133,7 @@ function runLane({ label, version, opentuiVersion, packageName, artifact, root, 
     `@opentui/keymap@${opentuiVersion}`,
     `@opentui/solid@${opentuiVersion}`,
     `solid-js@${SOLID_VERSION}`,
+    `typescript@${TYPESCRIPT_VERSION}`,
   ], { cwd: consumer, env });
   const smoke = `
     import { readFileSync } from "node:fs";
@@ -128,7 +167,8 @@ function runLane({ label, version, opentuiVersion, packageName, artifact, root, 
     renderSmokePath,
     `${packageName}/tui`,
   ], { cwd: consumer, env }));
-  return { label, requestedVersion: version, observed, renderSmoke, ok: true };
+  const typecheck = typecheckInstalledSource({ consumer, packageName, env });
+  return { label, requestedVersion: version, observed, renderSmoke, typecheck, ok: true };
 }
 
 function runUnsupportedPeerLane({ version, packageName, artifact, root, env }) {
@@ -217,6 +257,7 @@ export function main() {
         "@opentui/keymap": [OPENTUI_FLOOR, OPENTUI_CURRENT],
         "@opentui/solid": [OPENTUI_FLOOR, OPENTUI_CURRENT],
         "solid-js": SOLID_VERSION,
+        "typescript": TYPESCRIPT_VERSION,
       },
       lanes: results,
       negativeLanes: [runUnsupportedPeerLane({

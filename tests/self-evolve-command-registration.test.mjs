@@ -126,7 +126,6 @@ test("own-equivalent duplicate factories are idempotent", async () => {
 });
 
 test("execution revalidates ownership and handled legacy branches replace parts exactly once", async () => {
-  SelfEvolvePlugin.__test.__resetCommandOwnershipForTests();
   const hooks = await legacyHooks();
   const cfg = { model: "openai/test", agent: {} };
   const unconfigured = trackedOutput();

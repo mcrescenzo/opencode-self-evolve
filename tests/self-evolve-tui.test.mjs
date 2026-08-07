@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -13,6 +14,7 @@ import {
   formatProposalDigest,
   notificationRateLimiter,
   pruneReviewBookkeeping,
+  resolveTuiStateRoot,
   safeIdlePredicate,
   shouldShowProposal,
 } from "../self-evolve-tui.js";
@@ -20,7 +22,7 @@ import tuiModule, { TUI_KV_KEYS, TUI_LEGACY_KV_KEYS } from "../self-evolve-tui.j
 import { publishControlState, readTuiHostHealth } from "../self-evolve-bridge.js";
 import { openStore, projectFingerprintFor } from "../self-evolve-store.js";
 import * as schemas from "../self-evolve-schemas.js";
-import { stateRootIdentity } from "../self-evolve-state-root.js";
+import { resolveStateRoot, stateRootIdentity } from "../self-evolve-state-root.js";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -207,9 +209,9 @@ test("production TUI acquires and refreshes the project-scoped projection store"
     },
   });
   assert.equal(calls[0].api, h.api);
-  assert.equal(calls[0].config.stateRoot, "/state");
-  assert.equal(calls[0].config.worktree, "/worktree");
-  assert.match(calls[0].config.projectFingerprint, /^[a-f0-9]{64}$/u);
+  assert.equal(calls[0].config.startupStateRoot, "/state");
+  assert.equal(calls[0].config.startupWorktree, "/worktree");
+  assert.equal(Object.hasOwn(calls[0].config, "projectFingerprint"), false);
   assert.deepEqual(calls[0].runtimeMetadata, {
     hostVersion: "1.18.3",
     hostVersionSource: "tui-app-version",
@@ -217,6 +219,61 @@ test("production TUI acquires and refreshes the project-scoped projection store"
   });
   assert.equal(calls[1], "refresh");
   await h.dispose();
+});
+
+test("TUI root selection matches server precedence and fails closed when the official SDK is unavailable", async () => {
+  const calls = [];
+  const api = {
+    state: { path: { state: "/official/synchronous", worktree: "/workspace", directory: "/workspace" } },
+    client: { path: { get: async (input) => {
+      calls.push(input);
+      return { data: { state: "/official/sdk" } };
+    } } },
+  };
+  const environment = { XDG_STATE_HOME: "/environment/xdg", HOME: "/environment/home" };
+
+  assert.equal(await resolveTuiStateRoot(api, { stateRoot: "/explicit", env: environment }), "/explicit");
+  assert.equal(await resolveTuiStateRoot(api, { env: environment }), "/official/synchronous");
+  assert.equal(calls.length, 0, "explicit and synchronous official roots must not call the SDK");
+
+  delete api.state.path.state;
+  assert.equal(await resolveTuiStateRoot(api, { env: environment }), "/official/sdk");
+  assert.deepEqual(calls, [{ directory: "/workspace" }]);
+  assert.equal(await resolveStateRoot({
+    directory: "/workspace",
+    client: api.client,
+  }, { env: environment }), "/official/sdk");
+
+  api.client.path.get = async () => { throw new Error("official-unavailable"); };
+  assert.equal(await resolveTuiStateRoot(api, { env: environment, stateRootTimeoutMs: 10 }), null);
+  delete api.client.path;
+  assert.equal(await resolveTuiStateRoot(api, { env: environment }), "/environment/xdg/opencode");
+  assert.equal(await resolveTuiStateRoot(api, { env: { HOME: "/environment/home" } }), "/environment/home/.local/state/opencode");
+});
+
+test("fresh TUI processes derive the same environment root identities without inherited environment merging", () => {
+  const moduleUrl = new URL("../self-evolve-tui.js", import.meta.url).href;
+  const stateRootModuleUrl = new URL("../self-evolve-state-root.js", import.meta.url).href;
+  const run = (environment) => spawnSync(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    `import { resolveTuiStateRoot } from ${JSON.stringify(moduleUrl)};\n`
+      + `import { stateRootIdentity } from ${JSON.stringify(stateRootModuleUrl)};\n`
+      + "const root = await resolveTuiStateRoot({ state: { path: { worktree: '/workspace', directory: '/workspace' } }, client: {} });\n"
+      + "process.stdout.write(stateRootIdentity(root));\n",
+  ], { env: environment, encoding: "utf8" });
+
+  const xdg = run({ XDG_STATE_HOME: "/isolated/xdg", HOME: "/ignored/home" });
+  assert.equal(xdg.error, undefined);
+  assert.equal(xdg.status, 0, xdg.stderr);
+  assert.equal(xdg.stderr, "");
+  assert.equal(xdg.stdout, stateRootIdentity("/isolated/xdg/opencode"));
+
+  const home = run({ HOME: "/isolated/home" });
+  assert.equal(home.error, undefined);
+  assert.equal(home.status, 0, home.stderr);
+  assert.equal(home.stderr, "");
+  assert.equal(home.stdout, stateRootIdentity("/isolated/home/.local/state/opencode"));
 });
 
 test("production background refresh never emits toast, attention, or auto-dialog UI", async () => {
@@ -254,6 +311,210 @@ test("TUI publishes current api.app.version as a root-bound host-health runtime 
   assert.equal(health.projectFingerprint, projectFingerprint);
   await h.dispose();
   assert.equal(readTuiHostHealth(stateRoot, projectFingerprint, { now: 2_000, stateRootIdentity: stateRootIdentity(stateRoot) }), null);
+});
+
+test("TUI boot uses the v2 official path result before reactive path state is populated", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-path-bootstrap-"));
+  const stateRoot = path.join(root, "state");
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(worktree, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const h = harness({ kv: enabledKv(), clock: 2_000 });
+  t.after(async () => h.dispose());
+  h.api.app = { version: "1.18.14" };
+  h.api.state.path = { state: "", config: "", worktree: "", directory: "" };
+  const calls = [];
+  h.api.client.path = {
+    async get(input) {
+      calls.push(input);
+      return { data: { state: stateRoot, config: path.join(root, "config"), worktree, directory: worktree } };
+    },
+  };
+
+  await SelfEvolveTuiPlugin(h.api, {
+    __testTuiStoreFactory() {
+      return { refresh() { return Promise.resolve(); } };
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(Object.hasOwn(calls[0], "query"), false, "the TUI exposes the v2 SDK parameter shape");
+  const projectFingerprint = projectFingerprintFor("", worktree);
+  assert.equal(readTuiHostHealth(stateRoot, projectFingerprint, {
+    now: 2_000,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }).hostVersion, "1.18.14");
+});
+
+test("TUI boot resolves missing identity paths even when root precedence bypasses the SDK", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-identity-bootstrap-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  for (const source of ["explicit", "synchronous"]) {
+    const stateRoot = path.join(root, `${source}-state`);
+    const worktree = path.join(root, `${source}-worktree`);
+    fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(worktree, { recursive: true });
+    const h = harness({ kv: enabledKv(), clock: 2_000 });
+    h.api.app = { version: "1.18.14" };
+    h.api.state.path = {
+      state: source === "synchronous" ? stateRoot : "",
+      config: "",
+      worktree: "",
+      directory: "",
+    };
+    const calls = [];
+    h.api.client.path = {
+      async get(input) {
+        calls.push(input);
+        return { data: { state: stateRoot, config: path.join(root, `${source}-config`), worktree, directory: worktree } };
+      },
+    };
+
+    await SelfEvolveTuiPlugin(h.api, {
+      ...(source === "explicit" ? { stateRoot } : {}),
+      __testTuiStoreFactory() {
+        return { refresh() { return Promise.resolve(); } };
+      },
+    });
+
+    assert.deepEqual(calls, [{}], source);
+    const projectFingerprint = projectFingerprintFor("", worktree);
+    assert.equal(readTuiHostHealth(stateRoot, projectFingerprint, {
+      now: 2_000,
+      stateRootIdentity: stateRootIdentity(stateRoot),
+    }).hostVersion, "1.18.14", source);
+    await h.dispose();
+  }
+});
+
+test("TUI host-health publication rebinds when the official project path changes", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-health-rebind-"));
+  const stateRoot = path.join(root, "state");
+  const firstWorktree = path.join(root, "first-worktree");
+  const secondWorktree = path.join(root, "second-worktree");
+  fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(firstWorktree, { recursive: true });
+  fs.mkdirSync(secondWorktree, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const h = harness({ kv: enabledKv(), clock: 2_000 });
+  t.after(async () => h.dispose());
+  h.api.app = { version: "1.18.14" };
+  h.api.state.path = {
+    state: stateRoot,
+    config: path.join(root, "config"),
+    worktree: firstWorktree,
+    directory: firstWorktree,
+  };
+  let storeListener;
+  await SelfEvolveTuiPlugin(h.api, {
+    __testTuiStoreFactory() {
+      return {
+        refresh() { return Promise.resolve(); },
+        subscribe(listener) {
+          storeListener = listener;
+          return () => { storeListener = undefined; };
+        },
+      };
+    },
+  });
+  const firstFingerprint = projectFingerprintFor("", firstWorktree);
+  const secondFingerprint = projectFingerprintFor("", secondWorktree);
+  assert.equal(readTuiHostHealth(stateRoot, firstFingerprint, {
+    now: 2_000,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }).hostVersion, "1.18.14");
+  h.setClock(2_500);
+  storeListener({
+    phase: "ready",
+    projectFingerprint: firstFingerprint,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  });
+  assert.equal(readTuiHostHealth(stateRoot, firstFingerprint, {
+    now: 2_500,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }).issuedAt, 2_000, "unchanged store snapshots must not rewrite the health heartbeat");
+
+  h.api.state.path.worktree = secondWorktree;
+  h.api.state.path.directory = secondWorktree;
+  assert.equal(typeof storeListener, "function");
+  storeListener({
+    phase: "initializing",
+    projectFingerprint: secondFingerprint,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  });
+
+  assert.equal(readTuiHostHealth(stateRoot, firstFingerprint, {
+    now: 2_500,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }), null);
+  assert.equal(readTuiHostHealth(stateRoot, secondFingerprint, {
+    now: 2_500,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }).hostVersion, "1.18.14");
+
+  storeListener({ phase: "error" });
+  assert.equal(readTuiHostHealth(stateRoot, secondFingerprint, {
+    now: 2_500,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }), null);
+});
+
+test("TUI host-health rebind fails closed when the prior generation cannot be revoked", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-health-rebind-failure-"));
+  const stateRoot = path.join(root, "state");
+  const firstWorktree = path.join(root, "first-worktree");
+  const secondWorktree = path.join(root, "second-worktree");
+  fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(firstWorktree, { recursive: true });
+  fs.mkdirSync(secondWorktree, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const h = harness({ kv: enabledKv(), clock: 2_000 });
+  t.after(async () => h.dispose());
+  h.api.app = { version: "1.18.14" };
+  h.api.state.path = {
+    state: stateRoot,
+    config: path.join(root, "config"),
+    worktree: firstWorktree,
+    directory: firstWorktree,
+  };
+  let storeListener;
+  await SelfEvolveTuiPlugin(h.api, {
+    __testTuiStoreFactory() {
+      return {
+        refresh() { return Promise.resolve(); },
+        subscribe(listener) {
+          storeListener = listener;
+          return () => { storeListener = undefined; };
+        },
+      };
+    },
+  });
+  const firstFingerprint = projectFingerprintFor("", firstWorktree);
+  const secondFingerprint = projectFingerprintFor("", secondWorktree);
+  const firstReport = path.join(stateRoot, "self-evolve", "bridge", firstFingerprint, "tui-host-health.json");
+  fs.chmodSync(firstReport, 0o644);
+  h.api.state.path.worktree = secondWorktree;
+  h.api.state.path.directory = secondWorktree;
+  const originalWarn = console.warn;
+  let warning;
+  console.warn = (value) => { warning = String(value); };
+  try {
+    storeListener({
+      phase: "initializing",
+      projectFingerprint: secondFingerprint,
+      stateRootIdentity: stateRootIdentity(stateRoot),
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.match(warning, /tui-host-health-mode-rejected/u);
+  assert.equal(fs.existsSync(path.join(stateRoot, "self-evolve", "bridge", secondFingerprint, "tui-host-health.json")), false);
+  assert.equal(fs.existsSync(firstReport), true);
+  fs.chmodSync(firstReport, 0o600);
+  await h.dispose();
 });
 
 test("first-use consent is shown once and persists across TUI restarts", async () => {

@@ -1,7 +1,8 @@
 /** @jsxImportSource @opentui/solid */
 
-import { createMemo, createSignal, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup, onMount, Show } from "solid-js"
 import type { KeyEvent, Renderable } from "@opentui/core"
+import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { setTimeout as delay } from "node:timers/promises"
 // The legacy helper module is JSDoc-typed (allowJs) as a default-only module at
@@ -24,14 +25,50 @@ const CONTROL_CENTER_COMMAND = TUI_IDENTITIES.command
 const CONTROL_CENTER_ROUTE = TUI_IDENTITIES.route
 const CONTROL_CENTER_MODE = TUI_IDENTITIES.mode
 const CONTROL_CENTER_VIEW_ID = TUI_IDENTITIES.view
+const MAX_DESTINATION_SCROLL_FRAMES = 8
 const activeApis = new WeakSet<object>()
 
 type ProjectStore = ReturnType<typeof acquireProjectTuiStore>
+type RequestResponse = ReturnType<ProjectStore["getSnapshot"]>["responses"][number]
 type MaintenanceScope = "observations" | "proposals" | "project" | "all"
 type YoloTarget = "global" | "project"
+type FocusableRenderable = Renderable & {
+  id: string
+  focusable: boolean
+  focused: boolean
+  visible: boolean
+  getChildren(): FocusableRenderable[]
+  findDescendantById(id: string): FocusableRenderable | undefined
+}
+type BlurAwareRenderable = FocusableRenderable & {
+  on(event: "blurred", listener: () => void): void
+  off(event: "blurred", listener: () => void): void
+}
+type ScrollableRenderable = FocusableRenderable & {
+  viewport?: Pick<FocusableRenderable, "screenY" | "height">
+  scrollChildIntoView(id: string): void
+}
+type NavigationKeyEvent = KeyEvent & { shift: boolean, stopPropagation(): void }
+
+function snapshotIdentity(snapshot: ReturnType<ProjectStore["getSnapshot"]>) {
+  if (!snapshot?.key && !snapshot?.stateRootIdentity && !snapshot?.projectFingerprint) return null
+  return JSON.stringify([
+    snapshot.key ?? null,
+    snapshot.stateRootIdentity ?? null,
+    snapshot.projectFingerprint ?? null,
+  ])
+}
 
 function isActivationKey(event: KeyEvent) {
   return event.name === "return" || event.name === "linefeed" || event.name === "space"
+}
+
+// OpenTUI executes accessor children reactively, but its supported 0.4/0.5
+// declarations currently omit that runtime form from JSX.Element. Keep the
+// type bridge limited to children; intrinsic element props still come directly
+// from each installed peer and remain closed against arbitrary properties.
+function reactiveChild<Value>(render: () => Value): Value {
+  return render as unknown as Value
 }
 
 function relativeTime(timestamp: number, now = Date.now()) {
@@ -40,6 +77,17 @@ function relativeTime(timestamp: number, now = Date.now()) {
   if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)}m ago`
   if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}h ago`
   return `${Math.floor(elapsed / 86_400_000)}d ago`
+}
+
+function requestResponseMessage(completedResponse: RequestResponse) {
+  if (completedResponse.response?.ok === false) {
+    return completedResponse.response.status === "expired"
+      ? `${completedResponse.action?.replaceAll("-", " ") ?? "Request"} expired without a server response. Retry creates a new request ID after re-reading current server nonce authority.`
+      : `Server rejected ${completedResponse.action?.replaceAll("-", " ") ?? "the request"}: ${completedResponse.response.reason}`
+  }
+  return completedResponse.action === "purge-all" && completedResponse.response?.status === "accepted-terminal"
+    ? "Purge all accepted; Self-evolve authority stopped. Restart OpenCode to reinitialize durable state."
+    : `${completedResponse.action?.replaceAll("-", " ") ?? "Request"} accepted by the server.`
 }
 
 function SidebarCard(props: {
@@ -70,8 +118,8 @@ function SidebarCard(props: {
         paddingLeft={1}
         paddingRight={1}
         flexDirection="column"
-        onFocus={() => setFocused(true)}
-        onBlur={() => setFocused(false)}
+        on:focused={() => setFocused(true)}
+        on:blurred={() => setFocused(false)}
         onMouseDown={() => cardNode?.focus()}
         onMouseUp={props.open}
         onKeyDown={(event: KeyEvent) => {
@@ -80,7 +128,7 @@ function SidebarCard(props: {
           props.open()
         }}
       >
-        <text fg={props.api.theme.current.text}><b>{props.card()?.title}</b></text>
+        <text fg={props.api.theme.current.text}><b>{focused() ? "› " : "  "}{props.card()?.title}</b></text>
         <text fg={props.api.theme.current.textMuted} wrapMode="word">{props.card()?.summary}</text>
         <text fg={props.api.theme.current.textMuted} wrapMode="word">{props.card()?.detail}</text>
         <text fg={props.api.theme.current.info} wrapMode="word">{props.card()?.action}</text>
@@ -93,7 +141,7 @@ function ControlCenter(props: {
   api: Parameters<TuiPlugin>[0]
   store: ProjectStore
   snapshot: () => ReturnType<ProjectStore["getSnapshot"]>
-  prior: { name: string; params?: Record<string, unknown> }
+  prior: () => { name: string; params?: Record<string, unknown> }
   initial: ReturnType<typeof parseControlCenterDestination>
 }) {
   const names = CONTROL_CENTER_SECTIONS
@@ -116,6 +164,7 @@ function ControlCenter(props: {
   const [diagnosticsExpanded, setDiagnosticsExpanded] = createSignal(false)
   const [feedback, setFeedback] = createSignal<string | null>(null)
   const [confirmation, setConfirmation] = createSignal<string | null>(null)
+  const [consentIntent, setConsentIntent] = createSignal<string | null>(null)
   const [folderInput, setFolderInput] = createSignal("")
   const [folderError, setFolderError] = createSignal<string | null>(null)
   const [folderDraft, setFolderDraft] = createSignal<string[] | null>(null)
@@ -125,17 +174,103 @@ function ControlCenter(props: {
   const [maintenanceScope, setMaintenanceScope] = createSignal<MaintenanceScope>("observations")
   const [maintenanceIntent, setMaintenanceIntent] = createSignal<"export" | "delete" | null>(null)
   const [maintenanceConfirmation, setMaintenanceConfirmation] = createSignal("")
+  const [focusedControl, setFocusedControl] = createSignal<string | null>(null)
+  const [activityIndex, setActivityIndex] = createSignal(0)
+  const recommendationNodes = new Map<number, Renderable>()
+  const activityNodes = new Map<number, Renderable>()
+  const terminalDimensions = useTerminalDimensions()
+  const compactShell = () => terminalDimensions().width <= 64 || terminalDimensions().height <= 20
+  const focusId = (key: string) => `self-evolve-focus-${key.replaceAll(/[^A-Za-z0-9_.-]/gu, "-")}`
+  const focusMark = (key: string) => focusedControl() === key ? "› " : "  "
+  const focusHandlers = (key: string) => ({
+    focused: () => setFocusedControl(key),
+    blurred: () => setFocusedControl((current) => current === key ? null : current),
+  })
+  let controlCenterNode: FocusableRenderable | undefined
+  let contentScrollbox: ScrollableRenderable | undefined
+  let cancelDestinationFocus = () => {}
+  let refreshDestinationFocus = () => {}
+  const focusableDescendants = () => {
+    const result: FocusableRenderable[] = []
+    const visit = (node: FocusableRenderable) => {
+      for (const child of node.getChildren()) {
+        if (child.focusable && child.visible) result.push(child)
+        visit(child)
+      }
+    }
+    if (controlCenterNode) visit(controlCenterNode)
+    return result
+  }
+  useKeyboard((event) => {
+    if (event.name !== "tab") return
+    const navigationEvent = event as NavigationKeyEvent
+    const nodes = focusableDescendants()
+    if (!nodes.length) return
+    navigationEvent.preventDefault()
+    navigationEvent.stopPropagation()
+    const current = nodes.findIndex((node) => node.focused)
+    const offset = navigationEvent.shift ? -1 : 1
+    const next = current < 0
+      ? (navigationEvent.shift ? nodes.length - 1 : 0)
+      : (current + offset + nodes.length) % nodes.length
+    nodes[next].focus()
+  })
   const model = createMemo(() => buildControlCenterModel(props.snapshot(), {
     selectedIndex: selectedIndex(),
     recommendationFilter: recommendationFilter(),
     activityFilter: activityFilter(),
   }))
   let popMode = () => {}
+  let unsubscribeIdentity = () => {}
+  let mountedIdentity = snapshotIdentity(props.snapshot())
+  let mountedPhase = props.snapshot().phase
+  const clearPreparedAuthority = () => {
+    setRejectionReason(null)
+    setRejectionText("")
+    setFeedback(null)
+    setConfirmation(null)
+    setConsentIntent(null)
+    setFolderInput("")
+    setFolderError(null)
+    setFolderDraft(null)
+    setFolderConfirmation("")
+    setYoloTarget(null)
+    setYoloConfirmation("")
+    setMaintenanceIntent(null)
+    setMaintenanceConfirmation("")
+  }
+  const resetForProjectIdentity = () => {
+    setSection("home")
+    setSelectedIndex(0)
+    setRecommendationFilter("needs-review")
+    setActivityFilter("all")
+    setSettingsAnchor(undefined)
+    setTechnicalExpanded(false)
+    setActivityExpanded(null)
+    setDiagnosticsExpanded(false)
+    setMaintenanceScope("observations")
+    clearPreparedAuthority()
+    void props.store.selectDetails([])
+  }
   onMount(() => {
     popMode = props.api.mode.push(CONTROL_CENTER_MODE)
     selectRecommendation(selectedIndex())
+    unsubscribeIdentity = props.store.subscribe((next) => {
+      const nextIdentity = snapshotIdentity(next)
+      if (mountedIdentity !== nextIdentity) {
+        resetForProjectIdentity()
+      } else if (mountedPhase !== "error" && next.phase === "error") {
+        clearPreparedAuthority()
+      }
+      mountedIdentity = nextIdentity
+      mountedPhase = next.phase
+    })
   })
-  onCleanup(() => popMode())
+  onCleanup(() => {
+    cancelDestinationFocus()
+    unsubscribeIdentity()
+    popMode()
+  })
   const navigate = (next: {
     section: (typeof names)[number]
     selectedIndex?: number
@@ -146,6 +281,7 @@ function ControlCenter(props: {
     setSettingsAnchor(next.section === "settings" ? next.anchor : undefined)
     if (Number.isSafeInteger(next.selectedIndex)) setSelectedIndex(next.selectedIndex!)
     if (typeof next.filter === "string") setActivityFilter(next.filter)
+    scheduleDestinationFocus(next)
   }
   const moveSection = (offset: number) => {
     const index = names.indexOf(section())
@@ -167,7 +303,16 @@ function ControlCenter(props: {
     const queue = recommendations().queue
     if (!queue.length) return
     const current = Math.max(0, queue.findIndex((item) => item.sourceIndex === selectedIndex()))
-    selectRecommendation(queue[(current + offset + queue.length) % queue.length].sourceIndex)
+    const next = queue[(current + offset + queue.length) % queue.length].sourceIndex
+    selectRecommendation(next)
+    recommendationNodes.get(next)?.focus()
+  }
+  const moveActivity = (offset: number) => {
+    const entries = activity().activity
+    if (!entries.length) return
+    const next = (activityIndex() + offset + entries.length) % entries.length
+    setActivityIndex(next)
+    activityNodes.get(next)?.focus()
   }
   const invoke = async (key: string, operation: () => Promise<unknown> | unknown, requiresConfirmation = false) => {
     if (requiresConfirmation && confirmation() !== key) {
@@ -183,51 +328,260 @@ function ControlCenter(props: {
       setFeedback(`Request was not submitted: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  const actionButton = (key: string, label: string, operation: () => Promise<unknown> | unknown, requiresConfirmation = false) => (
+  const requestPending = (action: string, subject: string) => props.snapshot().pending.some((entry) =>
+    entry.action === action && entry.subject === subject)
+  const actionButton = (
+    key: string,
+    label: string,
+    operation: () => Promise<unknown> | unknown,
+    requiresConfirmation = false,
+    pendingRequest?: { action: string, subject: string },
+  ) => {
+    const disabled = () => pendingRequest ? requestPending(pendingRequest.action, pendingRequest.subject) : false
+    const focus = focusHandlers(`action:${key}`)
+    return (
     <box
-      focusable
+      id={focusId(`action:${key}`)}
+      focusable={!disabled()}
       border
       paddingLeft={1}
       paddingRight={1}
       borderColor={confirmation() === key ? props.api.theme.current.warning : props.api.theme.current.borderSubtle}
-      onMouseUp={() => void invoke(key, operation, requiresConfirmation)}
+      on:focused={focus.focused}
+      on:blurred={focus.blurred}
+      onMouseUp={() => { if (!disabled()) void invoke(key, operation, requiresConfirmation) }}
       onKeyDown={(event: KeyEvent) => {
-        if (!isActivationKey(event)) return
+        if (!isActivationKey(event) || disabled()) return
         event.preventDefault()
         void invoke(key, operation, requiresConfirmation)
       }}
     >
-      <text fg={props.api.theme.current.text}>{confirmation() === key ? `Confirm ${label}` : label}</text>
+      <text fg={disabled() ? props.api.theme.current.textMuted : props.api.theme.current.text}>
+        {focusMark(`action:${key}`)}{disabled() ? `${label} · Pending` : confirmation() === key ? `Confirm ${label}` : label}
+      </text>
     </box>
-  )
-  const localActionButton = (label: string, operation: () => void, warning = false, confirmationKey?: string) => (
+    )
+  }
+  const localActionButton = (
+    label: string,
+    operation: () => void,
+    warning = false,
+    confirmationKey?: string,
+    pendingRequest?: { action: string, subject: string },
+    focusKey?: string,
+  ) => {
+    const disabled = () => pendingRequest ? requestPending(pendingRequest.action, pendingRequest.subject) : false
+    const key = `local:${focusKey ?? confirmationKey ?? label}`
+    const focus = focusHandlers(key)
+    return (
     <box
-      focusable
+      id={focusId(key)}
+      focusable={!disabled()}
       border
       paddingLeft={1}
       paddingRight={1}
       borderColor={warning || confirmation() === confirmationKey ? props.api.theme.current.warning : props.api.theme.current.borderSubtle}
-      onMouseUp={operation}
+      on:focused={focus.focused}
+      on:blurred={focus.blurred}
+      onMouseUp={() => { if (!disabled()) operation() }}
       onKeyDown={(event: KeyEvent) => {
-        if (!isActivationKey(event)) return
+        if (!isActivationKey(event) || disabled()) return
         event.preventDefault()
         operation()
       }}
     >
-      <text fg={props.api.theme.current.text}>{confirmation() === confirmationKey ? `Confirm ${label}` : label}</text>
+      <text fg={disabled() ? props.api.theme.current.textMuted : props.api.theme.current.text}>
+        {focusMark(key)}{disabled() ? `${label} · Pending` : confirmation() === confirmationKey ? `Confirm ${label}` : label}
+      </text>
     </box>
-  )
-  const granted = () => new Set(
-    (props.snapshot().projection?.index?.allowedActions ?? []).map((action) => action.action),
-  )
+    )
+  }
   const paused = () => props.snapshot().dashboard?.settings?.paused === true
   const emergencyStop = () => props.snapshot().dashboard?.settings?.killSwitchActive === true
-  const completedResponse = () => props.snapshot().responses.at(-1)
   const home = () => model().sections.home
   const recommendations = () => model().sections.recommendations
   const activity = () => model().sections.activity
   const settings = () => model().sections.settings
-  const consentEnabled = (key: string) => settings().consent.find((entry) => entry.key === key)?.enabled === true
+  const settingsAnchorControl = (anchor: string) => {
+    if (anchor === "modes" || anchor === "setup") {
+      // Modes is a multi-control group. Focus its exact group anchor so the
+      // effective/global/project summary stays in view instead of implying
+      // that the current global-mode button is the only destination.
+      return `anchor:${anchor}`
+    }
+    if (anchor === "emergency-stop") {
+      return `action:${emergencyStop() ? "disable-emergency-stop" : "enable-emergency-stop"}`
+    }
+    if (anchor === "project-scope") {
+      return `action:${settings().projectExcluded ? "include-project" : "exclude-project"}`
+    }
+    const consentKey = anchor === "passive-consent"
+      ? "passiveCalls"
+      : anchor === "observation-consent"
+        ? "durableObservations"
+        : null
+    if (consentKey) {
+      const consent = settings().consent.find((entry) => entry.key === consentKey)
+      return consent?.enabled ? `action:consent-${consentKey}-off` : `local:consent:${consentKey}`
+    }
+    if (anchor === "approved-skill-folders") return "local:Add folder"
+    if (anchor === "maintenance") return "local:Export selected scope"
+    return `anchor:${anchor}`
+  }
+  const scheduleDestinationFocus = (next: {
+    section: (typeof names)[number]
+    selectedIndex?: number
+    filter?: string
+    anchor?: string
+  }) => {
+    cancelDestinationFocus()
+    const destinationCurrent = () => (
+      props.api.route.current.name === CONTROL_CENTER_ROUTE && section() === next.section
+    )
+    let targetId = focusId(`section:${next.section}`)
+    if (next.section === "activity" && typeof next.filter === "string") {
+      targetId = focusId(`activity-filter:${next.filter}`)
+    } else if (next.section === "settings" && next.anchor) {
+      targetId = focusId(settingsAnchorControl(next.anchor))
+    } else if (next.section === "home" && home().firstRun) {
+      targetId = focusId("action:automatic-recommendations")
+    }
+    const liveFocusable = (candidate: FocusableRenderable | undefined) => Boolean(
+      candidate
+      && candidate.visible
+      && candidate.focusable
+      && controlCenterNode?.findDescendantById(candidate.id) === candidate
+    ) ? candidate : undefined
+    const destinationTarget = () => {
+      if (!destinationCurrent()) return undefined
+      if (next.section === "recommendations" && Number.isSafeInteger(next.selectedIndex)) {
+        return liveFocusable(recommendationNodes.get(next.selectedIndex!) as FocusableRenderable | undefined)
+      }
+      return liveFocusable(controlCenterNode?.findDescendantById(targetId))
+    }
+    const fallbackTarget = () => {
+      if (!destinationCurrent()) return undefined
+      return liveFocusable(controlCenterNode?.findDescendantById(focusId(`anchor:${next.anchor ?? "setup"}`)))
+        ?? liveFocusable(controlCenterNode?.findDescendantById(focusId(`section:${next.section}`)))
+    }
+    let active = true
+    let watchedTarget: BlurAwareRenderable | undefined
+    let mountGeneration = 0
+    let scrollGeneration = 0
+    const stop = () => {
+      if (!active) return
+      active = false
+      mountGeneration += 1
+      scrollGeneration += 1
+      watchedTarget?.off("blurred", handleTargetBlurred)
+      if (cancelDestinationFocus === stop) {
+        cancelDestinationFocus = () => {}
+        refreshDestinationFocus = () => {}
+      }
+    }
+    const targetInView = (target: FocusableRenderable) => Boolean(
+      contentScrollbox && (() => {
+        const viewport = contentScrollbox.viewport ?? contentScrollbox
+        const viewportBottom = viewport.screenY + viewport.height
+        if (target.height > viewport.height) {
+          // A target taller than the viewport is settled when its top is visible.
+          return target.screenY >= viewport.screenY && target.screenY < viewportBottom
+        }
+        return target.screenY >= viewport.screenY
+          && target.screenY + target.height <= viewportBottom
+      })()
+    )
+    const settleTargetScroll = (target: BlurAwareRenderable, generation: number, attempt = 0) => {
+      requestAnimationFrame(() => {
+        if (!active
+          || generation !== scrollGeneration
+          || watchedTarget !== target
+          || destinationTarget() !== target
+          || attempt >= MAX_DESTINATION_SCROLL_FRAMES) return
+        if (contentScrollbox?.findDescendantById(target.id)) {
+          contentScrollbox.scrollChildIntoView(target.id)
+        }
+        requestAnimationFrame(() => {
+          if (active
+            && generation === scrollGeneration
+            && watchedTarget === target
+            && destinationTarget() === target
+            && !targetInView(target)) {
+            settleTargetScroll(target, generation, attempt + 1)
+          }
+        })
+      })
+    }
+    const watchAndFocus = (target: BlurAwareRenderable) => {
+      if (watchedTarget !== target) {
+        watchedTarget?.off("blurred", handleTargetBlurred)
+        watchedTarget = target
+        watchedTarget.on("blurred", handleTargetBlurred)
+      }
+      target.focus()
+    }
+    const focusExactTarget = (target: BlurAwareRenderable) => {
+      watchAndFocus(target)
+      if (contentScrollbox?.findDescendantById(target.id)) {
+        contentScrollbox.scrollChildIntoView(target.id)
+      }
+      settleTargetScroll(target, ++scrollGeneration)
+    }
+    const focusDestination = () => {
+      if (!active || !destinationCurrent()) {
+        stop()
+        return
+      }
+      const target = destinationTarget() as BlurAwareRenderable | undefined
+      if (target) {
+        focusExactTarget(target)
+        return
+      }
+      const fallback = fallbackTarget() as BlurAwareRenderable | undefined
+      if (fallback) {
+        watchAndFocus(fallback)
+        if (contentScrollbox?.findDescendantById(fallback.id)) {
+          contentScrollbox.scrollChildIntoView(fallback.id)
+        }
+      }
+    }
+    const handleTargetBlurred = () => {
+      if (!destinationCurrent()) {
+        stop()
+        return
+      }
+      const current = watchedTarget?.ctx.currentFocusedRenderable
+      if (current == null || current === controlCenterNode || current.id === watchedTarget?.id) {
+        // The host clears focus or focuses the route root after mounting.
+        // Reclaim mount transitions and same-ID renderable replacement;
+        // explicit scrolling and different-child focus cancel.
+        focusDestination()
+        return
+      }
+      stop()
+    }
+    const refresh = () => {
+      focusDestination()
+      const generation = ++mountGeneration
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (active && generation === mountGeneration) focusDestination()
+      }))
+    }
+    refreshDestinationFocus = refresh
+    cancelDestinationFocus = stop
+    refresh()
+  }
+  onMount(() => scheduleDestinationFocus(props.initial))
+  createEffect(() => {
+    props.snapshot()
+    refreshDestinationFocus()
+  })
+  const retryProjection = async () => {
+    const refreshed = await props.store.refresh()
+    setFeedback(refreshed.phase === "error"
+      ? "Retry did not restore a fresh projection. Read-only stale context remains available."
+      : "Projection refreshed. Only newly negotiated actions are available.")
+  }
   const modeRank = (value: string | null) => ({ manual: 0, auto: 1, yolo: 2 }[value ?? ""] ?? 0)
   const projectedModeFor = (target: string, scope: "global" | "project") => {
     if (scope === "global") return target
@@ -253,39 +607,37 @@ function ControlCenter(props: {
       riskIncreasing,
     )
   }
-  const waitForControlResponse = async (requestId: string, timeoutMs = 15_000) => {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() <= deadline) {
-      await props.store.refresh()
-      const completed = props.snapshot().responses.find((entry) => entry.requestId === requestId)
-      if (completed?.response) {
-        if (completed.response.ok !== true) {
-          throw new Error(completed.response.reason ?? "control-request-rejected")
-        }
-        return completed.response
-      }
-      await delay(100)
-    }
-    throw new Error("control-response-timeout")
+  const enableAutomaticRecommendations = () => props.store.submitControl("set-mode", { mode: "auto" })
+  const openConsentDisclosure = (key: string) => {
+    setConsentIntent(key)
+    setFeedback("Review the privacy disclosure, then confirm or cancel the consent change.")
   }
-  const submitControlAndWait = async (action: string, payload: Record<string, unknown>) => {
-    const request = await props.store.submitControl(action, payload)
-    await waitForControlResponse(request.requestId)
+  const confirmConsent = async (key: string) => {
+    await props.store.submitControl("set-consent", { key, enabled: true })
+    await delay(0)
+    setConsentIntent(null)
   }
-  const enableAutomaticRecommendations = async () => {
-    if (!consentEnabled("passiveCalls")) {
-      await submitControlAndWait("set-consent", { key: "passiveCalls", enabled: true })
-    }
-    if (!consentEnabled("durableObservations")) {
-      await submitControlAndWait("set-consent", { key: "durableObservations", enabled: true })
-    }
-    if (modeRank(settings().mode.global.value) < modeRank("auto")) {
-      await submitControlAndWait("set-mode", { mode: "auto" })
-    }
-  }
-  const automaticRecommendationsReady = () => modeRank(settings().mode.global.value) >= modeRank("auto")
-    && consentEnabled("passiveCalls")
-    && consentEnabled("durableObservations")
+  const consentDisclosure = (key: string) => (
+    <Show when={consentIntent() === key && settings().consent.find((entry) => entry.key === key)}>
+      {(entry) => (
+        <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
+          <text><b>Consent disclosure</b></text>
+          <text wrapMode="word">{entry().description}</text>
+          <text fg={props.api.theme.current.textMuted} wrapMode="word">{entry().dependency}</text>
+          <box flexDirection="row" flexWrap="wrap" gap={1}>
+            {actionButton(
+              `confirm-consent-${key}`,
+              `Confirm allow ${entry().label}`,
+              () => confirmConsent(key),
+              false,
+              { action: "set-consent", subject: `consent:${key}` },
+            )}
+            {localActionButton("Cancel consent change", () => setConsentIntent(null), false, undefined, undefined, `cancel-consent:${key}`)}
+          </box>
+        </box>
+      )}
+    </Show>
+  )
   const confirmYolo = async () => {
     const target = yoloTarget()
     if (!target || yoloConfirmation() !== "ENABLE YOLO") {
@@ -399,11 +751,10 @@ function ControlCenter(props: {
       ? props.snapshot().projection?.index?.reviews?.[sourceIndex!]?.proposalId ?? null
       : null
   }
-  const pendingRecommendation = () => props.snapshot().pending.some((entry) =>
-    ["apply-proposal", "reject-proposal", "snooze-proposal", "rollback-proposal"].includes(entry.action ?? ""))
+  const pendingRecommendation = () => props.snapshot().pending.some((entry) => entry.subject === selectedProposalId())
   const activateRecommendation = async (action: string, snoozeMs?: number) => {
     const proposalId = selectedProposalId()
-    if (!proposalId || pendingRecommendation()) return
+    if (!proposalId || requestPending(action, proposalId)) return
     if (action === "open-activity") {
       navigate({ section: "activity", filter: "recommendations" })
       return
@@ -458,44 +809,58 @@ function ControlCenter(props: {
   return (
     <box
       id={CONTROL_CENTER_VIEW_ID}
+      ref={(value: Renderable) => (controlCenterNode = value as FocusableRenderable)}
       focusable
       width="100%"
       height="100%"
       flexDirection="column"
-      paddingLeft={2}
-      paddingRight={2}
+      paddingLeft={compactShell() ? 1 : 2}
+      paddingRight={compactShell() ? 1 : 2}
     >
-      <box flexDirection="row" gap={1} flexWrap="wrap">
+      <box
+        flexDirection="row"
+        gap={1}
+        flexWrap="wrap"
+        flexShrink={0}
+        height={compactShell() ? 3 : "auto"}
+        overflow="hidden"
+      >
         <box flexDirection="column" flexGrow={1}>
           <text fg={props.api.theme.current.text}><b>Self-evolve</b></text>
           <text fg={props.api.theme.current.textMuted} wrapMode="word">
             {model().operational.label} · {home().mode.effective.label}
           </text>
         </box>
-        <Show when={granted().has("set-paused")}>
+        <Show when={settings().controls.pause}>
           {actionButton(
             paused() ? "resume" : "pause",
             paused() ? "Resume" : "Pause",
             () => props.store.submitOperation("set-paused", { paused: !paused() }),
+            false,
+            { action: "set-paused", subject: "project" },
           )}
         </Show>
-        <Show when={granted().has("set-kill-switch")}>
+        <Show when={settings().controls.emergencyStop}>
           {actionButton(
             emergencyStop() ? "disable-emergency-stop" : "enable-emergency-stop",
             emergencyStop() ? "Turn off Emergency stop" : "Emergency stop",
             () => props.store.submitOperation("set-kill-switch", { enabled: !emergencyStop() }),
             emergencyStop(),
+            { action: "set-kill-switch", subject: "project" },
           )}
         </Show>
       </box>
-      <box flexDirection="row" gap={1} flexWrap="wrap">
+      <box flexDirection="row" gap={1} flexWrap="wrap" flexShrink={0} height={3} overflow="hidden">
         {names.map((name) => (
           <box
+            id={focusId(`section:${name}`)}
             focusable
             border
             paddingLeft={1}
             paddingRight={1}
             borderColor={section() === name ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
+            on:focused={() => setFocusedControl(`section:${name}`)}
+            on:blurred={() => setFocusedControl((current) => current === `section:${name}` ? null : current)}
             onMouseUp={() => navigate({ section: name })}
             onKeyDown={(event: KeyEvent) => {
               if (isActivationKey(event)) {
@@ -511,15 +876,36 @@ function ControlCenter(props: {
             }}
           >
             <text fg={section() === name ? props.api.theme.current.text : props.api.theme.current.textMuted}>
-              {name.charAt(0).toUpperCase() + name.slice(1)}
+              {focusMark(`section:${name}`)}{name.charAt(0).toUpperCase() + name.slice(1)}
               {name === "recommendations" && model().operational.count > 0 ? ` (${model().operational.count})` : ""}
             </text>
           </box>
         ))}
       </box>
-      <scrollbox flexGrow={1} width="100%">
+      <scrollbox
+        ref={(value: Renderable) => (contentScrollbox = value as ScrollableRenderable)}
+        flexGrow={1}
+        minHeight={1}
+        width="100%"
+        onMouseScroll={() => cancelDestinationFocus()}
+      >
+        <Show when={model().recovery}>
+          {(recovery) => (
+            <box border borderColor={props.api.theme.current.error} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
+              <text><b>{recovery().stale ? "Read-only stale snapshot" : "Projection unavailable"}</b></text>
+              <text wrapMode="word">Latest refresh failed: {recovery().diagnostic}</text>
+              <text fg={props.api.theme.current.textMuted} wrapMode="word">
+                Decision, control, and operation actions are unavailable until a fresh projection is negotiated.
+              </text>
+              <Show when={recovery().canRetry}>
+                {localActionButton("Retry", () => void retryProjection())}
+              </Show>
+            </box>
+          )}
+        </Show>
         <Show when={section() === "home"}>
           <box flexDirection="column" gap={1}>
+            <text><b>Home</b></text>
             <text fg={props.api.theme.current.text}><b>{home().operational.label}</b></text>
             <text wrapMode="word">{home().operational.explanation}</text>
             <text fg={props.api.theme.current.textMuted} wrapMode="word">{home().operational.nextAction}</text>
@@ -532,13 +918,14 @@ function ControlCenter(props: {
             <Show when={home().firstRun}>
               <box border borderColor={props.api.theme.current.info} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
                 <text><b>Get automatic recommendations</b></text>
-                <text wrapMode="word">Choose proactive review without granting automatic writes. Background AI analysis and saved structured patterns remain separate consent gates in Settings.</text>
+                <text wrapMode="word">Choose proactive review without granting automatic writes or privacy consent. Background AI analysis and saved structured patterns remain separate consent gates in Settings.</text>
                 <Show when={settings().controls.globalMode}>
                   {actionButton(
                     "automatic-recommendations",
                     "Turn on automatic recommendations",
                     enableAutomaticRecommendations,
                     true,
+                    { action: "set-mode", subject: "global-mode" },
                   )}
                 </Show>
                 <Show when={!settings().controls.globalMode}>
@@ -547,38 +934,43 @@ function ControlCenter(props: {
                 <text><b>Optional evidence excerpts</b></text>
                 <text wrapMode="word">Sanitized excerpts can make evidence richer, but redaction is not a secrecy guarantee. This choice is independent of automatic recommendations.</text>
                 <Show when={settings().controls.consent}>
-                  {actionButton(
-                    "first-run-sanitized-excerpts",
-                    "Allow sanitized excerpts",
-                    () => props.store.submitControl("set-consent", { key: "sanitizedExcerpts", enabled: true }),
-                    true,
+                  {localActionButton(
+                    "Review consent for Sanitized evidence excerpts",
+                    () => openConsentDisclosure("sanitizedExcerpts"),
                   )}
                 </Show>
                 <Show when={!settings().controls.consent}>
                   <text fg={props.api.theme.current.textMuted}>Excerpt consent can be changed later in Settings.</text>
                 </Show>
+                {consentDisclosure("sanitizedExcerpts")}
               </box>
             </Show>
             <Show when={home().blockers.length}>
               <box flexDirection="column">
                 <text><b>Setup</b></text>
-                {() => home().blockers.map((blocker) => (
+                {reactiveChild(() => home().blockers.map((blocker) => (
                   <box
                     focusable
                     border
                     borderColor={props.api.theme.current.warning}
                     paddingLeft={1}
                     paddingRight={1}
-                    onMouseUp={() => navigate({ section: "settings", anchor: blocker.code })}
+                    on:focused={() => setFocusedControl(`blocker:${blocker.code}`)}
+                    on:blurred={() => setFocusedControl((current) => current === `blocker:${blocker.code}` ? null : current)}
+                    onMouseUp={() => navigate(blocker.destination)}
                     onKeyDown={(event: KeyEvent) => {
                       if (!isActivationKey(event)) return
                       event.preventDefault()
-                      navigate({ section: "settings", anchor: blocker.code })
+                      navigate(blocker.destination)
                     }}
                   >
-                    <text wrapMode="word">{blocker.summary} · Open Settings</text>
+                    <text wrapMode="word">
+                      {focusMark(`blocker:${blocker.code}`)}{blocker.summary} · Open {blocker.destination.section === "activity"
+                        ? "Activity errors"
+                        : blocker.destination.section.charAt(0).toUpperCase() + blocker.destination.section.slice(1)}
+                    </text>
                   </box>
-                ))}
+                )))}
               </box>
             </Show>
             <Show when={home().lastCycle}>
@@ -592,11 +984,14 @@ function ControlCenter(props: {
             <Show when={home().attention}>
               {(attention) => (
                 <box
+                  id={focusId("home:attention")}
                   focusable
                   border
                   borderColor={props.api.theme.current.warning}
                   paddingLeft={1}
                   paddingRight={1}
+                  on:focused={() => setFocusedControl("home:attention")}
+                  on:blurred={() => setFocusedControl((current) => current === "home:attention" ? null : current)}
                   onMouseUp={() => navigate(attention().destination)}
                   onKeyDown={(event: KeyEvent) => {
                     if (!isActivationKey(event)) return
@@ -604,7 +999,7 @@ function ControlCenter(props: {
                     navigate(attention().destination)
                   }}
                 >
-                  <text>{attention().count} {attention().kind === "applied" ? "applied change" : "recommendation"} needs attention</text>
+                  <text>{focusMark("home:attention")}{attention().count} {attention().kind === "applied" ? "applied change" : "recommendation"} needs attention</text>
                 </box>
               )}
             </Show>
@@ -621,7 +1016,7 @@ function ControlCenter(props: {
             <Show when={home().recentActivity.length}>
               <box flexDirection="column">
                 <text><b>Recent activity</b></text>
-                {() => home().recentActivity.map((entry) => <text wrapMode="word">[{entry.marker}] {entry.summary}</text>)}
+                {reactiveChild(() => home().recentActivity.map((entry) => <text wrapMode="word">[{entry.marker}] {entry.summary}</text>))}
               </box>
             </Show>
             <Show when={home().emptyState}>
@@ -646,11 +1041,14 @@ function ControlCenter(props: {
                 ["all", "All"],
               ] as const).map(([value, label]) => (
                 <box
+                  id={focusId(`recommendation-filter:${value}`)}
                   focusable
                   border
                   borderColor={recommendationFilter() === value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
                   paddingLeft={1}
                   paddingRight={1}
+                  on:focused={() => setFocusedControl(`recommendation-filter:${value}`)}
+                  on:blurred={() => setFocusedControl((current) => current === `recommendation-filter:${value}` ? null : current)}
                   onMouseUp={() => {
                     setRecommendationFilter(value)
                     const first = buildControlCenterModel(props.snapshot(), { recommendationFilter: value }).sections.recommendations.queue[0]
@@ -664,20 +1062,30 @@ function ControlCenter(props: {
                     if (first) selectRecommendation(first.sourceIndex)
                   }}
                 >
-                  <text>{label}</text>
+                  <text>{focusMark(`recommendation-filter:${value}`)}{label}</text>
                 </box>
               ))}
             </box>
             <Show when={recommendations().emptyState}><text>{recommendations().emptyState}</text></Show>
-            {() => recommendations().queue.map((item, index) => (
+            {reactiveChild(() => recommendations().queue.map((item, index) => (
               <box
+                id={focusId(`recommendation-row:${item.sourceIndex}`)}
+                ref={(value: Renderable) => recommendationNodes.set(item.sourceIndex, value)}
                 focusable
                 border
                 borderColor={recommendations().selectedIndex === index ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
                 paddingLeft={1}
                 paddingRight={1}
                 flexDirection="column"
-                onMouseUp={() => selectRecommendation(item.sourceIndex)}
+                on:focused={() => {
+                  setFocusedControl(`recommendation-row:${item.sourceIndex}`)
+                  selectRecommendation(item.sourceIndex)
+                }}
+                on:blurred={() => setFocusedControl((current) => current === `recommendation-row:${item.sourceIndex}` ? null : current)}
+                onMouseUp={() => {
+                  selectRecommendation(item.sourceIndex)
+                  recommendationNodes.get(item.sourceIndex)?.focus()
+                }}
                 onKeyDown={(event: KeyEvent) => {
                   if (isActivationKey(event)) {
                     event.preventDefault()
@@ -692,6 +1100,7 @@ function ControlCenter(props: {
                 }}
               >
                 <text wrapMode="word">
+                  {focusMark(`recommendation-row:${item.sourceIndex}`)}
                   {item.attention === "critical" ? "[Urgent] " : item.attention === "warning" ? "[Attention] " : ""}
                   {item.target} · {item.state.replaceAll("-", " ")} · {relativeTime(item.updatedAt)}
                 </text>
@@ -700,7 +1109,7 @@ function ControlCenter(props: {
                   Risk: {item.risk ?? "Loading"} · Evidence: {item.evidenceCount ?? "Loading"}
                 </text>
               </box>
-            ))}
+            )))}
             <Show when={recommendations().selected}>
               {(selected) => (
                 <box border borderColor={props.api.theme.current.borderActive} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
@@ -717,15 +1126,15 @@ function ControlCenter(props: {
                       </box>
                       <box flexDirection="column">
                         <text><b>Proposed change</b></text>
-                        {() => selected().diff?.lines.map((line) => <text wrapMode="word">{line}</text>) ?? []}
+                        {reactiveChild(() => selected().diff?.lines.map((line) => <text wrapMode="word">{line}</text>) ?? [])}
                         <Show when={selected().diff?.overflow?.truncated}>
                           <text fg={props.api.theme.current.warning}>The proposed change was truncated by the bounded projection.</text>
                         </Show>
                       </box>
                       <box flexDirection="column">
                         <text><b>Evidence</b></text>
-                        {() => selected().evidence.map((entry) =>
-                          <text wrapMode="word">{entry.kind}: {entry.summary}{entry.redacted ? " [redacted]" : ""}</text>)}
+                        {reactiveChild(() => selected().evidence.map((entry) =>
+                          <text wrapMode="word">{entry.kind}: {entry.summary}{entry.redacted ? " [redacted]" : ""}</text>))}
                         <Show when={!selected().evidence.length}><text>No bounded evidence detail is loaded.</text></Show>
                       </box>
                       <box flexDirection="column">
@@ -733,8 +1142,8 @@ function ControlCenter(props: {
                         <text>Critic: {summary().criticPassed ? "Passed" : "Not passed"}</text>
                         <text>Deterministic checks: {summary().validDeterministic ? "Passed" : "Not passed"}</text>
                         <text>Injection scan: {summary().injectionFlagged ? "Flagged" : "Clear"}</text>
-                        {() => summary().eligibility.checks.map((check) =>
-                          <text wrapMode="word">[{check.met ? "Passed" : "Blocked"}] {check.name}: {check.actual} / {check.required}</text>)}
+                        {reactiveChild(() => summary().eligibility.checks.map((check) =>
+                          <text wrapMode="word">[{check.met ? "Passed" : "Blocked"}] {check.name}: {check.actual} / {check.required}</text>))}
                       </box>
                       <box flexDirection="column">
                         <text><b>Token impact</b></text>
@@ -750,6 +1159,8 @@ function ControlCenter(props: {
                         borderColor={technicalExpanded() ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
                         paddingLeft={1}
                         paddingRight={1}
+                        on:focused={() => setFocusedControl("recommendation:technical")}
+                        on:blurred={() => setFocusedControl((current) => current === "recommendation:technical" ? null : current)}
                         onMouseUp={() => setTechnicalExpanded((value) => !value)}
                         onKeyDown={(event: KeyEvent) => {
                           if (!isActivationKey(event)) return
@@ -757,14 +1168,14 @@ function ControlCenter(props: {
                           setTechnicalExpanded((value) => !value)
                         }}
                       >
-                        <text>Technical details {technicalExpanded() ? "▲" : "▼"}</text>
+                        <text>{focusMark("recommendation:technical")}Technical details {technicalExpanded() ? "▲" : "▼"}</text>
                       </box>
                       <Show when={technicalExpanded()}>
                         <text>State: {summary().state}</text>
                         <text>Effective mode: {summary().effectiveMode}</text>
                         <text>Operation: {summary().operation.status}</text>
-                        {() => selected().audit.map((entry) =>
-                          <text wrapMode="word">{entry.kind}: {entry.summary}</text>)}
+                        {reactiveChild(() => selected().audit.map((entry) =>
+                          <text wrapMode="word">{entry.kind}: {entry.summary}</text>))}
                       </Show>
                     </>
                   )}
@@ -774,13 +1185,15 @@ function ControlCenter(props: {
                   <box flexDirection="column">
                     <text fg={props.api.theme.current.textMuted}>Optional rejection feedback (audit-only)</text>
                     <box flexDirection="row" gap={1} flexWrap="wrap">
-                      {() => recommendations().rejectionFeedbackOptions.map((option) => (
+                      {reactiveChild(() => recommendations().rejectionFeedbackOptions.map((option) => (
                         <box
                           focusable
                           border
                           borderColor={rejectionReason() === option.value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
                           paddingLeft={1}
                           paddingRight={1}
+                          on:focused={() => setFocusedControl(`rejection:${option.value}`)}
+                          on:blurred={() => setFocusedControl((current) => current === `rejection:${option.value}` ? null : current)}
                           onMouseUp={() => setRejectionReason(rejectionReason() === option.value ? null : option.value)}
                           onKeyDown={(event: KeyEvent) => {
                             if (!isActivationKey(event)) return
@@ -788,9 +1201,9 @@ function ControlCenter(props: {
                             setRejectionReason(rejectionReason() === option.value ? null : option.value)
                           }}
                         >
-                          <text>{option.label}</text>
+                          <text>{focusMark(`rejection:${option.value}`)}{option.label}</text>
                         </box>
-                      ))}
+                      )))}
                     </box>
                     <Show when={rejectionReason() === "other"}>
                       <input
@@ -802,7 +1215,7 @@ function ControlCenter(props: {
                   </box>
                 </Show>
                 <box flexDirection="row" gap={1} flexWrap="wrap">
-                  {() => selected().actions.flatMap((action) => {
+                  {reactiveChild(() => selected().actions.flatMap((action) => {
                     const choices = action.action === "snooze-proposal"
                       ? [
                         { label: "Snooze 1 hour", delay: 3_600_000 },
@@ -821,29 +1234,35 @@ function ControlCenter(props: {
                       const key = `${action.action}:${choice.delay ?? ""}`
                       return (
                         <box
-                          focusable={!pendingRecommendation()}
+                          focusable={!action.pending}
                           border
                           borderColor={confirmation() === key ? props.api.theme.current.warning : props.api.theme.current.borderSubtle}
                           paddingLeft={1}
                           paddingRight={1}
-                          onMouseUp={() => void activateRecommendation(action.action, choice.delay)}
+                          on:focused={() => setFocusedControl(`recommendation-action:${key}`)}
+                          on:blurred={() => setFocusedControl((current) => current === `recommendation-action:${key}` ? null : current)}
+                          onMouseUp={() => { if (!action.pending) void activateRecommendation(action.action, choice.delay) }}
                           onKeyDown={(event: KeyEvent) => {
-                            if (!isActivationKey(event)) return
+                            if (!isActivationKey(event) || action.pending) return
                             event.preventDefault()
                             void activateRecommendation(action.action, choice.delay)
                           }}
                         >
-                          <text>{confirmation() === key ? `Confirm ${choice.label}` : choice.label}</text>
+                          <text fg={action.pending ? props.api.theme.current.textMuted : props.api.theme.current.text}>
+                            {focusMark(`recommendation-action:${key}`)}{action.pending ? `${choice.label} · Pending` : confirmation() === key ? `Confirm ${choice.label}` : choice.label}
+                          </text>
                         </box>
                       )
                     })
-                  })}
+                  }))}
                   <box
                     focusable
                     border
                     borderColor={props.api.theme.current.borderSubtle}
                     paddingLeft={1}
                     paddingRight={1}
+                    on:focused={() => setFocusedControl("recommendation:open-activity")}
+                    on:blurred={() => setFocusedControl((current) => current === "recommendation:open-activity" ? null : current)}
                     onMouseUp={() => void activateRecommendation("open-activity")}
                     onKeyDown={(event: KeyEvent) => {
                       if (!isActivationKey(event)) return
@@ -851,7 +1270,7 @@ function ControlCenter(props: {
                       void activateRecommendation("open-activity")
                     }}
                   >
-                    <text>Open in Activity</text>
+                    <text>{focusMark("recommendation:open-activity")}Open in Activity</text>
                   </box>
                 </box>
                 <Show when={pendingRecommendation()}>
@@ -873,36 +1292,52 @@ function ControlCenter(props: {
                 ["errors", "Errors"],
               ] as const).map(([value, label]) => (
                 <box
+                  id={focusId(`activity-filter:${value}`)}
                   focusable
                   border
                   borderColor={activityFilter() === value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
                   paddingLeft={1}
                   paddingRight={1}
+                  on:focused={() => setFocusedControl(`activity-filter:${value}`)}
+                  on:blurred={() => setFocusedControl((current) => current === `activity-filter:${value}` ? null : current)}
                   onMouseUp={() => {
                     setActivityFilter(value)
                     setActivityExpanded(null)
+                    setActivityIndex(0)
                   }}
                   onKeyDown={(event: KeyEvent) => {
                     if (!isActivationKey(event)) return
                     event.preventDefault()
                     setActivityFilter(value)
                     setActivityExpanded(null)
+                    setActivityIndex(0)
                   }}
                 >
-                  <text>{label}</text>
+                  <text>{focusMark(`activity-filter:${value}`)}{label}</text>
                 </box>
               ))}
             </box>
             <Show when={activity().emptyState}><text wrapMode="word">{activity().emptyState}</text></Show>
-            {() => activity().activity.map((entry, index) => (
+            {reactiveChild(() => activity().activity.map((entry, index) => (
               <box
+                id={focusId(`activity-row:${index}`)}
+                ref={(value: Renderable) => activityNodes.set(index, value)}
                 focusable
                 border
                 borderColor={activityExpanded() === index ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
                 paddingLeft={1}
                 paddingRight={1}
                 flexDirection="column"
-                onMouseUp={() => setActivityExpanded(activityExpanded() === index ? null : index)}
+                on:focused={() => {
+                  setFocusedControl(`activity-row:${index}`)
+                  setActivityIndex(index)
+                }}
+                on:blurred={() => setFocusedControl((current) => current === `activity-row:${index}` ? null : current)}
+                onMouseUp={() => {
+                  setActivityIndex(index)
+                  activityNodes.get(index)?.focus()
+                  setActivityExpanded(activityExpanded() === index ? null : index)
+                }}
                 onKeyDown={(event: KeyEvent) => {
                   if (isActivationKey(event)) {
                     event.preventDefault()
@@ -910,11 +1345,17 @@ function ControlCenter(props: {
                   } else if (event.name === "right" && entry.destination?.section === "recommendations") {
                     event.preventDefault()
                     openActivityDestination(entry)
+                  } else if (event.name === "up") {
+                    event.preventDefault()
+                    moveActivity(-1)
+                  } else if (event.name === "down") {
+                    event.preventDefault()
+                    moveActivity(1)
                   }
                 }}
               >
                 <text wrapMode="word">
-                  [{entry.marker}] {entry.summary} · {relativeTime(entry.occurredAt)}
+                  {focusMark(`activity-row:${index}`)}[{entry.marker}] {entry.summary} · {relativeTime(entry.occurredAt)}
                 </text>
                 <Show when={entry.target}><text fg={props.api.theme.current.textMuted}>Skill: {entry.target}</text></Show>
                 <Show when={activityExpanded() === index}>
@@ -930,6 +1371,8 @@ function ControlCenter(props: {
                       borderColor={props.api.theme.current.borderSubtle}
                       paddingLeft={1}
                       paddingRight={1}
+                      on:focused={() => setFocusedControl(`activity-open:${index}`)}
+                      on:blurred={() => setFocusedControl((current) => current === `activity-open:${index}` ? null : current)}
                       onMouseUp={() => openActivityDestination(entry)}
                       onKeyDown={(event: KeyEvent) => {
                         if (!isActivationKey(event)) return
@@ -937,12 +1380,12 @@ function ControlCenter(props: {
                         openActivityDestination(entry)
                       }}
                     >
-                      <text>Open recommendation</text>
+                      <text>{focusMark(`activity-open:${index}`)}Open recommendation</text>
                     </box>
                   </Show>
                 </Show>
               </box>
-            ))}
+            )))}
             <Show when={activity().overflowMessage}>
               <text fg={props.api.theme.current.warning} wrapMode="word">{activity().overflowMessage}</text>
             </Show>
@@ -952,6 +1395,8 @@ function ControlCenter(props: {
               borderColor={diagnosticsExpanded() ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
               paddingLeft={1}
               paddingRight={1}
+              on:focused={() => setFocusedControl("activity:diagnostics")}
+              on:blurred={() => setFocusedControl((current) => current === "activity:diagnostics" ? null : current)}
               onMouseUp={() => setDiagnosticsExpanded((value) => !value)}
               onKeyDown={(event: KeyEvent) => {
                 if (!isActivationKey(event)) return
@@ -959,7 +1404,7 @@ function ControlCenter(props: {
                 setDiagnosticsExpanded((value) => !value)
               }}
             >
-              <text>Diagnostics {diagnosticsExpanded() ? "▲" : "▼"}</text>
+              <text>{focusMark("activity:diagnostics")}Diagnostics {diagnosticsExpanded() ? "▲" : "▼"}</text>
             </box>
             <Show when={diagnosticsExpanded()}>
               <box flexDirection="column">
@@ -1010,9 +1455,20 @@ function ControlCenter(props: {
             <text><b>Settings</b></text>
             <Show when={settingsAnchor()}>
               {(anchor) => (
-                <text fg={props.api.theme.current.info} wrapMode="word">
-                  Opened at {anchor().replaceAll("-", " ")} settings.
-                </text>
+                <box
+                  id={focusId(`anchor:${anchor()}`)}
+                  focusable
+                  border
+                  borderColor={focusedControl() === `anchor:${anchor()}` ? props.api.theme.current.borderActive : props.api.theme.current.info}
+                  paddingLeft={1}
+                  paddingRight={1}
+                  on:focused={() => setFocusedControl(`anchor:${anchor()}`)}
+                  on:blurred={() => setFocusedControl((current) => current === `anchor:${anchor()}` ? null : current)}
+                >
+                  <text fg={props.api.theme.current.info} wrapMode="word">
+                    {focusMark(`anchor:${anchor()}`)}Opened at {anchor().replaceAll("-", " ")} settings.
+                  </text>
+                </box>
               )}
             </Show>
             <Show when={settings().limited}>
@@ -1031,21 +1487,22 @@ function ControlCenter(props: {
             <text fg={props.api.theme.current.textMuted} wrapMode="word">
               The global default applies to every current and future project. “Use for this project” creates an override here only.
             </text>
-            <Show when={settings().controls.globalMode && settings().controls.consent && !automaticRecommendationsReady()}>
+            <Show when={settings().controls.globalMode && modeRank(settings().mode.global.value) < modeRank("auto")}>
               <box border borderColor={props.api.theme.current.info} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
                 <text><b>Automatic recommendations setup</b></text>
                 <text wrapMode="word">
-                  One confirmation enables background AI analysis, saved structured patterns, and the Analyze and recommend global mode in sequence. Sanitized excerpts remain a separate choice.
+                  This confirmation changes only the global mode. Background AI analysis, saved structured patterns, and sanitized excerpts remain separate consent choices below.
                 </text>
                 {actionButton(
                   "automatic-recommendations",
                   "Turn on automatic recommendations",
                   enableAutomaticRecommendations,
                   true,
+                  { action: "set-mode", subject: "global-mode" },
                 )}
               </box>
             </Show>
-            {() => settings().modes.map((mode) => (
+            {reactiveChild(() => settings().modes.map((mode) => (
               <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
                 <text><b>{mode.label}</b>{settings().mode.effective.value === mode.value ? " · Effective now" : ""}</text>
                 <text wrapMode="word">{mode.description}</text>
@@ -1054,7 +1511,7 @@ function ControlCenter(props: {
                 <text fg={props.api.theme.current.textMuted} wrapMode="word">Write authority: {mode.writeAuthority}</text>
                 <text fg={props.api.theme.current.textMuted} wrapMode="word">Prerequisites: {mode.prerequisites}</text>
                 <Show when={mode.blockers.length}>
-                  {() => mode.blockers.map((blocker) => <text fg={props.api.theme.current.warning} wrapMode="word">• {blocker}</text>)}
+                  {reactiveChild(() => mode.blockers.map((blocker) => <text fg={props.api.theme.current.warning} wrapMode="word">• {blocker}</text>))}
                 </Show>
                 <Show when={mode.available}>
                   <box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -1064,6 +1521,7 @@ function ControlCenter(props: {
                         () => submitMode("global", mode.value as "manual" | "auto" | "yolo"),
                         mode.value === "yolo",
                         `global-mode-${mode.value}`,
+                        { action: "set-mode", subject: "global-mode" },
                       )}
                     </Show>
                     <Show when={settings().controls.repositoryMode}>
@@ -1072,18 +1530,20 @@ function ControlCenter(props: {
                         () => submitMode("project", mode.value as "manual" | "auto" | "yolo"),
                         mode.value === "yolo",
                         `project-mode-${mode.value}`,
+                        { action: "set-repo-mode", subject: "repository-mode" },
                       )}
                     </Show>
                   </box>
                 </Show>
               </box>
-            ))}
+            )))}
             <Show when={settings().controls.repositoryMode}>
               {localActionButton(
                 settings().mode.repository.value === "inherit" ? "Inherit global default ✓" : "Make this project inherit global default",
                 () => submitMode("project", "inherit"),
                 false,
                 "project-mode-inherit",
+                { action: "set-repo-mode", subject: "repository-mode" },
               )}
             </Show>
             <Show when={yoloTarget()}>
@@ -1099,11 +1559,17 @@ function ControlCenter(props: {
                   onInput={(value: string) => setYoloConfirmation(value.slice(0, 64))}
                 />
                 <box flexDirection="row" flexWrap="wrap" gap={1}>
-                  {localActionButton("Submit Apply automatically", () => void confirmYolo(), true)}
+                  {localActionButton(
+                    "Submit Apply automatically",
+                    () => void confirmYolo(),
+                    true,
+                    undefined,
+                    { action: yoloTarget() === "global" ? "set-mode" : "set-repo-mode", subject: yoloTarget() === "global" ? "global-mode" : "repository-mode" },
+                  )}
                   {localActionButton("Cancel", () => {
                     setYoloTarget(null)
                     setYoloConfirmation("")
-                  })}
+                  }, false, undefined, undefined, "cancel-yolo")}
                 </box>
               </box>
             </Show>
@@ -1120,27 +1586,39 @@ function ControlCenter(props: {
                   settings().projectExcluded ? "Include this project" : "Exclude this project",
                   () => props.store.submitControl("set-repo-excluded", { excluded: !settings().projectExcluded }),
                   settings().projectExcluded === true,
+                  { action: "set-repo-excluded", subject: "project-inclusion" },
                 )}
               </Show>
             </box>
-            {() => settings().consent.map((entry) => (
+            {reactiveChild(() => settings().consent.map((entry) => (
               <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
                 <text><b>{entry.label}</b>: {entry.enabled ? "Allowed" : "Not allowed"} · {entry.scope}</text>
                 <text wrapMode="word">{entry.description}</text>
                 <text fg={props.api.theme.current.textMuted} wrapMode="word">{entry.dependency}</text>
                 <Show when={settings().controls.consent && (entry.enabled || entry.canEnable)}>
-                  {actionButton(
-                    `consent-${entry.key}-${entry.enabled ? "off" : "on"}`,
-                    entry.enabled ? `Stop allowing ${entry.label}` : `Allow ${entry.label}`,
-                    () => props.store.submitControl("set-consent", { key: entry.key, enabled: !entry.enabled }),
-                    !entry.enabled,
-                  )}
+                  {entry.enabled
+                    ? actionButton(
+                      `consent-${entry.key}-off`,
+                      `Stop allowing ${entry.label}`,
+                      () => props.store.submitControl("set-consent", { key: entry.key, enabled: false }),
+                      false,
+                      { action: "set-consent", subject: `consent:${entry.key}` },
+                    )
+                    : localActionButton(
+                      `Review consent for ${entry.label}`,
+                      () => openConsentDisclosure(entry.key),
+                      false,
+                      undefined,
+                      undefined,
+                      `consent:${entry.key}`,
+                    )}
                 </Show>
+                {consentDisclosure(entry.key)}
                 <Show when={!entry.enabled && !entry.canEnable}>
                   <text fg={props.api.theme.current.warning} wrapMode="word">Resolve the dependency above before enabling this setting.</text>
                 </Show>
               </box>
-            ))}
+            )))}
             <text wrapMode="word">Pause automatic work: {settings().paused ? "Paused" : "Running when eligible"}. Pause preserves modes and consent.</text>
             <text wrapMode="word">Emergency stop: {settings().emergencyStop ? "On" : "Off"}. It overrides every automatic provider and write path.</text>
 
@@ -1149,16 +1627,16 @@ function ControlCenter(props: {
             <Show when={!settings().approvedSkillFolders.length}>
               <text fg={props.api.theme.current.warning} wrapMode="word">No folder is approved; Apply automatically cannot be enabled.</text>
             </Show>
-            {() => settings().approvedSkillFolders.map((folder) => (
+            {reactiveChild(() => settings().approvedSkillFolders.map((folder) => (
               <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="row" flexWrap="wrap" gap={1}>
                 <text wrapMode="word">{folder}</text>
                 <Show when={settings().controls.approvedSkillFolders}>
                   {localActionButton("Remove", () => stageFolderList(
                     settings().approvedSkillFolders.filter((candidate) => candidate !== folder),
-                  ))}
+                  ), false, undefined, undefined, `remove-folder:${folder}`)}
                 </Show>
               </box>
-            ))}
+            )))}
             <Show when={settings().controls.approvedSkillFolders}>
               <box flexDirection="column">
                 <text>Add one canonical absolute folder</text>
@@ -1181,7 +1659,7 @@ function ControlCenter(props: {
                 <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
                   <text><b>Exact replacement</b></text>
                   <Show when={draft().length}>
-                    {() => draft().map((folder) => <text wrapMode="word">• {folder}</text>)}
+                    {reactiveChild(() => draft().map((folder) => <text wrapMode="word">• {folder}</text>))}
                   </Show>
                   <Show when={draft().length === 0}><text>(empty)</text></Show>
                   <text>Type exactly: UPDATE ALLOWLIST</text>
@@ -1191,11 +1669,17 @@ function ControlCenter(props: {
                     onInput={(value: string) => setFolderConfirmation(value.slice(0, 64))}
                   />
                   <box flexDirection="row" flexWrap="wrap" gap={1}>
-                    {localActionButton("Replace approved folders", () => void submitFolderList(), true)}
+                    {localActionButton(
+                      "Replace approved folders",
+                      () => void submitFolderList(),
+                      true,
+                      undefined,
+                      { action: "update-allowlist", subject: "approved-skill-folders" },
+                    )}
                     {localActionButton("Cancel", () => {
                       setFolderDraft(null)
                       setFolderConfirmation("")
-                    })}
+                    }, false, undefined, undefined, "cancel-folder-update")}
                   </box>
                 </box>
               )}
@@ -1203,7 +1687,7 @@ function ControlCenter(props: {
 
             <text><b>Limits and retention</b></text>
             <text wrapMode="word">These values are read-only here. Change configured numeric limits through startup configuration.</text>
-            {() => settings().limits.map((limit) => (
+            {reactiveChild(() => settings().limits.map((limit) => (
               <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
                 <text><b>{limit.label}</b></text>
                 <text wrapMode="word">Actual: {limit.actual}</text>
@@ -1213,7 +1697,7 @@ function ControlCenter(props: {
                 </Show>
                 <text fg={props.api.theme.current.textMuted} wrapMode="word">{limit.explanation}</text>
               </box>
-            ))}
+            )))}
             <Show when={settings().rolloutProgress}>
               {(rolloutProgress) => (
                 <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
@@ -1227,13 +1711,15 @@ function ControlCenter(props: {
             <text><b>Maintenance</b></text>
             <text wrapMode="word">Sensitive exports are private and short-lived. Delete actions permanently remove the selected retained data.</text>
             <box flexDirection="row" flexWrap="wrap" gap={1}>
-              {() => settings().maintenance.scopes.map((scope) => (
+              {reactiveChild(() => settings().maintenance.scopes.map((scope) => (
                 <box
                   focusable
                   border
                   borderColor={maintenanceScope() === scope.value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
                   paddingLeft={1}
                   paddingRight={1}
+                  on:focused={() => setFocusedControl(`maintenance-scope:${scope.value}`)}
+                  on:blurred={() => setFocusedControl((current) => current === `maintenance-scope:${scope.value}` ? null : current)}
                   onMouseUp={() => {
                     setMaintenanceScope(scope.value as MaintenanceScope)
                     setMaintenanceIntent(null)
@@ -1247,9 +1733,9 @@ function ControlCenter(props: {
                     setMaintenanceConfirmation("")
                   }}
                 >
-                  <text>{scope.label}</text>
+                  <text>{focusMark(`maintenance-scope:${scope.value}`)}{scope.label}</text>
                 </box>
-              ))}
+              )))}
             </box>
             <text wrapMode="word">
               {settings().maintenance.scopes.find((scope) => scope.value === maintenanceScope())?.explanation}
@@ -1288,11 +1774,16 @@ function ControlCenter(props: {
                     maintenanceIntent() === "export" ? "Create sensitive export" : "Delete permanently",
                     () => void submitMaintenance(),
                     true,
+                    undefined,
+                    {
+                      action: maintenanceIntent() === "export" ? "export-data" : maintenanceScope() === "all" ? "purge-all" : "purge-scope",
+                      subject: maintenanceScope() === "all" && maintenanceIntent() === "delete" ? "project" : `scope:${maintenanceScope()}`,
+                    },
                   )}
                   {localActionButton("Cancel", () => {
                     setMaintenanceIntent(null)
                     setMaintenanceConfirmation("")
-                  })}
+                  }, false, undefined, undefined, "cancel-maintenance")}
                 </box>
               </box>
             </Show>
@@ -1316,21 +1807,24 @@ function ControlCenter(props: {
           </box>
         </Show>
       </scrollbox>
-      <Show when={completedResponse()}>
-        <text fg={completedResponse()?.response?.ok === false ? props.api.theme.current.error : props.api.theme.current.info} wrapMode="word">
-          {completedResponse()?.response?.ok === false
-            ? `Server rejected ${completedResponse()?.action?.replaceAll("-", " ") ?? "the request"}: ${completedResponse()?.response?.reason}`
-            : completedResponse()?.action === "purge-all" && completedResponse()?.response?.status === "accepted-terminal"
-              ? "Purge all accepted; Self-evolve authority stopped. Restart OpenCode to reinitialize durable state."
-              : `${completedResponse()?.action?.replaceAll("-", " ") ?? "Request"} accepted by the server.`}
+      <box
+        flexDirection="column"
+        flexShrink={0}
+        height={compactShell() ? 2 : "auto"}
+        overflow="hidden"
+      >
+        <text fg={props.api.theme.current.textMuted}>
+          Esc returns to {props.prior().name}
         </text>
-      </Show>
-      <Show when={feedback()}>
-        <text fg={props.api.theme.current.info} wrapMode="word">{feedback()}</text>
-      </Show>
-      <text fg={props.api.theme.current.textMuted}>
-        Esc returns to {props.prior.name}
-      </text>
+        {reactiveChild(() => props.snapshot().responses.map((completedResponse) => (
+          <text fg={completedResponse.response?.ok === false ? props.api.theme.current.error : props.api.theme.current.info} wrapMode="word">
+            {requestResponseMessage(completedResponse)}
+          </text>
+        )))}
+        <Show when={feedback()}>
+          <text fg={props.api.theme.current.info} wrapMode="word">{feedback()}</text>
+        </Show>
+      </box>
     </box>
   )
 }
@@ -1364,20 +1858,33 @@ const tui: TuiPlugin = async (api, options, meta) => {
   await legacyModule.tui(api, compatibilityOptions, meta)
   if (!projectStore) return
   releaseWithNativeCleanup = true
-  const [snapshot, setSnapshot] = createSignal(projectStore.getSnapshot())
-  const unsubscribe = projectStore.subscribe(setSnapshot)
+  const [priorRoute, setPriorRoute] = createSignal<{ name: string; params?: Record<string, unknown> }>({ name: "home" })
+  const initialSnapshot = projectStore.getSnapshot()
+  const [snapshot, setSnapshot] = createSignal(initialSnapshot)
+  let activeSnapshotIdentity = snapshotIdentity(initialSnapshot)
+  const unsubscribe = projectStore.subscribe((next) => {
+    const nextIdentity = snapshotIdentity(next)
+    if (activeSnapshotIdentity !== nextIdentity) {
+      setPriorRoute({ name: "home" })
+      if (api.route.current.name === CONTROL_CENTER_ROUTE) {
+        api.route.navigate(CONTROL_CENTER_ROUTE, { section: "home" })
+      }
+    }
+    activeSnapshotIdentity = nextIdentity
+    setSnapshot(next)
+  })
   api.lifecycle.onDispose(unsubscribe)
-  let priorRoute: { name: string; params?: Record<string, unknown> } = { name: "home" }
   const closeControlCenter = () => {
     if (api.route.current.name !== CONTROL_CENTER_ROUTE) return
-    api.route.navigate(priorRoute.name, priorRoute.params)
+    const prior = priorRoute()
+    api.route.navigate(prior.name, prior.params)
   }
   const openControlCenter = (destination: ReturnType<typeof deriveSidebarCard>["destination"] = { section: "home" }) => {
     if (api.route.current.name !== CONTROL_CENTER_ROUTE) {
-      priorRoute = {
+      setPriorRoute({
         name: api.route.current.name,
         ...("params" in api.route.current ? { params: api.route.current.params } : {}),
-      }
+      })
     }
     api.route.navigate(CONTROL_CENTER_ROUTE, controlCenterRouteParams(destination, snapshot()))
   }
@@ -1415,7 +1922,8 @@ const tui: TuiPlugin = async (api, options, meta) => {
   })
   api.lifecycle.onDispose(() => {
     if (surfaceOwnership.owns?.() && api.route.current.name === CONTROL_CENTER_ROUTE) {
-      api.route.navigate(priorRoute.name, priorRoute.params)
+      const prior = priorRoute()
+      api.route.navigate(prior.name, prior.params)
     }
     if (surfaceOwnership.owns?.()) {
       unregisterRoute?.()

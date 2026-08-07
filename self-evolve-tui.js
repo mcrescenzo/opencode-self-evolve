@@ -16,7 +16,7 @@ import {
 } from "./self-evolve-bridge.js";
 import { resolveProjectIdentity } from "./self-evolve-store.js";
 import {
-  initialStateRootSelection,
+  resolveStateRoot,
   stateRootIdentity,
   validateProjectedStateRoot,
 } from "./self-evolve-state-root.js";
@@ -504,6 +504,68 @@ export function parseAllowlistInput(value) {
   return roots;
 }
 
+function nonEmptyPath(value) {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function boundedTuiPath(task, timeoutMs) {
+  const boundedTimeout = Math.min(10_000, Math.max(10, Number.isFinite(timeoutMs) ? timeoutMs : 2_000));
+  let timer;
+  return Promise.race([
+    Promise.resolve().then(task),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("official-state-path-timeout")), boundedTimeout); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function resolveTuiStartupPath(api, config = {}) {
+  const statePath = api?.state?.path;
+  const sourcePathApi = api?.client?.path;
+  let officialPath;
+  let officialPathPromise;
+  const requestOfficialPath = typeof sourcePathApi?.get === "function"
+    ? (directory) => {
+        officialPathPromise ??= sourcePathApi.get.call(sourcePathApi, directory ? { directory } : {})
+          .then((result) => {
+            if (result?.data && typeof result.data === "object" && !Array.isArray(result.data)) officialPath = result.data;
+            return result;
+          });
+        return officialPathPromise;
+      }
+    : null;
+  const client = typeof sourcePathApi?.get === "function"
+    ? {
+        path: {
+          async get(input = {}) {
+            const directory = nonEmptyPath(input?.query?.directory);
+            return requestOfficialPath(directory);
+          },
+        },
+      }
+    : api?.client;
+  const stateRoot = await resolveStateRoot({
+    directory: nonEmptyPath(statePath?.directory) ?? nonEmptyPath(config.worktree) ?? nonEmptyPath(statePath?.worktree),
+    path: statePath,
+    client,
+  }, {
+    stateRoot: config.stateRoot,
+    env: config.env,
+    stateRootTimeoutMs: config.stateRootTimeoutMs,
+  });
+  const hasIdentityPath = nonEmptyPath(config.worktree)
+    ?? nonEmptyPath(officialPath?.worktree)
+    ?? nonEmptyPath(statePath?.worktree)
+    ?? nonEmptyPath(officialPath?.directory)
+    ?? nonEmptyPath(statePath?.directory);
+  if (!hasIdentityPath && requestOfficialPath && !officialPath) {
+    try { await boundedTuiPath(() => requestOfficialPath(), config.stateRootTimeoutMs); } catch {}
+  }
+  return { stateRoot, officialPath };
+}
+
+export async function resolveTuiStateRoot(api, config = {}) {
+  return (await resolveTuiStartupPath(api, config)).stateRoot;
+}
+
 /** @type {TuiPlugin} */
 export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const config = options?.selfEvolve ?? options ?? {};
@@ -516,12 +578,10 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const serverTimeoutMs = Math.min(MAX_SERVER_WAIT_MS, Math.max(1, Number.isFinite(config.serverTimeoutMs) ? config.serverTimeoutMs : MAX_SERVER_WAIT_MS));
   const pollMs = Math.min(5_000, Math.max(25, Number.isFinite(config.mailboxPollMs) ? config.mailboxPollMs : 250));
   let stateRoot;
+  let officialPath;
   try {
-    stateRoot = initialStateRootSelection({
-      explicitStateRoot: config.stateRoot,
-      hostStateRoot: api.state?.path?.state,
-      environment: {},
-    }).stateRoot;
+    ({ stateRoot, officialPath } = await resolveTuiStartupPath(api, config));
+    if (!stateRoot) throw new Error("state-root-unavailable");
   } catch (error) {
     console.warn(`self-evolve TUI disabled: ${error instanceof Error ? error.message : String(error)}`);
     return;
@@ -531,8 +591,8 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     identity = resolveProjectIdentity({
       projectFingerprint: config.projectFingerprint,
       remoteUrl: config.remoteUrl,
-      worktreePath: config.worktree ?? api.state?.path?.worktree,
-      directory: api.state?.path?.directory,
+      worktreePath: nonEmptyPath(config.worktree) ?? nonEmptyPath(officialPath?.worktree) ?? nonEmptyPath(api.state?.path?.worktree),
+      directory: nonEmptyPath(officialPath?.directory) ?? nonEmptyPath(api.state?.path?.directory),
     });
   } catch (error) {
     console.warn(`self-evolve TUI disabled: ${error instanceof Error ? error.message : String(error)}`);
@@ -546,9 +606,8 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       api,
       config: {
         ...config,
-        stateRoot,
-        projectFingerprint,
-        worktree: identity.worktreePath,
+        startupStateRoot: stateRoot,
+        startupWorktree: identity.worktreePath,
       },
       clientFactory: options?.__testTuiStoreClientFactory,
       acknowledgementStore: createTuiAcknowledgementStore(api.kv, {
@@ -565,43 +624,91 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   }
   const tuiHostVersion = typeof api.app?.version === "string" ? api.app.version.trim() : "";
   let hostHealthTimer;
-  let hostHealthNonce;
+  let hostHealthContext = { stateRoot, projectFingerprint, nonce: undefined };
   let hostHealthStopped = false;
+  let hostHealthSuspended = false;
   let hostHealthWarningShown = false;
-  const publishHostHealth = () => {
-    if (!tuiHostVersion) return;
+  let hostHealthStoreUnsubscribe;
+  const currentHostHealthContext = () => {
+    const currentStateRoot = nonEmptyPath(config.stateRoot) ?? nonEmptyPath(api.state?.path?.state) ?? stateRoot;
+    const currentIdentity = resolveProjectIdentity({
+      projectFingerprint: config.projectFingerprint,
+      remoteUrl: config.remoteUrl,
+      worktreePath: nonEmptyPath(config.worktree) ?? nonEmptyPath(api.state?.path?.worktree) ?? identity.worktreePath,
+      directory: nonEmptyPath(api.state?.path?.directory) ?? identity.worktreePath,
+    });
+    return { stateRoot: currentStateRoot, projectFingerprint: currentIdentity.projectFingerprint };
+  };
+  const revokeCurrentHostHealth = () => {
+    if (!hostHealthContext.nonce) return;
+    revokeTuiHostHealth(hostHealthContext.stateRoot, hostHealthContext.projectFingerprint, {
+      nonce: hostHealthContext.nonce,
+      stateRootIdentity: stateRootIdentity(hostHealthContext.stateRoot),
+    });
+    hostHealthContext.nonce = undefined;
+  };
+  const warnHostHealth = (error) => {
+    if (!hostHealthWarningShown) {
+      hostHealthWarningShown = true;
+      console.warn(`self-evolve TUI host-health publication failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const publishHostHealth = (targetContext) => {
+    if (!tuiHostVersion || hostHealthStopped || (hostHealthSuspended && !targetContext)) return;
     try {
-      const health = publishTuiHostHealth(stateRoot, {
-        projectFingerprint,
-        stateRootIdentity: stateRootIdentity(stateRoot),
+      const current = targetContext ?? currentHostHealthContext();
+      if (targetContext && !hostHealthSuspended && hostHealthContext.nonce
+          && current.stateRoot === hostHealthContext.stateRoot
+          && current.projectFingerprint === hostHealthContext.projectFingerprint) return;
+      if (current.stateRoot !== hostHealthContext.stateRoot
+          || current.projectFingerprint !== hostHealthContext.projectFingerprint) {
+        revokeCurrentHostHealth();
+        hostHealthContext = { ...current, nonce: undefined };
+      }
+      hostHealthSuspended = false;
+      const health = publishTuiHostHealth(hostHealthContext.stateRoot, {
+        projectFingerprint: hostHealthContext.projectFingerprint,
+        stateRootIdentity: stateRootIdentity(hostHealthContext.stateRoot),
         hostVersion: tuiHostVersion,
-        nonce: hostHealthNonce,
+        nonce: hostHealthContext.nonce,
         issuedAt: nowFor(api),
       });
-      hostHealthNonce = health.nonce;
+      hostHealthContext.nonce = health.nonce;
     } catch (error) {
-      if (!hostHealthWarningShown) {
-        hostHealthWarningShown = true;
-        console.warn(`self-evolve TUI host-health publication failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
+      warnHostHealth(error);
     }
+  };
+  const suspendHostHealth = () => {
+    if (hostHealthStopped || hostHealthSuspended) return;
+    hostHealthSuspended = true;
+    try { revokeCurrentHostHealth(); } catch (error) { warnHostHealth(error); }
   };
   if (tuiHostVersion) {
     publishHostHealth();
     hostHealthTimer = setInterval(publishHostHealth, HOST_HEALTH_REFRESH_MS);
     hostHealthTimer.unref?.();
+    if (typeof projectStore?.subscribe === "function") {
+      hostHealthStoreUnsubscribe = projectStore.subscribe((snapshot) => {
+        if (!snapshot?.projectFingerprint || !snapshot?.stateRootIdentity) {
+          if (snapshot?.phase === "error") suspendHostHealth();
+          return;
+        }
+        const currentStateRoot = nonEmptyPath(config.stateRoot) ?? nonEmptyPath(api.state?.path?.state) ?? stateRoot;
+        if (stateRootIdentity(currentStateRoot) !== snapshot.stateRootIdentity) {
+          suspendHostHealth();
+          return;
+        }
+        publishHostHealth({ stateRoot: currentStateRoot, projectFingerprint: snapshot.projectFingerprint });
+      });
+    }
   }
   const stopHostHealth = () => {
     if (hostHealthStopped) return;
     hostHealthStopped = true;
     clearInterval(hostHealthTimer);
-    if (!hostHealthNonce) return;
-    try {
-      revokeTuiHostHealth(stateRoot, projectFingerprint, {
-        nonce: hostHealthNonce,
-        stateRootIdentity: stateRootIdentity(stateRoot),
-      });
-    } catch {}
+    try { hostHealthStoreUnsubscribe?.(); } catch {}
+    hostHealthStoreUnsubscribe = undefined;
+    try { revokeCurrentHostHealth(); } catch {}
   };
   void projectStore?.refresh();
   if (typeof api.ui?.dialog?.replace !== "function"

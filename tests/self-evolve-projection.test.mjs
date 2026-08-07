@@ -209,6 +209,26 @@ test("fresh manual projection guides first-run setup without bundling excerpt co
   assert.equal(current.global.consent.sanitizedExcerpts, false);
 });
 
+test("dashboard retention derives operational records from the configured store policy", (t) => {
+  const f = fixture(t);
+  for (const [retentionDays, operationalDays] of [[1, 3], [10, 30], [30, 90], [3_650, 10_950]]) {
+    const current = f.store.getSettings();
+    assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
+      ...current.global,
+      retentionDays,
+      updatedAt: current.global.updatedAt + 1,
+    })).retentionDays, retentionDays);
+    assert.deepEqual(build(f).dashboard.retention, {
+      observationsDays: retentionDays,
+      operationalDays,
+    });
+    assert.deepEqual(build(f).dashboardV1.retention, {
+      observationsDays: retentionDays,
+      operationalDays: 90,
+    });
+  }
+});
+
 test("approved skill folders block automatic apply but not automatic recommendations", (t) => {
   const f = fixture(t, { mode: "auto" });
   const current = f.store.getSettings();
@@ -293,6 +313,39 @@ test("pending projections render bounded diff, evidence, eligibility, budgets, a
   assert.equal(result.unavailableDetailIds.length, 0);
 });
 
+test("critic-pending stays internal until one pending review is published, while failure uses the critical surface", (t) => {
+  const f = fixture(t);
+  const draft = proposal(f.skillRoot, {
+    id: "critic-draft",
+    state: "critic-pending",
+    criticScore: 0,
+    criticPassed: false,
+  });
+  append(f.store, "proposal", draft);
+  seedContent(f.store, draft);
+  const hidden = build(f, { detailProposalIds: [draft.id] });
+
+  assert.deepEqual(hidden.index.reviews, []);
+  assert.deepEqual(hidden.publicationDetails, []);
+  assert.deepEqual(hidden.details, []);
+  assert.deepEqual(hidden.unavailableDetailIds, []);
+  assert.doesNotMatch(JSON.stringify(hidden), /critic-draft/u);
+  assert.equal(f.store.readRecords("proposal").at(-1).payload.state, "critic-pending");
+
+  append(f.store, "proposal", { ...draft, state: "pending", criticScore: 0.95, criticPassed: true, decisionVersion: 1 });
+  const revealed = build(f, { detailProposalIds: [draft.id] });
+  assert.deepEqual(revealed.index.reviews.map((review) => review.proposalId), [draft.id]);
+  assert.deepEqual(revealed.publicationDetails.map((detail) => detail.proposalId), [draft.id]);
+  assert.deepEqual(revealed.details.map((detail) => detail.proposalId), [draft.id]);
+
+  append(f.store, "proposal", { ...draft, state: "failed-closed", decisionVersion: 1 });
+  const failed = build(f, { detailProposalIds: [draft.id] });
+  assert.deepEqual(failed.index.reviews.map((review) => [review.proposalId, review.attention]), [
+    [draft.id, "critical"],
+  ]);
+  assert.deepEqual(failed.details[0].allowedActions, []);
+});
+
 test("manual and yolo pending projections remain reviewable without inferring Apply authority", (t) => {
   for (const mode of ["manual", "yolo"]) {
     const f = fixture(t, { mode });
@@ -304,6 +357,35 @@ test("manual and yolo pending projections remain reviewable without inferring Ap
     assert.equal(result.details[0].summary.effectiveMode, mode);
     assert.deepEqual(result.details[0].allowedActions.map((action) => action.action), ["reject-proposal"]);
   }
+});
+
+test("failed-closed review stays critical and actionless while enhanced dashboards are otherwise healthy", (t) => {
+  const f = fixture(t, { mode: "auto" });
+  const current = f.store.getSettings();
+  assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
+    ...current.global,
+    consent: {
+      ...current.global.consent,
+      passiveCalls: true,
+      durableObservations: true,
+    },
+    updatedAt: current.global.updatedAt + 1,
+  })).mode, "auto");
+  const pending = proposal(f.skillRoot, { id: "failed-healthy-dashboard" });
+  append(f.store, "proposal", pending);
+  seedContent(f.store, pending);
+  const failed = { ...pending, state: "failed-closed", decisionVersion: 1 };
+  append(f.store, "proposal", failed);
+  seedLegacyGrant(f.store, failed);
+
+  const result = build(f, { detailProposalIds: [failed.id] });
+  assert.equal(result.dashboard.automation.state, "ready");
+  assert.equal(result.dashboardV1.automation.state, "ready");
+  assert.deepEqual(result.index.reviews.map((review) => [review.state, review.attention]), [
+    ["failed-closed", "critical"],
+  ]);
+  assert.deepEqual(result.details[0].allowedActions, []);
+  assert.equal(Buffer.byteLength(result.details[0].summary.rationale, "utf8") <= 2 * 1_024, true);
 });
 
 test("applied audit projections expose verified rollback eligibility and local acknowledgement only", (t) => {
@@ -661,6 +743,74 @@ test("dashboard activity narrates lifecycle, controls, maintenance, recovery, an
     JSON.stringify(result.dashboard.activity),
     /never\/projected|ses_private|token=|privateArtifactPath|privateSession|privatePath|privateError/u,
   );
+});
+
+test("semantic proposal IDs redact legacy session/message IDs and malformed records", (t) => {
+  const f = fixture(t);
+  const events = [
+    audit("decision", "proposal-logical-1", {
+      action: "cycle-outcome",
+      outcome: "valid-no-change",
+      triggerClass: "manual",
+      mode: "manual",
+      observationCount: 1,
+      eligibilityCount: 0,
+      occurredAt: NOW - 500,
+      reason: "no-change",
+    }, NOW - 500),
+    audit("apply", "ses_legacy", { "readback-verified": true }, NOW - 400),
+    audit("rollback", "session_legacy", { "readback-verified": true }, NOW - 300),
+    audit("decision", "msg_legacy", { action: "snooze", snoozedUntil: NOW + 10_000 }, NOW - 200),
+    audit("apply", "message_legacy", { "readback-verified": true }, NOW - 100),
+  ];
+  for (const event of events) append(f.store, "audit-event", event, event.timestamp);
+
+  const snapshot = f.store.readProjectionSnapshot();
+  const corruptEvent = {
+    ...audit("rollback", "proposal-placeholder", { "readback-verified": true }, NOW - 50),
+    proposalId: { legacy: "ses_corrupt" },
+  };
+  const corruptSnapshot = {
+    ...snapshot,
+    records: [...snapshot.records, {
+      id: hash("corrupt-legacy-record"),
+      kind: "audit-event",
+      createdAt: corruptEvent.timestamp,
+      payload: corruptEvent,
+    }],
+  };
+  const result = buildUiProjection(corruptSnapshot, {
+    stateRootIdentity: ROOT_IDENTITY,
+    now: NOW,
+    targetReader: f.targetReader,
+    inventory: f.inventory(),
+  });
+  const recommendationActivity = result.dashboard.activity
+    .filter((entry) => entry.category === "recommendation");
+
+  assert.equal(result.dashboard.lastCycle.proposalId, "proposal-logical-1");
+  assert.equal(recommendationActivity.length, 5);
+  assert.equal(recommendationActivity.every((entry) => entry.proposalId === null), true);
+  assert.doesNotMatch(
+    JSON.stringify(result.dashboard),
+    /(?:ses|session|msg|message)_(?:legacy|corrupt)/u,
+  );
+});
+
+test("private semantic proposal IDs never enter index or detail serialization", (t) => {
+  const f = fixture(t);
+  const logical = proposal(f.skillRoot, { id: "proposal-logical-1" });
+  const legacy = proposal(f.skillRoot, { id: "session_legacy_proposal" });
+  append(f.store, "proposal", logical);
+  seedContent(f.store, logical);
+  append(f.store, "proposal", legacy);
+  seedContent(f.store, legacy);
+
+  const result = build(f, { detailProposalIds: [logical.id, legacy.id] });
+  assert.deepEqual(result.index.reviews.map((review) => review.proposalId), [logical.id]);
+  assert.deepEqual(result.details.map((detail) => detail.proposalId), [logical.id]);
+  assert.doesNotMatch(JSON.stringify(result.index), /session_legacy_proposal/u);
+  assert.doesNotMatch(JSON.stringify(result.details), /session_legacy_proposal/u);
 });
 
 test("index bounds are deterministic, report exact overflow, and filter cross-project records", (t) => {

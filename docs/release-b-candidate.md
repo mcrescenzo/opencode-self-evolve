@@ -8,18 +8,18 @@ authorize a commit, push, tag, npm publication, or GitHub Release.
 
 - Package: `@mcrescenzo/opencode-self-evolve`
 - Candidate version: `0.2.0` (unpublished working-tree candidate)
-- Source commit: `6a1014a608800b038e8efdf21445b03c161f1a9f`
+- Source commit: `649153b0367cd175452c0fa3247844b2403a08ba`
 - Working-tree state: intentionally includes the uncommitted Release B
   implementation. The final packed artifact hash and exact inventory identify
   candidate contents beyond the source commit.
 - Node: `v25.6.1`
 - npm: `11.9.0`
 - Bun: `1.3.8`
-- Local OpenCode: `1.18.11`
+- Local OpenCode: `1.18.14`
 - Packed artifact SHA-256:
-  `0d13b9e03652f53d15bde3820d67dae0d6bdf67ebde09e289bd5cff2b2e8d7f8`
+  `296713192583c94e49585c2508c38e247430ae26580f2a116494b7a911520ebe`
 - Packed inventory SHA-256:
-  `7a5c82a34f4ac3f07b81d15d7a99c521c091a69a772f947cbe19162f5b3d51d3`
+  `68658ce79b993904333ef172bcdb7b740ae537c3e1f38b1eaa74bb79021b7ae2`
 - Packed inventory: 36 exact files:
   - `CHANGELOG.md`
   - `CODE_OF_CONDUCT.md`
@@ -88,13 +88,14 @@ from live-host and real-operator evidence.
 
 | Gate | Result |
 |---|---|
-| `npm test` | Passed: 749 tests, 749 passed, 0 failed, 0 skipped. |
+| `npm test` | Passed: 1,027 tests, 1,027 passed, 0 failed, 0 skipped, and zero unexplained sandbox residue. |
 | `npm run check` | Passed: TUI TypeScript check, deterministic generated-artifact rebuild, generated JavaScript syntax, and every listed Node syntax check. |
 | `npm run pack:check` | Passed: 36 exact files, deterministic built TUI validated, and root plus explicit server exports imported from a fresh peerless consumer; hashes are recorded above. |
-| `npm run test:tui-matrix` | Passed: exact aligned OpenCode/plugin 1.18.3 floor, 1.18.4 adjacent, and registry-resolved 1.18.11 latest common stable lanes; OpenTUI 0.4.5 and 0.5.0 loaded the built target, Solid was 1.9.12, and npm rejected OpenTUI 0.6.0 through the declared peer contract. Resolution time: `2026-08-04T00:51:44.684Z`. |
-| `npm run bench:perf` | Passed thresholds on Node v25.6.1 with 3,460 audit records / 1,853,453 bytes. Post-drain medians: idle 7.433 ms, lifecycle 2.155 ms, boot 63.171 ms. |
+| `npm run test:tui-matrix` | Passed: exact aligned OpenCode/plugin 1.18.3 floor, 1.18.4 adjacent, and registry-resolved 1.18.14 latest common stable lanes; OpenTUI 0.4.5 and 0.5.0 loaded the built target, Solid was 1.9.12, and npm rejected OpenTUI 0.6.0 through the declared peer contract. |
+| `npm run bench:perf -- --verify` | Passed thresholds on Node v25.6.1 with 3,460 audit records / 1,853,453 bytes. Post-drain medians: idle 10.702 ms, lifecycle 2.261 ms, boot 76.674 ms; growth was 0.7127 ms per 1,000 records. |
+| `npm run audit:dependencies` | Passed through the recorded owner exception for `GHSA-4x5r-pxfx-6jf8`, with review due 2026-09-05 and expiry 2026-11-05. |
 | `git diff --check` | Passed with no output. |
-| `npm run smoke:live` | Passed against local OpenCode 1.18.11: official health/CLI/plugin version agreement, both target loads, durable boot and restart modes, plugin-owned production command route, exact headless apply/replay, mailbox/control lifecycle, process stop, and temporary-state cleanup. |
+| `npm run smoke:live` | Passed against local OpenCode 1.18.14: official health/CLI/plugin version agreement, both target loads, durable boot and restart modes, plugin-owned production command route, exact headless apply/replay, mailbox/control lifecycle, process stop, and temporary-state cleanup. |
 
 This table is a point-in-time record of the candidate and dependency resolution stated above, not a promise that future unpinned registry resolution will reproduce it. Upstream OpenCode/OpenTUI peer metadata can drift; rerun the current gates for any new candidate and record fresh versions and hashes separately.
 
@@ -116,14 +117,12 @@ fixture defect, not a waived product failure.
 
 The current Self-Evolve `./tui` export is
 `self-evolve-tui.generated.js`, SHA-256
-`dfe9d60d648e191cd7440450b8545745325f1c5c6c6438d44aa6bd44611ab094`.
+`e4c1600d3e82c09fccbc2233c67bcb1e7b5dd113d41199309e0853b9f60a43ae`.
 The paired OpenCode Workflows 0.6.0 checkout exported
 `workflow-tui/index.js`, SHA-256
-`2b7223b8a778dc4bbc76bba130a3c8c16c4aa7775be3c944278ea5b1e1a2dc94`.
-Its counterpart epic `opencode_workflows-vkdp` had 7 of 8 children closed;
-only its final aggregate gate remained open when this evidence was recorded.
+`8bd6ec9f42fd2b9eebeb6c42bc302977629fc02f5ab6f1ff319e0a6df3ba3add`.
 
-On OpenCode 1.18.11, the canonical Workflows harness passed 30 source-checkout
+On OpenCode 1.18.14, the canonical Workflows harness passed 30 source-checkout
 no-witness starts: 10 Workflows-alone baselines and 20 paired starts split
 across both registration orders. All reached the input-ready frame with zero
 provider prompts and no MCP requirement. Two later witness starts proved both

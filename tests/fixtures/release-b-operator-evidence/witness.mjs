@@ -614,14 +614,17 @@ async function runEvidence(api, state) {
       const setupCard = await eventually(() => node(api, CARD_ID), "setup sidebar card");
       setupCard.focus();
       keys.pressKey(" ");
-      await eventually(() => api.route.current.name === ROUTE_ID && frameText(api).includes("Settings"), "Space setup deep link");
-      await capture("medium-setup-space", ["Settings", "Effective result"]);
+      await eventually(() => (
+        api.route.current.name === ROUTE_ID
+        && frameText(api).includes("› Review consent for Background AI analysis")
+      ), "Space exact setup consent deep link");
+      await capture("medium-setup-space", ["Settings", "› Review consent for Background AI analysis"]);
       await scrollUntilVisible("Saved structured patterns", "medium saved-data setting");
       await capture("medium-setup-consent", [
         "Background AI analysis",
         "Saved structured patterns",
       ]);
-      proofs.spaceOpenedSettingsDeepLink = true;
+      proofs.spaceOpenedExactSettingsDeepLink = true;
       keys.pressKey("ESCAPE");
       await eventually(() => JSON.stringify(api.route.current) === initialRoute, "setup Escape restoration");
 

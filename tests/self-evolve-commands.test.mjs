@@ -133,6 +133,38 @@ test("parser covers the complete command surface and rejects malformed input", (
   assert.equal(parseSelfEvolveCommand("wat").ok, false);
 });
 
+test("path-valued commands accept quoted and escaped spaces without consuming trailing flags", () => {
+  assert.deepEqual(command('yolo confirm --allowlist "/skills/team tools"'), {
+    verb: "mode", mode: "yolo", confirmed: true, allowlist: ["/skills/team tools"],
+  });
+  assert.deepEqual(command("allowlist add '/skills/team tools' --confirm UPDATE ALLOWLIST"), {
+    verb: "allowlist", action: "add", path: "/skills/team tools", confirmation: "UPDATE ALLOWLIST",
+  });
+  assert.equal(command("allowlist remove /skills/team\\ tools --confirm UPDATE ALLOWLIST").path, "/skills/team tools");
+  assert.equal(command('allowlist add "/skills/\\"quoted\\" tools" --confirm UPDATE ALLOWLIST').path, '/skills/"quoted" tools');
+  assert.equal(command("yolo confirm --allowlist /skills").allowlist[0], "/skills");
+  assert.equal(command("allowlist add /skills --confirm UPDATE ALLOWLIST").path, "/skills");
+
+  for (const input of [
+    'yolo confirm --allowlist "/skills/team tools" --extra',
+    "allowlist add '/skills/team tools' --confirm UPDATE ALLOWLIST --extra",
+    "allowlist add /skills team --confirm UPDATE ALLOWLIST",
+  ]) assert.equal(parseSelfEvolveCommand(input).ok, false, input);
+});
+
+test("command tokenizer rejects malformed quoting and escaping fail closed", () => {
+  for (const input of [
+    'yolo confirm --allowlist "/skills/team tools',
+    "allowlist add '/skills/team tools --confirm UPDATE ALLOWLIST",
+    "allowlist add /skills/team\\",
+    'allowlist add "/skills/team tools\\',
+  ]) {
+    const result = parseSelfEvolveCommand(input);
+    assert.equal(result.ok, false, input);
+    assert.match(result.error, /^Malformed command:/u);
+  }
+});
+
 test("status exposes consent and approved skill folders headlessly", (t) => {
   const { policy } = fixture(t);
   policy.execute(command("consent passive on"), { projectFingerprint: FINGERPRINT });

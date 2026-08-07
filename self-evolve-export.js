@@ -24,7 +24,18 @@ const DEFAULT_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TEMP_QUOTA_BYTES = 128 * 1024 * 1024;
 const HASH_RE = /^[a-f0-9]{64}$/u;
+const NONCE_RE = /^[a-f0-9]{32}$/u;
+const OWNED_TEMP_RE = /^\.([0-9]+)-([0-9]+)-([a-f0-9]{32})-.+\.tmp$/u;
 const NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) ? constants.O_NOFOLLOW : 0;
+
+function conservativeProcessIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
 
 function assertDirectory(directory, boundary) {
   const stat = lstatSync(directory);
@@ -85,6 +96,7 @@ export function createSensitiveExportManager({
   ttlMs = DEFAULT_TTL_MS,
   maxArtifactBytes = DEFAULT_MAX_ARTIFACT_BYTES,
   temporaryQuotaBytes = DEFAULT_TEMP_QUOTA_BYTES,
+  processIsAlive = conservativeProcessIsAlive,
   faultInjection,
 } = {}) {
   const boundary = path.resolve(String(stateRoot ?? ""));
@@ -98,29 +110,68 @@ export function createSensitiveExportManager({
   ensureDirectory(projectRoot, boundary);
   const lockPath = path.join(projectRoot, "active.lock");
   let active = false;
+  let activeNonce = null;
+
+  function readLock() {
+    const stat = lstatOptional(lockPath);
+    if (!stat) return null;
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o777) !== FILE_MODE) {
+      throw new Error("export-lock-rejected");
+    }
+    let owner;
+    try { owner = JSON.parse(readFileSync(lockPath, "utf8")); } catch { return Object.freeze({ valid: false }); }
+    return Object.freeze({
+      valid: Number.isSafeInteger(owner?.pid) && owner.pid > 0
+        && Number.isSafeInteger(owner?.issuedAt)
+        && Number.isSafeInteger(owner?.expiresAt)
+        && NONCE_RE.test(String(owner?.nonce ?? "")),
+      pid: owner?.pid,
+      issuedAt: owner?.issuedAt,
+      expiresAt: owner?.expiresAt,
+      nonce: owner?.nonce,
+      dev: stat.dev,
+      ino: stat.ino,
+    });
+  }
+
+  function removeOwnedLock(expected) {
+    const current = readLock();
+    if (!current?.valid
+        || current.pid !== expected.pid
+        || current.nonce !== expected.nonce
+        || (expected.dev !== undefined && (current.dev !== expected.dev || current.ino !== expected.ino))) return 0;
+    unlinkSync(lockPath);
+    return 1;
+  }
 
   function cleanup(timestamp = now()) {
     let removed = 0;
     let bytes = 0;
+    const lock = readLock();
+    if (lock?.valid && lock.expiresAt <= timestamp && !processIsAlive(lock.pid)) {
+      removed += removeOwnedLock(lock);
+    }
     for (const entry of readdirSync(projectRoot, { withFileTypes: true })) {
       const filePath = path.join(projectRoot, entry.name);
       if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("export-artifact-rejected");
       const stat = lstatSync(filePath);
       if (stat.nlink !== 1 || (stat.mode & 0o077) !== 0) throw new Error("export-artifact-rejected");
-      if (entry.name === "active.lock") {
-        try {
-          const lock = JSON.parse(readFileSync(filePath, "utf8"));
-          if (!Number.isSafeInteger(lock.expiresAt) || lock.expiresAt <= timestamp) removed += removeFile(filePath);
-        } catch {
-          removed += removeFile(filePath);
-        }
-        continue;
-      }
+      if (entry.name === "active.lock") continue;
       const createdAt = /^\.?([0-9]+)-/u.exec(entry.name)?.[1];
       const expiresAt = createdAt && Number.isSafeInteger(Number(createdAt))
         ? Number(createdAt) + ttlMs
         : stat.mtimeMs + ttlMs;
-      if (entry.name.endsWith(".tmp") || expiresAt <= timestamp) {
+      const temporaryOwner = OWNED_TEMP_RE.exec(entry.name);
+      if (temporaryOwner) {
+        const ownerPid = Number(temporaryOwner[2]);
+        if (expiresAt <= timestamp && Number.isSafeInteger(ownerPid) && ownerPid > 0 && !processIsAlive(ownerPid)) {
+          removed += removeFile(filePath);
+        } else {
+          bytes += stat.size;
+        }
+      } else if (entry.name.endsWith(".tmp")) {
+        bytes += stat.size;
+      } else if (expiresAt <= timestamp) {
         removed += removeFile(filePath);
       } else {
         bytes += stat.size;
@@ -133,19 +184,21 @@ export function createSensitiveExportManager({
     if (active) throw new Error("export-job-active");
     cleanup(timestamp);
     let descriptor;
+    const nonce = randomBytes(16).toString("hex");
     try {
       descriptor = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NOFOLLOW, FILE_MODE);
       const source = `${JSON.stringify({
         pid: process.pid,
         issuedAt: timestamp,
         expiresAt: timestamp + ttlMs,
-        nonce: randomBytes(16).toString("hex"),
+        nonce,
       })}\n`;
       writeSync(descriptor, source);
       fsyncSync(descriptor);
       const stat = fstatSync(descriptor);
       if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== FILE_MODE) throw new Error("export-lock-rejected");
       active = true;
+      activeNonce = nonce;
     } catch (error) {
       if (error?.code === "EEXIST") throw new Error("export-job-active");
       throw error;
@@ -156,7 +209,10 @@ export function createSensitiveExportManager({
 
   function release() {
     active = false;
-    try { removeFile(lockPath); } catch (error) {
+    const nonce = activeNonce;
+    activeNonce = null;
+    if (!nonce) return;
+    try { removeOwnedLock({ pid: process.pid, nonce }); } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
   }
@@ -165,7 +221,7 @@ export function createSensitiveExportManager({
     const timestamp = now();
     acquire(timestamp);
     const id = randomBytes(16).toString("hex");
-    const temporaryPath = path.join(projectRoot, `.${timestamp}-${id}.json.tmp`);
+    const temporaryPath = path.join(projectRoot, `.${timestamp}-${process.pid}-${activeNonce}-${id}.json.tmp`);
     const artifactPath = path.join(projectRoot, `${timestamp}-${id}.json`);
     let descriptor;
     let metadataDescriptor;
@@ -177,6 +233,7 @@ export function createSensitiveExportManager({
     try {
       const usage = cleanup(timestamp);
       descriptor = openSync(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NOFOLLOW, FILE_MODE);
+      faultInjection?.("export-after-temporary-open", { temporaryPath });
       for (const chunk of encodeJson({
         ...archive,
         exportScope: scope,
@@ -192,8 +249,11 @@ export function createSensitiveExportManager({
         writeSync(descriptor, buffer);
         hash.update(buffer);
       }
-      writeSync(descriptor, Buffer.from("\n"));
       bytes += 1;
+      if (bytes > maxArtifactBytes || usage.bytes + bytes > temporaryQuotaBytes) {
+        throw new Error(bytes > maxArtifactBytes ? "export-size-exceeded" : "export-temporary-quota-exceeded");
+      }
+      writeSync(descriptor, Buffer.from("\n"));
       hash.update("\n");
       fsyncSync(descriptor);
       const stat = fstatSync(descriptor);
@@ -221,10 +281,14 @@ export function createSensitiveExportManager({
         classification: "sensitive-self-evolve-archive",
       });
       metadataPath = `${artifactPath}.meta.json`;
-      metadataTemporaryPath = `${metadataPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+      metadataTemporaryPath = path.join(projectRoot, `.${timestamp}-${process.pid}-${activeNonce}-${id}.meta.json.tmp`);
+      const metadataSource = Buffer.from(`${JSON.stringify(result)}\n`, "utf8");
+      if (usage.bytes + bytes + metadataSource.length > temporaryQuotaBytes) {
+        throw new Error("export-temporary-quota-exceeded");
+      }
       try {
         metadataDescriptor = openSync(metadataTemporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NOFOLLOW, FILE_MODE);
-        writeSync(metadataDescriptor, `${JSON.stringify(result)}\n`);
+        writeSync(metadataDescriptor, metadataSource);
         fsyncSync(metadataDescriptor);
         closeSync(metadataDescriptor);
         metadataDescriptor = undefined;
@@ -247,10 +311,16 @@ export function createSensitiveExportManager({
   }
 
   function purge() {
+    acquire(now());
     let removed = 0;
-    for (const entry of readdirSync(projectRoot, { withFileTypes: true })) {
-      if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("export-artifact-rejected");
-      removed += removeFile(path.join(projectRoot, entry.name));
+    try {
+      for (const entry of readdirSync(projectRoot, { withFileTypes: true })) {
+        if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("export-artifact-rejected");
+        if (entry.name === "active.lock") continue;
+        removed += removeFile(path.join(projectRoot, entry.name));
+      }
+    } finally {
+      release();
     }
     try { rmdirSync(projectRoot); } catch (error) { if (error?.code !== "ENOENT") throw error; }
     return { ok: true, removed };

@@ -291,3 +291,14 @@ test("live fixture uses the production target and renderer-level operator input"
     assert.match(witness, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   }
 });
+
+test("the mixed-version witness stays pinned to the strict Release A 0.2.1 contract", async () => {
+  const [schemas, bridge] = await Promise.all([
+    fs.readFile(new URL("../self-evolve-schemas.js", import.meta.url), "utf8"),
+    fs.readFile(new URL("../self-evolve-bridge.js", import.meta.url), "utf8"),
+  ]);
+  assert.match(schemas, /export const SCHEMA_VERSION = "0\.2\.2";/u);
+  assert.match(bridge, /export const BRIDGE_SCHEMA_VERSION = "0\.2\.1";/u);
+  assert.match(bridge, /value !== BRIDGE_SCHEMA_VERSION && value !== "0\.2\.2"/u);
+  assert.equal(RELEASE_A_TUI_COMMIT, "6a1014a608800b038e8efdf21445b03c161f1a9f");
+});

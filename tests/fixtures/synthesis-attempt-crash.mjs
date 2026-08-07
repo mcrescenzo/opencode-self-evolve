@@ -53,8 +53,11 @@ const ctx = {
   } },
 };
 const pipeline = createPipeline({ store, inventory, privacy, synthesis, applier, commands, schemas, observation, now: () => ++clock });
-const faultInjection = (currentPoint) => {
-  if (currentPoint === point) process.kill(process.pid, "SIGKILL");
+const faultInjection = (currentPoint, context = {}) => {
+  const qualifiedPoint = currentPoint === "pipeline-after-content-chunk"
+    ? `${currentPoint}-${context.chunkIndex}`
+    : currentPoint;
+  if (qualifiedPoint === point) process.kill(process.pid, "SIGKILL");
 };
 for (let index = 1; index <= 3; index += 1) {
   const sessionID = `crash-${index}`;

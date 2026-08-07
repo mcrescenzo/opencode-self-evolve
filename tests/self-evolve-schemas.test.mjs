@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import * as schemas from "../self-evolve-schemas.js";
 
@@ -8,6 +9,22 @@ const SCOPE = H("b");
 const CURRENT = H("c");
 const PROPOSED = H("d");
 const CLUSTER = H("e");
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+function legacyEnvelope(kind, payload) {
+  return {
+    schemaVersion: schemas.SCHEMA_VERSION,
+    kind,
+    id: createHash("sha256").update(`${kind}\n${canonicalize(payload)}`).digest("hex"),
+    createdAt: 300,
+    payload,
+  };
+}
 
 test("errorReasonCode consistently extracts bounded reason prefixes", () => {
   assert.equal(schemas.errorReasonCode(new Error("invalid-input: detail"), "fallback"), "invalid-input");
@@ -158,6 +175,26 @@ test("settings enforce versions, canonical roots, booleans, retention, and budge
   assert.throws(() => globalSettings({ allowedSkillRoots: Array.from({ length: 33 }, (_, i) => `/skills/${i}`) }), /out-of-bounds/);
 });
 
+test("budget defaults and repository overrides use distinct complete and partial contracts", () => {
+  assert.deepEqual(schemas.makeBudgets({}), schemas.DEFAULT_BUDGETS);
+  assert.deepEqual(repoSettings({ budgets: { idleDebounceMs: 25 } }).budgets, { idleDebounceMs: 25 });
+  assert.throws(() => schemas.makeBudgets({ unknown: 1 }), /unexpected field unknown/u);
+  assert.throws(() => repoSettings({ budgets: { unknown: 1 } }), /unexpected field unknown/u);
+});
+
+test("settings migration is structural and partition validators enforce its documented boundary", () => {
+  const current = globalSettings();
+  assert.equal(schemas.migrateSettings(current), current);
+  assert.throws(() => schemas.makeGlobalSettings(schemas.migrateSettings({ ...current, paused: "yes" })), /must be boolean/u);
+  const legacy = schemas.SUPPORTED_SCHEMA_VERSIONS.find((version) => version !== schemas.SCHEMA_VERSION);
+  assert.ok(legacy);
+  assert.throws(() => schemas.makeGlobalSettings(schemas.migrateSettings({ ...current, schemaVersion: legacy, paused: "yes" })), /must be boolean/u);
+  const combined = schemas.migrateSettings({ schemaVersion: legacy, global: current, repo: repoSettings() });
+  assert.equal(combined.schemaVersion, schemas.SCHEMA_VERSION);
+  assert.deepEqual(schemas.makeGlobalSettings(combined.global), current);
+  assert.deepEqual(schemas.makeRepoSettings(combined.repo), repoSettings());
+});
+
 test("global aggregate claims use an exact bounded versioned allowlist", () => {
   const claim = schemas.makeAggregateClaim({
     schemaVersion: schemas.SCHEMA_VERSION,
@@ -177,6 +214,10 @@ test("global aggregate claims use an exact bounded versioned allowlist", () => {
   assert.throws(() => schemas.makeAggregateClaim({ ...claim, rawText: "secret" }), /unexpected field/);
   assert.throws(() => schemas.makeAggregateClaim({ ...claim, claimType: "unknown" }), /invalid-enum/);
   assert.throws(() => schemas.makeAggregateClaim({ ...claim, firstSeenDay: "2026-02-30" }), /UTC day/);
+  assert.throws(
+    () => schemas.makeAggregateClaim({ ...claim, firstSeenDay: "2021-13-01" }),
+    (error) => error instanceof TypeError && /malformed-payload.*UTC day/u.test(error.message),
+  );
   assert.throws(() => schemas.makeAggregateClaim({ ...claim, expiresAt: 100 }), /expire after creation/);
 });
 
@@ -221,6 +262,29 @@ test("records written by a compatible earlier schema version are read and normal
   }
   assert.throws(() => schemas.assertRecord({ ...current, schemaVersion: "0.1.0" }), /unsupported-version/);
   assert.throws(() => schemas.assertRecord({ ...current, schemaVersion: "9.9.9" }), /unsupported-version/);
+});
+
+test("target-less legacy evidence envelopes retain historical hash compatibility and normalize to null", () => {
+  const currentReceipt = schemas.makeReceipt({
+    receiptType: "repeated-command", signatureHash: H("4"), occurrences: 2,
+    firstSeenAt: 100, lastSeenAt: 200, projectFingerprint: PROJECT, scopeFingerprint: SCOPE,
+  });
+  const { targetLogicalName: _receiptTarget, ...legacyReceipt } = currentReceipt;
+  const currentObservation = observation();
+  const { targetLogicalName: _observationTarget, ...legacyStructuredFields } = currentObservation.structuredFields;
+  const legacyObservation = { ...currentObservation, structuredFields: legacyStructuredFields };
+  const currentCluster = cluster();
+  const { targetLogicalName: _clusterTarget, ...legacyCluster } = currentCluster;
+
+  const normalized = [
+    schemas.assertRecord(legacyEnvelope("receipt", legacyReceipt)),
+    schemas.assertRecord(legacyEnvelope("observation", legacyObservation)),
+    schemas.assertRecord(legacyEnvelope("evidence-cluster", legacyCluster)),
+  ];
+  assert.equal(normalized[0].payload.targetLogicalName, null);
+  assert.equal(normalized[1].payload.structuredFields.targetLogicalName, null);
+  assert.equal(normalized[2].payload.targetLogicalName, null);
+  assert.equal(normalized.every((record) => record.id !== legacyEnvelope(record.kind, record.kind === "observation" ? legacyObservation : record.kind === "receipt" ? legacyReceipt : legacyCluster).id), true);
 });
 
 test("settings written by a compatible earlier schema version are normalized to the current version", () => {
@@ -299,6 +363,9 @@ test("receipt validates type, independent timestamps, counts, and scope hashes",
     scopeFingerprint: SCOPE,
   });
   assert.equal(receipt.occurrences, 2);
+  assert.equal(receipt.targetLogicalName, null, "legacy receipts default the new target field");
+  assert.equal(schemas.makeReceipt({ ...receipt, targetLogicalName: "durable-review" }).targetLogicalName, "durable-review");
+  assert.throws(() => schemas.makeReceipt({ ...receipt, targetLogicalName: "Durable Review" }), /invalid-skill-name/);
   assert.throws(() => schemas.makeReceipt({ ...receipt, occurrences: 0 }), /out-of-bounds/);
   assert.throws(() => schemas.makeReceipt({ ...receipt, lastSeenAt: 9 }), /out-of-order/);
   assert.throws(() => schemas.makeReceipt({ ...receipt, receiptType: "raw-message" }), /invalid-enum/);
@@ -306,6 +373,9 @@ test("receipt validates type, independent timestamps, counts, and scope hashes",
 
 test("observation accepts only fixed typed primitives and rejects raw bodies or transcripts", () => {
   assert.equal(observation().redacted, true);
+  assert.equal(observation({ structuredFields: { ...observation().structuredFields, targetLogicalName: null } }).structuredFields.targetLogicalName, null);
+  assert.equal(observation({ structuredFields: { ...observation().structuredFields, targetLogicalName: "durable-review" } }).structuredFields.targetLogicalName, "durable-review");
+  assert.throws(() => observation({ structuredFields: { ...observation().structuredFields, targetLogicalName: "../private" } }), /invalid-skill-name/);
   assert.throws(() => observation({ rawMessageBody: "secret text" }), /unexpected field/);
   assert.throws(() => observation({ transcript: "complete transcript" }), /unexpected field/);
   assert.throws(() => observation({ sessionID: "raw-host-session" }), /unexpected field/);
@@ -313,7 +383,20 @@ test("observation accepts only fixed typed primitives and rejects raw bodies or 
   assert.throws(() => observation({ structuredFields: { ...observation().structuredFields, rawMessageBody: "secret" } }), /privacy-field-rejected/);
   assert.throws(() => observation({ structuredFields: { ...observation().structuredFields, transcript: ["secret"] } }), /privacy-field-rejected/);
   assert.throws(() => observation({ structuredFields: { eventKind: { nested: "not primitive" } } }), /malformed-string/);
+  for (const [field, value] of [
+    ["eventKind", "sk-abcdefghijklmnopqrstuvwxyz"],
+    ["toolErrorCode", "ghp_abcdefghijklmnopqrstuvwxyz"],
+    ["clarificationCategory", "-----BEGIN PRIVATE KEY-----"],
+  ]) {
+    assert.throws(() => observation({ structuredFields: { [field]: value } }), /privacy-field-rejected/u);
+  }
   assert.throws(() => observation({ receiptIds: Array.from({ length: 65 }, (_, i) => i.toString(16).padStart(64, "0")) }), /out-of-bounds/);
+});
+
+test("legacy evidence clusters default a nullable target and reject malformed targets", () => {
+  assert.equal(cluster().targetLogicalName, null);
+  assert.equal(cluster({ targetLogicalName: "durable-review" }).targetLogicalName, "durable-review");
+  assert.throws(() => cluster({ targetLogicalName: "/skills/durable-review" }), /invalid-skill-name/);
 });
 
 test("proposal enforces rationale, target, critic, hashes, state, and coordination bounds", () => {

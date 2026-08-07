@@ -30,7 +30,9 @@ function seedActiveHostOwners(root, stateRoot, sessions) {
   const { projectFingerprint } = resolveProjectIdentity({ worktreePath: root, directory: root });
   const store = openStore(stateRoot, { projectFingerprint, now: () => NOW });
   for (const { id, agent } of sessions) {
-    assert.equal(store.acquireHostOwner(id, { agent, projectFingerprint, rootIdentity: store.rootIdentity, generation: 0, pid: deadOwnerPid() }).ok, true);
+    const acquired = store.acquireHostOwner(id, { agent, projectFingerprint, rootIdentity: store.rootIdentity, generation: 0, pid: deadOwnerPid() });
+    assert.equal(acquired.ok, true);
+    assert.equal(store.retainHostOwner(id, acquired.nonce).ok, true);
   }
   store.close();
 }
@@ -50,7 +52,14 @@ function tempRoot(t, label) {
 }
 
 function skillFixture(t, label = "skill") {
-  const root = tempRoot(t, label);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `self-evolve-hardening-${label}-`));
+  let applier;
+  let store;
+  t.after(() => {
+    try { applier?.close(); } catch {}
+    try { store?.close(); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   const skillRoot = path.join(root, "skills");
   const skillDir = path.join(skillRoot, "hardening");
   const target = path.join(skillDir, "SKILL.md");
@@ -58,10 +67,9 @@ function skillFixture(t, label = "skill") {
   fs.writeFileSync(target, CURRENT);
   const roots = inventory.loadAllowlist({ globalSkillRoots: [skillRoot] }).canonicalRoots;
   const records = inventory.discoverSkills(roots);
-  const store = openStore(path.join(root, "state"), { projectName: "hardening", projectFingerprint: PROJECT_A, now: () => NOW });
+  store = openStore(path.join(root, "state"), { projectName: "hardening", projectFingerprint: PROJECT_A, now: () => NOW });
   const privacy = createPrivacyGuard({ consent: {}, projectFingerprint: PROJECT_A, store, now: () => NOW });
-  const applier = createApplier({ store, inventory: { records, canonicalRoots: roots }, privacy, now: () => NOW });
-  t.after(() => { applier.close(); store.close(); });
+  applier = createApplier({ store, inventory: { records, canonicalRoots: roots }, privacy, now: () => NOW });
   return { root, skillRoot, target, roots, records, store, privacy, applier };
 }
 
@@ -392,7 +400,10 @@ test("11 bounded cost and concurrency: ten idle events stay under six calls and 
       });
     },
   });
-  t.after(() => { scheduler.dispose(); store.close(); });
+  t.after(() => {
+    scheduler.dispose();
+    try { store.close(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
   for (let index = 0; index < 10; index += 1) {
     const sessionID = `session-${index % 3}`;
     await scheduler.handleEvent({ type: "session.idle", properties: { sessionID, parentID: "shared-root-session", scopeFingerprint: SCOPE } });
@@ -419,7 +430,7 @@ test("12 hidden analyzer sessions are aborted after success, failure, and timeou
       abort: async () => { calls.abort += 1; return { data: {} }; },
     } } };
     const result = await synthesis.runSynthesis({ ctx, cluster, targetSkill: synthesisTarget(f), inventory: f.records, privacy: { checkPartition: () => ({ ok: true }), isObservationEligible: () => true }, options: { store: f.store, currentContent: CURRENT, eligibility: { clusterId: cluster.id, eligible: true }, validateTarget: () => ({ ok: true }), timeoutMs: 5 }, now: NOW });
-    synthesis.disposeSynthesis();
+    synthesis.resetSynthesisProcessStateForTests();
     assert.equal(calls.abort, 1);
     return result;
   }
@@ -474,7 +485,7 @@ test("15 provider and TUI hangs are bounded and fail closed without disabling ma
   let aborts = 0;
   const started = Date.now();
   const result = await synthesis.runSynthesis({ ctx: { directory: f.root, client: { session: { create: async () => ({ data: { id: "hung" } }), prompt: async () => await new Promise(() => {}), abort: async () => { aborts += 1; } } } }, cluster, targetSkill: synthesisTarget(f), inventory: f.records, privacy: { checkPartition: () => ({ ok: true }), isObservationEligible: () => true }, options: { store: f.store, currentContent: CURRENT, eligibility: cluster.eligibility, validateTarget: () => ({ ok: true }), timeoutMs: 5, cleanupTimeoutMs: 5 }, now: NOW });
-  synthesis.disposeSynthesis();
+  synthesis.resetSynthesisProcessStateForTests();
   assert.equal(result.ok, false);
   assert.ok(Date.now() - started < 2_000);
   assert.equal(aborts, 1);
@@ -517,7 +528,9 @@ test("16 newer schema state falls back to manual, reports health, and blocks aut
   const store = openStore(root, { projectFingerprint: PROJECT_A, now: () => NOW });
   const privacy = createPrivacyGuard({ projectFingerprint: PROJECT_A, store, now: () => NOW });
   const policy = createCommandPolicy({ store, privacy, now: () => NOW });
-  t.after(() => store.close());
+  t.after(() => {
+    try { store.close(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
   assert.equal(policy.getMode(), "manual");
   assert.equal(policy.getEffectiveMode({ projectFingerprint: PROJECT_A }), "manual");
   assert.match(policy.execute({ verb: "health" }, { projectFingerprint: PROJECT_A }).responseText, /Corrupt or unsupported/u);
@@ -577,7 +590,9 @@ test("18 quota refuses writes above 8 MiB and retention removes old observations
   const line = `${JSON.stringify(old)}\n`;
   fs.writeFileSync(file, line.repeat(Math.ceil((8 * 1024 * 1024 + 1) / Buffer.byteLength(line))));
   store = openStore(root, { projectFingerprint: PROJECT_A, now: () => clock });
-  t.after(() => store.close());
+  t.after(() => {
+    try { store.close(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
   const guard = createPrivacyGuard({ projectFingerprint: PROJECT_A, store, now: () => clock });
   assert.equal(guard.checkQuota(fs.statSync(file).size).ok, false);
   const fresh = schemas.wrapRecord("observation", observationPayload({ id: H("fresh"), incidentId: "fresh" }), NOW);
@@ -598,7 +613,9 @@ function integrationThresholdHarness(t, successRate) {
   const scheduler = { createScheduler: () => ({ setMode() {}, getCircuitBreaker: () => ({ open: false }), handleEvent() {}, recordWorkResult() {}, dispose() {} }) };
   const runtime = createIntegration({ store, inventory: {}, privacy, schemas, observation: {}, synthesisModule: {}, applier: rawApplier, commands: { ...awaitableCommands }, pipeline, scheduler, now: () => NOW });
   runtime.__testBridge.setMode("yolo", { confirmed: true, allowlist: [root] });
-  t.after(() => store.close());
+  t.after(() => {
+    try { store.close(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
   return { runtime, get applies() { return applies; } };
 }
 

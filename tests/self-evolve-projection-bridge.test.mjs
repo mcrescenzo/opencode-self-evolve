@@ -12,6 +12,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,8 +20,11 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  BRIDGE_SCHEMA_VERSION,
   cleanupBridge,
+  publishControlState,
   publishUiProjection,
+  readControlState,
   readProjectInbox,
   readUiProjection,
 } from "../self-evolve-bridge.js";
@@ -34,7 +38,9 @@ import {
   UI_DASHBOARD_VERSION,
   UI_OPERATION_PROTOCOL_VERSION,
   UI_PROJECTION_VERSION,
+  UI_PROTOCOL_LIMITS,
   hashUiProtocol,
+  makeUiDashboard,
 } from "../self-evolve-ui-protocol.js";
 
 const PROJECT = "a".repeat(64);
@@ -68,6 +74,7 @@ function bundle(root, {
   issuedAt = NOW,
   includeActions = true,
   includeDashboard = false,
+  retentionDays = 30,
 } = {}) {
   const rootIdentity = stateRootIdentity(root);
   const expiresAt = issuedAt + 60_000;
@@ -213,16 +220,24 @@ function bundle(root, {
       },
       approvedSkillFolderCount: 1,
     },
-    retention: { observationsDays: 30, operationalDays: 90 },
+    retention: { observationsDays: retentionDays, operationalDays: retentionDays * 3 },
     supportedControls: ["set-paused"],
     activity: [],
     overflow: { activity: overflow(0) },
+  };
+  const dashboardV1Body = {
+    ...dashboardBody,
+    dashboardVersion: 1,
+    retention: { observationsDays: retentionDays, operationalDays: 90 },
   };
   return {
     index,
     details: [detail],
     ...(includeDashboard
-      ? { dashboard: { ...dashboardBody, dashboardHash: hashUiProtocol("dashboard", dashboardBody) } }
+      ? {
+          dashboard: { ...dashboardBody, dashboardHash: hashUiProtocol("dashboard", dashboardBody) },
+          dashboardV1: { ...dashboardV1Body, dashboardHash: hashUiProtocol("dashboard", dashboardV1Body) },
+        }
       : {}),
     offer: clientOffer(),
     now: issuedAt,
@@ -240,8 +255,8 @@ function detailPath(root, generation) {
   return path.join(directory, names[0]);
 }
 
-function dashboardPath(root, generation) {
-  return path.join(projectionRoot(root), "generations", generation, "dashboard-v1.json");
+function dashboardPath(root, generation, version = UI_DASHBOARD_VERSION) {
+  return path.join(projectionRoot(root), "generations", generation, `dashboard-v${version}.json`);
 }
 
 function runPublisher(root, bundlePath) {
@@ -316,7 +331,40 @@ test("publication is atomic, private, negotiated, and preserves the legacy inbox
   assert.deepEqual(readProjectInbox(root, PROJECT, { now: NOW }), []);
 });
 
-test("dashboard-v1 publishes before the index and malformed enhanced data degrades without invalidating core review", (t) => {
+test("control-state publication uses Release A wire 0.2.1 and current readers accept it", (t) => {
+  const root = fixture(t);
+  const rootIdentity = stateRootIdentity(root);
+  const state = publishControlState(root, {
+    schemaVersion: "0.2.2",
+    projectFingerprint: PROJECT,
+    actor: "self-evolve-integration",
+    issuedAt: NOW,
+    expiresAt: NOW + 60_000,
+    settingsUpdatedAt: NOW - 1,
+    settingsVersion: "3".repeat(64),
+    stateRootIdentity: rootIdentity,
+    nonce: "release-a-control-state",
+    mode: "manual",
+    effectiveMode: "manual",
+    allowedSkillRoots: [],
+    consent: {
+      passiveCalls: false,
+      durableObservations: false,
+      sanitizedExcerpts: false,
+      crossRepoAggregation: false,
+    },
+    repoExcluded: false,
+  });
+  const controlStatePath = path.join(root, "self-evolve", "bridge", PROJECT, "control-state.json");
+  const bytes = readFileSync(controlStatePath, "utf8");
+  assert.equal(state.schemaVersion, BRIDGE_SCHEMA_VERSION);
+  assert.equal(JSON.parse(bytes).schemaVersion, "0.2.1");
+  assert.equal(readControlState(root, PROJECT, { now: NOW }).schemaVersion, "0.2.1");
+  assert.match(bytes, /^\{"schemaVersion":"0\.2\.1","projectFingerprint"/u);
+  assert.doesNotMatch(bytes, /0\.2\.2/u);
+});
+
+test("dashboard sidecars publish before the index, prefer v2, and degrade without invalidating core review", (t) => {
   const root = fixture(t);
   const first = bundle(root, { generation: "7".repeat(64) });
   publishUiProjection(root, first);
@@ -334,13 +382,16 @@ test("dashboard-v1 publishes before the index and malformed enhanced data degrad
 
   publishUiProjection(root, enhanced);
   const dashboardFile = dashboardPath(root, enhanced.index.generation);
+  const dashboardV1File = dashboardPath(root, enhanced.index.generation, 1);
   assert.equal(statMode(dashboardFile), 0o600);
+  assert.equal(statMode(dashboardV1File), 0o600);
   const read = readUiProjection(root, PROJECT, {
     now: NOW,
     clientOffer: clientOffer(),
     detailProposalIds: ["proposal-1"],
   });
   assert.equal(read.dashboard.dashboardHash, enhanced.dashboard.dashboardHash);
+  assert.equal(read.dashboard.dashboardVersion, UI_DASHBOARD_VERSION);
   assert.equal(read.dashboard.indexHash, read.index.projectionHash);
   assert.equal(read.dashboardError, null);
   const dashboardWithReducedCoreOffer = readUiProjection(root, PROJECT, {
@@ -353,6 +404,26 @@ test("dashboard-v1 publishes before the index and malformed enhanced data degrad
   assert.equal(dashboardWithReducedCoreOffer.dashboardError, null);
 
   writeFileSync(dashboardFile, "{}\n", { mode: 0o600 });
+  const invalidV2 = readUiProjection(root, PROJECT, {
+    now: NOW,
+    clientOffer: clientOffer(),
+    detailProposalIds: ["proposal-1"],
+  });
+  assert.equal(invalidV2.index.projectionHash, enhanced.index.projectionHash);
+  assert.equal(invalidV2.details[0].detailHash, enhanced.details[0].detailHash);
+  assert.equal(invalidV2.dashboard, null);
+  assert.match(invalidV2.dashboardError, /ui-dashboard/u);
+  assert.equal(Buffer.byteLength(invalidV2.dashboardError, "utf8") <= UI_PROTOCOL_LIMITS.reasonBytes, true);
+
+  unlinkSync(dashboardFile);
+  const fallback = readUiProjection(root, PROJECT, {
+    now: NOW,
+    clientOffer: clientOffer(),
+  });
+  assert.equal(fallback.dashboard.dashboardVersion, 1);
+  assert.equal(fallback.dashboardError, null);
+
+  writeFileSync(dashboardV1File, "{}\n", { mode: 0o600 });
   const degraded = readUiProjection(root, PROJECT, {
     now: NOW,
     clientOffer: clientOffer(),
@@ -365,6 +436,7 @@ test("dashboard-v1 publishes before the index and malformed enhanced data degrad
   const cleaned = cleanupBridge(root, PROJECT, { now: NOW });
   assert.equal(cleaned.ok, true);
   assert.equal(existsSync(dashboardFile), false);
+  assert.equal(existsSync(dashboardV1File), false);
   assert.equal(existsSync(path.join(projectionRoot(root), "index.json")), true);
 
   const { dashboardHash: _hash, ...wrongBody } = enhanced.dashboard;
@@ -376,6 +448,66 @@ test("dashboard-v1 publishes before the index and malformed enhanced data degrad
       dashboardHash: hashUiProtocol("dashboard", wrongBindingBody),
     },
   }), /stale-projection/u);
+});
+
+test("dashboard sidecars preserve old-server and old-TUI retention compatibility", (t) => {
+  const oldServerRoot = fixture(t);
+  const oldServerBundle = bundle(oldServerRoot, {
+    generation: "5".repeat(64),
+    includeDashboard: true,
+    retentionDays: 10,
+  });
+  const { dashboardV1: oldDashboard, ...oldServerValues } = oldServerBundle;
+  publishUiProjection(oldServerRoot, { ...oldServerValues, dashboard: oldDashboard });
+
+  const currentReader = readUiProjection(oldServerRoot, PROJECT, {
+    now: NOW,
+    clientOffer: clientOffer(),
+  });
+  assert.equal(currentReader.dashboard.dashboardVersion, 1);
+  assert.deepEqual(currentReader.dashboard.retention, {
+    observationsDays: 10,
+    operationalDays: 90,
+  });
+  assert.equal(currentReader.dashboardError, null);
+
+  const currentServerRoot = fixture(t);
+  const currentServerBundle = bundle(currentServerRoot, {
+    generation: "6".repeat(64),
+    includeDashboard: true,
+    retentionDays: 3_650,
+  });
+  publishUiProjection(currentServerRoot, currentServerBundle);
+  const current = readUiProjection(currentServerRoot, PROJECT, {
+    now: NOW,
+    clientOffer: clientOffer(),
+  });
+  assert.equal(current.dashboard.dashboardVersion, UI_DASHBOARD_VERSION);
+  assert.deepEqual(current.dashboard.retention, {
+    observationsDays: 3_650,
+    operationalDays: 10_950,
+  });
+
+  const v1Value = JSON.parse(readFileSync(
+    dashboardPath(currentServerRoot, current.index.generation, 1),
+    "utf8",
+  ));
+  const oldTuiDashboard = makeUiDashboard(v1Value, {
+    projectFingerprint: PROJECT,
+    stateRootIdentity: stateRootIdentity(currentServerRoot),
+    generation: current.index.generation,
+    indexHash: current.index.projectionHash,
+    now: NOW,
+  });
+  assert.equal(oldTuiDashboard.dashboardVersion, 1);
+  assert.deepEqual(oldTuiDashboard.retention, {
+    observationsDays: 3_650,
+    operationalDays: 90,
+  });
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(
+    path.join(projectionRoot(currentServerRoot), "protocol-offer.json"),
+    "utf8",
+  ))), ["projectionVersions", "operationProtocolVersions", "capabilities"]);
 });
 
 test("publication permits a non-writable shared state-root mode but rejects writable roots before creating artifacts", (t) => {
@@ -404,14 +536,48 @@ function statMode(filePath) {
 test("interrupted generation replacement leaves the prior index readable and converges on retry", (t) => {
   const root = fixture(t);
   const first = bundle(root, { generation: "1".repeat(64) });
-  const second = bundle(root, { generation: "2".repeat(64) });
+  const second = bundle(root, { generation: "2".repeat(64), includeDashboard: true });
   publishUiProjection(root, first);
+  const fsyncedBeforeIndex = [];
+  const directoryChainBeforeIndex = [];
+  const durabilityOrder = [];
   assert.throws(() => publishUiProjection(root, {
     ...second,
+    __testAfterDirectoryFsync({ filePath }) {
+      const relative = path.relative(projectionRoot(root), filePath).split(path.sep).join("/");
+      fsyncedBeforeIndex.push(relative);
+      durabilityOrder.push(`file:${relative}`);
+    },
+    __testAfterDirectoryChainFsync({ directory }) {
+      directoryChainBeforeIndex.push(directory);
+      durabilityOrder.push(`directory:${directory}`);
+    },
     __testFaultInjection(point) {
-      if (point === "ui-projection-before-index") throw new Error("fixture-before-index");
+      if (point === "ui-projection-before-index") {
+        durabilityOrder.push("before-index");
+        throw new Error("fixture-before-index");
+      }
     },
   }), /fixture-before-index/u);
+  const projection = projectionRoot(root);
+  const generationRoot = path.join(projection, "generations", second.index.generation);
+  assert.deepEqual(directoryChainBeforeIndex, [
+    path.join(generationRoot, "details"),
+    generationRoot,
+    path.join(projection, "generations"),
+    projection,
+    path.join(root, "self-evolve", "bridge", PROJECT),
+    path.join(root, "self-evolve", "bridge"),
+    path.join(root, "self-evolve"),
+    root,
+  ]);
+  assert.equal(fsyncedBeforeIndex.some((file) => /\/details\/[a-f0-9]{64}\.json$/u.test(file)), true);
+  assert.equal(fsyncedBeforeIndex.includes(`generations/${second.index.generation}/dashboard-v1.json`), true);
+  assert.equal(fsyncedBeforeIndex.includes(`generations/${second.index.generation}/dashboard-v2.json`), true);
+  assert.equal(fsyncedBeforeIndex.at(-1), "protocol-offer.json");
+  assert.equal(fsyncedBeforeIndex.includes("index.json"), false);
+  assert.equal(durabilityOrder.indexOf(`directory:${root}`) < durabilityOrder.indexOf("file:protocol-offer.json"), true);
+  assert.equal(durabilityOrder.at(-1), "before-index");
   assert.equal(readUiProjection(root, PROJECT, {
     now: NOW,
     clientOffer: clientOffer(),
@@ -420,7 +586,14 @@ test("interrupted generation replacement leaves the prior index readable and con
     readdirSync(path.join(projectionRoot(root), "generations")).sort(),
     [first.index.generation, second.index.generation].sort(),
   );
-  publishUiProjection(root, second);
+  const fsyncedOnCommit = [];
+  publishUiProjection(root, {
+    ...second,
+    __testAfterDirectoryFsync({ filePath }) {
+      fsyncedOnCommit.push(path.relative(projectionRoot(root), filePath).split(path.sep).join("/"));
+    },
+  });
+  assert.equal(fsyncedOnCommit.at(-1), "index.json");
   assert.equal(readUiProjection(root, PROJECT, {
     now: NOW,
     clientOffer: clientOffer(),

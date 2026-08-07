@@ -5,6 +5,16 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  BRIDGE_TTL_MS,
+} from "../self-evolve-bridge.js";
+import {
+  UI_ACTION_CAPABILITIES,
+  UI_CAPABILITIES,
+  UI_DASHBOARD_BLOCKER_DESTINATIONS,
+  UI_PROJECTION_VERSION,
+  hashUiProtocol,
+} from "../self-evolve-ui-protocol.js";
+import {
   CONTROL_CENTER_SECTIONS,
   __testTuiStore,
   acquireProjectTuiStore,
@@ -26,11 +36,18 @@ function lifecycle() {
   const disposers = [];
   return {
     signal: controller.signal,
-    onDispose(callback) { disposers.push(callback); },
+    onDispose(callback) {
+      disposers.push(callback);
+      return () => {
+        const index = disposers.indexOf(callback);
+        if (index !== -1) disposers.splice(index, 1);
+      };
+    },
     abort() { controller.abort(); },
     dispose() {
       for (const callback of disposers.splice(0)) callback();
     },
+    count() { return disposers.length; },
   };
 }
 
@@ -54,7 +71,7 @@ function eventBus() {
 
 function apiFor(root, worktree) {
   return {
-    state: { path: { state: root, worktree, directory: worktree } },
+    state: { ready: true, path: { state: root, worktree, directory: worktree } },
     event: eventBus(),
     lifecycle: lifecycle(),
   };
@@ -109,8 +126,12 @@ function harness({ watchError } = {}) {
 function projection(generation = "a") {
   return Object.freeze({
     mode: "native",
+    projectionVersion: 1,
+    operationProtocolVersion: 1,
     index: Object.freeze({ generation: generation.repeat(64) }),
     details: Object.freeze([]),
+    effectiveIndexActions: Object.freeze([]),
+    effectiveDetailActions: Object.freeze({}),
   });
 }
 
@@ -183,6 +204,9 @@ function modelSnapshot({
     dashboard: dashboardValue,
     dashboardError,
     projection: {
+      mode: "native",
+      projectionVersion: 1,
+      operationProtocolVersion: 1,
       capabilities: ["legacy-control-v1", "legacy-decision-v1"],
       dashboard: dashboardValue,
       dashboardError,
@@ -237,7 +261,7 @@ async function settle() {
 test.beforeEach(() => __testTuiStore.reset());
 test.afterEach(() => __testTuiStore.reset());
 
-test("one operational precedence drives truthful sidebar destinations and never renders raw identifiers", () => {
+test("one operational precedence drives truthful sidebar states and bounded entry destinations", () => {
   const privateReview = { proposalId: "private-proposal-id", state: "pending", attention: "normal" };
   const cases = [
     ["terminal", modelSnapshot({ status: { state: "terminal" } }), "home"],
@@ -249,7 +273,7 @@ test("one operational precedence drives truthful sidebar destinations and never 
     ["on-demand", modelSnapshot({ dashboard: dashboard({
       automation: { state: "on-demand", reason: null },
       settings: { ...dashboard().settings, globalMode: "manual", effectiveMode: "manual" },
-    }) }), "settings"],
+    }) }), "home"],
     ["setup-required", modelSnapshot({ dashboard: dashboard({
       automation: { state: "setup-required", reason: "setup-required" },
       blockers: [{ code: "provider", summary: "Background analysis has no usable provider.", destination: "settings" }],
@@ -294,10 +318,136 @@ test("one operational precedence drives truthful sidebar destinations and never 
     const sidebar = deriveSidebarCard(snapshot);
     assert.equal(operational.state, expectedState);
     assert.equal(sidebar.destination.section, expectedSection);
-    assert.equal(sidebar.destination.section, operational.destination.section);
+    assert.equal(
+      operational.destination.section,
+      expectedState === "on-demand" ? "settings" : sidebar.destination.section,
+    );
     assert.equal(sidebar.summary, expectedState === "ready" ? "Watching this project" : operational.label);
     assert.doesNotMatch(JSON.stringify(sidebar), /private-proposal-id|[a-f0-9]{64}/u);
   }
+});
+
+test("critic-pending is absent from TUI attention, queue, routes, detail, and actions; failed-closed routes to errors", () => {
+  const critic = {
+    proposalId: "critic-hidden",
+    state: "critic-pending",
+    target: "hidden/SKILL.md",
+    attention: "warning",
+    updatedAt: 2,
+  };
+  const pending = {
+    proposalId: "pending-visible",
+    state: "pending",
+    target: "visible/SKILL.md",
+    attention: "normal",
+    updatedAt: 1,
+  };
+  const snapshot = modelSnapshot({ reviews: [critic, pending] });
+  snapshot.projection.details = [
+    { proposalId: critic.proposalId, summary: { rationale: "hidden" } },
+  ];
+  snapshot.projection.effectiveDetailActions = {
+    [critic.proposalId]: [{ action: "apply-proposal" }],
+  };
+
+  const operational = deriveOperationalView(snapshot);
+  const recommendations = buildRecommendationsModel(snapshot, { filter: "all", selectedIndex: 0 });
+  assert.equal(operational.state, "recommendation");
+  assert.equal(operational.count, 1);
+  assert.equal(operational.destination.selectedIndex, 1);
+  assert.deepEqual(recommendations.queue.map((entry) => entry.state), ["pending"]);
+  assert.equal(recommendations.selected.summary, null);
+  assert.deepEqual(recommendations.selected.actions, []);
+  assert.deepEqual(controlCenterRouteParams({ section: "recommendations", selectedIndex: 0 }, snapshot), {
+    section: "recommendations",
+  });
+  assert.deepEqual(parseControlCenterDestination({
+    section: "recommendations",
+    recommendation: critic.proposalId,
+  }, snapshot), { section: "home" });
+  assert.doesNotMatch(JSON.stringify(buildControlCenterModel(snapshot)), /critic-hidden|hidden\/SKILL\.md/u);
+
+  const failed = modelSnapshot({
+    reviews: [{ ...pending, state: "failed-closed", attention: "critical" }],
+    dashboard: dashboard({ automation: { state: "setup-required", reason: "setup-required" } }),
+  });
+  const failure = deriveOperationalView(failed);
+  assert.equal(failure.state, "failure");
+  assert.deepEqual(failure.destination, { section: "activity", filter: "errors" });
+  assert.equal(deriveSidebarCard(failed).kind, "failure");
+});
+
+test("failed-closed reviews override healthy enhanced and limited views without exposing Apply authority", () => {
+  const failedReview = {
+    proposalId: "failed-review",
+    state: "failed-closed",
+    target: "failed/SKILL.md",
+    attention: "critical",
+    updatedAt: 1_000,
+  };
+  const enhanced = modelSnapshot({ reviews: [failedReview] });
+  enhanced.projection.effectiveDetailActions = {
+    [failedReview.proposalId]: [
+      { action: "apply-proposal" },
+      { action: "reject-proposal" },
+    ],
+  };
+
+  const enhancedOperational = deriveOperationalView(enhanced);
+  assert.equal(enhanced.dashboard.automation.state, "ready");
+  assert.equal(enhancedOperational.state, "failure");
+  assert.deepEqual(enhancedOperational.destination, { section: "activity", filter: "errors" });
+  assert.equal(Buffer.byteLength(enhancedOperational.explanation, "utf8") <= 240, true);
+  assert.deepEqual(buildRecommendationsModel(enhanced, { filter: "all" }).selected.actions, []);
+
+  const limited = modelSnapshot({ reviews: [failedReview], dashboard: null });
+  const limitedOperational = deriveOperationalView(limited);
+  assert.equal(limitedOperational.state, "failure");
+  assert.equal(limitedOperational.limited, true);
+  assert.deepEqual(limitedOperational.destination, { section: "activity", filter: "errors" });
+
+  for (const [expected, snapshot] of [
+    ["terminal", modelSnapshot({ status: { state: "terminal" }, reviews: [failedReview] })],
+    ["corrupt", modelSnapshot({ status: { state: "corrupt" }, reviews: [failedReview] })],
+    ["emergency-stop", modelSnapshot({
+      reviews: [failedReview],
+      dashboard: dashboard({ automation: { state: "emergency-stop", reason: "emergency-stop" } }),
+    })],
+    ["circuit-breaker", modelSnapshot({
+      reviews: [failedReview],
+      dashboard: dashboard({ automation: { state: "circuit-breaker", reason: "three-failures-in-24h" } }),
+    })],
+  ]) assert.equal(deriveOperationalView(snapshot).state, expected);
+});
+
+test("project runtime strips inconsistent failed-closed detail grants before any decision submit", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-failed-authority-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-failed-authority-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const proposalId = "failed-runtime-review";
+  const failedProjection = {
+    ...projection(),
+    dashboard: dashboard(),
+    index: {
+      generation: "a".repeat(64),
+      reviews: [{ proposalId, state: "failed-closed", attention: "critical" }],
+    },
+    effectiveDetailActions: {
+      [proposalId]: [{ action: "apply-proposal" }],
+    },
+  };
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), harness(), () => ({
+    async read() { return failedProjection; },
+  })));
+
+  await store.refresh();
+  assert.deepEqual(store.getSnapshot().projection.effectiveDetailActions[proposalId], []);
+  await assert.rejects(
+    store.submitDecision({ proposalId, newState: "approved" }),
+    /decision-not-authorized-by-current-projection/u,
+  );
+  store.dispose();
 });
 
 test("setup semantics cover missing auto consent/provider and YOLO rollout without ambiguous readiness", () => {
@@ -329,6 +479,37 @@ test("sidebar indicator remains visible during startup and old-server fallback i
   const malformed = deriveSidebarCard(modelSnapshot({ dashboard: null, dashboardError: "dashboard-hash-mismatch" }));
   assert.equal(malformed.summary, "Limited view");
   assert.match(malformed.detail, /could not be validated/u);
+});
+
+test("manual sidebar entry opens Home while the explicit mode-setting action remains in Settings", () => {
+  const snapshot = modelSnapshot({ dashboard: dashboard({
+    automation: { state: "on-demand", reason: null },
+    settings: { ...dashboard().settings, globalMode: "manual", effectiveMode: "manual" },
+  }) });
+  const operational = deriveOperationalView(snapshot);
+  const sidebar = deriveSidebarCard(snapshot);
+  assert.deepEqual(operational.destination, { section: "settings", anchor: "modes" });
+  assert.deepEqual(sidebar.destination, { section: "home" });
+  assert.equal(sidebar.action, "Open Home");
+});
+
+test("every published blocker round-trips through one closed exact destination contract", () => {
+  for (const [code, contract] of Object.entries(UI_DASHBOARD_BLOCKER_DESTINATIONS)) {
+    const value = modelSnapshot({ dashboard: dashboard({
+      automation: { state: "setup-required", reason: code },
+      blockers: [{ code, summary: `Resolve ${code}.`, destination: contract.dashboard }],
+    }) });
+    const blocker = buildHomeModel(value).blockers[0];
+    assert.deepEqual(blocker.destination, {
+      section: contract.section,
+      ...(contract.filter ? { filter: contract.filter } : {}),
+      ...(contract.anchor ? { anchor: contract.anchor } : {}),
+    }, code);
+    const params = controlCenterRouteParams(blocker.destination, value);
+    assert.deepEqual(parseControlCenterDestination(params, value), blocker.destination, code);
+  }
+  const firstRun = UI_DASHBOARD_BLOCKER_DESTINATIONS["first-run"];
+  assert.deepEqual(firstRun, { dashboard: "home", section: "home" });
 });
 
 test("applied attention supports multiple local acknowledgements while Activity history remains", () => {
@@ -380,6 +561,55 @@ test("control center model exposes exactly four sections and remains available w
   assert.equal(Object.isFrozen(healthy.sections), true);
 });
 
+test("error and expired snapshots retain bounded stale context but remove every projected action", () => {
+  const proposalId = "stale-proposal";
+  const snapshot = modelSnapshot({
+    phase: "error",
+    reviews: [{ proposalId, state: "pending", target: "stale/SKILL.md", attention: "normal", updatedAt: 900 }],
+  });
+  snapshot.stale = true;
+  snapshot.error = `expired-projection:${"x".repeat(400)}`;
+  snapshot.pending = [{ requestId: "pending-request", kind: "decision", action: "apply-proposal", submittedAt: 800 }];
+  snapshot.controlState = {
+    mode: "auto",
+    effectiveMode: "auto",
+    repoExcluded: false,
+    allowedSkillRoots: ["/stale/approved"],
+    consent: dashboard().settings.consent,
+  };
+  snapshot.projection.effectiveIndexActions = [
+    { action: "set-paused" },
+    { action: "set-kill-switch" },
+    { action: "export-data" },
+  ];
+  snapshot.projection.effectiveDetailActions = {
+    [proposalId]: [{ action: "apply-proposal" }, { action: "reject-proposal" }],
+  };
+
+  const model = buildControlCenterModel(snapshot);
+  assert.equal(model.recovery.stale, true);
+  assert.equal(model.recovery.canRetry, true);
+  assert.equal(model.recovery.diagnostic.length, 240);
+  assert.equal(model.sections.recommendations.queue.length, 1, "stale recommendation context remains readable");
+  assert.deepEqual(model.sections.recommendations.selected.actions, []);
+  assert.deepEqual(model.sections.settings.controls, {
+    globalMode: false,
+    repositoryMode: false,
+    consent: false,
+    projectInclusion: false,
+    approvedSkillFolders: false,
+    pause: false,
+    emergencyStop: false,
+  });
+  assert.deepEqual(model.sections.settings.maintenance, {
+    scopes: model.sections.settings.maintenance.scopes,
+    canExport: false,
+    canDeleteScope: false,
+    canDeleteAll: false,
+  });
+  assert.equal(snapshot.pending.length, 1, "pending status remains read-only context");
+});
+
 test("control-center route parameters are bounded, project-current, and round-trip sidebar destinations", () => {
   const reviews = [
     { proposalId: "proposal-one", state: "pending" },
@@ -423,9 +653,8 @@ test("native renderer binds the four-section shell, deep links, granted header c
     'section() === "recommendations"',
     'section() === "activity"',
     'section() === "settings"',
-    "projection?.index?.allowedActions",
-    'granted().has("set-paused")',
-    'granted().has("set-kill-switch")',
+    "settings().controls.pause",
+    "settings().controls.emergencyStop",
     'flexWrap="wrap"',
     '["all", "All"]',
     '["recommendations", "Recommendations"]',
@@ -440,8 +669,9 @@ test("native renderer binds the four-section shell, deep links, granted header c
     "The global default applies to every current and future project",
     "confirmation() === confirmationKey",
     "automatic-recommendations",
-    "submitControlAndWait",
-    "One confirmation enables background AI analysis",
+    "Review consent for",
+    "Confirm allow",
+    "Cancel consent change",
     "UPDATE ALLOWLIST",
     "EXPORT SENSITIVE SELF-EVOLVE DATA",
     "PURGE ALL SELF-EVOLVE DATA",
@@ -456,9 +686,10 @@ test("native renderer binds the four-section shell, deep links, granted header c
   assert.doesNotMatch(source, />Help<|>Safety<|>Maintenance<\/text>\s*<\/box>\s*<\/Show>/u);
   assert.doesNotMatch(source, /ReviewDialog|REVIEW_DIALOG_ID|api\.ui\.dialog\.replace/u);
   assert.doesNotMatch(source, /api\.ui\.toast|api\.attention\.notify/u);
-  const automaticSetup = source.slice(source.indexOf("const enableAutomaticRecommendations"), source.indexOf("const automaticRecommendationsReady"));
-  assert.ok(automaticSetup.indexOf('key: "passiveCalls"') < automaticSetup.indexOf('key: "durableObservations"'));
-  assert.ok(automaticSetup.indexOf('key: "durableObservations"') < automaticSetup.indexOf('mode: "auto"'));
+  const automaticSetup = source.slice(source.indexOf("const enableAutomaticRecommendations"), source.indexOf("const openConsentDisclosure"));
+  assert.equal(automaticSetup.match(/submitControl\("set-mode", \{ mode: "auto" \}\)/gu)?.length, 1);
+  assert.doesNotMatch(automaticSetup, /set-consent/u);
+  assert.match(source, /entry\.enabled\s*\?\s*actionButton\([\s\S]*enabled: false[\s\S]*:\s*localActionButton\([\s\S]*Review consent for/u);
 });
 
 test("section models are pure, immutable, human-labeled, and share Home/sidebar operational state", () => {
@@ -686,7 +917,10 @@ test("Activity filters semantic history, deep-links safely, bounds diagnostics, 
 });
 
 test("Settings explains scope, gates repository mode, validates folder lists, distinguishes limits, and consolidates maintenance", () => {
-  const value = dashboard();
+  const value = dashboard({
+    dashboardVersion: 2,
+    retention: { observationsDays: 10, operationalDays: 30 },
+  });
   const snapshot = modelSnapshot({ dashboard: value });
   snapshot.controlState = {
     mode: "auto",
@@ -735,6 +969,11 @@ test("Settings explains scope, gates repository mode, validates folder lists, di
   assert.match(settings.limits.find((limit) => limit.key === "passive").actual, /1 used; 2 remaining/u);
   assert.match(settings.limits.find((limit) => limit.key === "passive").configured, /3 per rolling hour/u);
   assert.match(settings.limits.find((limit) => limit.key === "retention").actual, /5 retained observations/u);
+  assert.equal(
+    settings.limits.find((limit) => limit.key === "retention").configured,
+    "10 days for observations; 30 days for operational records",
+  );
+  assert.deepEqual(settings.retention, { observationsDays: 10, operationalDays: 30 });
   assert.match(settings.limits.find((limit) => limit.key === "concurrency").configured, /1 observation/u);
   assert.deepEqual(settings.maintenance, {
     scopes: [
@@ -894,19 +1133,23 @@ test("duplicate TUI owners share one project runtime, poller, watcher, and immut
   assert.equal(first.getSnapshot().phase, "ready");
   assert.equal(Object.isFrozen(first.getSnapshot()), true);
   assert.equal(Object.isFrozen(first.getSnapshot().projection), true);
+  assert.equal(firstApi.lifecycle.count(), 1);
+  assert.equal(secondApi.lifecycle.count(), 1);
 
   first.dispose();
   assert.equal(__testTuiStore.registrySize(), 1);
   assert.equal(scheduler.intervals.size, 1);
+  assert.equal(firstApi.lifecycle.count(), 0);
   second.dispose();
   assert.equal(__testTuiStore.registrySize(), 0);
   assert.equal(scheduler.intervals.size, 0);
   assert.equal(scheduler.watchers[0].closed, true);
   assert.equal(firstApi.event.count(), 0);
   assert.equal(secondApi.event.count(), 0);
+  assert.equal(secondApi.lifecycle.count(), 0);
 });
 
-test("project and worktree changes isolate runtimes and rebind on official path events", async (t) => {
+test("project and worktree changes isolate runtimes and rebind on the supported path poll", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-isolation-"));
   const firstWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-project-a-"));
   const secondWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-project-b-"));
@@ -926,7 +1169,7 @@ test("project and worktree changes isolate runtimes and rebind on official path 
 
   api.state.path.worktree = secondWorktree;
   api.state.path.directory = secondWorktree;
-  api.event.emit("workspace.updated");
+  scheduler.tick();
   await store.refresh();
   const second = store.getSnapshot();
   assert.notEqual(second.key, first.key);
@@ -935,6 +1178,121 @@ test("project and worktree changes isolate runtimes and rebind on official path 
   assert.equal(clients.length, 2);
   assert.equal(__testTuiStore.registrySize(), 1);
   assert.equal(scheduler.watchers[0].closed, true);
+  store.dispose();
+});
+
+test("startup path fallbacks do not pin the projection store after live paths arrive", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-startup-path-"));
+  const firstWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-startup-a-"));
+  const secondWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-startup-b-"));
+  const placeholderDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-startup-placeholder-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(firstWorktree, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(secondWorktree, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(placeholderDirectory, { recursive: true, force: true }));
+  const scheduler = harness();
+  const contexts = [];
+  const api = apiFor("", "");
+  api.state.ready = true;
+  api.state.path.directory = placeholderDirectory;
+  const store = acquireProjectTuiStore(options(api, scheduler, (context) => {
+    contexts.push(context);
+    return { async read() { return projection(contexts.length === 1 ? "a" : "b"); } };
+  }, {
+    config: { startupStateRoot: root, startupWorktree: firstWorktree },
+  }));
+  await store.refresh();
+  const first = store.getSnapshot();
+  assert.equal(first.worktreePath, firstWorktree);
+
+  api.state.path.state = root;
+  api.state.path.worktree = secondWorktree;
+  api.state.path.directory = secondWorktree;
+  scheduler.tick();
+  await store.refresh();
+  const second = store.getSnapshot();
+
+  assert.notEqual(second.projectFingerprint, first.projectFingerprint);
+  assert.equal(second.worktreePath, secondWorktree);
+  assert.equal(contexts.length, 2);
+
+  api.state.path.worktree = "";
+  api.state.path.directory = "";
+  scheduler.tick();
+  await store.refresh();
+  const unavailable = store.getSnapshot();
+  assert.equal(unavailable.phase, "error");
+  assert.equal("projectFingerprint" in unavailable, false);
+  store.dispose();
+});
+
+test("directory-only changes do not replace an explicitly pinned runtime or lose pending requests", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-explicit-path-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-explicit-worktree-"));
+  const otherDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-explicit-directory-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(otherDirectory, { recursive: true, force: true }));
+  const scheduler = harness();
+  const contexts = [];
+  const api = apiFor(root, worktree);
+  const store = acquireProjectTuiStore(options(api, scheduler, (context) => {
+    contexts.push(context);
+    return {
+      async read() { return projection(); },
+      async reconcilePending(entries) { return { pending: entries, responses: [] }; },
+    };
+  }, { config: { worktree }, now: () => 1_100 }));
+  await store.refresh();
+  await store.trackPending({
+    requestId: "explicit-path-pending",
+    kind: "decision",
+    action: "apply-proposal",
+    subject: "proposal-explicit-path",
+    submittedAt: 1_000,
+    expiresAt: 2_000,
+  });
+  const before = store.getSnapshot();
+
+  api.state.path.directory = otherDirectory;
+  scheduler.tick();
+  await store.refresh();
+  const after = store.getSnapshot();
+
+  assert.equal(after.key, before.key);
+  assert.equal(contexts.length, 1);
+  assert.equal(after.pending.length, 1);
+  assert.equal(after.pending[0].requestId, "explicit-path-pending");
+  store.dispose();
+});
+
+test("an identity-less subscribed store becomes identified without retaining the error snapshot", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-late-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-late-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const scheduler = harness();
+  const api = apiFor("relative-state-root", worktree);
+  const store = acquireProjectTuiStore(options(api, scheduler, () => ({
+    async read() { return projection(); },
+  })));
+  const snapshots = [];
+  store.subscribe((value) => snapshots.push(value));
+  assert.equal(store.getSnapshot().phase, "error");
+  assert.equal("key" in store.getSnapshot(), false);
+  assert.equal("projectFingerprint" in store.getSnapshot(), false);
+  assert.equal("stateRootIdentity" in store.getSnapshot(), false);
+
+  api.state.path.state = root;
+  api.event.emit("project.updated");
+  await store.refresh();
+  const identified = store.getSnapshot();
+  assert.equal(identified.phase, "ready");
+  assert.match(identified.key, /^[a-f0-9]{64}:[a-f0-9]{64}$/u);
+  assert.match(identified.projectFingerprint, /^[a-f0-9]{64}$/u);
+  assert.match(identified.stateRootIdentity, /^[a-f0-9]{64}$/u);
+  assert.equal(snapshots.some((value) => value.phase === "error" && !("key" in value)), true);
+  assert.equal(snapshots.at(-1), identified);
   store.dispose();
 });
 
@@ -993,7 +1351,7 @@ test("dashboard snapshots and local audit acknowledgements remain immutable and 
 
   api.state.path.worktree = secondWorktree;
   api.state.path.directory = secondWorktree;
-  api.event.emit("workspace.updated");
+  scheduler.tick();
   await store.refresh();
   const secondFingerprint = store.getSnapshot().projectFingerprint;
   assert.notEqual(secondFingerprint, firstFingerprint);
@@ -1002,7 +1360,7 @@ test("dashboard snapshots and local audit acknowledgements remain immutable and 
 
   api.state.path.worktree = firstWorktree;
   api.state.path.directory = firstWorktree;
-  api.event.emit("workspace.updated");
+  scheduler.tick();
   await store.refresh();
   assert.equal(store.getSnapshot().projectFingerprint, firstFingerprint);
   assert.deepEqual(store.getSnapshot().acknowledgedAuditIds, ["audit-one", "audit-two"]);
@@ -1022,6 +1380,8 @@ test("TUI store sends structured rejection only when the current projection adve
     async read() {
       return {
         mode: "native",
+        projectionVersion: 1,
+        operationProtocolVersion: 1,
         index: {
           generation: "a".repeat(64),
           capabilities: ["legacy-decision-v1"],
@@ -1052,6 +1412,12 @@ test("TUI store sends structured rejection only when the current projection adve
     },
     async submitDecision(request) {
       submissions.push(request);
+    },
+    async reconcilePending(entries) {
+      return {
+        pending: [],
+        responses: entries.map((entry) => ({ ...entry, response: { ok: true, status: "accepted" } })),
+      };
     },
   })));
   await store.refresh();
@@ -1086,6 +1452,8 @@ test("TUI store emits repository mode controls only when the exact capability an
     async read() {
       return {
         mode: "native",
+        projectionVersion: 1,
+        operationProtocolVersion: 1,
         capabilities: ["legacy-control-v1"],
         index: {
           generation: "a".repeat(64),
@@ -1145,6 +1513,278 @@ test("TUI store emits repository mode controls only when the exact capability an
   assert.deepEqual(request.payload, { mode: "manual" });
   assert.equal(submissions.length, 1);
   store.dispose();
+});
+
+test("downgraded peers never expose raw grants or write mailbox requests", async (t) => {
+  for (const mode of ["read-only", "legacy"]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `self-evolve-tui-${mode}-root-`));
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), `self-evolve-tui-${mode}-project-`));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+    const scheduler = harness();
+    const writes = [];
+    const proposalId = `proposal-${mode}`;
+    const rawGrant = {
+      action: "set-paused",
+      capability: "operation-pause-v1",
+      nonce: "raw-index-nonce",
+      expiresAt: 10_000,
+    };
+    let negotiatedMode = mode;
+    let negotiatedOperationProtocolVersion = null;
+    const projectionValue = mode === "legacy" ? {
+      mode,
+      projectionVersion: null,
+      operationProtocolVersion: null,
+      index: null,
+      details: [],
+      effectiveIndexActions: [],
+      effectiveDetailActions: {},
+    } : {
+      mode,
+      projectionVersion: 1,
+      operationProtocolVersion: null,
+      index: {
+        generation: "a".repeat(64),
+        reviews: [{ proposalId, state: "pending", target: "review/SKILL.md", attention: "normal" }],
+        allowedActions: [rawGrant],
+      },
+      dashboard: dashboard(),
+      details: [],
+      effectiveIndexActions: [],
+      effectiveDetailActions: { [proposalId]: [] },
+    };
+    const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, () => ({
+      async read() {
+        return {
+          ...projectionValue,
+          mode: negotiatedMode,
+          operationProtocolVersion: negotiatedOperationProtocolVersion,
+        };
+      },
+      async readControlState() {
+        return {
+          schemaVersion: SCHEMA_VERSION,
+          projectFingerprint: "a".repeat(64),
+          actor: "self-evolve-integration",
+          issuedAt: 1_000,
+          expiresAt: 10_000,
+          settingsUpdatedAt: 900,
+          settingsVersion: "b".repeat(64),
+          stateRootIdentity: "c".repeat(64),
+          nonce: "raw-control-nonce",
+          mode: "auto",
+          effectiveMode: "auto",
+          allowedSkillRoots: [worktree],
+          consent: dashboard().settings.consent,
+          repoExcluded: false,
+        };
+      },
+      async readInbox() { return [{ id: proposalId }]; },
+      async submitDecision(request) { writes.push(request); },
+      async submitControl(request) { writes.push(request); },
+      async submitOperation(request) { writes.push(request); },
+    }), { now: () => 1_100 }));
+    await store.refresh();
+    const snapshot = store.getSnapshot();
+    assert.deepEqual(buildRecommendationsModel(snapshot).selected?.actions ?? [], []);
+    assert.deepEqual(buildSettingsModel(snapshot).controls, {
+      globalMode: false,
+      repositoryMode: false,
+      consent: false,
+      projectInclusion: false,
+      approvedSkillFolders: false,
+      pause: false,
+      emergencyStop: false,
+    });
+    assert.deepEqual(buildSettingsModel(snapshot).maintenance, {
+      scopes: buildSettingsModel(snapshot).maintenance.scopes,
+      canExport: false,
+      canDeleteScope: false,
+      canDeleteAll: false,
+    });
+    await assert.rejects(store.submitDecision({ proposalId, newState: "rejected" }), /native.*protocol/u);
+    await assert.rejects(store.submitControl("set-mode", { mode: "manual" }), /native.*protocol/u);
+    await assert.rejects(store.submitOperation("set-paused", { paused: true }), /native.*protocol/u);
+    assert.equal(writes.length, 0);
+    if (mode === "read-only") {
+      negotiatedMode = "native";
+      negotiatedOperationProtocolVersion = 1;
+      await store.refresh();
+      await assert.rejects(store.submitOperation("set-paused", { paused: true }), /operation-not-authorized/u);
+      assert.equal(writes.length, 0, "an empty effective list never falls back to the raw index grant");
+      await store.submitControl("set-mode", { mode: "manual" });
+      assert.equal(writes.length, 1, "a matching native peer still submits supported controls");
+    }
+    store.dispose();
+  }
+});
+
+test("failed refresh strips retained authority and Retry restores only freshly negotiated actions", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-stale-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-stale-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const scheduler = harness();
+  const proposalId = "proposal-stale-retry";
+  let state = "initial";
+  const projectionFor = () => ({
+    mode: "native",
+    projectionVersion: 1,
+    operationProtocolVersion: 1,
+    index: {
+      generation: (state === "fresh" ? "b" : "a").repeat(64),
+      reviews: [{ proposalId, state: "pending", target: "review/SKILL.md", attention: "normal", updatedAt: 1_000 }],
+      allowedActions: [],
+    },
+    dashboard: dashboard(),
+    details: [],
+    effectiveIndexActions: state === "fresh" ? [{ action: "set-kill-switch" }] : [{ action: "set-paused" }],
+    effectiveDetailActions: {
+      [proposalId]: state === "fresh" ? [{ action: "reject-proposal" }] : [{ action: "apply-proposal" }],
+    },
+  });
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, () => ({
+    async read() {
+      if (state === "expired") throw new Error(`expired-projection:${"private".repeat(80)}`);
+      return projectionFor();
+    },
+    async readControlState() {
+      return {
+        schemaVersion: SCHEMA_VERSION,
+        projectFingerprint: "a".repeat(64),
+        actor: "self-evolve-integration",
+        issuedAt: 1_000,
+        expiresAt: 10_000,
+        settingsUpdatedAt: 900,
+        settingsVersion: "b".repeat(64),
+        stateRootIdentity: "c".repeat(64),
+        nonce: "stale-retry-control-nonce",
+        mode: "auto",
+        effectiveMode: "auto",
+        allowedSkillRoots: [worktree],
+        consent: dashboard().settings.consent,
+        repoExcluded: false,
+      };
+    },
+    async reconcilePending(entries) { return { pending: entries, responses: [] }; },
+  }), { now: () => 1_100 }));
+
+  await store.refresh();
+  await store.trackPending({
+    requestId: "still-pending",
+    kind: "decision",
+    action: "apply-proposal",
+    subject: proposalId,
+    submittedAt: 1_000,
+    expiresAt: 2_000,
+  });
+  state = "expired";
+  await store.refresh();
+  const expired = store.getSnapshot();
+  assert.equal(expired.phase, "error");
+  assert.equal(expired.stale, true);
+  assert.equal(expired.error.length, 240);
+  assert.equal(expired.controlState, null);
+  assert.deepEqual(expired.projection.effectiveIndexActions, []);
+  assert.deepEqual(expired.projection.effectiveDetailActions[proposalId], []);
+  assert.equal(expired.pending.length, 1);
+  await assert.rejects(store.submitControl("set-mode", { mode: "manual" }), /native-operation-protocol-unavailable/u);
+
+  state = "fresh";
+  await store.refresh();
+  const fresh = store.getSnapshot();
+  assert.equal(fresh.phase, "ready");
+  assert.equal(fresh.stale, false);
+  assert.deepEqual(fresh.projection.effectiveIndexActions.map((entry) => entry.action), ["set-kill-switch"]);
+  assert.deepEqual(buildRecommendationsModel(fresh).selected.actions.map((entry) => entry.action), ["reject-proposal"]);
+  assert.equal(buildSettingsModel(fresh).controls.pause, false);
+  assert.equal(buildSettingsModel(fresh).controls.emergencyStop, true);
+  store.dispose();
+});
+
+test("authority preflight waits for replacement reads and fails closed before every submit boundary", async (t) => {
+  for (const kind of ["decision", "control", "operation"]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `self-evolve-tui-preflight-${kind}-root-`));
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), `self-evolve-tui-preflight-${kind}-project-`));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+    const scheduler = harness();
+    const proposalId = `proposal-${kind}-race`;
+    const writes = [];
+    let reads = 0;
+    let resolveReplacement;
+    let expireFollowUp = false;
+    const authorized = () => ({
+      mode: "native",
+      projectionVersion: 1,
+      operationProtocolVersion: 1,
+      index: {
+        generation: "a".repeat(64),
+        reviews: [{ proposalId, state: "pending", target: "review/SKILL.md", attention: "normal" }],
+        allowedActions: [],
+      },
+      dashboard: dashboard(),
+      details: [],
+      effectiveIndexActions: [{ action: "set-paused" }],
+      effectiveDetailActions: {
+        [proposalId]: [{ action: "reject-proposal" }, { action: "snooze-proposal" }],
+      },
+    });
+    const controlState = {
+      schemaVersion: SCHEMA_VERSION,
+      projectFingerprint: "a".repeat(64),
+      actor: "self-evolve-integration",
+      issuedAt: 1_000,
+      expiresAt: 10_000,
+      settingsUpdatedAt: 900,
+      settingsVersion: "b".repeat(64),
+      stateRootIdentity: "c".repeat(64),
+      nonce: `preflight-${kind}-nonce`,
+      mode: "auto",
+      effectiveMode: "auto",
+      allowedSkillRoots: [worktree],
+      consent: dashboard().settings.consent,
+      repoExcluded: false,
+    };
+    const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, () => ({
+      read() {
+        reads += 1;
+        if (reads === 2) return new Promise((resolve) => { resolveReplacement = resolve; });
+        if (expireFollowUp) throw new Error("expired-projection");
+        return authorized();
+      },
+      async readControlState() { return controlState; },
+      async readInbox() {
+        return [{
+          id: proposalId,
+          skillTarget: { currentHash: "d".repeat(64) },
+          proposedContentHash: "e".repeat(64),
+          decisionVersion: 0,
+        }];
+      },
+      async submitDecision(request) { writes.push(request); },
+      async submitControl(request) { writes.push(request); },
+      async submitOperation(request) { writes.push(request); },
+    }), { now: () => 1_100 }));
+    await store.refresh();
+
+    const replacement = store.refresh();
+    await settle();
+    const submission = kind === "decision"
+      ? store.submitDecision({ proposalId, newState: "rejected" })
+      : kind === "control"
+        ? store.submitControl("set-mode", { mode: "manual" })
+        : store.submitOperation("snooze-proposal", { snoozedUntil: 5_000 }, { proposalId });
+    expireFollowUp = true;
+    resolveReplacement(authorized());
+    await replacement;
+    await assert.rejects(submission, /native-operation-protocol-unavailable/u, kind);
+    assert.equal(reads, 3, `${kind} preflight must await the queued replacement read`);
+    assert.equal(writes.length, 0, `${kind} reached its submit boundary with stale authority`);
+    assert.equal(store.getSnapshot().phase, "error");
+    store.dispose();
+  }
 });
 
 test("write bursts coalesce while an in-flight reread receives one bounded follow-up", async (t) => {
@@ -1219,7 +1859,7 @@ test("pending responses reconcile into the immutable project snapshot", async (t
     async reconcilePending(entries) {
       return {
         pending: [],
-        responses: entries.map((entry) => ({ ...entry, response: { ok: true, status: "completed" } })),
+        responses: entries.map((entry) => ({ ...entry, response: { ok: true, status: "completed", processedAt: 200 } })),
       };
     },
   })));
@@ -1227,7 +1867,9 @@ test("pending responses reconcile into the immutable project snapshot", async (t
     requestId: "request-1",
     kind: "operation",
     action: "export-data",
+    subject: "scope:project",
     submittedAt: 123,
+    expiresAt: 456,
   });
   const snapshot = store.getSnapshot();
   assert.deepEqual(snapshot.pending, []);
@@ -1236,6 +1878,313 @@ test("pending responses reconcile into the immutable project snapshot", async (t
   assert.equal(Object.isFrozen(snapshot.responses), true);
   assert.equal(Object.isFrozen(snapshot.responses[0]), true);
   store.dispose();
+});
+
+test("missing responses expire by authoritative class deadline and late responses stay expired", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-expiry-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-expiry-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const scheduler = harness();
+  let now = 100;
+  let publishLateResponses = false;
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, () => ({
+    async read() { return projection(); },
+    async reconcilePending(entries) {
+      return {
+        pending: publishLateResponses ? entries.filter((entry) => entry.expiresAt > now) : entries,
+        responses: publishLateResponses
+          ? entries
+            .filter((entry) => entry.expiresAt <= now)
+            .map((entry) => ({ ...entry, response: { ok: true, status: "accepted" } }))
+          : [],
+      };
+    },
+  }), { now: () => now }));
+
+  await store.trackPending({
+    requestId: "decision-expiry",
+    kind: "decision",
+    action: "apply-proposal",
+    subject: "proposal-a",
+    submittedAt: 100,
+    expiresAt: 110,
+  });
+  await store.trackPending({
+    requestId: "control-expiry",
+    kind: "control",
+    action: "set-consent",
+    subject: "consent:passiveCalls",
+    submittedAt: 100,
+    expiresAt: 120,
+  });
+  await store.trackPending({
+    requestId: "operation-expiry",
+    kind: "operation",
+    action: "export-data",
+    subject: "scope:project",
+    submittedAt: 100,
+    expiresAt: 130,
+  });
+
+  now = 120;
+  publishLateResponses = true;
+  await store.refresh();
+  const atControlExpiry = store.getSnapshot();
+  assert.deepEqual(atControlExpiry.pending.map((entry) => entry.requestId), ["operation-expiry"]);
+  assert.deepEqual(atControlExpiry.responses.map((entry) => [entry.requestId, entry.response.status]), [
+    ["decision-expiry", "expired"],
+    ["control-expiry", "expired"],
+  ]);
+  assert.equal(atControlExpiry.responses.every((entry) => entry.response.ok === false), true);
+  assert.equal(atControlExpiry.responses.every((entry) => entry.response.reason === "response-not-received-before-expiry"), true);
+
+  now = 130;
+  await store.refresh();
+  const complete = store.getSnapshot();
+  assert.deepEqual(complete.pending, []);
+  assert.equal(complete.responses.at(-1).requestId, "operation-expiry");
+  assert.equal(complete.responses.at(-1).response.status, "expired");
+
+  await store.refresh();
+  assert.equal(store.getSnapshot().responses.length, 3, "late polling cannot resurrect expired authority");
+  store.dispose();
+});
+
+test("real decision, control, and operation submissions track authoritative deadlines and retry with fresh authority", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-deadlines-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-deadlines-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const scheduler = harness();
+  let now = 1_000;
+  let decisionNonce = "decision-nonce-1";
+  const proposalId = "proposal-deadlines";
+  const submissions = [];
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, (context) => {
+    const generation = "c".repeat(64);
+    const grant = {
+      action: "set-paused",
+      capability: UI_ACTION_CAPABILITIES["set-paused"],
+      nonce: "operation-nonce",
+      expiresAt: 31_000,
+    };
+    const indexBody = {
+      projectionVersion: UI_PROJECTION_VERSION,
+      projectFingerprint: context.projectFingerprint,
+      stateRootIdentity: context.stateRootIdentity,
+      generation,
+      issuedAt: 900,
+      expiresAt: 61_000,
+      capabilities: UI_CAPABILITIES,
+      status: {
+        state: "ready",
+        reason: null,
+        storedMode: "auto",
+        effectiveMode: "auto",
+        paused: false,
+        killSwitchActive: false,
+        repoExcluded: false,
+        circuitBreakerOpen: false,
+      },
+      budgets: {
+        passiveCallsPerHour: 3,
+        synthesisPerDay: 2,
+        tokensPerSynthesis: 100,
+        concurrentObservationsPerProject: 1,
+        concurrentSynthesesGlobal: 1,
+        idleDebounceMs: 1_500,
+        storageQuotaMiB: 8,
+      },
+      reviews: [],
+      operations: [],
+      allowedActions: [grant],
+      overflow: {
+        reviews: { truncated: false, includedCount: 0, omittedCount: 0, omittedBytes: 0, reason: "none" },
+        operations: { truncated: false, includedCount: 0, omittedCount: 0, omittedBytes: 0, reason: "none" },
+        allowedActions: { truncated: false, includedCount: 1, omittedCount: 0, omittedBytes: 0, reason: "none" },
+      },
+    };
+    const index = { ...indexBody, projectionHash: hashUiProtocol("projection-index", indexBody) };
+    return {
+      async read() {
+        return {
+          mode: "native",
+          projectionVersion: UI_PROJECTION_VERSION,
+          operationProtocolVersion: 1,
+          index,
+          dashboard: dashboard(),
+          details: [],
+          effectiveIndexActions: [grant],
+          effectiveDetailActions: { [proposalId]: [{ action: "apply-proposal" }] },
+        };
+      },
+      async readInbox() {
+        return [{
+          id: proposalId,
+          projectFingerprint: context.projectFingerprint,
+          skillTarget: { currentHash: "d".repeat(64) },
+          proposedContentHash: "e".repeat(64),
+          decisionVersion: 0,
+          state: "pending",
+          decisionNonce,
+        }];
+      },
+      async readControlState() {
+        return {
+          schemaVersion: SCHEMA_VERSION,
+          projectFingerprint: context.projectFingerprint,
+          actor: "self-evolve-integration",
+          issuedAt: 900,
+          expiresAt: 6_000,
+          settingsUpdatedAt: 900,
+          settingsVersion: "f".repeat(64),
+          stateRootIdentity: context.stateRootIdentity,
+          nonce: "control-nonce",
+          mode: "auto",
+          effectiveMode: "auto",
+          allowedSkillRoots: [worktree],
+          consent: dashboard().settings.consent,
+          repoExcluded: false,
+        };
+      },
+      async submitDecision(request) { submissions.push(request); },
+      async submitControl(request) { submissions.push(request); },
+      async submitOperation(request) { submissions.push(request); },
+      async reconcilePending(entries) { return { pending: entries, responses: [] }; },
+    };
+  }, { now: () => now }));
+  await store.refresh();
+
+  const firstDecision = await store.submitDecision({ proposalId, newState: "approved" });
+  await store.submitControl("set-consent", { key: "passiveCalls", enabled: true });
+  const operation = await store.submitOperation("set-paused", { paused: true });
+  const pending = new Map(store.getSnapshot().pending.map((entry) => [entry.requestId, entry]));
+  assert.equal(pending.get(firstDecision.requestId).expiresAt, 1_000 + BRIDGE_TTL_MS);
+  assert.equal([...pending.values()].find((entry) => entry.kind === "control").expiresAt, 6_000);
+  assert.equal(pending.get(operation.requestId).expiresAt, operation.expiresAt);
+  assert.equal(operation.expiresAt, 31_000);
+
+  now = 1_000 + BRIDGE_TTL_MS;
+  await store.refresh();
+  decisionNonce = "decision-nonce-2";
+  const retried = await store.submitDecision({ proposalId, newState: "approved" });
+  assert.notEqual(retried.requestId, firstDecision.requestId);
+  assert.notEqual(retried.nonce, firstDecision.nonce);
+  assert.equal(retried.nonce, decisionNonce);
+  assert.equal(submissions.length, 4);
+  store.dispose();
+});
+
+test("pending tracking rejects overflow instead of forgetting published requests", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-capacity-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-capacity-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const scheduler = harness();
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, () => ({
+    async read() { return projection(); },
+    async reconcilePending(entries) { return { pending: entries, responses: [] }; },
+  }), { now: () => 200 }));
+  for (let index = 0; index < 32; index += 1) {
+    await store.trackPending({
+      requestId: `capacity-${index}`,
+      kind: "control",
+      action: "set-consent",
+      subject: `consent:${index}`,
+      submittedAt: 100,
+      expiresAt: 1_000,
+    });
+  }
+  await assert.rejects(store.trackPending({
+    requestId: "capacity-overflow",
+    kind: "control",
+    action: "set-consent",
+    subject: "consent:overflow",
+    submittedAt: 100,
+    expiresAt: 1_000,
+  }), /pending-request-capacity-exhausted/u);
+  assert.equal(store.getSnapshot().pending.length, 32);
+  assert.equal(store.getSnapshot().pending[0].requestId, "capacity-0");
+  store.dispose();
+});
+
+test("concurrent matching submissions publish only one request", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-concurrent-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-concurrent-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const scheduler = harness();
+  const submissions = [];
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, (context) => ({
+    async read() {
+      return {
+        ...projection(),
+        dashboard: dashboard(),
+      };
+    },
+    async readControlState() {
+      return {
+        schemaVersion: SCHEMA_VERSION,
+        projectFingerprint: context.projectFingerprint,
+        actor: "self-evolve-integration",
+        issuedAt: 1_000,
+        expiresAt: 10_000,
+        settingsUpdatedAt: 900,
+        settingsVersion: "b".repeat(64),
+        stateRootIdentity: context.stateRootIdentity,
+        nonce: "concurrent-control-nonce",
+        mode: "auto",
+        effectiveMode: "auto",
+        allowedSkillRoots: [worktree],
+        consent: dashboard().settings.consent,
+        repoExcluded: false,
+      };
+    },
+    async submitControl(request) { submissions.push(request); },
+    async reconcilePending(entries) { return { pending: entries, responses: [] }; },
+  }), { now: () => 1_100 }));
+  await store.refresh();
+  const results = await Promise.allSettled([
+    store.submitControl("set-mode", { mode: "manual" }),
+    store.submitControl("set-mode", { mode: "manual" }),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected"
+    && /matching-request-already-pending/u.test(result.reason?.message)).length, 1);
+  assert.equal(submissions.length, 1);
+  assert.equal(store.getSnapshot().pending.length, 1);
+  store.dispose();
+});
+
+test("recommendation pending state disables only the exact proposal action", () => {
+  const reviews = [
+    { proposalId: "proposal-a", state: "pending", target: "a/SKILL.md", attention: "normal", updatedAt: 1_000 },
+    { proposalId: "proposal-b", state: "pending", target: "b/SKILL.md", attention: "normal", updatedAt: 1_000 },
+  ];
+  const value = modelSnapshot({ reviews });
+  value.pending = [{
+    requestId: "pending-a-apply",
+    kind: "decision",
+    action: "apply-proposal",
+    subject: "proposal-a",
+    submittedAt: 1_000,
+    expiresAt: 2_000,
+  }];
+  value.projection.effectiveDetailActions = {
+    "proposal-a": [{ action: "apply-proposal" }, { action: "reject-proposal" }],
+    "proposal-b": [{ action: "apply-proposal" }],
+  };
+
+  const first = buildRecommendationsModel(value, { selectedIndex: 0 });
+  assert.deepEqual(first.selected.actions.map((entry) => [entry.action, entry.pending]), [
+    ["apply-proposal", true],
+    ["reject-proposal", false],
+  ]);
+  const second = buildRecommendationsModel(value, { selectedIndex: 1 });
+  assert.deepEqual(second.selected.actions.map((entry) => [entry.action, entry.pending]), [
+    ["apply-proposal", false],
+  ]);
 });
 
 test("abort during initialization cancels the final owner and prevents post-disposal subscriber updates", async (t) => {

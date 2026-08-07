@@ -2,86 +2,341 @@ name: release
 
 # Fully automatic npm releases via npm trusted publishing (OIDC).
 #
-# Trigger: any push to main that touches package.json. The job compares the
-# manifest version against the npm registry; if the version is already
-# published it exits green without side effects, so ordinary pushes are safe.
-# A version bump commit is the release intent: it publishes to npm (with
-# provenance), tags the commit vX.Y.Z, and creates a GitHub Release.
-#
-# Auth: no tokens. npmjs.com is configured to trust this exact workflow file
-# in this repository (package Settings -> Trusted Publisher). Requires the
-# id-token: write permission below and npm >= 11.5.1 on the runner.
+# Trigger: successful completion of the required CI workflow on main. Validation
+# checks out that exact tested commit and creates one commit-bound tarball. The
+# privileged jobs only consume and verify that artifact: publication receives
+# OIDC, while delivery alone receives GitHub contents write access.
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
-    paths: ["package.json"]
-  workflow_dispatch: {}
 
 concurrency:
   group: release
   cancel-in-progress: false
 
-permissions:
-  contents: write # push the release tag + create the GitHub Release
-  id-token: write # OIDC token for npm trusted publishing + provenance
+permissions: {}
 
 jobs:
-  release:
+  validate:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.reconciliation.outputs.publish }}
+      create_tag: ${{ steps.reconciliation.outputs.create_tag }}
+      create_release: ${{ steps.reconciliation.outputs.create_release }}
+      name: ${{ steps.version.outputs.name }}
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.artifact.outputs.commit }}
+      artifact_name: ${{ steps.artifact.outputs.artifact_name }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      tarball_name: ${{ steps.artifact.outputs.tarball_name }}
+      tarball_sha256: ${{ steps.artifact.outputs.sha256 }}
+      provenance_sha256: ${{ steps.artifact.outputs.provenance_sha256 }}
+      inventory_sha256: ${{ steps.artifact.outputs.inventory_sha256 }}
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
+      - name: Check out the required CI commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 22
-          registry-url: "https://registry.npmjs.org"
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind release to the required CI commit
+        env:
+          RELEASE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.11.0"
           package-manager-cache: false
 
-      - name: Ensure npm supports trusted publishing (>= 11.5.1)
-        run: npm install -g npm@latest && npm --version
+      - name: Set up exact npm trusted-publishing client
+        run: |
+          npm install --global npm@11.5.1 --ignore-scripts --no-audit --no-fund
+          test "$(npm --version)" = "11.5.1"
 
-      - name: Detect unpublished version
+      - name: Read release identity
         id: version
         run: |
           NAME=$(node -p "require('./package.json').name")
           VERSION=$(node -p "require('./package.json').version")
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::$NAME@$VERSION is already on the registry - nothing to publish."
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::$NAME@$VERSION is unpublished - releasing."
-          fi
 
-      - uses: oven-sh/setup-bun@v2
-        if: steps.version.outputs.publish == 'true'
+      - name: Set up exact Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.8"
 
-      - name: Install dependencies (repo-canonical package manager)
-        if: steps.version.outputs.publish == 'true'
+      - name: Assert exact release toolchain
         run: |
-          if [ -f bun.lock ]; then
-            bun install --frozen-lockfile
-          else
-            npm ci
-          fi
+          test "$(node --version)" = "v22.11.0"
+          test "$(npm --version)" = "11.5.1"
+          test "$(bun --version)" = "1.3.8"
+
+      - name: Install locked dependency graph
+        run: bun install --frozen-lockfile
 
       - name: Test
-        if: steps.version.outputs.publish == 'true'
-        run: node --test tests/*.test.mjs
+        run: npm test
 
-      - name: Publish to npm (trusted publishing; provenance is automatic)
-        if: steps.version.outputs.publish == 'true'
-        run: npm publish
+      - name: Create and validate the one commit-bound release artifact
+        id: artifact
+        env:
+          RELEASE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          node scripts/release-artifact.mjs \
+            --commit "$RELEASE_COMMIT" \
+            --output "$RUNNER_TEMP/release-artifact"
 
-      - name: Tag and create GitHub Release
-        if: steps.version.outputs.publish == 'true'
+      - name: Classify npm publication state
+        id: registry
+        env:
+          NAME: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ERROR_FILE="$RUNNER_TEMP/npm-view-error"
+          if METADATA=$(npm view "$NAME@$VERSION" dist.integrity --json 2>"$ERROR_FILE"); then
+            INTEGRITY=$(node -e '
+              const value = JSON.parse(process.argv[1]);
+              if (typeof value !== "string" || !value.startsWith("sha512-")) process.exit(1);
+              process.stdout.write(value);
+            ' "$METADATA")
+            echo "integrity=$INTEGRITY" >> "$GITHUB_OUTPUT"
+          elif grep -Eq '^npm (ERR!|error) code E404' "$ERROR_FILE"; then
+            echo "integrity=missing" >> "$GITHUB_OUTPUT"
+          else
+            cat "$ERROR_FILE" >&2
+            echo "::error::Unable to classify npm publication state."
+            exit 1
+          fi
+
+      - name: Inspect tag and GitHub Release state
+        id: github_state
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.artifact.outputs.commit }}
+          TAG: v${{ steps.version.outputs.version }}
+          TARBALL_NAME: ${{ steps.artifact.outputs.tarball_name }}
+          EXPECTED_TARBALL_SHA256: ${{ steps.artifact.outputs.sha256 }}
+          EXPECTED_PROVENANCE_SHA256: ${{ steps.artifact.outputs.provenance_sha256 }}
         run: |
-          TAG="v${{ steps.version.outputs.version }}"
-          git tag "$TAG"
-          git push origin "$TAG"
-          gh release create "$TAG" --title "$TAG" --generate-notes
+          TAG_ERROR="$RUNNER_TEMP/tag-error"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >"$RUNNER_TEMP/tag.json" 2>"$TAG_ERROR"; then
+            TAG_COMMIT=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
+            echo "tag_commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+          elif grep -Fq "HTTP 404" "$TAG_ERROR"; then
+            echo "tag_commit=missing" >> "$GITHUB_OUTPUT"
+          else
+            cat "$TAG_ERROR" >&2
+            echo "::error::Unable to classify tag $TAG."
+            exit 1
+          fi
+
+          RELEASE_ERROR="$RUNNER_TEMP/release-error"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >"$RUNNER_TEMP/release.json" 2>"$RELEASE_ERROR"; then
+            RELEASE_DIR="$RUNNER_TEMP/existing-release"
+            mkdir "$RELEASE_DIR"
+            for ASSET in "$TARBALL_NAME" provenance.json; do
+              if [ "$ASSET" = provenance.json ]; then
+                EXPECTED_SHA256="$EXPECTED_PROVENANCE_SHA256"
+              else
+                EXPECTED_SHA256="$EXPECTED_TARBALL_SHA256"
+              fi
+              if ! node -e '
+                const release = require(process.argv[1]);
+                if (release.assets.filter((asset) => asset.name === process.argv[2]).length !== 1) process.exit(1);
+              ' "$RUNNER_TEMP/release.json" "$ASSET"; then
+                echo "::error::GitHub Release $TAG is missing $ASSET, expected SHA-256 $EXPECTED_SHA256."
+                exit 1
+              fi
+              if ! gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir "$RELEASE_DIR"; then
+                echo "::error::Unable to download $ASSET from GitHub Release $TAG for SHA-256 verification."
+                exit 1
+              fi
+            done
+            echo "tarball_sha256=$(sha256sum "$RELEASE_DIR/$TARBALL_NAME" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+            echo "provenance_sha256=$(sha256sum "$RELEASE_DIR/provenance.json" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+            echo "release=present" >> "$GITHUB_OUTPUT"
+          elif grep -Fq "HTTP 404" "$RELEASE_ERROR"; then
+            echo "release=missing" >> "$GITHUB_OUTPUT"
+          else
+            cat "$RELEASE_ERROR" >&2
+            echo "::error::Unable to classify GitHub Release $TAG."
+            exit 1
+          fi
+
+      - name: Plan release reconciliation
+        id: reconciliation
+        env:
+          NAME: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PUBLISHED_INTEGRITY: ${{ steps.registry.outputs.integrity }}
+          EXPECTED_INTEGRITY: ${{ steps.artifact.outputs.integrity }}
+          TAG_COMMIT: ${{ steps.github_state.outputs.tag_commit }}
+          EXPECTED_COMMIT: ${{ steps.artifact.outputs.commit }}
+          RELEASE_STATE: ${{ steps.github_state.outputs.release }}
+          RELEASE_TARBALL_SHA256: ${{ steps.github_state.outputs.tarball_sha256 }}
+          RELEASE_PROVENANCE_SHA256: ${{ steps.github_state.outputs.provenance_sha256 }}
+          TARBALL_NAME: ${{ steps.artifact.outputs.tarball_name }}
+          EXPECTED_TARBALL_SHA256: ${{ steps.artifact.outputs.sha256 }}
+          EXPECTED_PROVENANCE_SHA256: ${{ steps.artifact.outputs.provenance_sha256 }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from "node:fs";
+          const missing = (value) => value === "missing" ? null : value;
+          const releaseAssets = process.env.RELEASE_STATE === "missing" ? null : {
+            [process.env.TARBALL_NAME]: process.env.RELEASE_TARBALL_SHA256,
+            "provenance.json": process.env.RELEASE_PROVENANCE_SHA256,
+          };
+          writeFileSync(process.env.RUNNER_TEMP + "/reconciliation.json", JSON.stringify({
+            packageName: process.env.NAME,
+            version: process.env.VERSION,
+            publishedIntegrity: missing(process.env.PUBLISHED_INTEGRITY),
+            expectedIntegrity: process.env.EXPECTED_INTEGRITY,
+            tagCommit: missing(process.env.TAG_COMMIT),
+            expectedCommit: process.env.EXPECTED_COMMIT,
+            releaseAssets,
+            expectedAssets: {
+              [process.env.TARBALL_NAME]: process.env.EXPECTED_TARBALL_SHA256,
+              "provenance.json": process.env.EXPECTED_PROVENANCE_SHA256,
+            },
+          }));
+          NODE
+          node scripts/release-artifact.mjs --reconcile "$RUNNER_TEMP/reconciliation.json"
+
+      - name: Record release artifact provenance
+        run: cat "${{ steps.artifact.outputs.provenance }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the exact validated artifact
+        if: steps.reconciliation.outputs.publish == 'true' || steps.reconciliation.outputs.create_release == 'true'
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact.outputs.artifact_name }}
+          path: |
+            ${{ steps.artifact.outputs.tarball }}
+            ${{ steps.artifact.outputs.provenance }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: validate
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Set up exact Node.js and npm registry
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.11.0"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Set up exact npm trusted-publishing client
+        run: |
+          npm install --global npm@11.5.1 --ignore-scripts --no-audit --no-fund
+          test "$(node --version)" = "v22.11.0"
+          test "$(npm --version)" = "11.5.1"
+
+      - name: Download the validated artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.validate.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-artifact
+
+      - name: Verify publication artifact identity
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/release-artifact
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          TARBALL_NAME: ${{ needs.validate.outputs.tarball_name }}
+          TARBALL_SHA256: ${{ needs.validate.outputs.tarball_sha256 }}
+          PROVENANCE_SHA256: ${{ needs.validate.outputs.provenance_sha256 }}
+          INVENTORY_SHA256: ${{ needs.validate.outputs.inventory_sha256 }}
+        run: |
+          TARBALL="$ARTIFACT_DIR/$TARBALL_NAME"
+          PROVENANCE="$ARTIFACT_DIR/provenance.json"
+          test "$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.tgz' | wc -l)" = "1"
+          printf '%s  %s\n' "$TARBALL_SHA256" "$TARBALL" | sha256sum --check --status
+          printf '%s  %s\n' "$PROVENANCE_SHA256" "$PROVENANCE" | sha256sum --check --status
+          test "$(node -p "require(process.argv[1]).commit" "$PROVENANCE")" = "$RELEASE_COMMIT"
+          test "$(node -p "require(process.argv[1]).filename" "$PROVENANCE")" = "$TARBALL_NAME"
+          test "$(node -p "require(process.argv[1]).inventorySha256" "$PROVENANCE")" = "$INVENTORY_SHA256"
+
+      - name: Publish exact validated tarball to npm
+        env:
+          TARBALL: ${{ runner.temp }}/release-artifact/${{ needs.validate.outputs.tarball_name }}
+        run: npm publish "$TARBALL"
+
+  deliver:
+    needs: [validate, publish]
+    if: >-
+      always() &&
+      needs.validate.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
+      (needs.validate.outputs.create_tag == 'true' || needs.validate.outputs.create_release == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the published artifact
+        if: needs.validate.outputs.create_release == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.validate.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-artifact
+
+      - name: Verify delivery artifact identity
+        if: needs.validate.outputs.create_release == 'true'
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/release-artifact
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          TARBALL_NAME: ${{ needs.validate.outputs.tarball_name }}
+          TARBALL_SHA256: ${{ needs.validate.outputs.tarball_sha256 }}
+          PROVENANCE_SHA256: ${{ needs.validate.outputs.provenance_sha256 }}
+          INVENTORY_SHA256: ${{ needs.validate.outputs.inventory_sha256 }}
+        run: |
+          TARBALL="$ARTIFACT_DIR/$TARBALL_NAME"
+          PROVENANCE="$ARTIFACT_DIR/provenance.json"
+          test "$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.tgz' | wc -l)" = "1"
+          printf '%s  %s\n' "$TARBALL_SHA256" "$TARBALL" | sha256sum --check --status
+          printf '%s  %s\n' "$PROVENANCE_SHA256" "$PROVENANCE" | sha256sum --check --status
+          test "$(node -p "require(process.argv[1]).commit" "$PROVENANCE")" = "$RELEASE_COMMIT"
+          test "$(node -p "require(process.argv[1]).filename" "$PROVENANCE")" = "$TARBALL_NAME"
+          test "$(node -p "require(process.argv[1]).inventorySha256" "$PROVENANCE")" = "$INVENTORY_SHA256"
+
+      - name: Tag the exact commit
+        if: needs.validate.outputs.create_tag == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          TAG="v$VERSION"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$TAG" \
+            -f sha="$RELEASE_COMMIT"
+
+      - name: Create GitHub Release from the exact artifact
+        if: needs.validate.outputs.create_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARBALL: ${{ runner.temp }}/release-artifact/${{ needs.validate.outputs.tarball_name }}
+          PROVENANCE: ${{ runner.temp }}/release-artifact/provenance.json
+        run: |
+          TAG="v$VERSION"
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes \
+            "$TARBALL" \
+            "$PROVENANCE#release provenance"

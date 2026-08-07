@@ -394,6 +394,8 @@ test("statusText includes cooldown and pending proposal details", () => {
   const cooldownText = statusText(state, 1_000);
   assert.match(cooldownText, /Self-evolve status: cooldown/);
   assert.match(cooldownText, /Cooldown until: 1970-01-01T00:01:00\.000Z/);
+  assert.equal(state.updatedAt, 0, "a status read does not refresh LRU activity");
+  assert.equal(state.status, STATUSES.ACTIVE, "a status read does not mutate cached transition state");
 
   state.pendingProposal = { id: "se-3", title: "Pending docs proposal" };
   const pendingText = statusText(state, 1_000);

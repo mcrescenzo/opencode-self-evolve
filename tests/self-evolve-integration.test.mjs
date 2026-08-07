@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
-import { createIntegration, ROLLOUT_GATES } from "../self-evolve-integration.js";
+import { createIntegration, recoverOrphanedAnalyzerSessions, ROLLOUT_GATES } from "../self-evolve-integration.js";
 import {
   createControlRequest,
   createDecisionRequest,
@@ -23,6 +23,8 @@ import {
   submitUiOperationRequest,
 } from "../self-evolve-bridge.js";
 import * as inventoryModule from "../self-evolve-inventory.js";
+import * as observationModule from "../self-evolve-observation.js";
+import { createSensitiveExportManager } from "../self-evolve-export.js";
 import { openStore } from "../self-evolve-store.js";
 import { spawnSync } from "node:child_process";
 
@@ -34,6 +36,7 @@ function deadOwnerPid() {
 function seedDeadHostOwner(root, sessionId, agent) {
   const store = openStore(root, { projectName: "fixture", projectFingerprint: FINGERPRINT, now: () => 100 });
   const seeded = store.acquireHostOwner(sessionId, { agent, projectFingerprint: FINGERPRINT, rootIdentity: store.rootIdentity, generation: 0, pid: deadOwnerPid() });
+  if (seeded.ok) assert.equal(store.retainHostOwner(sessionId, seeded.nonce).ok, true);
   store.close();
   return seeded;
 }
@@ -41,6 +44,7 @@ import * as schemas from "../self-evolve-schemas.js";
 import * as commandModule from "../self-evolve-commands.js";
 import {
   UI_CAPABILITIES,
+  UI_DASHBOARD_VERSION,
   UI_OPERATION_PROTOCOL_VERSION,
   UI_PROJECTION_VERSION,
 } from "../self-evolve-ui-protocol.js";
@@ -48,6 +52,31 @@ import {
 const FINGERPRINT = "a".repeat(64);
 const CURRENT_HASH = "b".repeat(64);
 const PROPOSED_HASH = "c".repeat(64);
+const OPERATION_EFFECT_CRASH = path.join(import.meta.dirname, "fixtures", "operation-effect-crash.mjs");
+
+function exactTree(directory, root = directory) {
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .flatMap((entry) => {
+      const filePath = path.join(directory, entry.name);
+      const relative = path.relative(root, filePath);
+      if (entry.isDirectory()) return [{ path: relative, type: "directory" }, ...exactTree(filePath, root)];
+      return [{ path: relative, type: "file", bytes: readFileSync(filePath).toString("base64") }];
+    });
+}
+
+function supportedHostSession(id, { parentID, version = "1.18.4" } = {}) {
+  return {
+    id,
+    projectID: "project-fixture",
+    directory: "/workspace/project",
+    ...(parentID === undefined ? {} : { parentID }),
+    title: `Session ${id}`,
+    version,
+    time: { created: 1, updated: 2 },
+  };
+}
 
 function proposal(root, overrides = {}) {
   return schemas.makeProposal({
@@ -127,7 +156,7 @@ function harness(t, config = {}) {
     recordWrites: 0,
     applierCloses: 0,
   };
-  const integrationStore = config.instrumentStore
+  let integrationStore = config.instrumentStore
     ? {
         ...store,
         getSettings(...args) {
@@ -144,6 +173,12 @@ function harness(t, config = {}) {
         },
       }
     : store;
+  if (config.releaseOwnedHostOwners) {
+    integrationStore = {
+      ...integrationStore,
+      releaseOwnedHostOwners: (...args) => config.releaseOwnedHostOwners(store, ...args),
+    };
+  }
   const privacy = config.privacy?.(store, root) ?? {
     exportScope: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
     purgeScope: () => ({ ok: true, counts: {} }),
@@ -179,7 +214,10 @@ function harness(t, config = {}) {
       return {
         async runEvolutionCycle(args) {
           calls.cycles.push(args);
-          if (config.deferredCycle) return config.deferredCycle.promise;
+          if (config.deferredCycle) {
+            config.deferredCycle.signal = args.options?.signal;
+            return config.deferredCycle.promise;
+          }
           if (config.cycleError) throw new Error(config.cycleError);
           const item = config.cycleProposal ?? proposal(root);
           const fixture = {
@@ -237,18 +275,33 @@ function harness(t, config = {}) {
           return { ok: true, value: await operation() };
         },
         recordWorkResult(item, result) { calls.workResults.push({ item, result }); return { accepted: true }; },
-        dispose() {},
+        stopAdmission() { calls.schedulerStopped = (calls.schedulerStopped ?? 0) + 1; },
+        async drain() { calls.schedulerDrains = (calls.schedulerDrains ?? 0) + 1; },
+        dispose() { calls.schedulerDisposals = (calls.schedulerDisposals ?? 0) + 1; },
       };
     },
   };
 
-  const ctx = { client: { tui: { publish(value) { calls.published.push(value); } } } };
+  const ctx = {
+    directory: "/workspace/project",
+    client: {
+      tui: { publish(value) { calls.published.push(value); } },
+      session: {
+        async get(args) {
+          calls.sessionGets ??= [];
+          calls.sessionGets.push(args);
+          if (config.sessionGet) return config.sessionGet(args);
+          return { data: supportedHostSession(args.path.id, { version: config.integrationOptions?.hostVersion }) };
+        },
+      },
+    },
+  };
   const integration = createIntegration({
     store: integrationStore,
     inventory: config.inventory ?? {},
     privacy,
     schemas,
-    observation: {},
+    observation: observationModule,
     synthesisModule: {},
     applier: rawApplier,
     commands: commandModule,
@@ -266,7 +319,10 @@ function harness(t, config = {}) {
     },
     now,
   });
-  t.after(() => { try { store.close(); } catch {} });
+  t.after(() => {
+    try { store.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  });
   return { root, store, integration, calls, now, ctx };
 }
 
@@ -292,6 +348,78 @@ function exactDecision(item, newState, at = 20, actor = "self-evolve-tui") {
     newState,
   });
 }
+
+test("server integration boot rejects a replaced store root before mailbox authority starts", (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-integration-root-race-"));
+  const held = `${root}.held`;
+  const outside = mkdtempSync(path.join(tmpdir(), "self-evolve-integration-root-outside-"));
+  const store = openStore(root, { projectFingerprint: FINGERPRINT });
+  const dependencies = {
+    store,
+    schemas,
+    pipeline: {},
+    scheduler: {},
+    applier: {},
+  };
+  assert.throws(() => createIntegration({
+    ...dependencies,
+    options: { stateRoot: outside },
+  }), /state-root-store-mismatch/u);
+  assert.deepEqual(readdirSync(outside), []);
+
+  renameSync(root, held);
+  symlinkSync(outside, root, "dir");
+  t.after(() => {
+    try { store.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
+    rmSync(held, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  assert.throws(() => createIntegration({
+    ...dependencies,
+    options: { stateRoot: root },
+  }), /state-root-boundary-rejected/u);
+  assert.deepEqual(readdirSync(outside), []);
+});
+
+test("server integration boot exposes incompatible state health without mutating the partition", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-integration-version-reject-"));
+  const base = path.join(root, "self-evolve");
+  mkdirSync(path.join(base, FINGERPRINT), { recursive: true });
+  writeFileSync(path.join(base, "version.json"), '{"schemaVersion":"9.9.9"}\n');
+  writeFileSync(path.join(base, FINGERPRINT, "sentinel.bin"), Buffer.from([0, 1, 2, 255]));
+  const before = exactTree(root);
+  const store = openStore(root, { projectFingerprint: FINGERPRINT });
+  const schedulerModes = [];
+  const integration = createIntegration({
+    store,
+    schemas,
+    privacy: {},
+    synthesisModule: {},
+    applier: { circuitBreakerOpen: () => false },
+    commands: {},
+    pipeline: { createPipeline: () => ({}) },
+    scheduler: {
+      createScheduler: () => ({
+        setMode(mode) { schedulerModes.push(mode); },
+        getCircuitBreaker: () => ({ open: false }),
+      }),
+    },
+    options: { stateRoot: root },
+  });
+  t.after(() => {
+    try { store.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const boot = await integration.boot({ recoverHostSessions: false });
+  assert.equal(boot.ok, false);
+  assert.equal(boot.mode, "manual");
+  assert.equal(boot.health.lastError, "unsupported-state-version");
+  assert.deepEqual(schedulerModes, ["manual"]);
+  assert.deepEqual(exactTree(root), before);
+});
 
 function headlessCommand(store, item, overrides = {}) {
   const grant = store.readRecords("audit-event").map((record) => record.payload).findLast((event) =>
@@ -366,6 +494,78 @@ test("manual mode has no passive scheduler activity or writes", async (t) => {
   assert.deepEqual(result, { scheduled: false, reason: "manual-mode" });
   assert.equal(h.calls.events.length, 0);
   assert.equal(h.store.exportAll().records.length, before);
+});
+
+test("passive scheduling hydrates only trustworthy direct roots through supported 1.18.x session reads", async (t) => {
+  for (const hostVersion of ["1.18.3", "1.18.4", "1.18.14"]) {
+    await t.test(hostVersion, async (t) => {
+      const h = harness(t, { integrationOptions: { hostVersion } });
+      assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+      const result = await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: `direct-${hostVersion}` } });
+      assert.equal(result.scheduled, true);
+      assert.deepEqual(h.calls.sessionGets, [{ path: { id: `direct-${hostVersion}` }, query: { directory: "/workspace/project" } }]);
+      assert.equal(h.calls.events.length, 1);
+      assert.deepEqual(Object.keys(supportedHostSession("shape", { version: hostVersion })).sort(), ["directory", "id", "projectID", "time", "title", "version"]);
+    });
+  }
+});
+
+test("delegated and package-owned canonical, legacy, and anonymous sessions never reach passive scheduling", async (t) => {
+  await t.test("delegated", async (t) => {
+    const sessions = {
+      child: supportedHostSession("child", { parentID: "root" }),
+      root: supportedHostSession("root"),
+    };
+    const h = harness(t, { sessionGet: ({ path }) => ({ data: sessions[path.id] }) });
+    assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+    assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "child" } }), {
+      scheduled: false,
+      reason: "delegated-root",
+    });
+    assert.equal(h.calls.events.length, 0);
+    assert.equal(h.calls.cycles.length, 0);
+  });
+
+  for (const [name, sessionID, agent] of [
+    ["canonical", "canonical-private-session", "mcrescenzo.self-evolve.synthesizer"],
+    ["legacy", "legacy-private-session", "self-evolve-critic"],
+    ["anonymous", "anonymous-private-session", "mcrescenzo.self-evolve.analyzer"],
+  ]) {
+    await t.test(name, async (t) => {
+      const h = harness(t, { sessionGet: ({ path }) => ({ data: supportedHostSession(path.id) }) });
+      assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+      const owned = h.store.acquireHostOwner(sessionID, {
+        agent,
+        projectFingerprint: FINGERPRINT,
+        rootIdentity: h.store.rootIdentity,
+        generation: 0,
+      });
+      assert.equal(owned.ok, true);
+      assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: { sessionID } }), {
+        scheduled: false,
+        reason: "non-user-root",
+      });
+      assert.equal(h.calls.events.length, 0);
+      assert.equal(h.calls.cycles.length, 0);
+      assert.doesNotMatch(JSON.stringify(h.store.exportAll()), new RegExp(sessionID, "u"));
+      assert.equal(h.store.releaseHostOwner(sessionID, owned.nonce).ok, true);
+    });
+  }
+});
+
+test("ancestry metadata failures fail closed without persisting raw session ids", async (t) => {
+  const rawSessionID = "private-session-canary";
+  const h = harness(t, { sessionGet: async () => { throw new Error(`host failed for ${rawSessionID}`); } });
+  assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+  const before = JSON.stringify(h.store.exportAll());
+  assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: rawSessionID } }), {
+    scheduled: false,
+    reason: "session-ancestry-unavailable",
+  });
+  assert.equal(h.calls.events.length, 0);
+  const after = JSON.stringify(h.store.exportAll());
+  assert.equal(after, before);
+  assert.doesNotMatch(after, new RegExp(rawSessionID, "u"));
 });
 
 test("manual scan commands hold the scheduler episode lease", async (t) => {
@@ -563,9 +763,21 @@ test("the production integration publishes a negotiated server-authored UI proje
   assert.equal(projected.index.status.effectiveMode, "manual");
   assert.deepEqual(projected.index.reviews, []);
   assert.equal(projected.dashboard.indexHash, projected.index.projectionHash);
+  assert.equal(projected.dashboard.dashboardVersion, UI_DASHBOARD_VERSION);
   assert.equal(projected.dashboard.automation.state, "on-demand");
   assert.equal(projected.dashboard.usage.storage.usedBytes > 0, true);
   assert.equal(projected.dashboardError, null);
+  const generationFiles = readdirSync(path.join(
+    h.root,
+    "self-evolve",
+    "bridge",
+    FINGERPRINT,
+    "ui-projections",
+    "generations",
+    projected.index.generation,
+  ));
+  assert.equal(generationFiles.includes("dashboard-v1.json"), true);
+  assert.equal(generationFiles.includes(`dashboard-v${UI_DASHBOARD_VERSION}.json`), true);
 });
 
 test("repository mode control is capability-advertised, exact, version-bound, replay-safe, and yolo-gated", async (t) => {
@@ -722,6 +934,115 @@ test("repository mode control is capability-advertised, exact, version-bound, re
   }
 });
 
+test("global yolo control enforces consent, rollout, and breaker admission", async (t) => {
+  const blockedCases = [
+    {
+      name: "passive-consent",
+      mutate(blocked) {
+        blocked.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+          ...global,
+          consent: { ...global.consent, passiveCalls: false },
+          updatedAt: blocked.now(),
+        }));
+      },
+      reason: "passive-consent-required",
+    },
+    {
+      name: "observation-consent",
+      mutate(blocked) {
+        blocked.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+          ...global,
+          consent: { ...global.consent, durableObservations: false },
+          updatedAt: blocked.now(),
+        }));
+      },
+      reason: "observation-consent-required",
+    },
+    {
+      name: "rollout",
+      config: { rolloutOutcomes: 0 },
+      reason: "yolo-rollout-not-ready",
+    },
+    {
+      name: "breaker",
+      config: { breakerOpen: true },
+      reason: "circuit-breaker-open",
+    },
+  ];
+  for (const blockedCase of blockedCases) {
+    const blocked = harness(t, {
+      initialClock: Date.now(),
+      inventory: inventoryModule,
+      integrationOptions: { stateRoot: true },
+      ...blockedCase.config,
+    });
+    blockedCase.mutate?.(blocked);
+    await blocked.integration.processMailbox();
+    const controlState = readControlState(blocked.root, FINGERPRINT, { now: blocked.now() });
+    const request = createControlRequest({
+      controlState,
+      action: "set-mode",
+      payload: blockedCase.payload ?? {
+        mode: "yolo",
+        confirmation: "ENABLE YOLO",
+        allowlist: [blocked.root],
+      },
+      timestamp: blocked.now(),
+      requestId: `global-yolo-blocked-${blockedCase.name}`,
+    });
+    submitControlRequest(blocked.root, request);
+    await blocked.integration.processMailbox();
+    const response = pollControlResponse(blocked.root, FINGERPRINT, request.requestId);
+    assert.equal(response.ok, false);
+    assert.equal(response.reason, blockedCase.reason);
+    assert.equal(blocked.store.getSettings().global.mode, "manual");
+  }
+});
+
+for (const controlCase of [
+  { action: "set-mode", payload: { mode: "auto" } },
+  { action: "set-repo-mode", payload: { mode: "auto" } },
+  { action: "set-consent", payload: { key: "sanitizedExcerpts", enabled: true } },
+  { action: "set-repo-excluded", payload: { excluded: true } },
+  { action: "update-allowlist", payload: (root) => ({ allowlist: [root], confirmation: "UPDATE ALLOWLIST" }) },
+]) {
+  test(`${controlCase.action} recovers its exact committed result after response-publication crash`, async (t) => {
+    let interrupt = true;
+    const h = harness(t, {
+      initialClock: Date.now(),
+      inventory: inventoryModule,
+      integrationOptions: {
+        stateRoot: true,
+        __testAfterRequestHandled({ type, request }) {
+          if (!interrupt || type !== "control" || request?.action !== controlCase.action) return;
+          interrupt = false;
+          throw new Error("simulated-control-response-crash");
+        },
+      },
+    });
+    await h.integration.processMailbox();
+    const controlState = readControlState(h.root, FINGERPRINT, { now: h.now() });
+    const request = createControlRequest({
+      controlState,
+      action: controlCase.action,
+      payload: typeof controlCase.payload === "function" ? controlCase.payload(h.root) : controlCase.payload,
+      timestamp: h.now(),
+      requestId: `control-crash-${controlCase.action}`,
+    });
+    submitControlRequest(h.root, request);
+
+    const interrupted = await h.integration.processMailbox();
+    assert.equal(interrupted.ok, false);
+    assert.equal(pollControlResponse(h.root, FINGERPRINT, request.requestId), null);
+    const committed = JSON.stringify(h.store.getSettings());
+
+    await h.integration.processMailbox();
+    assert.equal(pollControlResponse(h.root, FINGERPRINT, request.requestId).ok, true);
+    assert.equal(JSON.stringify(h.store.getSettings()), committed);
+    assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.details?.action === "control-request-complete" && record.payload.details.requestId === request.requestId).length, 1);
+  });
+}
+
 test("native operation mailbox version-binds pause and recovers one exact response", async (t) => {
   const h = harness(t, {
     inventory: inventoryModule,
@@ -766,6 +1087,330 @@ test("native operation mailbox version-binds pause and recovers one exact respon
   assert.throws(() => submitUiOperationRequest(h.root, request), /operation-response-already-exists/u);
 });
 
+test("a settings operation killed after its effect replays its transactional completion without mutation", async (t) => {
+  let interrupt = true;
+  const h = harness(t, {
+    inventory: inventoryModule,
+    integrationOptions: {
+      stateRoot: true,
+      __testAfterOperationEffect() {
+        if (!interrupt) return;
+        interrupt = false;
+        throw new Error("simulated-process-death-after-effect");
+      },
+    },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+  });
+  const control = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.index.allowedActions.find((action) => action.action === "set-paused"),
+    payload: { paused: true, settingsVersion: control.settingsVersion },
+    timestamp: h.now(),
+    requestId: "pause-effect-crash",
+  });
+  submitUiOperationRequest(h.root, request);
+  await h.integration.processMailbox();
+  const committedUpdatedAt = h.store.getSettings().global.updatedAt;
+  const responsePath = path.join(h.root, "self-evolve", "bridge", FINGERPRINT, "operation-responses", `${request.requestId}.json`);
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).ok, false);
+  unlinkSync(responsePath);
+  submitUiOperationRequest(h.root, request);
+
+  await h.integration.processMailbox();
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).ok, true);
+  assert.equal(h.store.getSettings().global.updatedAt, committedUpdatedAt);
+  assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.details?.action === "ui-operation-complete" && record.payload.details.requestId === request.requestId).length, 1);
+});
+
+test("an export killed after publication recovers exact metadata without creating a second artifact", async (t) => {
+  let interrupt = true;
+  const h = harness(t, {
+    inventory: inventoryModule,
+    privacy: (store) => ({
+      exportScope: () => store.exportProject(),
+      exportAll: () => store.exportAll(),
+      purgeScope: ({ scope }) => store.purge({ scope }),
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: {
+      stateRoot: true,
+      __testAfterOperationEffect({ request }) {
+        if (!interrupt || request.action !== "export-data") return;
+        interrupt = false;
+        throw new Error("simulated-process-death-after-export");
+      },
+    },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+  });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.index.allowedActions.find((action) => action.action === "export-data"),
+    payload: { scope: "project", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" },
+    timestamp: h.now(),
+    requestId: "export-effect-crash",
+  });
+  submitUiOperationRequest(h.root, request);
+  await h.integration.processMailbox();
+  const responsePath = path.join(h.root, "self-evolve", "bridge", FINGERPRINT, "operation-responses", `${request.requestId}.json`);
+  unlinkSync(responsePath);
+  const exportDir = path.join(h.root, "self-evolve", "exports", FINGERPRINT);
+  const before = readdirSync(exportDir).filter((name) => !name.endsWith(".lock")).sort();
+  assert.equal(before.filter((name) => /^\d+-.+\.json$/u.test(name) && !name.endsWith(".meta.json")).length, 1);
+  submitUiOperationRequest(h.root, request);
+
+  await h.integration.processMailbox();
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).ok, true);
+  assert.deepEqual(readdirSync(exportDir).filter((name) => !name.endsWith(".lock")).sort(), before);
+  const completion = h.store.readRecords("audit-event").map((record) => record.payload).findLast((event) => event.details?.action === "ui-operation-complete" && event.details.requestId === request.requestId);
+  assert.match(completion.details.exportPath, /\.json$/u);
+  assert.match(completion.details.exportSha256, /^[a-f0-9]{64}$/u);
+});
+
+test("a slash-command purge invalidates the cached sensitive export manager", async (t) => {
+  const h = harness(t, {
+    inventory: inventoryModule,
+    privacy: (store) => ({
+      exportScope: () => store.exportProject(),
+      exportAll: () => store.exportAll(),
+      purgeScope: ({ scope }) => store.purge({ scope }),
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: { stateRoot: true },
+  });
+
+  async function exportProject(requestId) {
+    await h.integration.processMailbox();
+    const projected = readUiProjection(h.root, FINGERPRINT, {
+      now: h.now(),
+      clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+    });
+    const request = createUiOperationRequest({
+      projection: projected.index,
+      grant: projected.index.allowedActions.find((action) => action.action === "export-data"),
+      payload: { scope: "project", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" },
+      timestamp: h.now(),
+      requestId,
+    });
+    submitUiOperationRequest(h.root, request);
+    await h.integration.processMailbox();
+    return pollUiOperationResponse(h.root, request, { now: h.now() });
+  }
+
+  assert.equal((await exportProject("export-before-slash-purge")).ok, true);
+  assert.match((await h.integration.handleCommand("purge observations")).responseText, /Purge observations completed/u);
+  const after = await exportProject("export-after-slash-purge");
+  assert.equal(after.ok, true);
+  assert.notEqual(after.reason, "unknown-error");
+});
+
+test("a failed native purge clears the export manager cache in finally", async (t) => {
+  let managersCreated = 0;
+  const h = harness(t, {
+    inventory: inventoryModule,
+    privacy: (store) => ({
+      exportScope: () => store.exportProject(),
+      exportAll: () => store.exportAll(),
+      purgeScope: ({ scope }) => store.purge({ scope }),
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: {
+      stateRoot: true,
+      __testCreateSensitiveExportManager(args) {
+        managersCreated += 1;
+        const manager = createSensitiveExportManager(args);
+        if (managersCreated !== 1) return manager;
+        return Object.freeze({
+          ...manager,
+          purge() { throw new Error("injected-export-purge-failure"); },
+        });
+      },
+    },
+  });
+
+  async function operation(action, payload, requestId) {
+    await h.integration.processMailbox();
+    const projected = readUiProjection(h.root, FINGERPRINT, {
+      now: h.now(),
+      clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+    });
+    const request = createUiOperationRequest({
+      projection: projected.index,
+      grant: projected.index.allowedActions.find((item) => item.action === action),
+      payload,
+      timestamp: h.now(),
+      requestId,
+    });
+    submitUiOperationRequest(h.root, request);
+    await h.integration.processMailbox();
+    return pollUiOperationResponse(h.root, request, { now: h.now() });
+  }
+
+  const failed = await operation(
+    "purge-scope",
+    { scope: "observations", confirmation: "PURGE OBSERVATIONS" },
+    "failed-export-manager-purge",
+  );
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, "injected-export-purge-failure");
+
+  const exported = await operation(
+    "export-data",
+    { scope: "project", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" },
+    "export-after-failed-manager-purge",
+  );
+  assert.equal(exported.ok, true);
+  assert.equal(managersCreated, 2);
+});
+
+test("a real process kill after export publication replays completion without a second artifact", async (t) => {
+  const h = harness(t, {
+    initialClock: Date.now(),
+    inventory: inventoryModule,
+    privacy: (store) => ({
+      exportScope: () => store.exportProject(),
+      exportAll: () => store.exportAll(),
+      purgeScope: ({ scope }) => store.purge({ scope }),
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: { stateRoot: true },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+  });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.index.allowedActions.find((action) => action.action === "export-data"),
+    payload: { scope: "project", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" },
+    timestamp: h.now(),
+    requestId: "export-process-kill",
+  });
+  submitUiOperationRequest(h.root, request);
+  const requestDigest = createHash("sha256").update(`self-evolve-operation-request-completion-v1\n${JSON.stringify(request)}`).digest("hex");
+  assert.equal(h.store.beginRequestTransaction({
+    requestId: request.requestId,
+    projectFingerprint: request.projectFingerprint,
+    requestDigest,
+    nonceHash: createHash("sha256").update(request.nonce).digest("hex"),
+    action: request.action,
+    issuedAt: request.issuedAt,
+    expiresAt: request.expiresAt,
+  }).ok, true);
+  const killed = spawnSync(process.execPath, [OPERATION_EFFECT_CRASH, h.root, FINGERPRINT], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(killed.signal, "SIGKILL", JSON.stringify({ status: killed.status, signal: killed.signal, stdout: killed.stdout, stderr: killed.stderr }));
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }), null);
+  const exportDir = path.join(h.root, "self-evolve", "exports", FINGERPRINT);
+  const before = readdirSync(exportDir).filter((name) => !name.endsWith(".lock")).sort();
+  for (let elapsed = 0; elapsed <= 20_000; elapsed += 1) h.now();
+
+  await h.integration.processMailbox();
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).ok, true);
+  assert.deepEqual(readdirSync(exportDir).filter((name) => !name.endsWith(".lock")).sort(), before);
+  assert.equal(existsSync(path.join(h.root, "self-evolve", "request-transaction.json")), false);
+});
+
+test("project purge preserves only its in-flight request and reconstructs completion without repurge", async (t) => {
+  let interrupt = true;
+  const h = harness(t, {
+    inventory: inventoryModule,
+    privacy: (store) => ({
+      exportScope: () => store.exportProject(),
+      exportAll: () => store.exportAll(),
+      purgeScope: ({ scope }) => store.purge({ scope }),
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: {
+      stateRoot: true,
+      __testAfterOperationEffect({ request }) {
+        if (!interrupt || request.action !== "purge-scope") return;
+        interrupt = false;
+        throw new Error("simulated-process-death-after-project-purge");
+      },
+    },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+  });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.index.allowedActions.find((action) => action.action === "purge-scope"),
+    payload: { scope: "project", confirmation: "PURGE PROJECT" },
+    timestamp: h.now(),
+    requestId: "project-purge-effect-crash",
+  });
+  submitUiOperationRequest(h.root, request);
+  await h.integration.processMailbox();
+  const responsePath = path.join(h.root, "self-evolve", "bridge", FINGERPRINT, "operation-responses", `${request.requestId}.json`);
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).ok, false);
+  assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.kind === "purge" && record.payload.details.action === "project").length, 1);
+  unlinkSync(responsePath);
+  submitUiOperationRequest(h.root, request);
+
+  await h.integration.processMailbox();
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).ok, true);
+  assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.kind === "purge" && record.payload.details.action === "project").length, 1);
+  assert.equal(existsSync(path.join(h.root, "self-evolve", "request-transaction.json")), false);
+});
+
+for (const scope of ["observations", "proposals"]) {
+  test(`${scope} purge reconstructs completion after an effect crash without repurge`, async (t) => {
+    let interrupt = true;
+    const h = harness(t, {
+      inventory: inventoryModule,
+      privacy: (store) => ({
+        exportScope: () => store.exportProject(),
+        exportAll: () => store.exportAll(),
+        purgeScope: ({ scope: requestedScope }) => store.purge({ scope: requestedScope }),
+        scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+      }),
+      integrationOptions: {
+        stateRoot: true,
+        __testAfterOperationEffect({ request }) {
+          if (!interrupt || request.action !== "purge-scope") return;
+          interrupt = false;
+          throw new Error(`simulated-process-death-after-${scope}-purge`);
+        },
+      },
+    });
+    await h.integration.processMailbox();
+    const projected = readUiProjection(h.root, FINGERPRINT, {
+      now: h.now(),
+      clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+    });
+    const request = createUiOperationRequest({
+      projection: projected.index,
+      grant: projected.index.allowedActions.find((action) => action.action === "purge-scope"),
+      payload: { scope, confirmation: `PURGE ${scope.toUpperCase()}` },
+      timestamp: h.now(),
+      requestId: `${scope}-purge-effect-crash`,
+    });
+    submitUiOperationRequest(h.root, request);
+    await h.integration.processMailbox();
+    const responsePath = path.join(h.root, "self-evolve", "bridge", FINGERPRINT, "operation-responses", `${request.requestId}.json`);
+    assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).ok, false);
+    assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.kind === "purge" && record.payload.details.action === scope).length, 1);
+    unlinkSync(responsePath);
+    submitUiOperationRequest(h.root, request);
+
+    await h.integration.processMailbox();
+    assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).ok, true);
+    assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.kind === "purge" && record.payload.details.action === scope).length, 1);
+    assert.equal(existsSync(path.join(h.root, "self-evolve", "request-transaction.json")), false);
+  });
+}
+
 test("native operation mailbox rejects a stale projection without settings mutation", async (t) => {
   const h = harness(t, {
     inventory: inventoryModule,
@@ -800,7 +1445,10 @@ test("native operation mailbox rejects a stale projection without settings mutat
 
 test("native purge-all acknowledges accepted-terminal before bounded destructive work", async (t) => {
   let purgeCallback;
+  let resolveCycle;
+  const deferredCycle = { promise: new Promise((resolve) => { resolveCycle = resolve; }) };
   const h = harness(t, {
+    deferredCycle,
     inventory: inventoryModule,
     privacy: (store) => ({
       exportScope: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
@@ -820,6 +1468,10 @@ test("native purge-all acknowledges accepted-terminal before bounded destructive
       },
     },
   });
+  h.integration.__testBridge.setMode("auto");
+  const running = h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "native-purge-drain" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.integration.getInFlightWork().length, 1);
   await h.integration.processMailbox();
   const projected = readUiProjection(h.root, FINGERPRINT, {
     now: h.now(),
@@ -841,8 +1493,17 @@ test("native purge-all acknowledges accepted-terminal before bounded destructive
   assert.equal(consumed.operations[0].status, "accepted-terminal");
   assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).status, "accepted-terminal");
   assert.equal(existsSync(path.join(h.root, "self-evolve")), true);
+  assert.equal(deferredCycle.signal.aborted, true);
+  assert.equal(h.calls.schedulerDisposals ?? 0, 0);
   purgeCallback();
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(existsSync(path.join(h.root, "self-evolve")), true, "purge waits for admitted work to terminalize");
+  resolveCycle({ result: "failed-closed", cycleOutcome: "failed-closed", reason: "autonomous-work-cancelled" });
+  await running;
+  const deadline = Date.now() + 1_000;
+  while (existsSync(path.join(h.root, "self-evolve")) && Date.now() < deadline) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
   assert.equal(existsSync(path.join(h.root, "self-evolve")), false);
   assert.equal(h.integration.__testBridge.getHealth().lastError, "simulated-terminal-purge-failure");
   assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: {} }), {
@@ -851,6 +1512,258 @@ test("native purge-all acknowledges accepted-terminal before bounded destructive
   });
   await h.integration.shutdown();
 });
+
+test("purge-all boot recovery republishes accepted-terminal before destructive mailbox purge", async (t) => {
+  let interrupt = true;
+  let purgeCallback;
+  let purgeCalls = 0;
+  const h = harness(t, {
+    initialClock: Date.now(),
+    inventory: inventoryModule,
+    privacy: (store) => ({
+      exportScope: () => store.exportProject(),
+      exportAll: () => store.exportAll(),
+      purgeScope({ scope }) {
+        if (scope === "all") purgeCalls += 1;
+        return store.purge({ scope });
+      },
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: {
+      stateRoot: true,
+      __testAfterRequestHandled({ type, request }) {
+        if (!interrupt || type !== "operation" || request?.action !== "purge-all") return;
+        interrupt = false;
+        throw new Error("simulated-crash-before-operation-response");
+      },
+      __testSetTerminalPurgeTimeout(callback) {
+        purgeCallback = callback;
+        return { unref() {} };
+      },
+    },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.index.allowedActions.find((action) => action.action === "purge-all"),
+    payload: { confirmation: "PURGE ALL SELF-EVOLVE DATA" },
+    timestamp: h.now(),
+    requestId: "purge-all-response-crash",
+  });
+  submitUiOperationRequest(h.root, request);
+
+  const interrupted = await h.integration.processMailbox();
+  assert.equal(interrupted.ok, false);
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }), null);
+  assert.equal(purgeCalls, 0);
+  assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.details?.action === "ui-operation-complete" && record.payload.details.requestId === request.requestId).length, 1);
+
+  const recovered = await h.integration.boot({ recoverHostSessions: false });
+  assert.equal(recovered.reason, "restart-required-after-purge-all");
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).status, "accepted-terminal");
+  assert.equal(purgeCalls, 0);
+  assert.equal(typeof purgeCallback, "function");
+
+  purgeCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(purgeCalls, 1);
+  assert.equal(existsSync(path.join(h.root, "self-evolve")), false);
+});
+
+test("a real process kill after purge-all completion republishes accepted-terminal before purge", async (t) => {
+  let purgeCallback;
+  let purgeCalls = 0;
+  const h = harness(t, {
+    initialClock: Date.now(),
+    inventory: inventoryModule,
+    privacy: (store) => ({
+      exportScope: () => store.exportProject(),
+      exportAll: () => store.exportAll(),
+      purgeScope({ scope }) {
+        if (scope === "all") purgeCalls += 1;
+        return store.purge({ scope });
+      },
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: {
+      stateRoot: true,
+      __testSetTerminalPurgeTimeout(callback) {
+        purgeCallback = callback;
+        return { unref() {} };
+      },
+    },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.index.allowedActions.find((action) => action.action === "purge-all"),
+    payload: { confirmation: "PURGE ALL SELF-EVOLVE DATA" },
+    timestamp: h.now(),
+    requestId: "purge-all-process-kill",
+  });
+  submitUiOperationRequest(h.root, request);
+  const requestDigest = createHash("sha256").update(`self-evolve-operation-request-completion-v1\n${JSON.stringify(request)}`).digest("hex");
+  assert.equal(h.store.beginRequestTransaction({
+    requestId: request.requestId,
+    projectFingerprint: request.projectFingerprint,
+    requestDigest,
+    nonceHash: createHash("sha256").update(request.nonce).digest("hex"),
+    action: request.action,
+    issuedAt: request.issuedAt,
+    expiresAt: request.expiresAt,
+  }).ok, true);
+
+  const killed = spawnSync(process.execPath, [OPERATION_EFFECT_CRASH, h.root, FINGERPRINT, "before-response"], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(killed.signal, "SIGKILL", JSON.stringify({ status: killed.status, signal: killed.signal, stdout: killed.stdout, stderr: killed.stderr }));
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }), null);
+  assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.details?.action === "ui-operation-complete" && record.payload.details.requestId === request.requestId).length, 1);
+  for (let elapsed = 0; elapsed <= 20_000; elapsed += 1) h.now();
+
+  await h.integration.processMailbox();
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }).status, "accepted-terminal");
+  assert.equal(purgeCalls, 0);
+  purgeCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(purgeCalls, 1);
+  assert.equal(existsSync(path.join(h.root, "self-evolve")), false);
+});
+
+for (const action of [
+  "export-data",
+  "purge-all",
+  "purge-scope",
+  "retry-bootstrap",
+  "rollback-proposal",
+  "set-kill-switch",
+  "set-paused",
+  "snooze-proposal",
+]) {
+  test(`${action} replays one durable result without re-entering operation authority`, async (t) => {
+    let executions = 0;
+    let interrupt = true;
+    let terminalPurgeCallback;
+    const h = harness(t, {
+      initialClock: Date.now(),
+      inventory: inventoryModule,
+      privacy: (store) => ({
+        exportScope: () => store.exportProject(),
+        exportAll: () => store.exportAll(),
+        purgeScope: ({ scope }) => store.purge({ scope }),
+        scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+      }),
+      integrationOptions: {
+        stateRoot: true,
+        ...(action === "retry-bootstrap" ? { passiveEventHookInstalled: false } : {}),
+        __testAfterOperationEffect({ request }) {
+          if (request.action === action) executions += 1;
+        },
+        __testAfterRequestHandled({ type, request }) {
+          if (!interrupt || type !== "operation" || request?.action !== action) return;
+          interrupt = false;
+          throw new Error("simulated-operation-response-crash");
+        },
+        __testSetTerminalPurgeTimeout(callback) {
+          terminalPurgeCallback = callback;
+          return { unref() {} };
+        },
+      },
+    });
+    let subject;
+    if (action === "snooze-proposal" || action === "rollback-proposal") {
+      const currentContent = "---\nname: demo\ndescription: Existing demo skill.\n---\n# Demo\n";
+      const proposedContent = "---\nname: demo\ndescription: Improved demo skill.\n---\n# Demo improved\n";
+      const currentHash = createHash("sha256").update(currentContent).digest("hex");
+      const proposedHash = createHash("sha256").update(proposedContent).digest("hex");
+      mkdirSync(path.join(h.root, "demo"), { recursive: true });
+      writeFileSync(path.join(h.root, "demo", "SKILL.md"), action === "rollback-proposal" ? proposedContent : currentContent);
+      subject = proposal(h.root, {
+        id: action === "rollback-proposal" ? "crash-rollback" : "crash-snooze",
+        skillTarget: { canonicalRoot: h.root, relativePath: "demo/SKILL.md", currentHash },
+        proposedContentHash: proposedHash,
+        ...(action === "rollback-proposal" ? { state: "applied", decisionVersion: 1 } : {}),
+      });
+      seedProposal(h.store, subject);
+      const content = schemas.makeProposalContent({
+        proposalId: subject.id,
+        contentHash: proposedHash,
+        contentEncoding: "base64",
+        chunkIndex: 0,
+        chunkCount: 1,
+        content: Buffer.from(proposedContent).toString("base64"),
+      });
+      h.store.appendRecord(schemas.wrapRecord("proposal-content", content, h.now()));
+      if (action === "rollback-proposal") {
+        const audit = makeAudit("apply", subject.id, { state: "readback-verified", appliedHash: proposedHash, "readback-verified": true }, h.now());
+        h.store.appendRecord(schemas.wrapRecord("audit-event", audit, audit.timestamp));
+      }
+    }
+    if (action === "retry-bootstrap") assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
+    await h.integration.processMailbox();
+    const projected = readUiProjection(h.root, FINGERPRINT, {
+      now: h.now(),
+      clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+      ...(subject ? { detailProposalIds: [subject.id] } : {}),
+    });
+    const grant = subject
+      ? projected.details.find((detail) => detail.proposalId === subject.id).allowedActions.find((item) => item.action === action)
+      : projected.index.allowedActions.find((item) => item.action === action);
+    assert.ok(grant, JSON.stringify({ action, status: projected.index.status, allowed: projected.index.allowedActions, details: projected.details }));
+    const control = readControlState(h.root, FINGERPRINT, { now: h.now() });
+    const payload = action === "export-data" ? { scope: "project", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" }
+      : action === "purge-all" ? { confirmation: "PURGE ALL SELF-EVOLVE DATA" }
+        : action === "purge-scope" ? { scope: "observations", confirmation: "PURGE OBSERVATIONS" }
+          : action === "rollback-proposal" ? { proposalId: subject.id, appliedHash: subject.proposedContentHash, decisionVersion: 2 }
+            : action === "set-kill-switch" ? { enabled: true, settingsVersion: control.settingsVersion }
+              : action === "set-paused" ? { paused: true, settingsVersion: control.settingsVersion }
+                : action === "snooze-proposal" ? {
+                  proposalId: subject.id,
+                  targetHash: subject.skillTarget.currentHash,
+                  proposedContentHash: subject.proposedContentHash,
+                  decisionVersion: 1,
+                  snoozedUntil: h.now() + 60_000,
+                }
+                  : {};
+    const request = createUiOperationRequest({
+      projection: projected.index,
+      grant,
+      payload,
+      timestamp: h.now(),
+      requestId: `operation-response-crash-${action}`,
+    });
+    submitUiOperationRequest(h.root, request);
+
+    const interrupted = await h.integration.processMailbox();
+    assert.equal(interrupted.ok, false);
+    assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }), null);
+    assert.equal(executions, 1);
+
+    await h.integration.processMailbox();
+    const response = pollUiOperationResponse(h.root, request, { now: h.now() });
+    assert.equal(response.ok, true);
+    if (action === "purge-all") {
+      assert.equal(response.status, "accepted-terminal");
+      assert.equal(typeof terminalPurgeCallback, "function");
+    }
+    assert.equal(executions, 1);
+    assert.equal(h.store.readRecords("audit-event").filter((record) => record.payload.details?.action === "ui-operation-complete" && record.payload.details.requestId === request.requestId).length, 1);
+  });
+}
 
 test("only scheduler-originated cycles receive the passive provider reservation API", async (t) => {
   const h = harness(t);
@@ -1046,13 +1959,17 @@ test("only validated, project-bound, deduplicated synthesis outcomes grant yolo 
 test("mode changes converge across integrations on the next event", async (t) => {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-shared-"));
   const store = openStore(root, { projectName: "shared", projectFingerprint: FINGERPRINT });
-  t.after(() => { try { store.close(); } catch {} });
+  t.after(() => {
+    try { store.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  });
   const current = store.getSettings();
   store.setGlobalSettings(schemas.makeGlobalSettings({ ...current.global, consent: { passiveCalls: true, durableObservations: true }, updatedAt: Date.now() }));
   const calls = [];
   const schedulerModule = { createScheduler: ({ enqueueWork }) => ({ handleEvent: async (event) => { calls.push(event); await enqueueWork({ sessionID: event.properties.sessionID, projectFingerprint: FINGERPRINT, leaseNonce: "shared", epoch: 1, scheduledAt: Date.now() }); }, setMode() {}, getCircuitBreaker: () => ({ open: false }), recordWorkResult() {}, dispose() {} }) };
   const pipelineModule = { createPipeline: () => ({ runEvolutionCycle: async () => ({ result: "no-eligible" }), runApprovalFlow: async () => ({}), runRollbackFlow: async () => ({}) }) };
-  const deps = { store, inventory: {}, privacy: { exportScope: () => ({ records: [] }), purgeScope: () => ({ ok: true }), scanForForbiddenContent: () => ({ ok: true }) }, schemas, observation: {}, synthesisModule: {}, applier: { applyProposal: async () => ({ ok: false }), circuitBreakerOpen: () => false, recoverPending: () => [] }, commands: commandModule, pipeline: pipelineModule, scheduler: schedulerModule };
+  const ctx = { directory: "/workspace/project", client: { session: { get: async ({ path }) => ({ data: supportedHostSession(path.id) }) } } };
+  const deps = { store, inventory: {}, privacy: { exportScope: () => ({ records: [] }), purgeScope: () => ({ ok: true }), scanForForbiddenContent: () => ({ ok: true }) }, schemas, observation: observationModule, synthesisModule: {}, applier: { applyProposal: async () => ({ ok: false }), circuitBreakerOpen: () => false, recoverPending: () => [] }, commands: commandModule, pipeline: pipelineModule, scheduler: schedulerModule, options: { ctx } };
   const a = createIntegration(deps);
   const b = createIntegration(deps);
   assert.equal((await b.handleEvent({ type: "session.idle", properties: { sessionID: "before" } })).scheduled, false);
@@ -1082,12 +1999,33 @@ test("pause, exclusion, circuit breaker, and kill switch override stored authori
   await t.test("kill switch", async (t) => {
     const h = harness(t);
     h.integration.__testBridge.setMode("yolo", { confirmed: true, allowlist: [h.root] });
-    h.integration.triggerKillSwitch("test");
+    const stopped = h.integration.triggerKillSwitch("test");
+    assert.equal(stopped.auditEvent.details.reason, "test");
+    const persistedStop = h.store.readRecords("audit-event").map((record) => record.payload).findLast((event) => event.kind === "kill-switch");
+    assert.equal(persistedStop.details.reason, "test");
     assert.equal(h.integration.__testBridge.getMode().storedMode, "yolo");
     assert.equal(h.integration.__testBridge.getMode().effectiveMode, "manual");
     assert.equal((await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "killed" } })).scheduled, false);
     h.integration.clearKillSwitch("test-clear");
     assert.equal(h.integration.__testBridge.getMode().effectiveMode, "yolo");
+  });
+  await t.test("slash command clears an environment-sourced runtime kill switch", async (t) => {
+    const prior = process.env.SELF_EVOLVE_KILL;
+    process.env.SELF_EVOLVE_KILL = "true";
+    t.after(() => {
+      if (prior === undefined) delete process.env.SELF_EVOLVE_KILL;
+      else process.env.SELF_EVOLVE_KILL = prior;
+    });
+    const h = harness(t);
+    h.integration.__testBridge.setMode("yolo", { confirmed: true, allowlist: [h.root] });
+    assert.equal(h.integration.__testBridge.getMode().effectiveMode, "manual");
+
+    const cleared = await h.integration.handleCommand("/self-evolve kill-switch off");
+
+    assert.equal(cleared.ok, true);
+    assert.match(cleared.responseText, /Kill switch disabled/u);
+    assert.equal(h.integration.__testBridge.getMode().effectiveMode, "yolo");
+    assert.equal(h.store.getSettings().global.killSwitchActive, false);
   });
 });
 
@@ -1105,6 +2043,75 @@ test("in-flight downgrade cancels pending continuation and records downgrade", a
   resolve({ result: "proposal-ready" });
   await running;
   assert.equal(h.calls.workResults.filter((entry) => entry.item.sessionID === "in-flight").length, 1);
+});
+
+test("shutdown aborts and drains admitted autonomous work before releasing resources", async (t) => {
+  let resolve;
+  let shutdownSettled = false;
+  const deferredCycle = { promise: new Promise((done) => { resolve = done; }) };
+  const h = harness(t, { deferredCycle });
+  h.integration.__testBridge.setMode("auto");
+  const running = h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "shutdown-drain" } });
+  await new Promise((done) => setImmediate(done));
+  assert.equal(h.integration.getInFlightWork().length, 1);
+
+  const shutdown = h.integration.shutdown().then((result) => { shutdownSettled = true; return result; });
+  await new Promise((done) => setImmediate(done));
+  assert.equal(deferredCycle.signal?.aborted, true);
+  assert.equal(shutdownSettled, false);
+  assert.equal(h.calls.applierCloses, 0);
+  assert.equal(h.calls.schedulerDisposals ?? 0, 0);
+
+  resolve({ result: "failed-closed", cycleOutcome: "failed-closed", reason: "autonomous-work-cancelled" });
+  await running;
+  assert.equal((await shutdown).ok, true);
+  assert.equal(h.calls.schedulerStopped, 1);
+  assert.equal(h.calls.schedulerDisposals, 1);
+  assert.equal(h.calls.applierCloses, 1);
+  assert.equal(h.integration.getInFlightWork().length, 0);
+});
+
+test("shutdown timeout keeps resources fenced until background drain completes", async (t) => {
+  let resolve;
+  const deferredCycle = { promise: new Promise((done) => { resolve = done; }) };
+  const h = harness(t, { deferredCycle, integrationOptions: { __testShutdownTimeoutMs: 5 } });
+  h.integration.__testBridge.setMode("auto");
+  const running = h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "shutdown-timeout" } });
+  await new Promise((done) => setImmediate(done));
+
+  const timed = await h.integration.shutdown();
+  assert.equal(timed.ok, false);
+  assert.equal(timed.reason, "autonomous-work-draining");
+  assert.equal(typeof timed.completion?.then, "function");
+  assert.equal(h.calls.applierCloses, 0);
+  assert.equal(h.calls.schedulerDisposals ?? 0, 0);
+
+  resolve({ result: "failed-closed", cycleOutcome: "failed-closed", reason: "autonomous-work-cancelled" });
+  await running;
+  assert.equal((await timed.completion).ok, true);
+  assert.equal(h.calls.schedulerDisposals, 1);
+  assert.equal(h.calls.applierCloses, 1);
+});
+
+test("an event awaiting ancestry cannot admit work after shutdown starts", async (t) => {
+  let releaseLookup;
+  const lookup = new Promise((resolve) => { releaseLookup = resolve; });
+  const h = harness(t, {
+    sessionGet: async ({ path }) => {
+      await lookup;
+      return { data: supportedHostSession(path.id) };
+    },
+  });
+  h.integration.__testBridge.setMode("auto");
+  const event = h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "ancestry-shutdown" } });
+  await new Promise((done) => setImmediate(done));
+  const shutdown = h.integration.shutdown();
+  releaseLookup();
+
+  assert.deepEqual(await event, { scheduled: false, reason: "integration-closing" });
+  assert.equal((await shutdown).ok, true);
+  assert.equal(h.calls.events.length, 0);
+  assert.equal(h.calls.cycles.length, 0);
 });
 
 test("integration leaves normal fulfillment and rejection settlement to the scheduler", async (t) => {
@@ -1539,8 +2546,11 @@ test("shutdown remains closed while retrying a degraded applier lease release", 
 test("purge all is terminal through timer ticks, later events and commands, and shutdown", async (t) => {
   let retentionCallback;
   let timerCleared = false;
+  let resolveCycle;
+  const deferredCycle = { promise: new Promise((resolve) => { resolveCycle = resolve; }) };
   const timer = { unref() {} };
   const h = harness(t, {
+    deferredCycle,
     privacy: (store) => ({
       exportScope: () => store.exportProject(),
       exportAll: () => store.exportAll(),
@@ -1557,7 +2567,17 @@ test("purge all is terminal through timer ticks, later events and commands, and 
   const subtree = path.join(h.root, "self-evolve");
   const secondStore = openStore(h.root, { projectFingerprint: "b".repeat(64), now: h.now });
   assert.equal(existsSync(subtree), true);
-  const purged = await h.integration.handleCommand({ command: "purge --all", projectFingerprint: FINGERPRINT });
+  h.integration.__testBridge.setMode("auto");
+  const running = h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "headless-purge-drain" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const purge = h.integration.handleCommand({ command: "purge --all", projectFingerprint: FINGERPRINT });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deferredCycle.signal.aborted, true);
+  assert.equal(existsSync(subtree), true);
+  assert.equal(h.calls.schedulerDisposals ?? 0, 0);
+  resolveCycle({ result: "failed-closed", cycleOutcome: "failed-closed", reason: "autonomous-work-cancelled" });
+  await running;
+  const purged = await purge;
   assert.equal(purged.terminalPurge, true);
   assert.equal(timerCleared, true);
   assert.equal(existsSync(subtree), false);
@@ -1623,6 +2643,149 @@ test("host session recovery is bounded, selective, and idempotent", async (t) =>
   assert.deepEqual(aborted, ["active"]);
   assert.deepEqual(h.integration.__testBridge.getHealth().hostSessionRecovery, { ok: true, cancelled: false, attempts: 1, aborted: 1, failed: 0 });
   await h.integration.shutdown();
+});
+
+test("failed orphan abort retains its owner for one successful recovery retry", async () => {
+  const sessionId = "retry-hidden-session";
+  const ownerNonce = "ab".repeat(24);
+  let owner = ownerNonce;
+  let aborts = 0;
+  const leases = new Map();
+  const store = {
+    hostOwnerStatus(id) {
+      return id === sessionId && owner
+        ? { classification: "abortable", nonce: owner, reason: "host-owner-process-dead" }
+        : { classification: "unknown", reason: "host-owner-not-found" };
+    },
+    acquireLease(key) {
+      if (leases.has(key)) return { ok: false, reason: "lease-busy" };
+      const nonce = `claim-${leases.size}`;
+      leases.set(key, nonce);
+      return { ok: true, nonce };
+    },
+    releaseLease(key, nonce) {
+      if (leases.get(key) !== nonce) return { ok: false, reason: "nonce-mismatch" };
+      leases.delete(key);
+      return { ok: true };
+    },
+    releaseHostOwner(id, nonce) {
+      if (id !== sessionId || owner !== nonce) return { ok: false, reason: "nonce-mismatch" };
+      owner = null;
+      return { ok: true };
+    },
+  };
+  const client = { session: {
+    list: async () => ({ data: [{ id: sessionId, agent: "self-evolve-synthesizer", state: "running" }] }),
+    abort: async () => {
+      aborts += 1;
+      if (aborts === 1) throw new Error("fail-once");
+      return { data: {} };
+    },
+  } };
+  const recovery = { store, projectFingerprint: FINGERPRINT, rootIdentity: "d".repeat(64), now: 100 };
+
+  const failed = await recoverOrphanedAnalyzerSessions(client, "/workspace", recovery);
+  assert.equal(failed[0].action, "abort-failed");
+  assert.equal(store.hostOwnerStatus(sessionId).nonce, ownerNonce);
+
+  const succeeded = await recoverOrphanedAnalyzerSessions(client, "/workspace", recovery);
+  assert.equal(succeeded[0].action, "aborted");
+  assert.equal(store.hostOwnerStatus(sessionId).classification, "unknown");
+  assert.equal(aborts, 2);
+});
+
+test("concurrent orphan recovery claims one abort and never claims live or foreign owners", async () => {
+  const ownerNonce = "cd".repeat(24);
+  let owner = ownerNonce;
+  let claimNonce;
+  let aborts = 0;
+  let startAbort;
+  let finishAbort;
+  const abortStarted = new Promise((resolve) => { startAbort = resolve; });
+  const abortFinished = new Promise((resolve) => { finishAbort = resolve; });
+  const store = {
+    hostOwnerStatus(id) {
+      if (id === "dead" && owner) return { classification: "abortable", nonce: owner, reason: "host-owner-process-dead" };
+      if (id === "live") return { classification: "live-owner", reason: "host-owner-process-live" };
+      return { classification: "foreign", reason: "host-owner-scope-mismatch" };
+    },
+    acquireLease() {
+      if (claimNonce) return { ok: false, reason: "lease-busy" };
+      claimNonce = "recovery-claim";
+      return { ok: true, nonce: claimNonce };
+    },
+    releaseLease(_key, nonce) {
+      if (nonce !== claimNonce) return { ok: false, reason: "nonce-mismatch" };
+      claimNonce = null;
+      return { ok: true };
+    },
+    releaseHostOwner(id, nonce) {
+      if (id !== "dead" || nonce !== owner) return { ok: false, reason: "nonce-mismatch" };
+      owner = null;
+      return { ok: true };
+    },
+  };
+  const client = { session: {
+    list: async () => ({ data: [
+      { id: "dead", agent: "self-evolve-synthesizer", state: "running" },
+      { id: "live", agent: "self-evolve-critic", state: "running" },
+      { id: "foreign", agent: "self-evolve-analyzer", state: "running" },
+    ] }),
+    abort: async () => {
+      aborts += 1;
+      startAbort();
+      await abortFinished;
+      return { data: {} };
+    },
+  } };
+  const recovery = { store, projectFingerprint: FINGERPRINT, rootIdentity: "d".repeat(64), now: 100 };
+
+  const first = recoverOrphanedAnalyzerSessions(client, "/workspace", recovery);
+  await abortStarted;
+  const second = await recoverOrphanedAnalyzerSessions(client, "/workspace", recovery);
+  finishAbort();
+  const completed = await first;
+
+  assert.equal(aborts, 1);
+  assert.equal(completed.find((item) => item.id === "dead").action, "aborted");
+  assert.equal(second.find((item) => item.id === "dead").action, "deferred");
+  assert.equal(completed.find((item) => item.id === "live").action, "deferred");
+  assert.equal(completed.find((item) => item.id === "foreign").action, "foreign");
+  assert.equal(owner, null);
+});
+
+test("integration shutdown preserves a hidden-session owner whose cleanup is still pending", async (t) => {
+  const sessionId = "cleanup-pending-at-shutdown";
+  let acquired;
+  const h = harness(t, {
+    releaseOwnedHostOwners(store) {
+      store.releaseHostOwner(sessionId, acquired.nonce);
+      return { ok: true, released: 1 };
+    },
+  });
+  acquired = h.store.acquireHostOwner(sessionId, {
+    agent: "self-evolve-synthesizer",
+    projectFingerprint: FINGERPRINT,
+    rootIdentity: h.store.rootIdentity,
+    generation: 0,
+  });
+  assert.equal(acquired.ok, true);
+  assert.equal(h.store.retainHostOwner(sessionId, acquired.nonce).ok, true);
+
+  await h.integration.shutdown();
+
+  const reopened = openStore(h.root, { projectName: "fixture", projectFingerprint: FINGERPRINT, now: h.now });
+  try {
+    const status = reopened.hostOwnerStatus(sessionId, {
+      projectFingerprint: FINGERPRINT,
+      rootIdentity: reopened.rootIdentity,
+      now: h.now(),
+    });
+    assert.equal(status.classification, "live-owner");
+    assert.equal(status.owner.nonce, acquired.nonce);
+  } finally {
+    reopened.close();
+  }
 });
 
 test("shutdown cancels and awaits unavailable-client host recovery", async (t) => {

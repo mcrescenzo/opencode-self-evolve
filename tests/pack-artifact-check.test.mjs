@@ -107,6 +107,19 @@ test("TUI matrix resolver selects only the latest exact common stable 1.18.x pat
   assert.throws(() => resolveLatestCommon18(["1.18.2", "1.19.0"], ["1.18.2"]), /no-common-stable/u);
 });
 
+test("canonical TUI typecheck consumes actual peer props and keeps one closed negative fixture", () => {
+  const packageJSON = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+  const shim = readFileSync(path.join(repoRoot, "types", "self-evolve-tui-runtime.d.ts"), "utf8");
+  const fixture = readFileSync(path.join(repoRoot, "tests", "fixtures", "self-evolve-tui-invalid-prop.tsx"), "utf8");
+  const matrix = readFileSync(path.join(repoRoot, "scripts", "packed-tui-consumer-matrix.mjs"), "utf8");
+  assert.doesNotMatch(shim, /@opentui|solid-js|IntrinsicElements|\[name:/u);
+  assert.match(packageJSON.scripts["typecheck:tui"], /self-evolve-tui-invalid-prop\.tsx/u);
+  assert.match(fixture, /@ts-expect-error/u);
+  assert.match(fixture, /selfEvolveInvalidProperty/u);
+  assert.match(matrix, /actualPeerDeclarations: true/u);
+  assert.match(matrix, /invalidPropertyRejected: true/u);
+});
+
 test("pack command diagnostics distinguish spawn, signal, and exit failures", () => {
   for (const code of ["ENOENT", "EACCES", "EPERM"]) {
     const error = Object.assign(new Error(`synthetic ${code}`), { code });

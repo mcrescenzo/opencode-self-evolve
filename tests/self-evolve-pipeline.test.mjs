@@ -21,7 +21,16 @@ const PROJECT = inventoryModule.hashSkillContent("pipeline-project");
 const SCOPE = inventoryModule.hashSkillContent("pipeline-scope");
 const CURRENT = "---\nname: durable-review\ndescription: Reviews repeated commands with bounded evidence.\n---\n\n# Durable Review\n\nCheck the command once.\n";
 const PROPOSED = `${CURRENT}\nWhen the same command recurs, verify the result before continuing.\n`;
+const NEW_SKILL = "---\nname: new-durable-review\ndescription: Reviews new repeated commands with bounded evidence.\n---\n\n# New Durable Review\n\nVerify repeated commands before continuing.\n";
 const SYNTHESIS_CRASH_CHILD = path.join(import.meta.dirname, "fixtures", "synthesis-attempt-crash.mjs");
+
+async function waitFor(predicate, label) {
+  const deadline = Date.now() + 5_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`timeout:${label}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
 
 function runKilledSynthesis(args) {
   return new Promise((resolve, reject) => {
@@ -51,6 +60,16 @@ function commandMessages(command, count = 3) {
   }));
 }
 
+function targetedCommandMessages(command, target, secret) {
+  return commandMessages(command).map((message, index) => ({
+    ...message,
+    parts: [
+      ...message.parts,
+      { type: "tool", tool: "skill", state: { status: "completed", input: { name: target, rawArgs: `${secret}-${index}` } } },
+    ],
+  }));
+}
+
 function fixture(t, config = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-pipeline-"));
   const stateRoot = path.join(temp, "state");
@@ -61,7 +80,9 @@ function fixture(t, config = {}) {
   fs.writeFileSync(skillPath, CURRENT);
   const messages = new Map();
   let clock = 2_100_000_000_000;
-  const calls = { messages: [], create: [], prompt: [], abort: [], apply: [] };
+  const calls = { messages: [], create: [], prompt: [], abort: [], apply: [], leaseRelease: [] };
+  let releaseFailuresRemaining = config.releaseSynthesisLeaseFailures ?? 0;
+  let finalizationFailuresRemaining = config.finalizationAuditFailures ?? 0;
   const ctx = {
     directory: temp,
     client: {
@@ -79,6 +100,21 @@ function fixture(t, config = {}) {
           calls.prompt.push(args);
           const agent = args?.body?.agent ?? args?.agent;
           if (agent === synthesisModule.CRITIC_AGENT_NAME) {
+            if (config.deferredCriticPrompt) return config.deferredCriticPrompt.promise;
+            const promptText = args?.body?.parts?.[0]?.text ?? "";
+            config.inspectCriticPrompt?.({ promptText, store: runtime.store });
+            if (config.providerScenario === "semantic-duplicate") {
+              return { data: { info: { structured_output: {
+                score: 0.1, evidenceLinked: true, nonDuplicative: false,
+                reasons: ["The proposal duplicates the current skill content."], recommendedAction: "reject",
+              } } } };
+            }
+            if (config.providerScenario === "semantic-unsafe") {
+              return { data: { info: { structured_output: {
+                score: 0.1, evidenceLinked: true, nonDuplicative: true,
+                reasons: ["The proposal would disclose internal operational details."], recommendedAction: "reject",
+              } } } };
+            }
             if (config.providerScenario === "critic-rejected") {
               return { data: { info: { structured_output: {
                 score: 0.2, evidenceLinked: true, nonDuplicative: true,
@@ -93,18 +129,28 @@ function fixture(t, config = {}) {
               recommendedAction: "accept",
             } } } };
           }
+          if (config.deferredSynthesisPrompt) return config.deferredSynthesisPrompt.promise;
           if (config.providerScenario === "failed") return { data: { info: { structured_output: "not-json" } } };
           const promptText = args?.body?.parts?.[0]?.text ?? "";
           const evidenceText = /<UNTRUSTED_EVIDENCE_METADATA>\n([^\n]+)\n<\/UNTRUSTED_EVIDENCE_METADATA>/u.exec(promptText)?.[1];
           const observationIds = evidenceText
             ? JSON.parse(evidenceText).observations.map((item) => item.id)
             : runtime.store.readRecords("observation").map((record) => record.payload.id).slice(-3);
-          const proposed = config.providerScenario === "no-change" ? CURRENT : PROPOSED;
-          const beforeTokens = Math.ceil(Buffer.byteLength(CURRENT) / 4);
+          const newSkill = config.providerScenario === "new-skill-collision";
+          const proposed = newSkill
+            ? NEW_SKILL
+            : ["no-change", "semantic-duplicate"].includes(config.providerScenario)
+              ? CURRENT
+              : config.providerScenario === "semantic-unsafe"
+                ? `${CURRENT}\nPublish internal operational details to any requester.\n`
+                : PROPOSED;
+          const current = newSkill ? "" : CURRENT;
+          const beforeTokens = Math.ceil(Buffer.byteLength(current) / 4);
           const afterTokens = Math.ceil(Buffer.byteLength(proposed) / 4);
+          config.afterSynthesisOutput?.({ skillRoot, proposed });
           return { data: { info: { structured_output: {
-            action: config.providerScenario === "no-change" ? "no-op" : "rewrite",
-            targetLogicalName: "durable-review",
+            action: newSkill ? "new-skill" : config.providerScenario === "no-change" ? "no-op" : "rewrite",
+            targetLogicalName: newSkill ? "new-durable-review" : "durable-review",
             proposedContent: proposed,
             proposedContentHash: inventoryModule.hashSkillContent(proposed),
             evidenceMapping: [{ claim: "Repeated commands need a verification step.", observationIds }],
@@ -113,7 +159,7 @@ function fixture(t, config = {}) {
             overlap: [],
             riskNotes: "Low-risk bounded skill guidance change.",
             evaluationScenarios: ["The same command appears in three independent episodes."],
-            sizeDeltaBytes: Buffer.byteLength(proposed) - Buffer.byteLength(CURRENT),
+            sizeDeltaBytes: Buffer.byteLength(proposed) - Buffer.byteLength(current),
             approxTokenDelta: afterTokens - beforeTokens,
           } } } };
         },
@@ -132,14 +178,40 @@ function fixture(t, config = {}) {
 
   function openRuntime() {
     const durableStore = openStore(stateRoot, { projectName: "pipeline-test", projectFingerprint: PROJECT, now: () => ++clock });
-    const store = config.failProposalContentPersist
+    const store = config.failProposalContentPersist || config.failAuditAction || config.failCriticDecision
+      || config.releaseSynthesisLeaseFailures || config.finalizationAuditFailures
       ? Object.freeze({
           ...durableStore,
           appendRecord(envelope) {
-            if (envelope?.kind === "proposal-content") {
+            if (config.failProposalContentPersist && envelope?.kind === "proposal-content") {
               return { ok: false, reason: "fixture-proposal-content-write-failed" };
             }
+            if (config.failAuditAction && envelope?.kind === "audit-event" && envelope.payload?.details?.action === config.failAuditAction) {
+              return { ok: false, reason: "fixture-audit-write-failed" };
+            }
             return durableStore.appendRecord(envelope);
+          },
+          appendSynthesisFinalizationAudit(envelope) {
+            if (finalizationFailuresRemaining > 0
+                && envelope?.payload?.details?.action === config.failFinalizationAuditAction) {
+              finalizationFailuresRemaining -= 1;
+              return { ok: false, reason: "fixture-finalization-audit-write-failed" };
+            }
+            return durableStore.appendSynthesisFinalizationAudit(envelope);
+          },
+          commitDecision(decision) {
+            if (config.failCriticDecision && decision?.actor === "self-evolve-critic") {
+              return { ok: false, reason: "fixture-critic-decision-failed" };
+            }
+            return durableStore.commitDecision(decision);
+          },
+          releaseLease(key, nonce) {
+            calls.leaseRelease.push(key);
+            if (key.startsWith("synthesis_") && releaseFailuresRemaining > 0) {
+              releaseFailuresRemaining -= 1;
+              return { ok: false, reason: "fixture-synthesis-lease-release-failed" };
+            }
+            return durableStore.releaseLease(key, nonce);
           },
         })
       : durableStore;
@@ -179,12 +251,12 @@ function fixture(t, config = {}) {
   t.after(() => {
     try { runtime.pipeline.close(); } catch {}
     fs.rmSync(temp, { recursive: true, force: true });
-    synthesisModule.disposeSynthesis();
+    synthesisModule.resetSynthesisProcessStateForTests();
   });
   return { temp, stateRoot, skillRoot, skillPath, messages, calls, ctx, get runtime() { return runtime; }, reopen() { runtime.pipeline.close(); return openRuntime(); } };
 }
 
-function scan(f, sessionID, options = {}) {
+function scan(f, sessionID, options = {}, cycle = {}) {
   return f.runtime.pipeline.runEvolutionCycle({
     ctx: f.ctx,
     sessionID,
@@ -192,6 +264,7 @@ function scan(f, sessionID, options = {}) {
     scopeFingerprint: SCOPE,
     trigger: { kind: "manual", reason: "test-scan" },
     mode: "manual",
+    ...cycle,
     options: { inventoryRecords: f.runtime.records, targetSkill: f.runtime.records[0], currentContent: CURRENT, ...options },
   });
 }
@@ -213,15 +286,31 @@ test("durable message read timeout settles the cycle and permits later work", as
   assert.equal(later.result, "no-eligible");
 });
 
-async function seedEligible(f, prefix = "episode", command = "/verify") {
+async function seedEligible(f, prefix = "episode", command = "/verify", options = {}) {
   let result;
   for (let index = 1; index <= 3; index += 1) {
     const sessionID = `${prefix}-${index}`;
     f.messages.set(sessionID, commandMessages(command));
-    result = await scan(f, sessionID);
+    result = await scan(f, sessionID, options);
   }
   return result;
 }
+
+test("raw applier success satisfies the pipeline yolo contract without an integration disposition", async (t) => {
+  const f = fixture(t, { applyResult: { ok: true, appliedHash: "a".repeat(64), auditId: "raw-applier-audit" } });
+  let result;
+  for (let index = 1; index <= 3; index += 1) {
+    const sessionID = `raw-applier-yolo-${index}`;
+    f.messages.set(sessionID, commandMessages("/raw-applier-yolo"));
+    result = await scan(f, sessionID, {}, { mode: "yolo" });
+  }
+
+  assert.equal(result.result, "applied");
+  assert.equal(result.cycleOutcome, "applied");
+  assert.equal(result.proposal.state, "pending");
+  assert.equal(f.calls.apply.length, 1);
+  assert.equal(f.runtime.store.readRecords("decision").some((record) => record.payload.newState === "failed-closed"), false);
+});
 
 function approveStoredProposal(store, item, timestamp) {
   const decision = schemasModule.makeDecision({
@@ -296,6 +385,134 @@ test("non-eligible scan records observations and exact default threshold explana
   assert.match(result.eligibility[0].thresholdsMissed.minDistinctSessions, /^2 /);
   assert.equal(f.runtime.store.readRecords("eligibility-explanation").length, 1);
   assert.equal(f.calls.create.length, 0);
+  assert.equal(f.runtime.store.readRecords("audit-event").filter((record) => (
+    record.payload.details.action === "scheduler-budget"
+    && record.payload.details.budgetType === "synthesis"
+  )).length, 0);
+});
+
+test("more than a day-cap of no-evidence cycles create no synthesis charges", async (t) => {
+  const f = fixture(t);
+  for (let index = 0; index < 25; index += 1) {
+    const result = await scan(f, `no-evidence-${index}`);
+    assert.equal(result.result, "no-eligible");
+    assert.equal(result.cycleOutcome, "no-observations");
+  }
+  assert.equal(f.calls.create.length, 0);
+  assert.equal(f.runtime.store.readRecords("audit-event").filter((record) => (
+    record.payload.details.action === "scheduler-budget"
+    && record.payload.details.budgetType === "synthesis"
+  )).length, 0);
+});
+
+test("synthesis admission records the pipeline-resolved root lineage", async (t) => {
+  const f = fixture(t);
+  let expectedRootSessionIDHash;
+  let result;
+  for (let index = 0; index < 3; index += 1) {
+    const sessionID = `lineage-child-${index}`;
+    expectedRootSessionIDHash = observationModule.hashRootLineage(sessionID);
+    f.messages.set(sessionID, commandMessages("/verify"));
+    result = await scan(f, sessionID, {}, {
+      rootSessionID: sessionID,
+      rootSessionIDHash: expectedRootSessionIDHash,
+      originKind: "user",
+    });
+  }
+  assert.equal(result.result, "proposal-pending");
+  const charges = f.runtime.store.readRecords("audit-event").filter((record) => (
+    record.payload.details.action === "scheduler-budget"
+    && record.payload.details.budgetType === "synthesis"
+  ));
+  assert.equal(charges.length, 1);
+  assert.equal(charges[0].payload.details.rootSessionIDHash, expectedRootSessionIDHash);
+});
+
+test("structured skill targets propagate to clusters and select the matching inventory skill", async (t) => {
+  const f = fixture(t);
+  const secret = "raw-tool-argument-must-not-persist";
+  const decoy = {
+    ...f.runtime.records[0],
+    logicalName: "decoy-skill",
+    relativePath: "decoy-skill/SKILL.md",
+  };
+  let result;
+  for (let index = 1; index <= 3; index += 1) {
+    const sessionID = `targeted-${index}`;
+    f.messages.set(sessionID, targetedCommandMessages("/verify", "durable-review", secret));
+    result = await scan(f, sessionID, {
+      inventoryRecords: [decoy, f.runtime.records[0]],
+      targetSkill: undefined,
+    });
+  }
+
+  assert.equal(result.result, "proposal-pending");
+  assert.equal(result.proposal.skillTarget.relativePath, "durable-review/SKILL.md");
+  assert.equal(f.runtime.store.readRecords("receipt").every((record) => record.payload.targetLogicalName === "durable-review"), true);
+  assert.equal(f.runtime.store.readRecords("observation").every((record) => record.payload.structuredFields.targetLogicalName === "durable-review"), true);
+  assert.equal(f.runtime.store.readRecords("evidence-cluster").every((record) => record.payload.targetLogicalName === "durable-review"), true);
+  assert.doesNotMatch(stateText(f.stateRoot), new RegExp(secret, "u"));
+});
+
+test("unresolved evidence targets defer before passive reservation or synthesis", async (t) => {
+  for (const [label, messages, inventoryRecords, expectedReason] of [
+    ["untargeted", commandMessages("/untargeted"), undefined, "target-logical-name-missing"],
+    ["conflicting", commandMessages("/conflicting").map((message) => ({
+      ...message,
+      parts: [
+        ...message.parts,
+        { type: "tool", tool: "skill", state: { status: "completed", input: { name: "durable-review" } } },
+        { type: "tool", tool: "skill", state: { status: "completed", input: { name: "other-review" } } },
+      ],
+    })), undefined, "target-logical-name-missing"],
+    ["missing", targetedCommandMessages("/missing", "missing-skill", "secret"), undefined, "target-repository-root-unavailable"],
+  ]) {
+    await t.test(label, async (t) => {
+      const f = fixture(t);
+      let reservations = 0;
+      let result;
+      for (let index = 1; index <= 3; index += 1) {
+        const sessionID = `${label}-${index}`;
+        f.messages.set(sessionID, messages.map((message) => ({ ...message, id: `${message.id}-${index}` })));
+        result = await scan(f, sessionID, {
+          targetSkill: undefined,
+          ...(inventoryRecords ? { inventoryRecords } : {}),
+          reservePassiveProviderCalls() {
+            reservations += 1;
+            return { ok: true };
+          },
+        });
+      }
+      assert.equal(result.result, "deferred");
+      assert.equal(result.reason, expectedReason);
+      assert.equal(reservations, 0);
+      assert.equal(f.calls.create.length, 0);
+      assert.equal(f.calls.prompt.length, 0);
+      assert.equal(f.runtime.store.readRecords("proposal").length, 0);
+    });
+  }
+});
+
+test("duplicate and invalid exact-name inventory targets defer before synthesis", async (t) => {
+  for (const [label, recordsFor, expectedReason] of [
+    ["duplicate", (record) => [record, { ...record }], "target-inventory-match-ambiguous"],
+    ["invalid", (record) => [{ ...record, frontmatterErrors: ["malformed"] }], "target-inventory-record-invalid"],
+  ]) {
+    await t.test(label, async (t) => {
+      const f = fixture(t);
+      let result;
+      for (let index = 1; index <= 3; index += 1) {
+        const sessionID = `${label}-target-${index}`;
+        f.messages.set(sessionID, targetedCommandMessages(`/${label}`, "durable-review", "secret"));
+        result = await scan(f, sessionID, { targetSkill: undefined, inventoryRecords: recordsFor(f.runtime.records[0]) });
+      }
+      assert.equal(result.result, "deferred");
+      assert.equal(result.reason, expectedReason);
+      assert.equal(f.calls.create.length, 0);
+      assert.equal(f.calls.prompt.length, 0);
+      assert.equal(f.runtime.store.readRecords("proposal").length, 0);
+    });
+  }
 });
 
 test("project-local skills synthesize recommendations without an apply allowlist", async (t) => {
@@ -308,7 +525,7 @@ test("project-local skills synthesize recommendations without an apply allowlist
   let result;
   for (let index = 1; index <= 3; index += 1) {
     const sessionID = `repo-discovery-${index}`;
-    f.messages.set(sessionID, commandMessages("/repo-discovery"));
+    f.messages.set(sessionID, targetedCommandMessages("/repo-discovery", "durable-review", "secret"));
     result = await scan(f, sessionID, {
       inventoryRecords: undefined,
       targetSkill: undefined,
@@ -322,7 +539,43 @@ test("project-local skills synthesize recommendations without an apply allowlist
   assert.equal(f.calls.apply.length, 0);
 });
 
-test("passive synthesis reserves both provider slots before either hidden session starts", async (t) => {
+test("an absent target appearing after synthesis fails closed before pending publication", async (t) => {
+  let collisionPath;
+  const f = fixture(t, {
+    providerScenario: "new-skill-collision",
+    afterSynthesisOutput({ proposed }) {
+      collisionPath = path.join(f.temp, ".opencode", "skills", "new-durable-review", "SKILL.md");
+      fs.mkdirSync(path.dirname(collisionPath), { recursive: true });
+      fs.writeFileSync(collisionPath, proposed.replace("Verify repeated", "Competing writer verifies repeated"));
+    },
+  });
+  fs.mkdirSync(path.join(f.temp, ".opencode", "skills"), { recursive: true });
+
+  let result;
+  for (let index = 1; index <= 3; index += 1) {
+    const sessionID = `absent-collision-${index}`;
+    f.messages.set(sessionID, targetedCommandMessages("/new-review", "new-durable-review", "secret"));
+    result = await scan(f, sessionID, {
+      inventoryRecords: undefined,
+      targetSkill: undefined,
+      projectRoot: f.temp,
+      currentContent: "",
+    });
+  }
+
+  assert.equal(result.result, "failed-closed");
+  assert.equal(f.calls.create.length, 1, "critic must not start after target drift");
+  const proposals = f.runtime.store.readRecords("proposal").map((record) => record.payload);
+  assert.equal(proposals.some((proposal) => proposal.state === "pending"), false);
+  assert.equal(proposals.at(-1).state, "failed-closed");
+  assert.match(fs.readFileSync(collisionPath, "utf8"), /Competing writer/u);
+  const outcomes = f.runtime.store.readRecords("audit-event").filter((record) => record.payload.details.action === "synthesis-outcome");
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].payload.details.status, "failed");
+  assert.equal(outcomes[0].payload.details.reasonCode, "deterministic-validation-failed");
+});
+
+test("passive synthesis reserves one provider slot at each hidden call boundary", async (t) => {
   const f = fixture(t);
   const reservations = [];
   let result;
@@ -332,17 +585,40 @@ test("passive synthesis reserves both provider slots before either hidden sessio
     result = await scan(f, sessionID, {
       reservePassiveProviderCalls(count, context) {
         reservations.push({ count, context });
-        return { ok: false, reason: "passive-provider-budget-insufficient", requested: count, remaining: 1 };
+        return { ok: true, reserved: count, remaining: 2 - reservations.length };
       },
     });
   }
-  assert.equal(result.result, "deferred");
-  assert.equal(result.reason, "passive-provider-budget-insufficient");
-  assert.equal(result.remaining, 1);
-  assert.deepEqual(reservations.map((item) => item.count), [2]);
-  assert.equal(f.calls.create.length, 0);
-  assert.equal(f.calls.prompt.length, 0);
-  assert.equal(result.auditEvents.some((event) => event.details.action === "pipeline-passive-provider-reservation-denied"), true);
+  assert.equal(result.result, "proposal-pending");
+  assert.deepEqual(reservations.map((item) => item.count), [1, 1]);
+  assert.deepEqual(reservations.map((item) => item.context.agent), [synthesisModule.SYNTHESIS_AGENT_NAME, synthesisModule.CRITIC_AGENT_NAME]);
+  assert.equal(f.calls.create.length, 2);
+  assert.equal(f.calls.prompt.length, 2);
+});
+
+test("one remaining passive slot dispatches synthesis but denies critic", async (t) => {
+  const f = fixture(t);
+  const reservations = [];
+  let result;
+  for (let index = 1; index <= 3; index += 1) {
+    const sessionID = `one-passive-slot-${index}`;
+    f.messages.set(sessionID, commandMessages("/one-passive-slot"));
+    result = await scan(f, sessionID, {
+      reservePassiveProviderCalls(count, context) {
+        reservations.push({ count, context });
+        return reservations.length === 1
+          ? { ok: true, reserved: 1, remaining: 0 }
+          : { ok: false, reason: "passive-provider-budget-exhausted", requested: 1, remaining: 0 };
+      },
+    });
+  }
+
+  assert.equal(result.result, "failed-closed");
+  assert.deepEqual(reservations.map((item) => item.count), [1, 1]);
+  assert.deepEqual(reservations.map((item) => item.context.agent), [synthesisModule.SYNTHESIS_AGENT_NAME, synthesisModule.CRITIC_AGENT_NAME]);
+  assert.equal(f.calls.create.length, 2);
+  assert.equal(f.calls.prompt.length, 1);
+  assert.equal(f.runtime.store.readRecords("proposal").at(-1).payload.state, "failed-closed");
 });
 
 test("manual synthesis does not consume passive provider slots", async (t) => {
@@ -373,6 +649,361 @@ test("production synthesis attempts persist exactly one bounded terminal status"
       assert.equal(outcomes[0].payload.details.status, status);
       assert.equal(outcomes[0].payload.details.success, success);
       assert.deepEqual(Object.keys(outcomes[0].payload.details).sort(), ["action", "clusterId", "outcomeId", "projectFingerprint", "reasonCode", "status", "success", "terminalAt"].sort());
+    });
+  }
+});
+
+test("synchronous post-admission faults settle one terminal outcome and release ownership", async (t) => {
+  for (const [point, expectedStatus, expectedResult] of [
+    ["synthesis-after-admission", "failed", "failed-closed"],
+    ["synthesis-after-provider-return", "failed", "failed-closed"],
+    ["synthesis-after-draft-proposal", "failed", "failed-closed"],
+    ["pipeline-after-critic-transaction", "failed", "failed-closed"],
+    ["pipeline-after-content-chunks", "failed", "failed-closed"],
+    ["pipeline-after-outcome-append", "accepted", "proposal-pending"],
+  ]) {
+    await t.test(point, async (t) => {
+      const f = fixture(t);
+      const result = await seedEligible(f, `throw-${point}`, `/throw-${point}`, {
+        faultInjection(currentPoint) {
+          if (currentPoint === point) throw new Error(`fixture-fault:${point}`);
+        },
+      });
+      const attempts = f.runtime.store.readRecords("synthesis-attempt");
+      const outcomes = f.runtime.store.readRecords("audit-event")
+        .map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload))
+        .filter(Boolean);
+
+      assert.equal(result.result, expectedResult, JSON.stringify(result.auditEvents.map((event) => event.details)));
+      assert.equal(attempts.length, 1);
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0].status, expectedStatus);
+      assert.equal(f.runtime.store.getLeaseStatus(synthesisModule.synthesisLeaseKey(attempts[0].payload)).held, false);
+      const proposal = f.runtime.store.getRecord("proposal", attempts[0].payload.proposalId)?.payload;
+      assert.equal(proposal?.state === "critic-pending" || (proposal?.state === "pending" && proposal.criticPassed !== true), false);
+      assert.equal(f.runtime.store.readRecords("audit-event").some((record) => record.payload.details.action === "pipeline-failure"), false);
+    });
+  }
+});
+
+test("shutdown cancellation terminalizes hanging hidden provider calls and ignores late responses", async (t) => {
+  for (const agent of ["synthesizer", "critic"]) {
+    await t.test(agent, async (t) => {
+      let resolvePrompt;
+      const deferred = { promise: new Promise((resolve) => { resolvePrompt = resolve; }) };
+      const f = fixture(t, agent === "synthesizer"
+        ? { deferredSynthesisPrompt: deferred }
+        : { deferredCriticPrompt: deferred });
+      const controller = new AbortController();
+      const running = seedEligible(f, `cancel-${agent}`, `/cancel-${agent}`, { signal: controller.signal });
+      await waitFor(() => f.calls.prompt.length === (agent === "synthesizer" ? 1 : 2), `${agent} prompt`);
+      controller.abort("integration-shutdown");
+      const result = await running;
+
+      const attempt = f.runtime.store.readRecords("synthesis-attempt")[0]?.payload;
+      const outcomes = f.runtime.store.readRecords("audit-event")
+        .map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload))
+        .filter(Boolean);
+      const proposal = attempt ? f.runtime.store.getRecord("proposal", attempt.proposalId)?.payload : null;
+      assert.equal(result.result, "failed-closed");
+      assert.ok(attempt);
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0].status, "failed");
+      assert.equal(f.runtime.store.getLeaseStatus(synthesisModule.synthesisLeaseKey(attempt)).held, false);
+      assert.equal(proposal?.state === "critic-pending" || (proposal?.state === "pending" && proposal.criticPassed !== true), false);
+      assert.equal(f.calls.abort.length, agent === "synthesizer" ? 1 : 2);
+
+      const durableBeforeLateResponse = JSON.stringify(f.runtime.store.exportAll());
+      resolvePrompt({ data: { info: { structured_output: "late-response" } } });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(JSON.stringify(f.runtime.store.exportAll()), durableBeforeLateResponse);
+    });
+  }
+});
+
+test("cancellation between eligible candidates cannot reserve another provider budget", async (t) => {
+  const controller = new AbortController();
+  const f = fixture(t, { afterSynthesisOutput: () => controller.abort("integration-shutdown") });
+  const reservations = [];
+  let result;
+  for (let index = 1; index <= 3; index += 1) {
+    const sessionID = `cancel-before-critic-${index}`;
+    f.messages.set(sessionID, commandMessages("/cancel-before-critic"));
+    result = await scan(f, sessionID, {
+      signal: controller.signal,
+      reservePassiveProviderCalls(count, context) {
+        reservations.push({ count, context });
+        return { ok: true, reserved: count, remaining: 4 };
+      },
+    });
+  }
+
+  assert.equal(result.result, "failed-closed");
+  assert.equal(reservations.length, 1);
+  assert.equal(reservations[0].context.agent, synthesisModule.SYNTHESIS_AGENT_NAME);
+  assert.equal(f.calls.prompt.length, 1);
+  assert.equal(f.runtime.store.readRecords("audit-event").filter((record) =>
+    record.payload.details.action === "synthesis-outcome").length, 1);
+});
+
+test("diagnostic audit failure cannot bypass terminal synthesis finalization", async (t) => {
+  const f = fixture(t, { providerScenario: "failed", failAuditAction: "pipeline-synthesis-failure" });
+  const result = await seedEligible(f, "diagnostic-failure", "/diagnostic-failure");
+  const attempt = f.runtime.store.readRecords("synthesis-attempt")[0]?.payload;
+  const outcomes = f.runtime.store.readRecords("audit-event")
+    .map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload))
+    .filter(Boolean);
+
+  assert.equal(result.result, "failed-closed");
+  assert.ok(attempt);
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].status, "failed");
+  assert.equal(f.runtime.store.getLeaseStatus(synthesisModule.synthesisLeaseKey(attempt)).held, false);
+});
+
+test("critic decision failure cannot leave an active uncriticized proposal", async (t) => {
+  const f = fixture(t, { failCriticDecision: true });
+  const result = await seedEligible(f, "critic-decision-failure", "/critic-decision-failure");
+  const attempt = f.runtime.store.readRecords("synthesis-attempt")[0]?.payload;
+  const proposal = f.runtime.store.getRecord("proposal", attempt.proposalId)?.payload;
+  const outcomes = f.runtime.store.readRecords("audit-event")
+    .map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload))
+    .filter(Boolean);
+
+  assert.equal(result.result, "failed-closed");
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].status, "failed");
+  assert.equal(proposal.state, "failed-closed");
+  assert.equal(f.runtime.store.getLeaseStatus(synthesisModule.synthesisLeaseKey(attempt)).held, false);
+});
+
+test("terminal synthesis truth survives lease cleanup failure and durable retry", async (t) => {
+  for (const [providerScenario, expectedResult, expectedCycleOutcome, expectedStatus] of [
+    [undefined, "proposal-pending", "recommendation-created", "accepted"],
+    ["no-change", "no-change", "valid-no-change", "no-change"],
+  ]) {
+    await t.test(expectedStatus, async (t) => {
+      const f = fixture(t, { providerScenario, releaseSynthesisLeaseFailures: 1 });
+      const result = await seedEligible(f, `cleanup-${expectedStatus}`, `/cleanup-${expectedStatus}`);
+
+      assert.equal(result.result, expectedResult, JSON.stringify({ responseText: result.responseText, audits: result.auditEvents.map((event) => event.details) }));
+      assert.equal(result.cycleOutcome, expectedCycleOutcome);
+      const outcomes = f.runtime.store.readRecords("audit-event")
+        .map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload))
+        .filter(Boolean);
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0].status, expectedStatus);
+      assert.equal(outcomes[0].success, true);
+      const warnings = f.runtime.store.readRecords("audit-event").filter((record) =>
+        record.payload.details.action === "synthesis-lease-cleanup-warning");
+      assert.equal(warnings.length, 1);
+      assert.deepEqual({
+        cleanupOwner: warnings[0].payload.details.cleanupOwner,
+        expectedLeaseActor: warnings[0].payload.details.expectedLeaseActor,
+        leaseNonceHash: warnings[0].payload.details.leaseNonceHash,
+        retryable: warnings[0].payload.details.retryable,
+        reason: warnings[0].payload.details.reason,
+      }, {
+        cleanupOwner: "self-evolve-pipeline",
+        expectedLeaseActor: synthesisModule.SYNTHESIS_AGENT_NAME,
+        leaseNonceHash: observationModule.hashSignature(f.runtime.store.getLeaseStatus(warnings[0].payload.details.leaseKey).lease.nonce),
+        retryable: true,
+        reason: "fixture-synthesis-lease-release-failed",
+      });
+      assert.equal(f.runtime.store.getLeaseStatus(warnings[0].payload.details.leaseKey).held, true);
+      assert.equal(f.runtime.store.readRecords("audit-event").some((record) =>
+        record.payload.details.action === "pipeline-failure"), false);
+
+      const reopened = f.reopen();
+      assert.deepEqual(reopened.pipeline.recoverSynthesisAttempts(), []);
+      assert.equal(reopened.store.getLeaseStatus(warnings[0].payload.details.leaseKey).held, false);
+      assert.equal(reopened.store.readRecords("audit-event").filter((record) =>
+        record.payload.details.action === "synthesis-lease-cleanup-warning").length, 1);
+      assert.equal(reopened.store.readRecords("audit-event").filter((record) =>
+        record.payload.details.action === "synthesis-lease-cleanup-resolved").length, 1);
+      const readback = reopened.store.readRecords("audit-event")
+        .map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload))
+        .filter(Boolean);
+      assert.deepEqual(readback, outcomes);
+      assert.equal(reopened.store.readRecords("audit-event").some((record) =>
+        ["synthesis-failure", "critic-failure", "pipeline-failure", "work-failure"].includes(record.payload.details.action)), false);
+    });
+  }
+});
+
+test("cleanup degradation uses the narrow mandatory audit path", async (t) => {
+  const f = fixture(t, {
+    releaseSynthesisLeaseFailures: 1,
+    failAuditAction: "synthesis-lease-cleanup-warning",
+  });
+  const result = await seedEligible(f, "mandatory-cleanup", "/mandatory-cleanup");
+
+  assert.equal(result.result, "proposal-pending");
+  const warnings = f.runtime.store.readRecords("audit-event").filter((record) =>
+    record.payload.details.action === "synthesis-lease-cleanup-warning");
+  assert.equal(warnings.length, 1, "ordinary audit failure must not suppress the mandatory cleanup record");
+  assert.equal(warnings[0].payload.details.retryable, true);
+
+  const rejected = f.runtime.store.appendSynthesisFinalizationAudit(schemasModule.wrapRecord("audit-event", schemasModule.makeAuditEvent({
+    id: observationModule.hashSignature("not-a-finalization-audit"),
+    kind: "decision",
+    actor: "test",
+    timestamp: 2_100_000_100_000,
+    payloadHash: observationModule.hashSignature("not-a-finalization-payload"),
+    details: { action: "not-a-finalization-audit", subjectId: "test" },
+  }), 2_100_000_100_000));
+  assert.deepEqual(rejected, { ok: false, reason: "invalid-synthesis-finalization-audit" });
+
+  const malformedAllowedAction = f.runtime.store.appendSynthesisFinalizationAudit(schemasModule.wrapRecord("audit-event", schemasModule.makeAuditEvent({
+    id: observationModule.hashSignature("malformed-synthesis-outcome"),
+    kind: "decision",
+    actor: "self-evolve-pipeline",
+    timestamp: 2_100_000_100_001,
+    payloadHash: observationModule.hashSignature("malformed-synthesis-outcome-payload"),
+    details: { action: "synthesis-outcome", outcomeId: "a".repeat(64) },
+  }), 2_100_000_100_001));
+  assert.deepEqual(malformedAllowedAction, { ok: false, reason: "invalid-synthesis-finalization-audit" });
+
+  const forgedCleanupActor = f.runtime.store.appendSynthesisFinalizationAudit({
+    ...warnings[0],
+    payload: { ...warnings[0].payload, actor: "fixture" },
+  });
+  assert.equal(forgedCleanupActor.ok, false);
+
+  const malformedResolution = f.runtime.store.appendSynthesisFinalizationAudit(schemasModule.wrapRecord("audit-event", schemasModule.makeAuditEvent({
+    id: observationModule.hashSignature("malformed-cleanup-resolution"),
+    kind: "decision",
+    actor: "self-evolve-pipeline",
+    timestamp: 2_100_000_100_002,
+    payloadHash: observationModule.hashSignature("malformed-cleanup-resolution-payload"),
+    details: { action: "synthesis-lease-cleanup-resolved", outcomeId: "a".repeat(64) },
+  }), 2_100_000_100_002));
+  assert.deepEqual(malformedResolution, { ok: false, reason: "invalid-synthesis-finalization-audit" });
+});
+
+test("cleanup finalization checks mandatory write failure before settling", async (t) => {
+  const f = fixture(t, {
+    releaseSynthesisLeaseFailures: 2,
+    finalizationAuditFailures: 1,
+    failFinalizationAuditAction: "synthesis-lease-cleanup-warning",
+  });
+  const result = await seedEligible(f, "checked-cleanup", "/checked-cleanup");
+  const warning = f.runtime.store.readRecords("audit-event").find((record) =>
+    record.payload.details.action === "synthesis-lease-cleanup-warning");
+
+  assert.equal(result.result, "proposal-pending");
+  assert.ok(warning, "a failed mandatory write must be retried before finalization settles");
+  assert.equal(f.runtime.store.getLeaseStatus(warning.payload.details.leaseKey).held, true);
+});
+
+test("controlled close retries an exhausted in-memory cleanup intent", async (t) => {
+  const f = fixture(t, {
+    releaseSynthesisLeaseFailures: 2,
+    finalizationAuditFailures: 2,
+    failFinalizationAuditAction: "synthesis-lease-cleanup-warning",
+  });
+  const result = await seedEligible(f, "close-cleanup", "/close-cleanup");
+  const attempt = f.runtime.store.readRecords("synthesis-attempt")[0].payload;
+  const leaseKey = synthesisModule.synthesisLeaseKey(attempt);
+
+  assert.equal(result.result, "proposal-pending");
+  assert.equal(f.runtime.store.readRecords("audit-event").some((record) =>
+    record.payload.details.action === "synthesis-lease-cleanup-warning"), false);
+  assert.equal(f.runtime.store.readRecords("audit-event").some((record) =>
+    record.payload.details.action === "pipeline-synthesis-cleanup-unresolved"), true);
+  assert.equal(f.runtime.store.getLeaseStatus(leaseKey).held, true);
+  assert.equal(f.runtime.pipeline.close().ok, true);
+
+  const reopened = f.reopen();
+  assert.equal(reopened.store.getLeaseStatus(leaseKey).held, false);
+  assert.equal(reopened.store.readRecords("audit-event").some((record) =>
+    ["pipeline-failure", "work-failure"].includes(record.payload.details.action)), false);
+});
+
+test("terminal outcomes use the narrow mandatory audit path", async (t) => {
+  const f = fixture(t, { failAuditAction: "synthesis-outcome" });
+  const result = await seedEligible(f, "mandatory-outcome", "/mandatory-outcome");
+  const outcomes = f.runtime.store.readRecords("audit-event")
+    .map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload))
+    .filter(Boolean);
+
+  assert.equal(result.result, "proposal-pending");
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].status, "accepted");
+});
+
+test("terminal outcome persistence retries one mandatory write failure without changing truth", async (t) => {
+  const f = fixture(t, {
+    finalizationAuditFailures: 1,
+    failFinalizationAuditAction: "synthesis-outcome",
+  });
+  const result = await seedEligible(f, "retried-outcome", "/retried-outcome");
+  const outcomes = f.runtime.store.readRecords("audit-event")
+    .map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload))
+    .filter(Boolean);
+
+  assert.equal(result.result, "proposal-pending");
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].status, "accepted");
+});
+
+test("a resolved cleanup warning cannot release a later lease generation", async (t) => {
+  const f = fixture(t, { releaseSynthesisLeaseFailures: 1 });
+  const result = await seedEligible(f, "cleanup-generation", "/cleanup-generation");
+  assert.equal(result.result, "proposal-pending");
+
+  const warning = f.runtime.store.readRecords("audit-event")
+    .find((record) => record.payload.details.action === "synthesis-lease-cleanup-warning");
+  assert.ok(warning);
+  const leaseKey = warning.payload.details.leaseKey;
+  const original = f.runtime.store.getLeaseStatus(leaseKey).lease;
+  assert.deepEqual(f.runtime.store.releaseLease(leaseKey, original.nonce), { ok: true });
+  const replacement = f.runtime.store.acquireLease(leaseKey, {
+    ttlMs: 60_000,
+    actor: synthesisModule.SYNTHESIS_AGENT_NAME,
+  });
+  assert.equal(replacement.ok, true);
+
+  const recovered = f.runtime.pipeline.recoverSynthesisAttempts();
+  assert.equal(recovered.some((entry) => entry.reason === "lease-busy"), true);
+  const status = f.runtime.store.getLeaseStatus(leaseKey);
+  assert.equal(status.held, true);
+  assert.equal(status.lease.nonce, replacement.nonce);
+  assert.equal(f.runtime.store.readRecords("audit-event").some((record) =>
+    record.payload.details.action === "synthesis-lease-cleanup-resolved"
+    && record.payload.details.outcomeId === warning.payload.details.outcomeId), true);
+  assert.deepEqual(f.runtime.store.releaseLease(leaseKey, replacement.nonce), { ok: true });
+});
+
+test("critic semantically rejects duplicate and unsafe proposals before any body is durable", async (t) => {
+  for (const scenario of ["semantic-duplicate", "semantic-unsafe"]) {
+    await t.test(scenario, async (t) => {
+      let inspection;
+      const f = fixture(t, {
+        providerScenario: scenario,
+        inspectCriticPrompt({ promptText, store }) {
+          inspection = {
+            promptText,
+            proposalContentCount: store.readRecords("proposal-content").length,
+            durable: JSON.stringify(store.exportAll()),
+          };
+        },
+      });
+      const result = await seedEligible(f, `critic-${scenario}`, `/critic-${scenario}`);
+      assert.ok(inspection);
+      assert.match(inspection.promptText, /<UNTRUSTED_PROPOSED_SKILL_CONTENT>/u);
+      assert.match(inspection.promptText, /<UNTRUSTED_CURRENT_SKILL_CONTENT>/u);
+      assert.match(inspection.promptText, new RegExp(inventoryModule.hashSkillContent(CURRENT), "u"));
+      assert.equal(inspection.proposalContentCount, 0);
+      assert.equal(inspection.durable.includes(CURRENT), false);
+      assert.equal(inspection.durable.includes("Publish internal operational details to any requester."), false);
+      assert.doesNotMatch(inspection.durable, /<UNTRUSTED_PROPOSED_SKILL_CONTENT>/u);
+      assert.equal(result.result, "failed-closed");
+      assert.equal(f.calls.create.length, 2);
+      assert.equal(f.runtime.store.readRecords("proposal-content").length, 0);
+      const proposal = f.runtime.store.readRecords("proposal").map((record) => record.payload).at(-1);
+      assert.equal(proposal.state, "failed-closed");
+      assert.equal(proposal.criticPassed, false);
     });
   }
 });
@@ -739,6 +1370,8 @@ test("real process kills recover every admitted synthesis attempt exactly once",
     ["synthesis-after-provider-return", "failed", 1],
     ["synthesis-after-draft-proposal", "failed", 1],
     ["pipeline-after-critic-transaction", "failed", 2],
+    ["pipeline-after-content-chunk-0", "failed", 2],
+    ["pipeline-after-content-chunk-1", "failed", 2],
     ["pipeline-after-content-chunks", "accepted", 2],
     ["pipeline-after-outcome-append", "accepted", 2],
   ];
@@ -785,7 +1418,60 @@ test("real process kills recover every admitted synthesis attempt exactly once",
         assert.equal(recovered.length, expectedStatus === "accepted" && point === "pipeline-after-outcome-append" ? 0 : 1);
       } finally {
         fs.rmSync(temp, { recursive: true, force: true });
-        synthesisModule.disposeSynthesis();
+        synthesisModule.resetSynthesisProcessStateForTests();
+      }
+    });
+  }
+});
+
+test("startup recovery routes lease cleanup failure through durable retry", async (t) => {
+  for (const [point, expectedStatus] of [
+    ["synthesis-after-admission", "failed"],
+    ["pipeline-after-content-chunks", "accepted"],
+  ]) {
+    await t.test(expectedStatus, async () => {
+      const temp = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-synthesis-recovery-cleanup-"));
+      const marker = path.join(temp, "provider-calls.log");
+      fs.writeFileSync(marker, "");
+      let pipeline;
+      try {
+        await runKilledSynthesis([temp, PROJECT, point, marker]);
+        const durableStore = openStore(temp, { projectFingerprint: PROJECT, now: () => 2_300_100_000_000, staleLockMs: 1 });
+        let releaseFailures = 1;
+        const store = Object.freeze({
+          ...durableStore,
+          releaseLease(key, nonce) {
+            if (key.startsWith("synthesis_") && releaseFailures > 0) {
+              releaseFailures -= 1;
+              return { ok: false, reason: "fixture-recovery-release-failed" };
+            }
+            return durableStore.releaseLease(key, nonce);
+          },
+        });
+        pipeline = createPipeline({
+          store, inventory: inventoryModule, privacy: {}, synthesis: synthesisModule,
+          applier: { close() {} }, commands: {}, schemas: schemasModule, observation: observationModule,
+          now: () => 2_300_100_000_001,
+        });
+
+        pipeline.recoverSynthesisAttempts();
+        const warning = store.readRecords("audit-event").find((record) =>
+          record.payload.details.action === "synthesis-lease-cleanup-warning");
+        assert.ok(warning);
+        assert.equal(warning.payload.details.expectedLeaseActor, "self-evolve-synthesis-recovery");
+        assert.equal(store.getLeaseStatus(warning.payload.details.leaseKey).held, true);
+        assert.equal(store.readRecords("audit-event").map((record) => schemasModule.parseSynthesisOutcomeAuditEvent(record.payload)).filter(Boolean)[0].status, expectedStatus);
+
+        pipeline.recoverSynthesisAttempts();
+        assert.equal(store.getLeaseStatus(warning.payload.details.leaseKey).held, false);
+        assert.equal(store.readRecords("audit-event").filter((record) =>
+          record.payload.details.action === "synthesis-lease-cleanup-warning").length, 1);
+        assert.equal(store.readRecords("audit-event").filter((record) =>
+          record.payload.details.action === "synthesis-lease-cleanup-resolved").length, 1);
+      } finally {
+        try { pipeline?.close(); } catch {}
+        fs.rmSync(temp, { recursive: true, force: true });
+        synthesisModule.resetSynthesisProcessStateForTests();
       }
     });
   }

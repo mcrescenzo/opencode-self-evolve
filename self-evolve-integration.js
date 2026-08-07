@@ -26,7 +26,7 @@ import {
   isDurableLifecycleEvent,
 } from "./self-evolve-core.js";
 import { buildUiProjection } from "./self-evolve-projection.js";
-import { stateRootIdentity } from "./self-evolve-state-root.js";
+import { stateRootIdentity, validateStateRootBoundary } from "./self-evolve-state-root.js";
 import { errorReasonCode, latestByLogicalId } from "./self-evolve-schemas.js";
 import {
   UI_ACTION_CAPABILITIES,
@@ -38,7 +38,7 @@ import {
   makeUiOperationRequest,
 } from "./self-evolve-ui-protocol.js";
 import { boundedHostCall, cleanupSession, listSessions } from "./self-evolve-client.js";
-import { createSensitiveExportManager } from "./self-evolve-export.js";
+import { createSensitiveExportManager, readLatestSensitiveExport } from "./self-evolve-export.js";
 
 const RESTART_REMINDER = "OpenCode must be restarted for the new skill content to load in existing sessions; new sessions will pick it up automatically.";
 const CYCLE_OUTCOMES = new Set(UI_DASHBOARD_OUTCOMES.slice(0, 9));
@@ -56,12 +56,16 @@ const HIDDEN_ANALYZER_AGENTS = new Set([
   SELF_EVOLVE_CRITIC_AGENT,
   ...Object.values(LEGACY_SELF_EVOLVE_AGENTS),
 ]);
+const SESSION_ANCESTRY_MAX_DEPTH = 16;
+const SESSION_ANCESTRY_TIMEOUT_MS = 250;
 const TERMINAL_SESSION_STATES = new Set(["aborted", "cancelled", "completed", "error", "failed", "idle"]);
 const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const ROUTING_SETTINGS_TTL_MS = 250;
 const UI_PROJECTION_REFRESH_MS = 5_000;
 const UI_PROJECTION_EXPIRY_MARGIN_MS = 5_000;
+const AUTONOMOUS_SHUTDOWN_TIMEOUT_MS = 10_000;
 const NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) ? constants.O_NOFOLLOW : null;
+const fallbackHostCleanupClaims = new WeakMap();
 let hostOwnerBootGeneration = 0;
 
 export const ROLLOUT_GATES = DEFAULT_ROLLOUT_GATES;
@@ -114,16 +118,39 @@ export async function recoverOrphanedAnalyzerSessions(client, directory, {
       outcomes.push({ id, ok: true, action, reason: status.reason ?? status.classification });
       continue;
     }
-    const claimed = store.releaseHostOwner?.(id, status.nonce);
-    if (!claimed?.ok || claimed.absent) {
-      outcomes.push({ id, ok: true, action: "deferred", reason: claimed?.absent ? "host-owner-already-claimed" : claimed?.reason ?? "host-owner-claim-failed" });
+    const claimKey = `host_cleanup_${sha256(`host-session-cleanup-v1\n${id}\n${status.nonce}`)}`;
+    let fallbackClaims;
+    let claimed;
+    if (typeof store.acquireLease === "function") {
+      claimed = store.acquireLease(claimKey, {
+        ttlMs: Math.max(1_000, timeoutMs + 1_000),
+        actor: "self-evolve-host-session-recovery",
+      });
+    } else {
+      fallbackClaims = fallbackHostCleanupClaims.get(store) ?? new Set();
+      fallbackHostCleanupClaims.set(store, fallbackClaims);
+      claimed = fallbackClaims.has(claimKey)
+        ? { ok: false, reason: "lease-busy" }
+        : { ok: true, nonce: claimKey };
+      if (claimed.ok) fallbackClaims.add(claimKey);
+    }
+    if (!claimed?.ok) {
+      outcomes.push({ id, ok: true, action: "deferred", reason: claimed?.reason ?? "host-owner-claim-failed" });
       continue;
     }
     try {
       await cleanupSession(ctx, id, { timeoutMs, signal, label: "session-abort" });
+      const released = store.releaseHostOwner?.(id, status.nonce);
+      if (!released?.ok) {
+        outcomes.push({ id, ok: false, action: "abort-failed", reason: released?.reason ?? "host-owner-release-failed" });
+        continue;
+      }
       outcomes.push({ id, ok: true, action: "aborted", reason: status.reason });
     } catch (error) {
       outcomes.push({ id, ok: false, action: "abort-failed", reason: errorReasonCode(error, "unknown-error") });
+    } finally {
+      if (fallbackClaims) fallbackClaims.delete(claimKey);
+      else store.releaseLease?.(claimKey, claimed.nonce);
     }
   }
   return outcomes;
@@ -213,6 +240,12 @@ export function createIntegration({
 } = {}) {
   if (!store || !schemas || !pipeline || !scheduler || !applier) throw new TypeError("integration-dependencies-required");
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
+  if (typeof store.rootPath === "string" && options.stateRoot) {
+    const boundary = validateStateRootBoundary(options.stateRoot);
+    if (boundary.path !== store.rootPath || boundary.identity !== store.rootIdentity) {
+      throw new Error("state-root-store-mismatch");
+    }
+  }
   const hostOwnerGeneration = ++hostOwnerBootGeneration;
   const rolloutGates = frozenRolloutGates(options.rolloutGates ?? options.settings?.rolloutGates);
   const inFlight = new Map();
@@ -224,6 +257,10 @@ export function createIntegration({
   let ctx = options.ctx;
   let closed = false;
   let shutdownDegraded = false;
+  let resourcesClosed = false;
+  let schedulerDisposed = false;
+  let workDrainTask;
+  let resourceCloseTask;
   let terminalPurge = false;
   let terminalPurgeTask;
   let mailboxTimer;
@@ -254,6 +291,70 @@ export function createIntegration({
   const terminalPurgeDelayMs = options.__testTerminalPurgeDelayMs ?? 1_000;
   const consumeMailbox = options.__testConsumeDecisionRequests ?? consumeDecisionRequests;
   const routingSettingsTtlMs = options.__testRoutingSettingsTtlMs ?? ROUTING_SETTINGS_TTL_MS;
+  const ancestryTimeoutMs = Number.isSafeInteger(options.__testSessionAncestryTimeoutMs)
+    ? Math.max(1, Math.min(2_000, options.__testSessionAncestryTimeoutMs))
+    : SESSION_ANCESTRY_TIMEOUT_MS;
+
+  function lifecycleSessionID(input) {
+    const event = input?.event && typeof input.event === "object" ? input.event : input;
+    return event?.properties?.sessionID
+      ?? event?.properties?.session?.id
+      ?? event?.sessionID
+      ?? event?.session?.id;
+  }
+
+  function validHostSessionID(value) {
+    return typeof value === "string"
+      && value.length > 0
+      && value.length <= 512
+      && Buffer.byteLength(value, "utf8") <= 1024
+      && !value.includes("\0");
+  }
+
+  function hostSessionRecord(result, expectedID, projectFingerprint) {
+    const value = result?.data ?? result;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("session-metadata-invalid");
+    const sessionID = value.id;
+    if (sessionID !== expectedID) throw new Error("session-metadata-identity-mismatch");
+    if (value.parentID !== undefined && !validHostSessionID(value.parentID)) throw new Error("session-parent-invalid");
+    const owned = typeof store.hostOwnerStatus === "function"
+      ? store.hostOwnerStatus(sessionID, hostOwnershipContext(projectFingerprint))
+      : { classification: "unknown", reason: "host-owner-not-found" };
+    if (owned?.classification === "unknown" && owned?.reason !== "host-owner-not-found") throw new Error("session-owner-unavailable");
+    if (!["unknown", "live-owner", "abortable"].includes(owned?.classification)) throw new Error("session-owner-invalid");
+    const pluginOwned = owned.classification === "live-owner"
+      || owned.classification === "abortable";
+    return {
+      sessionID,
+      parentID: value.parentID ?? null,
+      projectFingerprint,
+      owned: pluginOwned,
+      trustworthy: true,
+    };
+  }
+
+  async function hydrateRootLineage(input, projectFingerprint) {
+    const sessionID = lifecycleSessionID(input);
+    const session = ctx?.client?.session;
+    if (!validHostSessionID(sessionID) || typeof session?.get !== "function") return null;
+    const ancestry = [];
+    const visited = new Set();
+    let currentID = sessionID;
+    for (let depth = 0; depth <= SESSION_ANCESTRY_MAX_DEPTH; depth += 1) {
+      if (visited.has(currentID)) break;
+      visited.add(currentID);
+      const result = await boundedHostCall(
+        () => session.get.call(session, { path: { id: currentID }, query: { directory: ctx.directory } }),
+        { timeoutMs: ancestryTimeoutMs, label: "session-ancestry" },
+      );
+      if (result?.error) throw new Error("session-ancestry-unavailable");
+      const record = hostSessionRecord(result, currentID, projectFingerprint);
+      ancestry.push(record);
+      if (!record.parentID) break;
+      currentID = record.parentID;
+    }
+    return observation?.resolveRootLineage?.({ sessionID, projectFingerprint, sessions: ancestry }) ?? null;
+  }
 
   function invalidateRoutingSettings() {
     routingSettingsSnapshot = undefined;
@@ -292,7 +393,8 @@ export function createIntegration({
     if (!options.stateRoot) throw new Error("state-root-unavailable");
     const projectFingerprint = settings()?.repo?.projectFingerprint;
     if (!projectFingerprint) throw new Error("corrupt-settings");
-    sensitiveExportManager ??= createSensitiveExportManager({
+    const createManager = options.__testCreateSensitiveExportManager ?? createSensitiveExportManager;
+    sensitiveExportManager ??= createManager({
       stateRoot: options.stateRoot,
       projectFingerprint,
       now,
@@ -508,22 +610,29 @@ export function createIntegration({
   });
 
   async function enqueueWork(workItem) {
+    if (closed) return { ok: true, status: "cancelled", reason: "integration-closing" };
     const key = `${workItem.sessionID}:${workItem.leaseNonce ?? workItem.epoch ?? now()}`;
     const item = { ...workItem, key, mode: resolveEffectiveMode(workItem.projectFingerprint), stage: "pipeline", startedAt: now() };
-    inFlight.set(key, item);
+    const controller = new AbortController();
+    const promise = runEvolutionCycle({
+      ...workItem,
+      ctx,
+      trigger: workItem.trigger ?? "scheduler",
+      options: {
+        ...(workItem.options ?? {}),
+        signal: controller.signal,
+        reservePassiveProviderCalls: (count, context) => schedulerInstance.reservePassiveProviderCalls(count, {
+          ...context,
+          rootSessionIDHash: workItem.rootSessionIDHash,
+        }),
+      },
+    });
+    inFlight.set(key, { item, controller, promise });
     try {
-      return await runEvolutionCycle({
-        ...workItem,
-        ctx,
-        trigger: workItem.trigger ?? "scheduler",
-        options: {
-          ...(workItem.options ?? {}),
-          reservePassiveProviderCalls: (count, context) => schedulerInstance.reservePassiveProviderCalls(count, {
-            ...context,
-            rootSessionIDHash: workItem.rootSessionIDHash,
-          }),
-        },
-      });
+      const result = await promise;
+      return controller.signal.aborted
+        ? { ok: true, status: "cancelled", result: "cancelled", reason: "integration-shutdown" }
+        : result;
     } finally {
       inFlight.delete(key);
     }
@@ -538,7 +647,7 @@ export function createIntegration({
     log: options.log,
   });
 
-  function appendAudit(kind, details, proposalId, actor = "self-evolve-integration", timestampOverride) {
+  function makeAuditRecord(kind, details, proposalId, actor = "self-evolve-integration", timestampOverride) {
     const timestamp = timestampOverride ?? now();
     const clean = Object.fromEntries(Object.entries(details).filter(([, value]) => ["string", "boolean", "number"].includes(typeof value) || value === null));
     const payloadHash = sha256(JSON.stringify(clean));
@@ -551,10 +660,15 @@ export function createIntegration({
       payloadHash,
       details: clean,
     });
-    const saved = store.appendRecord(schemas.wrapRecord("audit-event", event, timestamp));
+    return schemas.wrapRecord("audit-event", event, timestamp);
+  }
+
+  function appendAudit(kind, details, proposalId, actor = "self-evolve-integration", timestampOverride) {
+    const record = makeAuditRecord(kind, details, proposalId, actor, timestampOverride);
+    const saved = store.appendRecord(record);
     if (!saved?.ok) throw new Error(saved?.reason ?? "audit-write-failed");
     uiProjectionDirty = true;
-    return event;
+    return record.payload;
   }
 
   function publish(type, properties = {}) {
@@ -744,6 +858,7 @@ export function createIntegration({
       index: built.index,
       details: built.publicationDetails,
       dashboard: built.dashboard,
+      dashboardV1: built.dashboardV1,
       now: timestamp,
     });
     uiProjectionDirty = false;
@@ -884,7 +999,20 @@ export function createIntegration({
   }
 
   function recordControlCompletion(request, result) {
-    return appendAudit("decision", {
+    const details = {
+      action: "control-request-complete",
+      requestId: request.requestId,
+      nonceHash: sha256(request.nonce),
+      requestDigest: mailboxRequestDigest("control", request),
+      controlAction: request.action,
+      accepted: result.ok === true,
+      reason: completionReason(result, "control-rejected"),
+    };
+    return appendAudit("decision", details, undefined, "self-evolve-integration");
+  }
+
+  function controlCompletionRecord(request, result) {
+    return makeAuditRecord("decision", {
       action: "control-request-complete",
       requestId: request.requestId,
       nonceHash: sha256(request.nonce),
@@ -893,6 +1021,48 @@ export function createIntegration({
       accepted: result.ok === true,
       reason: completionReason(result, "control-rejected"),
     }, undefined, "self-evolve-integration");
+  }
+
+  function operationIntent(request) {
+    const recorded = (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
+      event.details?.action === "ui-operation-intent"
+      && event.details?.requestId === request.requestId);
+    if (recorded) return recorded;
+    const transaction = store.readRequestTransaction?.();
+    if (transaction?.requestId !== request.requestId) return null;
+    return {
+      timestamp: transaction.issuedAt,
+      details: {
+        action: "ui-operation-intent",
+        requestId: transaction.requestId,
+        nonceHash: transaction.nonceHash,
+        requestDigest: transaction.requestDigest,
+        uiAction: transaction.action,
+        issuedAt: transaction.issuedAt,
+      },
+    };
+  }
+
+  function recordOperationIntent(request) {
+    const transaction = store.beginRequestTransaction?.({
+      requestId: request.requestId,
+      projectFingerprint: request.projectFingerprint,
+      requestDigest: mailboxRequestDigest("operation", request),
+      nonceHash: sha256(request.nonce),
+      action: request.action,
+      issuedAt: request.issuedAt,
+      expiresAt: request.expiresAt,
+    });
+    if (transaction?.ok === false) throw new Error(transaction.reason ?? "request-transaction-failed");
+    return appendAudit("decision", {
+      action: "ui-operation-intent",
+      requestId: request.requestId,
+      nonceHash: sha256(request.nonce),
+      requestDigest: mailboxRequestDigest("operation", request),
+      uiAction: request.action,
+      issuedAt: request.issuedAt,
+      ...(operationSubjectId(request) ? { subjectId: operationSubjectId(request) } : {}),
+    }, operationSubjectId(request), "self-evolve-integration");
   }
 
   function recordOperationStatus(request, status, subjectId, reason) {
@@ -907,7 +1077,26 @@ export function createIntegration({
   }
 
   function recordOperationCompletion(request, result, subjectId) {
-    return appendAudit("decision", {
+    const details = {
+      action: "ui-operation-complete",
+      requestId: request.requestId,
+      nonceHash: sha256(request.nonce),
+      requestDigest: mailboxRequestDigest("operation", request),
+      uiAction: request.action,
+      accepted: result.ok === true,
+      terminal: result.terminal === true,
+      reason: completionReason(result, "operation-rejected"),
+      ...(result.exportPath ? { exportPath: result.exportPath } : {}),
+      ...(Number.isSafeInteger(result.exportBytes) ? { exportBytes: result.exportBytes } : {}),
+      ...(result.exportSha256 ? { exportSha256: result.exportSha256 } : {}),
+      ...(Number.isSafeInteger(result.exportExpiresAt) ? { exportExpiresAt: result.exportExpiresAt } : {}),
+      ...(subjectId ? { subjectId } : {}),
+    };
+    return appendAudit("decision", details, subjectId, "self-evolve-integration");
+  }
+
+  function operationCompletionRecord(request, result, subjectId = operationSubjectId(request)) {
+    return makeAuditRecord("decision", {
       action: "ui-operation-complete",
       requestId: request.requestId,
       nonceHash: sha256(request.nonce),
@@ -953,8 +1142,90 @@ export function createIntegration({
       return { ok: false, reason: "replayed-request" };
     }
     return details.accepted === true
-      ? { ok: true, ...(details.terminal === true ? { terminal: true } : {}) }
+      ? {
+        ok: true,
+        ...(details.terminal === true ? { terminal: true } : {}),
+        ...(details.terminal === true && request.action === "purge-all" ? { afterResponse: scheduleTerminalPurge } : {}),
+        ...(details.exportPath ? { exportPath: details.exportPath } : {}),
+        ...(Number.isSafeInteger(details.exportBytes) ? { exportBytes: details.exportBytes } : {}),
+        ...(details.exportSha256 ? { exportSha256: details.exportSha256 } : {}),
+        ...(Number.isSafeInteger(details.exportExpiresAt) ? { exportExpiresAt: details.exportExpiresAt } : {}),
+      }
       : { ok: false, reason: String(details.reason ?? "operation-rejected").slice(0, 256) };
+  }
+
+  function validateOperationIntent(request, intent) {
+    const details = intent?.details;
+    return details?.nonceHash === sha256(request.nonce)
+      && details?.requestDigest === mailboxRequestDigest("operation", request)
+      && details?.uiAction === request.action;
+  }
+
+  function recoverOperationIntent(request, intent) {
+    if (!validateOperationIntent(request, intent)) return { ok: false, reason: "replayed-request" };
+    const fresh = settings();
+    if (request.action === "set-paused" && fresh?.global?.paused === request.payload.paused) return { ok: true };
+    if (request.action === "set-kill-switch" && fresh?.global?.killSwitchActive === request.payload.enabled) return { ok: true };
+    if (request.action === "snooze-proposal") {
+      const decisionNonce = sha256(`native-snooze:${request.requestId}:${request.operationHash}`);
+      const snoozed = (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
+        event.proposalId === request.payload.proposalId
+        && event.details?.action === "snooze"
+        && event.details?.requestId === request.requestId
+        && event.details?.snoozedUntil === request.payload.snoozedUntil);
+      if (snoozed) return { ok: true };
+      const decision = (store.readRecords?.("decision") ?? []).map((record) => record.payload).findLast((item) =>
+        item.proposalId === request.payload.proposalId
+        && item.nonce === decisionNonce
+        && item.newState === "pending");
+      if (decision) {
+        appendAudit("decision", {
+          action: "snooze",
+          requestId: request.requestId,
+          snoozedUntil: request.payload.snoozedUntil,
+          state: "pending",
+        }, request.payload.proposalId, BRIDGE_ACTOR);
+        return { ok: true };
+      }
+    }
+    if (request.action === "rollback-proposal") {
+      const proposal = currentProposal(request.payload.proposalId);
+      if (proposal?.state === "rolled-back") return { ok: true };
+      const rollback = (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
+        event.proposalId === request.payload.proposalId
+        && event.kind === "rollback"
+        && event.details?.["readback-verified"] === true);
+      if (proposal?.state === "applied" && rollback) {
+        const changed = casDecision(proposal, makeDecision(proposal, "rolled-back", "self-evolve-applier"));
+        return changed.ok ? { ok: true } : { ok: false, reason: changed.reason ?? "rollback-recovery-failed" };
+      }
+    }
+    if (request.action === "purge-scope") {
+      const purged = (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
+        event.kind === "purge"
+        && event.timestamp >= intent.timestamp
+        && event.details?.action === request.payload.scope);
+      if (purged) return { ok: true };
+    }
+    if (request.action === "export-data") {
+      const exported = readLatestSensitiveExport({
+        stateRoot: options.stateRoot,
+        projectFingerprint: request.projectFingerprint,
+        now: now(),
+      });
+      const createdAt = Number(path.basename(exported?.path ?? "").split("-", 1)[0]);
+      if (exported?.scope === request.payload.scope && createdAt >= intent.timestamp) {
+        return {
+          ok: true,
+          exportPath: exported.path,
+          exportBytes: exported.bytes,
+          exportSha256: exported.sha256,
+          exportExpiresAt: exported.expiresAt,
+        };
+      }
+    }
+    if (request.action === "retry-bootstrap" && uiProjection?.index?.status?.state === "ready") return { ok: true };
+    return null;
   }
 
   function finishBridgeRequest(request, result, recovered = false) {
@@ -973,6 +1244,35 @@ export function createIntegration({
       : undefined;
   }
 
+  function scheduleTerminalPurge() {
+    stopAfterPurgeAll();
+    terminalPurgeTask ??= new Promise((resolve) => {
+      const timer = setTerminalPurgeTimeout(() => {
+        void (async () => {
+          try {
+            await startWorkDrain();
+            sensitiveExportManager?.purge();
+            privacy.purgeScope({ scope: "all" });
+          } catch (error) {
+            lastError = errorReasonCode(error, "unknown-error");
+          } finally {
+            sensitiveExportManager = undefined;
+            resolve();
+          }
+        })();
+      }, terminalPurgeDelayMs);
+      timer.unref?.();
+    });
+  }
+
+  function clearOperationTransaction(request) {
+    const requestDigest = mailboxRequestDigest("operation", request);
+    const transaction = store.readRequestTransaction?.();
+    if (transaction?.requestDigest !== requestDigest) return;
+    const cleared = store.clearRequestTransaction?.(requestDigest);
+    if (cleared?.ok === false) throw new Error(cleared.reason ?? "request-transaction-failed");
+  }
+
   function finishOperationRequest(request, result) {
     const subjectId = operationSubjectId(request);
     recordOperationStatus(
@@ -981,7 +1281,8 @@ export function createIntegration({
       subjectId,
       result.ok === true ? undefined : result.reason,
     );
-    recordOperationCompletion(request, result, subjectId);
+    if (!completedOperationRequest(request)) recordOperationCompletion(request, result, subjectId);
+    clearOperationTransaction(request);
     uiProjectionDirty = true;
     return result;
   }
@@ -1007,27 +1308,31 @@ export function createIntegration({
     if (request.action === "set-kill-switch") {
       if (request.payload.settingsVersion !== settingsVersion(fresh)) return { ok: false, reason: "stale-settings-version" };
       return request.payload.enabled
-        ? triggerKillSwitch("native-control")
-        : clearKillSwitch("native-control");
+        ? triggerKillSwitch("native-control", request)
+        : clearKillSwitch("native-control", request);
     }
     if (request.action === "set-paused") {
       if (request.payload.settingsVersion !== settingsVersion(fresh)) return { ok: false, reason: "stale-settings-version" };
       let projectFingerprint;
+      const transactionAudits = [];
       const saved = store.updateGlobalSettings((global, current) => {
         if (settingsVersion(current) !== request.payload.settingsVersion) throw new Error("stale-settings-version");
         projectFingerprint = current.repo.projectFingerprint;
-        return schemas.makeGlobalSettings({ ...global, paused: request.payload.paused, updatedAt: now() });
-      });
+        const next = schemas.makeGlobalSettings({ ...global, paused: request.payload.paused, updatedAt: now() });
+        const effectiveMode = schemas.resolveMode(next.mode, current.repo.mode, modeOverrides({ ...current, global: next }, projectFingerprint));
+        transactionAudits.push(makeAuditRecord("mode-change", {
+          action: request.payload.paused ? "pause" : "resume",
+          paused: request.payload.paused,
+          storedMode: next.mode,
+          effectiveMode,
+        }));
+        transactionAudits.push(operationCompletionRecord(request, { ok: true }));
+        return next;
+      }, { additionalAudits: transactionAudits });
       if (!saved.ok) return { ok: false, reason: saved.reason ?? "pause-update-failed" };
       invalidateRoutingSettings();
       const effectiveMode = syncSchedulerMode(projectFingerprint, request.payload.paused ? "native-pause" : "native-resume");
       if (request.payload.paused) setModeForDowngrade("native-pause");
-      appendAudit("mode-change", {
-        action: request.payload.paused ? "pause" : "resume",
-        paused: request.payload.paused,
-        storedMode: saved.settings.global.mode,
-        effectiveMode,
-      });
       publish("self-evolve.settings", { action: request.payload.paused ? "pause" : "resume", effectiveMode });
       return { ok: true };
     }
@@ -1049,7 +1354,7 @@ export function createIntegration({
         decisionVersion: proposal.decisionVersion + 1,
         actor: BRIDGE_ACTOR,
         timestamp,
-        nonce: sha256(`${proposal.id}:${proposal.decisionVersion + 1}:${timestamp}:native-snooze:${request.requestId}`),
+        nonce: sha256(`native-snooze:${request.requestId}:${request.operationHash}`),
         priorState: "pending",
         newState: "pending",
       });
@@ -1057,6 +1362,7 @@ export function createIntegration({
       if (!committed.ok) return committed;
       appendAudit("decision", {
         action: "snooze",
+        requestId: request.requestId,
         snoozedUntil: request.payload.snoozedUntil,
         state: "pending",
       }, proposal.id, BRIDGE_ACTOR);
@@ -1085,9 +1391,10 @@ export function createIntegration({
     if (request.action === "purge-scope") {
       try {
         exportManager().purge();
-        sensitiveExportManager = undefined;
       } catch (error) {
         return { ok: false, reason: errorReasonCode(error, "unknown-error") };
+      } finally {
+        sensitiveExportManager = undefined;
       }
       const result = privacy.purgeScope({
         scope: request.payload.scope,
@@ -1099,23 +1406,7 @@ export function createIntegration({
       return {
         ok: true,
         terminal: true,
-        afterResponse() {
-          stopAfterPurgeAll();
-          terminalPurgeTask ??= new Promise((resolve) => {
-            const timer = setTerminalPurgeTimeout(() => {
-              try {
-                sensitiveExportManager?.purge();
-                sensitiveExportManager = undefined;
-                privacy.purgeScope({ scope: "all" });
-              } catch (error) {
-                lastError = errorReasonCode(error, "unknown-error");
-              } finally {
-                resolve();
-              }
-            }, terminalPurgeDelayMs);
-            timer.unref?.();
-          });
-        },
+        afterResponse: scheduleTerminalPurge,
       };
     }
     if (request.action === "export-data") {
@@ -1150,15 +1441,23 @@ export function createIntegration({
         hostVersion,
         hostVersionSource,
         recoverHostSessions: false,
+        processMailbox: false,
       });
-      return result.ok ? { ok: true } : { ok: false, reason: result.reason ?? result.health?.lastError ?? "bootstrap-retry-failed" };
+      const completion = result.ok ? { ok: true } : { ok: false, reason: result.reason ?? result.health?.lastError ?? "bootstrap-retry-failed" };
+      const saved = store.appendRecord(operationCompletionRecord(request, completion));
+      if (!saved?.ok) throw new Error(saved?.reason ?? "audit-write-failed");
+      return completion;
     }
     return { ok: false, reason: "unsupported-operation" };
   }
 
   async function validateMailboxOperation(request) {
     const completed = completedOperationRequest(request);
-    if (completed) return recoverOperationCompletion(request, completed);
+    if (completed) {
+      const recovered = recoverOperationCompletion(request, completed);
+      clearOperationTransaction(request);
+      return recovered;
+    }
     if (completedOperationNonce(request.nonce)) return { ok: false, reason: "replayed-operation" };
     const fresh = settings();
     if (!fresh) return finishOperationRequest(request, { ok: false, reason: "corrupt-settings" });
@@ -1166,30 +1465,42 @@ export function createIntegration({
         || request.stateRootIdentity !== stateRootIdentity(options.stateRoot)) {
       return finishOperationRequest(request, { ok: false, reason: "cross-scope-request" });
     }
-    const grant = currentOperationGrant(request);
-    if (!grant) return finishOperationRequest(request, { ok: false, reason: "stale-or-unavailable-projection" });
-    try {
-      makeUiOperationRequest(request, {
-        projectFingerprint: fresh.repo.projectFingerprint,
-        stateRootIdentity: stateRootIdentity(options.stateRoot),
-        generation: uiProjection.index.generation,
-        projectionHash: uiProjection.index.projectionHash,
-        now: now(),
-        supportedCapabilities: UI_CAPABILITIES,
-        grant,
-      });
-    } catch (error) {
-      return finishOperationRequest(request, { ok: false, reason: errorReasonCode(error, "unknown-error") });
+    const intent = operationIntent(request);
+    let authorizedIntent = false;
+    if (intent) {
+      if (!validateOperationIntent(request, intent)) return { ok: false, reason: "replayed-request" };
+      const recovered = recoverOperationIntent(request, intent);
+      if (recovered) return finishOperationRequest(request, recovered);
+      authorizedIntent = true;
+    }
+    if (!authorizedIntent) {
+      const grant = currentOperationGrant(request);
+      if (!grant) return finishOperationRequest(request, { ok: false, reason: "stale-or-unavailable-projection" });
+      try {
+        makeUiOperationRequest(request, {
+          projectFingerprint: fresh.repo.projectFingerprint,
+          stateRootIdentity: stateRootIdentity(options.stateRoot),
+          generation: uiProjection.index.generation,
+          projectionHash: uiProjection.index.projectionHash,
+          now: now(),
+          supportedCapabilities: UI_CAPABILITIES,
+          grant,
+        });
+      } catch (error) {
+        return finishOperationRequest(request, { ok: false, reason: errorReasonCode(error, "unknown-error") });
+      }
     }
     const subjectId = operationSubjectId(request);
-    recordOperationStatus(request, "queued", subjectId);
+    if (!authorizedIntent) recordOperationStatus(request, "queued", subjectId);
     recordOperationStatus(request, "running", subjectId);
+    if (!authorizedIntent) recordOperationIntent(request);
     let result;
     try {
       result = await executeUiOperation(request);
     } catch (error) {
       result = { ok: false, reason: errorReasonCode(error, "unknown-error") };
     }
+    await options.__testAfterOperationEffect?.({ request, result });
     return finishOperationRequest(request, result);
   }
 
@@ -1216,8 +1527,15 @@ export function createIntegration({
       return finishControlRequest(request, result);
     }
 
-    if (request.action === "set-repo-mode" && request.payload.mode === "yolo") {
-      const roots = fresh.global.allowedSkillRoots;
+    const yoloModeRequest = request.payload.mode === "yolo"
+      && (request.action === "set-mode" || request.action === "set-repo-mode");
+    if (yoloModeRequest) {
+      if (request.action === "set-mode" && request.payload.confirmation !== "ENABLE YOLO") {
+        return finishControlRequest(request, { ok: false, reason: "yolo-confirmation-required" });
+      }
+      const roots = request.action === "set-mode"
+        ? request.payload.allowlist
+        : fresh.global.allowedSkillRoots;
       if (!roots.length) result = { ok: false, reason: "yolo-allowlist-required" };
       else if (!fresh.global.consent.passiveCalls) result = { ok: false, reason: "passive-consent-required" };
       else if (!fresh.global.consent.durableObservations) result = { ok: false, reason: "observation-consent-required" };
@@ -1227,7 +1545,10 @@ export function createIntegration({
     }
 
     let transitionEvents = [];
+    const transactionAudits = [];
+    const successfulCompletion = controlCompletionRecord(request, { ok: true });
     const saved = store.updateSettings((current) => {
+      transactionAudits.push(successfulCompletion);
       if (current.global.updatedAt !== request.settingsUpdatedAt || settingsVersion(current) !== request.settingsVersion) throw new Error("stale-settings-version");
       if (request.action === "set-mode") {
         let global = current.global;
@@ -1242,6 +1563,7 @@ export function createIntegration({
         }, now(), BRIDGE_ACTOR);
         if (!transitioned.ok) throw new Error(transitioned.error);
         transitionEvents = transitioned.events;
+        transactionAudits.push(...transitionEvents.map((event) => schemas.wrapRecord("audit-event", event, event.timestamp)));
         return { global: transitioned.state.global };
       }
       if (request.action === "set-repo-mode") {
@@ -1252,6 +1574,7 @@ export function createIntegration({
         }, now(), BRIDGE_ACTOR);
         if (!transitioned.ok) throw new Error(transitioned.error);
         transitionEvents = transitioned.events;
+        transactionAudits.push(...transitionEvents.map((event) => schemas.wrapRecord("audit-event", event, event.timestamp)));
         return { repo: transitioned.state.repo };
       }
       if (request.action === "set-consent") {
@@ -1273,15 +1596,14 @@ export function createIntegration({
         return { global: schemas.makeGlobalSettings({ ...current.global, allowedSkillRoots: request.payload.allowlist, updatedAt: now() }) };
       }
       throw new Error("unknown-control-action");
-    }, { expectedGlobalUpdatedAt: request.settingsUpdatedAt });
+    }, { expectedGlobalUpdatedAt: request.settingsUpdatedAt, additionalAudits: transactionAudits });
     result = saved.ok ? { ok: true } : { ok: false, reason: saved.reason ?? "control-rejected" };
     if (saved.ok) {
       invalidateRoutingSettings();
-      for (const event of transitionEvents) store.appendRecord(schemas.wrapRecord("audit-event", event, event.timestamp));
       const effectiveMode = syncSchedulerMode(request.projectFingerprint, `control-${request.action}`);
       publish("self-evolve.settings", { action: request.action, effectiveMode });
     }
-    return finishControlRequest(request, result);
+    return saved.ok && saved.changed ? result : finishControlRequest(request, result);
   }
 
   async function validateMailboxDecision(request) {
@@ -1508,6 +1830,7 @@ export function createIntegration({
     const cycleOptions = {
       ...(args.options ?? {}),
       projectRoot,
+      rootSessionIDHash: args.rootSessionIDHash ?? args.options?.rootSessionIDHash,
       synthesis: { ...(args.options?.synthesis ?? {}), ...ownership },
       critic: { ...(args.options?.critic ?? {}), ...ownership },
       rolloutGates,
@@ -1597,6 +1920,7 @@ export function createIntegration({
   }
 
   async function handleEvent(event) {
+    if (closed) return { scheduled: false, reason: "integration-closing" };
     if (terminalPurge) return { scheduled: false, reason: "restart-required-after-purge-all" };
     if (!isDurableLifecycleEvent(event)) return { scheduled: false, reason: "irrelevant-event" };
     const current = settings({ routing: true });
@@ -1607,7 +1931,17 @@ export function createIntegration({
       invalidateRoutingSettings();
       return { scheduled: false, reason: "manual-mode" };
     }
-    await schedulerInstance.handleEvent(event);
+    let lineage;
+    try {
+      lineage = await hydrateRootLineage(event, projectFingerprint);
+    } catch {
+      return { scheduled: false, reason: "session-ancestry-unavailable" };
+    }
+    if (closed) return { scheduled: false, reason: "integration-closing" };
+    if (!lineage?.resolved) return { scheduled: false, reason: "session-ancestry-unavailable" };
+    if (lineage.originKind === "delegated") return { scheduled: false, reason: "delegated-root" };
+    if (lineage.originKind !== "user") return { scheduled: false, reason: "non-user-root" };
+    await schedulerInstance.handleEvent(event, lineage);
     return { scheduled: true, mode };
   }
 
@@ -1736,6 +2070,22 @@ export function createIntegration({
             ? "Self-evolve deferred this scan because another scan for the same session is already running."
             : `Self-evolve could not start this scan: ${episode.reason}.`,
         };
+    } else if (command.verb === "purge" && command.scope === "all") {
+      stopAfterPurgeAll();
+      await startWorkDrain();
+      result = commandPolicy.execute(command, { projectFingerprint: input?.projectFingerprint ?? settings()?.repo?.projectFingerprint });
+    } else if (command.verb === "kill-switch") {
+      const switchResult = command.enabled
+        ? triggerKillSwitch("command")
+        : clearKillSwitch("command");
+      result = {
+        ...switchResult,
+        responseText: switchResult.ok
+          ? command.enabled
+            ? `Kill switch enabled. Stored mode remains ${switchResult.storedMode}; effective mode is manual. No files were applied.`
+            : `Kill switch disabled. Stored mode remains ${switchResult.storedMode}. No files were applied.`
+          : `Kill switch failed: ${switchResult.reason ?? switchResult.error}.`,
+      };
     } else {
       result = commandPolicy.execute(command, { projectFingerprint: input?.projectFingerprint ?? settings()?.repo?.projectFingerprint });
       if ((command.verb === "status" || command.verb === "health") && backgroundRestartRequired()) {
@@ -1750,6 +2100,7 @@ export function createIntegration({
         syncSchedulerMode(input?.projectFingerprint, `command-${command.verb}`);
       }
     }
+    if (command.verb === "purge") sensitiveExportManager = undefined;
     if (output && typeof output === "object") output.responseText = result.responseText;
     if (!terminalPurge) await processMailbox();
     return result;
@@ -1762,8 +2113,11 @@ export function createIntegration({
     clearRetentionInterval(retentionTimer);
     retentionTimer = undefined;
     schedulerInstance.setMode?.("manual", "purge-all");
-    schedulerInstance.dispose?.();
-    for (const item of inFlight.values()) schedulerInstance.cancelPending?.(item.sessionID);
+    schedulerInstance.stopAdmission?.("purge-all");
+    for (const record of inFlight.values()) {
+      record.controller.abort("purge-all");
+      schedulerInstance.cancelPending?.(record.item.sessionID);
+    }
   }
 
   function setMode(mode, opts = {}) {
@@ -1786,7 +2140,8 @@ export function createIntegration({
     for (const event of transitioned.events) store.appendRecord(schemas.wrapRecord("audit-event", event, event.timestamp));
     const effectiveMode = syncSchedulerMode(projectFingerprint, "mode-change");
     if (effectiveMode === "manual") {
-      for (const item of inFlight.values()) {
+      for (const record of inFlight.values()) {
+        const { item } = record;
         schedulerInstance.cancelPending?.(item.sessionID);
         schedulerInstance.recordWorkResult?.(item, { result: "downgrade", downgrade: true });
       }
@@ -1870,10 +2225,11 @@ export function createIntegration({
     return hostRecoveryTask;
   }
 
-  function triggerKillSwitch(reason = "runtime") {
+  function triggerKillSwitch(reason = "runtime", request) {
     if (terminalPurge) return { ok: false, reason: "restart-required-after-purge-all" };
     let downgrade;
     let storedMode;
+    const transactionAudits = [];
     const saved = store.updateGlobalSettings((global, current) => {
       storedMode = global.mode;
       downgrade = schemas.downgradeOnKillSwitch({
@@ -1885,37 +2241,57 @@ export function createIntegration({
         timestamp: now(),
       });
       if (!downgrade.ok) throw new Error(downgrade.error);
+      transactionAudits.push(makeAuditRecord("kill-switch", {
+        action: "on",
+        reason: String(reason).slice(0, 512),
+        storedMode,
+        priorEffectiveMode: downgrade.events[0]?.details?.priorEffectiveMode ?? "manual",
+        effectiveMode: "manual",
+      }));
+      if (request) transactionAudits.push(operationCompletionRecord(request, { ok: true }));
       return schemas.makeGlobalSettings({ ...global, killSwitchActive: true, updatedAt: now() });
-    });
+    }, { additionalAudits: transactionAudits });
     if (!saved.ok) return { ok: false, reason: saved.reason };
     runtimeKillSwitch = true;
     invalidateRoutingSettings();
-    for (const event of downgrade.events) store.appendRecord(schemas.wrapRecord("audit-event", event, event.timestamp));
+    const auditEvent = saved.auditEvents?.find((event) => event.kind === "kill-switch")
+      ?? transactionAudits.find((record) => record.payload.kind === "kill-switch")?.payload;
     setModeForDowngrade("kill-switch");
     publish("self-evolve.settings", { action: "kill-switch", enabled: true });
-    return { ok: true, storedMode, effectiveMode: "manual", auditEvent: downgrade.events[0] };
+    return { ok: true, storedMode, effectiveMode: "manual", auditEvent };
   }
 
   function setModeForDowngrade(reason) {
     schedulerInstance.setMode?.("manual", reason);
-    for (const item of inFlight.values()) {
+    for (const record of inFlight.values()) {
+      const { item } = record;
       schedulerInstance.cancelPending?.(item.sessionID);
       schedulerInstance.recordWorkResult?.(item, { result: "downgrade", downgrade: true });
     }
   }
 
-  function clearKillSwitch(reason = "runtime") {
+  function clearKillSwitch(reason = "runtime", request) {
     if (terminalPurge) return { ok: false, reason: "restart-required-after-purge-all" };
-    runtimeKillSwitch = false;
     let projectFingerprint;
+    let effectiveMode;
+    const transactionAudits = [];
     const saved = store.updateGlobalSettings((global, current) => {
       projectFingerprint = current.repo.projectFingerprint;
-      return schemas.makeGlobalSettings({ ...global, killSwitchActive: false, updatedAt: now() });
-    });
+      const next = schemas.makeGlobalSettings({ ...global, killSwitchActive: false, updatedAt: now() });
+      effectiveMode = schemas.resolveMode(next.mode, current.repo.mode, {
+        ...modeOverrides({ ...current, global: next }, projectFingerprint),
+        killSwitchActive: false,
+      });
+      transactionAudits.push(makeAuditRecord("kill-switch", { action: "off", reason: String(reason), storedMode: next.mode, effectiveMode }));
+      if (request) transactionAudits.push(operationCompletionRecord(request, { ok: true }));
+      return next;
+    }, { additionalAudits: transactionAudits });
     if (!saved.ok) return { ok: false, reason: saved.reason };
+    runtimeKillSwitch = false;
     invalidateRoutingSettings();
-    const effectiveMode = syncSchedulerMode(projectFingerprint, "kill-switch-cleared");
-    const auditEvent = appendAudit("kill-switch", { action: "off", reason: String(reason), storedMode: saved.settings.global.mode, effectiveMode });
+    effectiveMode = syncSchedulerMode(projectFingerprint, "kill-switch-cleared");
+    const auditEvent = saved.auditEvents?.find((event) => event.kind === "kill-switch")
+      ?? transactionAudits.find((record) => record.payload.kind === "kill-switch")?.payload;
     publish("self-evolve.settings", { action: "kill-switch", enabled: false, effectiveMode });
     return { ok: true, storedMode: saved.settings.global.mode, effectiveMode, auditEvent };
   }
@@ -1935,8 +2311,20 @@ export function createIntegration({
         && event.details?.accepted === true
         && event.details?.terminal === true);
       if (terminalIntent) {
-        privacy.purgeScope({ scope: "all" });
+        if (store.hasPendingOperationRequest?.(terminalIntent.details.requestId) === true) await processMailbox();
+        if (terminalPurge) {
+          return {
+            ok: false,
+            mode: "manual",
+            reason: "restart-required-after-purge-all",
+            health: { mode: "manual", lastError: "restart-required-after-purge-all" },
+          };
+        }
         stopAfterPurgeAll();
+        await startWorkDrain();
+        try { sensitiveExportManager?.purge(); } catch {}
+        sensitiveExportManager = undefined;
+        privacy.purgeScope({ scope: "all" });
         return {
           ok: false,
           mode: "manual",
@@ -1991,7 +2379,7 @@ export function createIntegration({
       if (options.stateRoot) {
         issueBridgeNonces();
         issueControlGrant();
-        await processMailbox();
+        if (args.processMailbox !== false) await processMailbox();
         startMailboxPolling();
       }
       startRetentionTimer();
@@ -2005,29 +2393,37 @@ export function createIntegration({
     return { ok: !corrupt && recovery.every((item) => item.ok !== false || item.recoveredToFailedClosed === true) && synthesisRecovery.every((item) => item.ok) && hiddenSessionRecovery.every((item) => item.ok), mode, recovered: recovery, synthesisRecovery, hiddenSessionRecovery, health: getHealth() };
   }
 
-  async function shutdown() {
-    if (closed && !shutdownDegraded) return { ok: true, alreadyClosed: true };
-    if (!closed) {
-      closed = true;
-      hostRecoveryController?.abort();
-      clearMailboxInterval(mailboxTimer);
-      mailboxTimer = undefined;
-      clearRetentionInterval(retentionTimer);
-      retentionTimer = undefined;
+  function startWorkDrain() {
+    if (workDrainTask) return workDrainTask;
+    schedulerInstance.stopAdmission?.("shutdown");
+    hostRecoveryController?.abort();
+    for (const record of inFlight.values()) record.controller.abort("integration-shutdown");
+    clearMailboxInterval(mailboxTimer);
+    mailboxTimer = undefined;
+    clearRetentionInterval(retentionTimer);
+    retentionTimer = undefined;
+    workDrainTask = (async () => {
       await mailboxTask;
       await retentionTask;
       await hostRecoveryTask;
-      await terminalPurgeTask;
+      while (inFlight.size) await Promise.allSettled([...inFlight.values()].map((record) => record.promise));
+      await schedulerInstance.drain?.();
+      return { ok: true };
+    })();
+    return workDrainTask;
+  }
+
+  async function closeResources() {
+    await terminalPurgeTask;
+    if (!schedulerDisposed) {
       schedulerInstance.dispose?.();
+      schedulerDisposed = true;
     }
     const applierClose = await applier.close?.();
     if (applierClose?.ok === false) {
       shutdownDegraded = true;
       return { ok: false, reason: "applier-close-degraded", applier: applierClose };
     }
-    synthesisModule?.disposeSynthesis?.(store);
-    const hostOwnerRelease = store.releaseOwnedHostOwners?.({ pid: process.pid, generation: hostOwnerGeneration });
-    if (hostOwnerRelease?.ok === false) lastError = hostOwnerRelease.reason ?? "host-owner-release-degraded";
     if (!terminalPurge) await store.flushAudit?.();
     const storeClose = await store.close?.();
     if (storeClose?.ok === false) {
@@ -2035,7 +2431,39 @@ export function createIntegration({
       return { ok: false, reason: "store-close-degraded", store: storeClose };
     }
     shutdownDegraded = false;
+    resourcesClosed = true;
     return { ok: true };
+  }
+
+  function closeAfterDrain() {
+    if (!resourceCloseTask) {
+      resourceCloseTask = startWorkDrain().then(closeResources);
+      void resourceCloseTask.then((result) => {
+        if (result?.ok === false) resourceCloseTask = undefined;
+      }, () => { resourceCloseTask = undefined; });
+    }
+    return resourceCloseTask;
+  }
+
+  async function shutdown() {
+    if (resourcesClosed && !shutdownDegraded) return { ok: true, alreadyClosed: true };
+    closed = true;
+    const completion = closeAfterDrain();
+    const timeoutMs = Number.isSafeInteger(options.__testShutdownTimeoutMs) && options.__testShutdownTimeoutMs > 0
+      ? options.__testShutdownTimeoutMs
+      : AUTONOMOUS_SHUTDOWN_TIMEOUT_MS;
+    let timer;
+    const outcome = await Promise.race([
+      completion.then((result) => ({ settled: true, result })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ settled: false }), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome.settled) return outcome.result;
+    shutdownDegraded = true;
+    return { ok: false, reason: "autonomous-work-draining", timeoutMs, completion };
   }
 
   const testBridge = Object.freeze({
@@ -2084,6 +2512,6 @@ export function createIntegration({
     triggerKillSwitch,
     clearKillSwitch,
     getRetentionState: () => ({ scheduled: retentionTimer !== undefined, inFlight: retentionTask !== undefined }),
-    getInFlightWork: () => [...inFlight.values()].map((item) => ({ ...item })),
+    getInFlightWork: () => [...inFlight.values()].map((record) => ({ ...record.item })),
   });
 }

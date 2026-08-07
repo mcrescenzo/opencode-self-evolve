@@ -81,31 +81,80 @@ test("canonical server, durable, synthesis, source, and TUI identities stay alig
   const hooks = await SelfEvolvePlugin(pluginContext(), { durableAutonomy: false });
   const cfg = { model: "fixture/model", agent: {} };
   await hooks.config(cfg);
-  assert.ok(cfg.agent[SELF_EVOLVE_ANALYZER_AGENT]);
-  assert.equal(cfg.agent[SELF_EVOLVE_ANALYZER_AGENT].permission["*"], "deny");
-  assert.equal(cfg.agent[SELF_EVOLVE_ANALYZER_AGENT].permission.edit, "deny");
+  for (const agentName of [SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
+    const agent = cfg.agent[agentName];
+    assert.ok(agent);
+    assert.equal(agent.mode, "primary");
+    assert.equal(agent.hidden, true);
+    assert.equal(agent.temperature, 0);
+    assert.equal(agent.steps, 1);
+    assert.equal(agent.permission["*"], "deny");
+    assert.equal(agent.permission.edit, "deny");
+    assert.equal(agent.metadata, undefined, "agent registration uses only supported config fields");
+  }
+  assert.equal(typeof hooks["chat.params"], "function");
   await hooks.dispose();
 });
 
-test("agent registration preserves foreign definitions and treats owned duplicates as idempotent", async () => {
+test("all hidden agent registrations preserve foreign definitions and treat exact duplicates as idempotent", async () => {
   const hooks = await SelfEvolvePlugin(pluginContext(), { durableAutonomy: false });
   const foreign = { description: "Anonymous co-install agent", prompt: "foreign", permission: { "*": "allow" } };
-  const foreignFirst = { model: "fixture/model", agent: { [SELF_EVOLVE_ANALYZER_AGENT]: foreign } };
+  const foreignFirst = {
+    model: "fixture/model",
+    agent: {
+      [SELF_EVOLVE_ANALYZER_AGENT]: foreign,
+      [SELF_EVOLVE_SYNTHESIZER_AGENT]: foreign,
+      [SELF_EVOLVE_CRITIC_AGENT]: foreign,
+    },
+  };
   await hooks.config(foreignFirst);
-  assert.equal(foreignFirst.agent[SELF_EVOLVE_ANALYZER_AGENT], foreign);
+  for (const agentName of [SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
+    assert.equal(foreignFirst.agent[agentName], foreign);
+  }
 
   const owned = { model: "fixture/model", agent: {} };
   await hooks.config(owned);
-  const first = owned.agent[SELF_EVOLVE_ANALYZER_AGENT];
+  const first = new Map(Object.entries(owned.agent));
   await hooks.config(owned);
-  assert.equal(owned.agent[SELF_EVOLVE_ANALYZER_AGENT], first);
-  assert.equal(first.metadata.owner, MODULE_ID);
-  assert.match(first.metadata.definitionFingerprint, /^[a-f0-9]{64}$/u);
+  for (const [agentName, definition] of first) assert.equal(owned.agent[agentName], definition);
 
   owned.agent[SELF_EVOLVE_ANALYZER_AGENT] = foreign;
   await hooks.config(owned);
   assert.equal(owned.agent[SELF_EVOLVE_ANALYZER_AGENT], foreign, "a later foreign definition is not reclaimed");
   await hooks.dispose();
+});
+
+test("unsupported host agent config fails closed without replacing host state", () => {
+  const cfg = { model: "fixture/model", agent: "unsupported-host-shape" };
+  const registrations = SelfEvolvePlugin.__test.registerHiddenAgents(cfg);
+  assert.equal(cfg.agent, "unsupported-host-shape");
+  for (const agentName of [SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
+    assert.deepEqual(registrations.get(agentName), {
+      registered: false,
+      equivalent: false,
+      owned: false,
+      reason: "host-agent-config-unsupported",
+      definitionFingerprint: SelfEvolvePlugin.__test.agentDefinitionFingerprint(
+        SelfEvolvePlugin.__test.hiddenAgentDefinitions(cfg.model).get(agentName),
+      ),
+    });
+  }
+});
+
+test("durable synthesis binding overrides caller registration bypasses for both provider roles", async () => {
+  const calls = [];
+  const registration = { assert: () => {} };
+  const module = SelfEvolvePlugin.__test.bindHiddenAgentRegistration({
+    async runSynthesis(args) { calls.push(["synthesis", args]); return "synthesis"; },
+    async runCritic(args) { calls.push(["critic", args]); return "critic"; },
+  }, registration);
+  const bypass = { assert: () => { throw new Error("must be replaced"); } };
+
+  assert.equal(await module.runSynthesis({ options: { marker: 1, hiddenAgentRegistration: bypass } }), "synthesis");
+  assert.equal(await module.runCritic({ options: { marker: 2, hiddenAgentRegistration: bypass } }), "critic");
+  assert.equal(calls[0][1].options.hiddenAgentRegistration, registration);
+  assert.equal(calls[1][1].options.hiddenAgentRegistration, registration);
+  assert.deepEqual(calls.map(([, args]) => args.options.marker), [1, 2]);
 });
 
 test("TUI surface ownership preserves foreign claims in both load orders and deduplicates package loads", () => {
@@ -193,9 +242,10 @@ test("legacy hidden agents and source markers remain recognized for one release"
   assert.deepEqual(outcomes.map((item) => item.id), ["canonical", "legacy"]);
 
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-identity-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
   const store = openStore(root, { projectFingerprint: PROJECT, now: () => 100 });
-  t.after(() => store.close());
+  t.after(() => {
+    try { store.close(); } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   for (const [index, agent] of [SELF_EVOLVE_CRITIC_AGENT, LEGACY_SELF_EVOLVE_AGENTS.synthesizer].entries()) {
     const acquired = store.acquireHostOwner(`session-${index}`, {
       agent,

@@ -58,28 +58,6 @@ function eventProjectFingerprint(event) {
     ?? null;
 }
 
-function eventHidden(event) {
-  return event?.properties?.hidden
-    ?? event?.properties?.session?.hidden
-    ?? event?.hidden
-    ?? event?.session?.hidden;
-}
-
-function eventAgent(event) {
-  return event?.properties?.agent
-    ?? event?.properties?.session?.agent
-    ?? event?.agent
-    ?? event?.session?.agent;
-}
-
-function eventCreatedBy(event) {
-  return event?.properties?.session?.createdBy ?? event?.session?.createdBy;
-}
-
-function eventAnonymous(event) {
-  return event?.properties?.session?.anonymous ?? event?.session?.anonymous;
-}
-
 function eventEpoch(event) {
   const value = event?.properties?.epoch ?? event?.epoch;
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -188,8 +166,10 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   const sessions = new Map();
   const heldLeases = new Map();
   const inFlight = new Map();
+  const workPromises = new Set();
   const backoffUntil = new Map();
   let disposed = false;
+  let accepting = true;
   let modeOverride = null;
   let breaker = latestBreaker();
   let cachedMode = effectiveMode(initialSettings);
@@ -272,6 +252,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   }
 
   function scheduleDebounce(state, delay = configured.idleDebounceMs) {
+    if (!accepting || disposed) return;
     clearTimer(state);
     state.timer = setTimeout(() => {
       state.timer = null;
@@ -357,7 +338,9 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     if (!nonce || heldLeases.get(key) !== nonce) return;
     let result;
     try { result = store.releaseLease(key, nonce); } catch (error) { log({ level: "warn", action: "release-lease", error: String(error?.message ?? error) }); return; }
-    if (result?.ok || result?.reason === "lease-not-found") heldLeases.delete(key);
+    if (result?.ok || ["lease-not-found", "nonce-mismatch", "lease-corrupt"].includes(result?.reason)) {
+      heldLeases.delete(key);
+    }
   }
 
   async function runWithEpisodeLease({ projectFingerprint, sessionID } = {}, operation) {
@@ -389,7 +372,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   }
 
   async function reserveEpisode(state) {
-    if (disposed) return;
+    if (!accepting || disposed) return;
     const timestamp = now();
     cleanupStaleSessions(timestamp);
     const settings = safeSettings(store);
@@ -453,40 +436,54 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       }, timestamp, "lease");
       return;
     }
+    if (!accepting || disposed) {
+      try { store.releaseLease(key, lease.nonce); } catch {}
+      return;
+    }
 
+    let workItem;
     heldLeases.set(key, lease.nonce);
-    const reservedCursor = beginEpisode(cursor, timestamp, lease.nonce);
-    const workItem = Object.freeze({
-      sessionID: state.sessionID,
-      projectFingerprint,
-      scopeFingerprint: state.scopeFingerprint ?? projectFingerprint,
-      cursor: reservedCursor,
-      leaseNonce: lease.nonce,
-      scheduledAt: timestamp,
-      trigger: cachedMode,
-      epoch: state.epoch,
-      ...(state.canonicalRootSessionID ? { rootSessionID: state.canonicalRootSessionID } : {}),
-      rootSessionIDHash: state.rootLineageHash ?? UNKNOWN_ROOT_LINEAGE_HASH,
-      originKind: state.originKind ?? "unknown",
-    });
-    inFlight.set(state.sessionID, workItem);
-    audit("scheduler-budget", { budgetType: "synthesis", rootSessionIDHash: hashSessionLineage(state.rootSessionID) }, timestamp);
+    try {
+      const reservedCursor = beginEpisode(cursor, timestamp, lease.nonce);
+      workItem = Object.freeze({
+        sessionID: state.sessionID,
+        projectFingerprint,
+        scopeFingerprint: state.scopeFingerprint ?? projectFingerprint,
+        cursor: reservedCursor,
+        leaseNonce: lease.nonce,
+        scheduledAt: timestamp,
+        trigger: cachedMode,
+        epoch: state.epoch,
+        ...(state.canonicalRootSessionID ? { rootSessionID: state.canonicalRootSessionID } : {}),
+        rootSessionIDHash: state.rootLineageHash ?? UNKNOWN_ROOT_LINEAGE_HASH,
+        originKind: state.originKind ?? "unknown",
+      });
+      inFlight.set(state.sessionID, workItem);
+    } catch (error) {
+      releaseWorkLease({ _leaseKey: key, leaseNonce: lease.nonce, projectFingerprint, sessionID: state.sessionID });
+      if (inFlight.get(state.sessionID)?.leaseNonce === lease.nonce) inFlight.delete(state.sessionID);
+      audit("scheduler-failure", {
+        sessionIDHash,
+        reason: String(error?.message ?? error).slice(0, 400),
+      }, timestamp);
+      return;
+    }
 
-    queueMicrotask(() => {
-      void Promise.resolve()
-        .then(() => enqueueWork(workItem))
-        .then(
-          (result) => recordWorkResult(workItem, result),
-          (error) => recordWorkResult(workItem, { ok: false, error: String(error?.message ?? error) }),
-        )
-        .catch((error) => {
-          log({ level: "warn", action: "settle-work", error: String(error?.message ?? error) });
-        });
-    });
+    const workPromise = Promise.resolve()
+      .then(() => enqueueWork(workItem))
+      .then(
+        (result) => recordWorkResult(workItem, result),
+        (error) => recordWorkResult(workItem, { ok: false, error: String(error?.message ?? error) }),
+      )
+      .catch((error) => {
+        log({ level: "warn", action: "settle-work", error: String(error?.message ?? error) });
+      });
+    workPromises.add(workPromise);
+    void workPromise.finally(() => workPromises.delete(workPromise));
   }
 
-  async function handleEvent(input) {
-    if (disposed) return;
+  async function handleEvent(input, trustedLineage) {
+    if (!accepting || disposed) return;
     const event = eventBody(input);
     const status = statusType(event);
     if (!status && event?.type !== "session.compacted") return;
@@ -507,23 +504,16 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     state.touchedAt = timestamp;
     const parentID = eventParentID(event);
     const projectFingerprint = eventProjectFingerprint(event) ?? currentProject();
-    const hidden = eventHidden(event);
-    const agent = eventAgent(event);
-    const createdBy = eventCreatedBy(event);
-    const anonymous = eventAnonymous(event);
     state.reused ||= changedField(parentID, prior?.parentID, null)
-      || changedField(projectFingerprint, prior?.projectFingerprint, null)
-      || changedField(hidden, prior?.hidden, undefined)
-      || changedField(agent, prior?.agent, undefined)
-      || changedField(createdBy, prior?.createdBy, undefined)
-      || changedField(anonymous, prior?.anonymous, undefined);
+      || changedField(projectFingerprint, prior?.projectFingerprint, null);
     state.parentID = parentID !== null ? parentID : prior?.parentID ?? null;
     state.projectFingerprint = projectFingerprint ?? prior?.projectFingerprint;
-    state.hidden = hidden ?? prior?.hidden;
-    state.agent = agent ?? prior?.agent;
-    state.createdBy = createdBy ?? prior?.createdBy;
-    state.anonymous = anonymous ?? prior?.anonymous;
-    const root = resolveRootLineage({ sessionID, projectFingerprint: state.projectFingerprint, sessions: [...sessions.values(), state] });
+    const root = trustedLineage?.resolved === true
+      && trustedLineage.originKind === "user"
+      && typeof trustedLineage.rootSessionID === "string"
+      && typeof trustedLineage.rootLineageHash === "string"
+      ? trustedLineage
+      : resolveRootLineage({ sessionID, projectFingerprint: state.projectFingerprint, sessions: [...sessions.values(), state] });
     state.canonicalRootSessionID = root.resolved ? root.rootSessionID : null;
     state.rootLineageHash = root.rootLineageHash;
     state.originKind = root.originKind;
@@ -642,7 +632,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       backoffUntil.set(failureKey, nextBackoffUntil);
       if (failures >= 3 && !breaker.open) tripCircuitBreaker("three-failures-in-24h");
     }
-    if (state?.pendingAfterFlight && !disposed && cachedMode !== "manual" && !breaker.open) {
+    if (state?.pendingAfterFlight && accepting && !disposed && cachedMode !== "manual" && !breaker.open) {
       state.pendingAfterFlight = false;
       state.epoch = state.nextEpoch ?? state.epoch + 1;
       state.nextEpoch = null;
@@ -651,8 +641,21 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     return { accepted: true, stale: false };
   }
 
+  function stopAdmission() {
+    if (!accepting) return { ok: true, alreadyStopped: true };
+    accepting = false;
+    for (const state of sessions.values()) clearTimer(state);
+    return { ok: true };
+  }
+
+  async function drain() {
+    while (workPromises.size) await Promise.allSettled([...workPromises]);
+    return { ok: true };
+  }
+
   function dispose() {
     if (disposed) return;
+    stopAdmission();
     disposed = true;
     for (const state of sessions.values()) clearTimer(state);
     for (const [key, nonce] of heldLeases) {
@@ -681,6 +684,8 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     resetCircuitBreaker,
     setMode,
     recordWorkResult,
+    stopAdmission,
+    drain,
     dispose,
   });
 }

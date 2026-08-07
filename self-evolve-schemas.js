@@ -142,7 +142,7 @@ export function stripUndefined(value) {
   return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined));
 }
 
-function canonicalize(value) {
+export function canonicalize(value) {
   if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
   if (typeof value === "number") {
     if (!Number.isFinite(value)) fail("malformed-payload", "non-finite number");
@@ -176,6 +176,42 @@ function asBoolean(value, label, defaultValue) {
 function schemaVersion(value) {
   if (!SUPPORTED_SCHEMA_VERSIONS.includes(value)) fail("unsupported-version", String(value ?? "missing"));
   return SCHEMA_VERSION;
+}
+
+function compareSchemaVersions(left, right) {
+  const parse = (value) => String(value).split(".").map((part) => Number(part));
+  const a = parse(left);
+  const b = parse(right);
+  if (a.length !== 3 || b.length !== 3 || [...a, ...b].some((part) => !Number.isInteger(part) || part < 0)) return null;
+  for (let index = 0; index < 3; index += 1) if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+  return 0;
+}
+
+/**
+ * Structural version adapter only. Callers must validate the returned document
+ * with makeGlobalSettings/makeRepoSettings after selecting its partition shape.
+ * Legacy combined files can carry store-owned fields or receive their repository
+ * identity from the partition path, so this function cannot validate them alone.
+ */
+export function migrateSettings(settings) {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return null;
+  const comparison = compareSchemaVersions(settings.schemaVersion, SCHEMA_VERSION);
+  if (comparison === null || comparison > 0) return null;
+  if (comparison === 0) return settings;
+  const migrateRepo = (repo) => {
+    if (!repo || typeof repo !== "object" || Array.isArray(repo)) return repo;
+    const { consent: _removedConsent, ...rest } = repo;
+    return { ...rest, schemaVersion: SCHEMA_VERSION };
+  };
+  if ("projectFingerprint" in settings && !("global" in settings) && !("repo" in settings)) {
+    return migrateRepo(settings);
+  }
+  return {
+    ...settings,
+    schemaVersion: SCHEMA_VERSION,
+    ...(settings.global ? { global: { ...settings.global, schemaVersion: SCHEMA_VERSION } } : {}),
+    ...(settings.repo ? { repo: migrateRepo(settings.repo) } : {}),
+  };
 }
 
 export function asString(value, { max = MAX.string } = {}) {
@@ -285,9 +321,9 @@ export const RepoSettings = deepFreeze({
   fields: ["schemaVersion", "projectFingerprint", "mode", "excluded", "budgets"],
 });
 export const EpisodeCursor = deepFreeze({ fields: ["sessionIDHash", "lastIdleAt", "lastObservedMessageHash", "leaseNonce"] });
-export const Receipt = deepFreeze({ fields: ["receiptType", "signatureHash", "occurrences", "firstSeenAt", "lastSeenAt", "projectFingerprint", "scopeFingerprint"] });
+export const Receipt = deepFreeze({ fields: ["receiptType", "signatureHash", "occurrences", "firstSeenAt", "lastSeenAt", "projectFingerprint", "scopeFingerprint", "targetLogicalName"] });
 export const Observation = deepFreeze({ fields: ["id", "projectFingerprint", "receiptIds", "structuredFields", "incidentId", "sessionLineageHash", "rootLineageHash", "originKind", "createdAt", "injectionFlagged", "redacted"] });
-export const EvidenceCluster = deepFreeze({ fields: ["id", "receiptType", "projectFingerprint", "incidentIds", "scopeFingerprint", "occurrencesSum", "firstSeenAt", "lastSeenAt"] });
+export const EvidenceCluster = deepFreeze({ fields: ["id", "receiptType", "projectFingerprint", "incidentIds", "scopeFingerprint", "targetLogicalName", "occurrencesSum", "firstSeenAt", "lastSeenAt"] });
 export const EligibilityExplanation = deepFreeze({ fields: ["clusterId", "eligible", "reasons", "thresholdsMet", "thresholdsMissed"] });
 export const Proposal = deepFreeze({
   fields: ["id", "projectFingerprint", "clusterId", "skillTarget", "proposedContentHash", "rationaleText", "synthesizedAt", "synthesizerModelId", "criticScore", "criticPassed", "validDeterministic", "state", "injectionFlagged", "decisionVersion", "burnedNonceHashes"],
@@ -319,7 +355,7 @@ export function makeConsentState(data = {}) {
 }
 
 function validateBudgets(data = {}, partial = false) {
-  exactKeys(data, Budgets.fields, "Budgets", partial ? [] : []);
+  exactKeys(data, Budgets.fields, "Budgets", []);
   const result = {};
   for (const key of Budgets.fields) {
     if (partial && !(key in data)) continue;
@@ -365,7 +401,10 @@ export function makeRepoSettings(data) {
 
 function utcDay(value, label) {
   const clean = asNonEmptyString(value, { max: 10 });
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(clean) || new Date(`${clean}T00:00:00.000Z`).toISOString().slice(0, 10) !== clean) {
+  const date = new Date(`${clean}T00:00:00.000Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(clean)
+      || Number.isNaN(date.getTime())
+      || date.toISOString().slice(0, 10) !== clean) {
     fail("malformed-payload", `${label} must be a UTC day`);
   }
   return clean;
@@ -436,7 +475,7 @@ export function beginEpisode(cursor, now, nonce) {
 }
 
 export function makeReceipt(data) {
-  exactKeys(data, Receipt.fields, "Receipt");
+  exactKeys(data, Receipt.fields, "Receipt", Receipt.fields.filter((field) => field !== "targetLogicalName"));
   const firstSeenAt = asTimestamp(data.firstSeenAt);
   const lastSeenAt = asTimestamp(data.lastSeenAt);
   if (lastSeenAt < firstSeenAt) fail("out-of-order", "lastSeenAt precedes firstSeenAt");
@@ -448,28 +487,46 @@ export function makeReceipt(data) {
     lastSeenAt,
     projectFingerprint: asFingerprint(data.projectFingerprint),
     scopeFingerprint: asFingerprint(data.scopeFingerprint),
+    targetLogicalName: asTargetLogicalName(data.targetLogicalName),
   });
+}
+
+export function asTargetLogicalName(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(value)) {
+    fail("invalid-skill-name", "targetLogicalName must be an exact normalized skill name");
+  }
+  return value;
+}
+
+const STRUCTURED_SECRET_RE = /(?:-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[oprsu]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{20,})\b)/u;
+
+function asSafeStructuredLabel(value, max) {
+  const clean = asNonEmptyString(value, { max });
+  if (STRUCTURED_SECRET_RE.test(clean)) fail("privacy-field-rejected", "structured field contains a secret marker");
+  return clean;
 }
 
 const OBSERVATION_FIELDS = Object.freeze({
   receiptType: (value) => asEnum(value, RECEIPT_TYPES),
   scopeFingerprint: asFingerprint,
   occurrences: (value) => asInt(value, { min: 1, max: 1_000_000 }),
-  eventKind: (value) => asNonEmptyString(value, { max: 64 }),
+  eventKind: (value) => asSafeStructuredLabel(value, 64),
   commandSignatureHash: asSha256Hex,
-  toolErrorCode: (value) => asNonEmptyString(value, { max: 128 }),
+  toolErrorCode: (value) => asSafeStructuredLabel(value, 128),
   procedureFingerprint: asFingerprint,
-  clarificationCategory: (value) => asNonEmptyString(value, { max: 128 }),
+  clarificationCategory: (value) => asSafeStructuredLabel(value, 128),
   messageCount: (value) => asInt(value, { min: 0, max: 1_000_000 }),
   explicitUserSignal: (value) => asBoolean(value, "explicitUserSignal"),
   deterministicOutcome: (value) => asBoolean(value, "deterministicOutcome"),
+  targetLogicalName: asTargetLogicalName,
 });
 
 function structuredObservationFields(value) {
   object(value, "structuredFields");
   const keys = Object.keys(value);
   if (keys.length > MAX.structuredKeys) fail("out-of-bounds", "structuredFields has too many fields");
-  const output = {};
+  const output = { targetLogicalName: null };
   for (const key of keys.sort()) {
     if (!OBSERVATION_FIELDS[key]) fail("privacy-field-rejected", key);
     output[key] = OBSERVATION_FIELDS[key](value[key]);
@@ -496,7 +553,7 @@ export function makeObservation(data) {
 }
 
 export function makeEvidenceCluster(data) {
-  exactKeys(data, EvidenceCluster.fields, "EvidenceCluster");
+  exactKeys(data, EvidenceCluster.fields, "EvidenceCluster", EvidenceCluster.fields.filter((field) => field !== "targetLogicalName"));
   const firstSeenAt = asTimestamp(data.firstSeenAt);
   const lastSeenAt = asTimestamp(data.lastSeenAt);
   if (lastSeenAt < firstSeenAt) fail("out-of-order", "lastSeenAt precedes firstSeenAt");
@@ -506,6 +563,7 @@ export function makeEvidenceCluster(data) {
     projectFingerprint: asFingerprint(data.projectFingerprint),
     incidentIds: boundedList(data.incidentIds, "incidentIds", MAX.incidents, nonceString, { dedupe: true }),
     scopeFingerprint: asFingerprint(data.scopeFingerprint),
+    targetLogicalName: asTargetLogicalName(data.targetLogicalName),
     occurrencesSum: asInt(data.occurrencesSum, { min: 0, max: 1_000_000_000 }),
     firstSeenAt,
     lastSeenAt,
@@ -784,7 +842,16 @@ export function assertRecord(envelope) {
   exactKeys(envelope, ["schemaVersion", "kind", "id", "createdAt", "payload"], "record envelope");
   schemaVersion(envelope.schemaVersion);
   const expected = wrapRecord(envelope.kind, envelope.payload, envelope.createdAt);
-  if (asSha256Hex(envelope.id) !== expected.id) fail("corrupt-record");
+  const actualId = asSha256Hex(envelope.id);
+  if (actualId !== expected.id) {
+    const legacyTargetOmitted = (envelope.kind === "receipt" || envelope.kind === "evidence-cluster")
+      ? !Object.hasOwn(envelope.payload, "targetLogicalName")
+      : envelope.kind === "observation"
+        && isObject(envelope.payload.structuredFields)
+        && !Object.hasOwn(envelope.payload.structuredFields, "targetLogicalName");
+    const legacyId = legacyTargetOmitted ? sha256(`${envelope.kind}\n${canonicalize(envelope.payload)}`) : null;
+    if (actualId !== legacyId) fail("corrupt-record");
+  }
   return expected;
 }
 
@@ -877,7 +944,9 @@ export function recordIncident(cluster, observation, now) {
     const incident = makeObservation(observation);
     const timestamp = asTimestamp(now);
     if (incident.projectFingerprint !== current.projectFingerprint) fail("cross-scope", "project fingerprint mismatch");
-    if (incident.structuredFields.receiptType !== current.receiptType || incident.structuredFields.scopeFingerprint !== current.scopeFingerprint) fail("cross-scope", "correlation key mismatch");
+    if (incident.structuredFields.receiptType !== current.receiptType
+      || incident.structuredFields.scopeFingerprint !== current.scopeFingerprint
+      || (incident.structuredFields.targetLogicalName ?? null) !== current.targetLogicalName) fail("cross-scope", "correlation key mismatch");
     if (incident.createdAt > timestamp) fail("out-of-order", "observation is from the future");
     if (current.incidentIds.includes(incident.incidentId)) return { ok: true, state: current, events: [] };
     if (current.incidentIds.length >= MAX.incidents) fail("out-of-bounds", "incidentIds is full");

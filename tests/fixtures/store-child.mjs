@@ -49,6 +49,13 @@ if (operation === "append") {
   result = store.setGlobalSettings(makeGlobalSettings({ ...current, mode: value, updatedAt: now }));
 } else if (operation === "read-global") {
   result = { mode: store.getSettings().global.mode };
+} else if (operation === "read-settings-result") {
+  try {
+    store.getSettings();
+    result = { ok: true };
+  } catch (error) {
+    result = { ok: false, reason: error?.message ?? String(error) };
+  }
 } else if (operation === "update-global-mode") {
   result = store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, mode: value, updatedAt: global.updatedAt + 1 }));
 } else if (operation === "update-global-consent") {
@@ -66,26 +73,29 @@ if (operation === "append") {
 } else if (operation === "update-repo-excluded") {
   result = store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, excluded: value === "true" }));
 } else if (operation === "aggregate") {
-  store.updateGlobalSettings((global) => makeGlobalSettings({
+  const consentUpdate = store.updateGlobalSettings((global) => makeGlobalSettings({
     ...global,
     consent: { ...global.consent, sanitizedExcerpts: true, crossRepoAggregation: true },
     updatedAt: now,
   }));
-  const guard = createPrivacyGuard({
-    consent: { sanitizedExcerpts: true, crossRepoAggregation: true },
-    projectFingerprint,
-    now: () => now,
-    store,
-  });
-  result = guard.contributeAggregate({
-    claimType: "global-skill-candidate",
-    receiptType: "repeated-command",
-    signatureHash: hashContent("shared-signature"),
-    incidentId: value,
-    occurrenceCount: 1,
-    firstSeenAt: now,
-    lastSeenAt: now,
-  });
+  if (!consentUpdate.ok) result = consentUpdate;
+  else {
+    const guard = createPrivacyGuard({
+      consent: { sanitizedExcerpts: true, crossRepoAggregation: true },
+      projectFingerprint,
+      now: () => now,
+      store,
+    });
+    result = guard.contributeAggregate({
+      claimType: "global-skill-candidate",
+      receiptType: "repeated-command",
+      signatureHash: hashContent("shared-signature"),
+      incidentId: value,
+      occurrenceCount: 1,
+      firstSeenAt: now,
+      lastSeenAt: now,
+    });
+  }
 } else if (operation === "retain") {
   result = store.retain(Number(value));
 } else if (operation === "append-at") {

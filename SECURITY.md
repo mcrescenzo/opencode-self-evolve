@@ -6,6 +6,12 @@ Report security issues privately through GitHub Security Advisories for `mcresce
 
 Relevant reports include privacy-boundary bypasses, analyzer isolation failures, unsafe path handling, stale-hash or symlink bypasses, unauthorized application, audit/rollback defects, synthetic transcript injection, and unexpected external mutation.
 
+## Dependency Advisories
+
+Dependabot checks the Bun lockfile weekly. `npm run audit:dependencies` runs Bun's JSON audit and independently verifies recognized advisory metadata, the exact installed version and dependency path in `bun.lock`, and the advisory-specific applicability classification. It fails closed for malformed output, unknown or changed advisories, changed paths, and every unresolved finding.
+
+Only the repository owner may accept temporary dependency risk. An acceptance must be a bounded JSON record under `security/audit-exceptions/` with the advisory URL, exact package/version/path and applicability, narrow scope, accountable owner, review date, and expiry. Agents and automation must not create or renew these records. Expired or mismatched records fail the gate; dependency overrides and unsupported peer resolutions are not exceptions.
+
 ## Privacy Classes
 
 - Complete transcripts and raw message bodies are never stored.

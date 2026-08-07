@@ -45,6 +45,6 @@ if (result.ok) {
     process.exitCode = 3;
   }
 }
-process.stdout.write(`${JSON.stringify(result)}\n`);
+fs.writeFileSync(process.stdout.fd, `${JSON.stringify(result)}\n`);
 applier.close();
 store.close();

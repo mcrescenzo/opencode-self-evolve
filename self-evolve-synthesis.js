@@ -21,7 +21,12 @@ const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_CRITIC_THRESHOLD = 0.75;
 const SYNTHESIS_LEASE_TTL_MS = 5 * 60 * 1000;
 const MAX_FILE_BYTES = 64 * 1024;
-const synthesisStateByStore = new Map();
+const BYTES_PER_OUTPUT_TOKEN = 4;
+const MAX_METADATA_STRING_BYTES = 8 * 1024;
+const MAX_STRUCTURED_ITEMS = 64;
+const MUST_NOT_EXIST = "must-not-exist";
+const EXISTING_TARGET_ACTIONS = new Set(["delete", "consolidate", "rewrite", "relocate-detail", "add"]);
+const synthesisArbiter = { runs: [], active: false };
 const STANDALONE_HOST_OWNER_GENERATION = 1;
 // This is the durable decision-protocol actor authorized by self-evolve-schemas,
 // not the hidden host agent identity used to create the critic session.
@@ -34,23 +39,23 @@ export const SYNTHESIS_OUTPUT_SCHEMA = deepFreeze({
   properties: {
     action: { type: "string", enum: SYNTHESIS_ACTIONS },
     targetLogicalName: { type: "string", minLength: 1 },
-    proposedContent: { type: "string" },
+    proposedContent: { type: "string", maxLength: MAX_FILE_BYTES },
     proposedContentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
     evidenceMapping: {
-      type: "array", minItems: 1,
+      type: "array", minItems: 1, maxItems: MAX_STRUCTURED_ITEMS,
       items: {
         type: "object", additionalProperties: false, required: ["claim", "observationIds"],
         properties: {
-          claim: { type: "string", minLength: 1 },
-          observationIds: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1 } },
+          claim: { type: "string", minLength: 1, maxLength: MAX_METADATA_STRING_BYTES },
+          observationIds: { type: "array", minItems: 1, maxItems: MAX_STRUCTURED_ITEMS, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: MAX_METADATA_STRING_BYTES } },
         },
       },
     },
-    expectedBehavior: { type: "string", minLength: 1 },
-    counterExamples: { type: "array", items: { type: "string", minLength: 1 } },
-    overlap: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1 } },
-    riskNotes: { type: "string", minLength: 1 },
-    evaluationScenarios: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+    expectedBehavior: { type: "string", minLength: 1, maxLength: MAX_METADATA_STRING_BYTES },
+    counterExamples: { type: "array", maxItems: MAX_STRUCTURED_ITEMS, items: { type: "string", minLength: 1, maxLength: MAX_METADATA_STRING_BYTES } },
+    overlap: { type: "array", maxItems: MAX_STRUCTURED_ITEMS, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: MAX_METADATA_STRING_BYTES } },
+    riskNotes: { type: "string", minLength: 1, maxLength: MAX_METADATA_STRING_BYTES },
+    evaluationScenarios: { type: "array", minItems: 1, maxItems: MAX_STRUCTURED_ITEMS, items: { type: "string", minLength: 1, maxLength: MAX_METADATA_STRING_BYTES } },
     sizeDeltaBytes: { type: "integer" },
     approxTokenDelta: { type: "integer" },
   },
@@ -64,7 +69,7 @@ export const CRITIC_OUTPUT_SCHEMA = deepFreeze({
     score: { type: "number", minimum: 0, maximum: 1 },
     evidenceLinked: { type: "boolean" },
     nonDuplicative: { type: "boolean" },
-    reasons: { type: "array", items: { type: "string", minLength: 1 } },
+    reasons: { type: "array", maxItems: MAX_STRUCTURED_ITEMS, items: { type: "string", minLength: 1, maxLength: MAX_METADATA_STRING_BYTES } },
     recommendedAction: { type: "string", enum: ["accept", "reject", "request-revision"] },
   },
 });
@@ -98,7 +103,11 @@ function canonicalTarget(targetSkill, inventory) {
 function boundedCurrentContent(currentContent, targetSkill) {
   const content = String(currentContent ?? targetSkill?.currentContent ?? "");
   if (Buffer.byteLength(content, "utf8") > MAX_FILE_BYTES) throw new TypeError("current-content-exceeds-64KiB");
-  if (targetSkill?.currentHash && hashSkillContent(content) !== targetSkill.currentHash) throw new TypeError("current-content-hash-mismatch");
+  if (targetSkill?.currentHash === MUST_NOT_EXIST) {
+    if (content !== "") throw new TypeError("absent-target-current-content-must-be-empty");
+  } else if (targetSkill?.currentHash && hashSkillContent(content) !== targetSkill.currentHash) {
+    throw new TypeError("current-content-hash-mismatch");
+  }
   return content;
 }
 
@@ -124,7 +133,29 @@ export function buildSynthesizerPrompt({ cluster, currentContent, targetSkill, i
   ].join("\n");
 }
 
-export function buildCriticPrompt({ proposal, cluster, inventory }) {
+function boundedCriticInput(proposal, criticInput, inventory) {
+  if (!criticInput || typeof criticInput !== "object" || Array.isArray(criticInput)) throw new TypeError("critic-input-required");
+  if (typeof criticInput.proposedContent !== "string") throw new TypeError("critic-proposed-content-must-be-string");
+  if (typeof criticInput.currentContent !== "string") throw new TypeError("critic-current-content-must-be-string");
+  const proposedContent = criticInput.proposedContent;
+  if (Buffer.byteLength(proposedContent, "utf8") > MAX_FILE_BYTES) throw new TypeError("critic-proposed-content-exceeds-64KiB");
+  if (hashSkillContent(proposedContent) !== criticInput.proposedContentHash) throw new TypeError("critic-proposed-content-hash-mismatch");
+  if (criticInput.proposedContentHash !== proposal?.proposedContentHash) throw new TypeError("critic-proposed-hash-binding-mismatch");
+
+  if (criticInput.currentContentHash !== proposal?.skillTarget?.currentHash) throw new TypeError("critic-current-hash-binding-mismatch");
+  let currentContent;
+  try {
+    currentContent = boundedCurrentContent(criticInput.currentContent, proposal?.skillTarget);
+  } catch (error) {
+    throw new TypeError(`critic-${errorMessage(error)}`);
+  }
+  const target = canonicalTarget(proposal?.skillTarget, inventory);
+  if (!target || target.currentHash !== criticInput.currentContentHash) throw new TypeError("critic-current-inventory-binding-mismatch");
+  return { proposedContent, currentContent };
+}
+
+export function buildCriticPrompt({ proposal, criticInput, cluster, inventory }) {
+  const content = boundedCriticInput(proposal, criticInput, inventory);
   return [
     "You are a hidden independent critic. Return strict JSON only, matching the supplied schema.",
     "You CANNOT authorize or choose scope, target, budget, retention, consent, or application.",
@@ -133,10 +164,28 @@ export function buildCriticPrompt({ proposal, cluster, inventory }) {
     "Strict output schema:", JSON.stringify(CRITIC_OUTPUT_SCHEMA),
     "<UNTRUSTED_PROPOSAL>", JSON.stringify(proposal), "</UNTRUSTED_PROPOSAL>",
     "<UNTRUSTED_EVIDENCE_METADATA>", JSON.stringify({ cluster, inventory: inventory.map((item) => ({ logicalName: item.logicalName, currentHash: item.currentHash })) }), "</UNTRUSTED_EVIDENCE_METADATA>",
+    `<PROPOSED_CONTENT_SHA256>${proposal.proposedContentHash}</PROPOSED_CONTENT_SHA256>`,
+    "<UNTRUSTED_PROPOSED_SKILL_CONTENT>", content.proposedContent, "</UNTRUSTED_PROPOSED_SKILL_CONTENT>",
+    `<CURRENT_CONTENT_BINDING>${proposal.skillTarget.currentHash}</CURRENT_CONTENT_BINDING>`,
+    "<UNTRUSTED_CURRENT_SKILL_CONTENT>", content.currentContent, "</UNTRUSTED_CURRENT_SKILL_CONTENT>",
   ].join("\n");
 }
 
-function parseJson(rawJson) {
+function outputByteLimit(tokensPerSynthesis) {
+  if (!Number.isSafeInteger(tokensPerSynthesis) || tokensPerSynthesis < 0) throw new TypeError("invalid-tokensPerSynthesis");
+  return tokensPerSynthesis * BYTES_PER_OUTPUT_TOKEN;
+}
+
+function rawOutputBytes(rawJson) {
+  try {
+    return Buffer.byteLength(typeof rawJson === "string" ? rawJson : JSON.stringify(rawJson), "utf8");
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function parseJson(rawJson, tokensPerSynthesis) {
+  if (rawOutputBytes(rawJson) > outputByteLimit(tokensPerSynthesis)) return { value: null, errors: ["raw-output-byte-limit-exceeded"] };
   if (rawJson && typeof rawJson === "object" && !Array.isArray(rawJson)) return { value: rawJson, errors: [] };
   if (typeof rawJson !== "string" || !rawJson.trim() || rawJson.trim().startsWith("```")) return { value: null, errors: ["strict-json-required"] };
   try { return { value: JSON.parse(rawJson), errors: [] }; }
@@ -158,12 +207,20 @@ function nonEmptyStrings(value) {
   return Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim());
 }
 
+function boundedString(value) {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= MAX_METADATA_STRING_BYTES;
+}
+
+function boundedStringList(value) {
+  return Array.isArray(value) && value.length <= MAX_STRUCTURED_ITEMS && value.every(boundedString);
+}
+
 function estimatedTokenDelta(before, after) {
   return Math.ceil(Buffer.byteLength(after, "utf8") / 4) - Math.ceil(Buffer.byteLength(before, "utf8") / 4);
 }
 
-export function parseSynthesizerOutput(rawJson, { cluster, targetSkill, inventory, expectedCurrentHash }) {
-  const parsed = parseJson(rawJson);
+export function parseSynthesizerOutput(rawJson, { cluster, targetSkill, inventory, expectedCurrentHash, tokensPerSynthesis = SYNTHESIS_TOKEN_BUDGET }) {
+  const parsed = parseJson(rawJson, tokensPerSynthesis);
   const errors = [...parsed.errors];
   if (!parsed.value || !exactObject(parsed.value, SYNTHESIS_OUTPUT_SCHEMA, errors, "synthesis")) return { ok: false, result: null, errors };
   const result = parsed.value;
@@ -175,27 +232,38 @@ export function parseSynthesizerOutput(rawJson, { cluster, targetSkill, inventor
   if (!SYNTHESIS_ACTIONS.includes(result.action)) errors.push("invalid-action");
   for (const key of ["targetLogicalName", "expectedBehavior", "riskNotes"]) if (typeof result[key] !== "string" || !result[key].trim()) errors.push(`invalid-${key}`);
   if (typeof result.proposedContent !== "string") errors.push("invalid-proposedContent");
+  else if (Buffer.byteLength(result.proposedContent, "utf8") > MAX_FILE_BYTES) errors.push("proposedContent-byte-limit-exceeded");
   if (!nonEmptyStrings(result.counterExamples)) errors.push("invalid-counterExamples");
+  else if (!boundedStringList(result.counterExamples)) errors.push("counterExamples-field-limit-exceeded");
   if (!nonEmptyStrings(result.overlap) || new Set(result.overlap).size !== result.overlap.length) errors.push("invalid-overlap");
+  else if (!boundedStringList(result.overlap)) errors.push("overlap-field-limit-exceeded");
   if (!nonEmptyStrings(result.evaluationScenarios) || result.evaluationScenarios.length === 0) errors.push("invalid-evaluationScenarios");
+  else if (!boundedStringList(result.evaluationScenarios)) errors.push("evaluationScenarios-field-limit-exceeded");
+  for (const key of ["targetLogicalName", "expectedBehavior", "riskNotes"]) if (typeof result[key] === "string" && !boundedString(result[key])) errors.push(`${key}-field-limit-exceeded`);
   if (!Number.isSafeInteger(result.sizeDeltaBytes)) errors.push("invalid-sizeDeltaBytes");
   if (!Number.isSafeInteger(result.approxTokenDelta)) errors.push("invalid-approxTokenDelta");
 
   const target = canonicalTarget(targetSkill, inventory);
   if (!target || result.targetLogicalName !== target.logicalName) errors.push("target-logical-name-mismatch");
   if (targetSkill?.currentHash !== expectedCurrentHash || target?.currentHash !== expectedCurrentHash) errors.push("stale-current-hash");
+  const targetMustNotExist = expectedCurrentHash === MUST_NOT_EXIST;
+  if (result.action === "new-skill" && (!targetMustNotExist || target?.exists !== false)) errors.push("new-skill-target-already-exists");
+  if (EXISTING_TARGET_ACTIONS.has(result.action) && targetMustNotExist) errors.push("existing-target-action-requires-existing-target");
   const proposedHash = typeof result.proposedContent === "string" ? hashSkillContent(result.proposedContent) : null;
   if (result.proposedContentHash !== proposedHash) errors.push("proposed-content-hash-mismatch");
 
   const observationIds = new Set(observationMetadata(cluster).map((item) => item.id).filter(Boolean));
   if (!Array.isArray(result.evidenceMapping) || result.evidenceMapping.length === 0) errors.push("evidence-mapping-required");
+  else if (result.evidenceMapping.length > MAX_STRUCTURED_ITEMS) errors.push("evidence-mapping-field-limit-exceeded");
   else for (const mapping of result.evidenceMapping) {
     if (!mapping || typeof mapping !== "object" || Array.isArray(mapping) || Object.keys(mapping).some((key) => !["claim", "observationIds"].includes(key))) {
       errors.push("invalid-evidence-mapping");
       continue;
     }
     if (typeof mapping.claim !== "string" || !mapping.claim.trim()) errors.push("empty-evidence-claim");
+    else if (!boundedString(mapping.claim)) errors.push("evidence-claim-field-limit-exceeded");
     if (!Array.isArray(mapping.observationIds) || mapping.observationIds.length === 0 || mapping.observationIds.some((id) => !observationIds.has(id))) errors.push("unknown-observation-id");
+    else if (!boundedStringList(mapping.observationIds)) errors.push("observationIds-field-limit-exceeded");
     else if (new Set(mapping.observationIds).size !== mapping.observationIds.length) errors.push("duplicate-observation-id");
   }
 
@@ -215,8 +283,8 @@ export function parseSynthesizerOutput(rawJson, { cluster, targetSkill, inventor
   return { ok: errors.length === 0, result: errors.length ? null : result, errors };
 }
 
-export function parseCriticOutput(rawJson) {
-  const parsed = parseJson(rawJson);
+export function parseCriticOutput(rawJson, { tokensPerSynthesis = SYNTHESIS_TOKEN_BUDGET } = {}) {
+  const parsed = parseJson(rawJson, tokensPerSynthesis);
   const errors = [...parsed.errors];
   if (!parsed.value || !exactObject(parsed.value, CRITIC_OUTPUT_SCHEMA, errors, "critic")) return { ok: false, result: null, errors };
   const result = parsed.value;
@@ -224,6 +292,7 @@ export function parseCriticOutput(rawJson) {
   if (typeof result.evidenceLinked !== "boolean") errors.push("invalid-evidenceLinked");
   if (typeof result.nonDuplicative !== "boolean") errors.push("invalid-nonDuplicative");
   if (!nonEmptyStrings(result.reasons)) errors.push("invalid-reasons");
+  else if (!boundedStringList(result.reasons)) errors.push("reasons-field-limit-exceeded");
   if (!CRITIC_OUTPUT_SCHEMA.properties.recommendedAction.enum.includes(result.recommendedAction)) errors.push("invalid-recommendedAction");
   return { ok: errors.length === 0, result: errors.length ? null : result, errors };
 }
@@ -232,14 +301,17 @@ function errorMessage(error) {
   return String(error?.data?.message ?? error?.message ?? error ?? "unknown-error");
 }
 
-async function runHiddenSession(ctx, { agent, title, prompt, schema, options }) {
+async function runHiddenSession(ctx, { agent, title, prompt, schema, options, tokensPerSynthesis, reservationContext }) {
   let sessionID;
   let hostOwnerNonce;
+  let sessionClaim;
   const permission = [{ permission: "*", pattern: "*", action: "deny" }, { permission: "external_directory", pattern: "*", action: "deny" }];
-  const createBody = { title, agent, mode: "primary", hidden: true, temperature: 0, steps: 1, permission, ...(options.model ? { model: options.model } : {}) };
+  options.hiddenAgentRegistration?.assert(agent);
+  const createBody = { title, agent, permission, ...(options.model ? { model: options.model } : {}) };
   try {
     const created = await createSession(ctx, createBody, {
       timeoutMs: options.sdkTimeoutMs ?? 15_000,
+      signal: options.signal,
       label: `${agent}-create`,
       onLateResolve: (late) => {
         const lateID = createdSessionID(late);
@@ -259,6 +331,16 @@ async function runHiddenSession(ctx, { agent, title, prompt, schema, options }) 
       if (!acquired?.ok) throw new Error(`host-owner-acquire-failed:${acquired?.reason ?? "unknown"}`);
       hostOwnerNonce = acquired.nonce;
       options.faultInjection?.("hidden-session-after-owner-acquire", { agent, sessionID });
+      sessionClaim = options.hiddenAgentRegistration?.claimSession?.(agent, sessionID, tokensPerSynthesis);
+    }
+    if (options.signal?.aborted) throw new Error("autonomous-work-cancelled");
+    if (typeof options.reservePassiveProviderCalls === "function") {
+      if (options.reservePassiveProviderCalls.constructor?.name === "AsyncFunction") {
+        throw new Error("passive-provider-reservation-must-be-synchronous");
+      }
+      const reservation = options.reservePassiveProviderCalls(1, { agent, ...reservationContext });
+      if (reservation && typeof reservation.then === "function") throw new Error("passive-provider-reservation-must-be-synchronous");
+      if (!reservation?.ok) throw new Error(String(reservation?.reason ?? "passive-provider-budget-reservation-failed"));
     }
     const result = await promptSession(ctx, sessionID, {
       agent,
@@ -268,22 +350,38 @@ async function runHiddenSession(ctx, { agent, title, prompt, schema, options }) 
       ...(options.model ? { model: options.model } : {}),
     }, {
       timeoutMs: Math.min(DEFAULT_TIMEOUT_MS, Math.max(1, options.timeoutMs ?? DEFAULT_TIMEOUT_MS)),
+      signal: options.signal,
       label: agent,
     });
     return sessionOutput(result);
   } finally {
     if (sessionID) {
+      let cleanedUp = false;
       try {
         await cleanupSession(ctx, sessionID, {
           timeoutMs: options.cleanupTimeoutMs ?? 5_000,
           label: `${agent}-cleanup`,
-          optional: true,
-        }).catch(() => {});
+        });
+        cleanedUp = true;
+      } catch {
+        // Keep the durable owner so a later boot can retry this exact cleanup.
+        if (hostOwnerNonce) options.store.retainHostOwner?.(sessionID, hostOwnerNonce);
       } finally {
-        if (hostOwnerNonce) options.store.releaseHostOwner?.(sessionID, hostOwnerNonce);
+        if (sessionClaim) options.hiddenAgentRegistration?.releaseSession?.(agent, sessionID, sessionClaim);
+        if (cleanedUp && hostOwnerNonce) options.store.releaseHostOwner?.(sessionID, hostOwnerNonce);
       }
     }
   }
+}
+
+function freshTokensPerSynthesis(options) {
+  const settings = typeof options.store?.getSettings === "function" ? options.store.getSettings() : null;
+  const value = settings?.repo?.budgets?.tokensPerSynthesis
+    ?? settings?.global?.budgets?.tokensPerSynthesis
+    ?? options.tokensPerSynthesis
+    ?? SYNTHESIS_TOKEN_BUDGET;
+  outputByteLimit(value);
+  return value;
 }
 
 function requireStore(options) {
@@ -292,13 +390,11 @@ function requireStore(options) {
   return store;
 }
 
-function synthesisState(store) {
-  let state = synthesisStateByStore.get(store);
-  if (!state) {
-    state = { runs: [], active: false };
-    synthesisStateByStore.set(store, state);
-  }
-  return state;
+function freshSynthesisPerDay(options) {
+  const settings = typeof options.store?.getSettings === "function" ? options.store.getSettings() : null;
+  return settings?.global?.budgets?.synthesisPerDay
+    ?? options.synthesisPerDay
+    ?? DEFAULT_BUDGETS.synthesisPerDay;
 }
 
 function auditEnvelope(action, subjectId, timestamp, details = {}) {
@@ -350,7 +446,7 @@ function persistFailedSynthesis(store, cluster, targetSkill, timestamp, reason, 
 
 function preflight({ cluster, targetSkill, inventory, privacy, options, timestamp }) {
   const store = requireStore(options);
-  const state = synthesisState(store);
+  const state = synthesisArbiter;
   const eligibility = options.eligibility ?? cluster?.eligibility ?? cluster?.eligibilityExplanation;
   if (eligibility?.clusterId !== cluster?.id || eligibility?.eligible !== true) return { ok: false, reason: "cluster-not-deterministically-eligible", store };
   if (cluster?.injectionFlagged || observationMetadata(cluster).some((item) => item.injectionFlagged)) return { ok: false, reason: "injection-flagged-evidence", store };
@@ -362,17 +458,24 @@ function preflight({ cluster, targetSkill, inventory, privacy, options, timestam
   const target = canonicalTarget(targetSkill, inventory);
   if (!target || target.currentHash !== targetSkill.currentHash) return { ok: false, reason: "stale-current-hash", store };
   const currentContent = String(options.currentContent ?? targetSkill.currentContent ?? "");
-  const currentCandidate = {
-    skillTarget: { canonicalRoot: targetSkill.canonicalRoot, relativePath: targetSkill.relativePath, currentHash: targetSkill.currentHash },
-    proposedContent: currentContent,
-    proposedContentHash: hashSkillContent(currentContent),
-  };
-  const targetValidation = (options.validateTarget ?? validateProposalTarget)(currentCandidate, inventory);
-  if (!targetValidation?.ok) return { ok: false, reason: (targetValidation?.errors ?? ["target-validation-failed"]).join(","), store };
+  boundedCurrentContent(currentContent, targetSkill);
+  if (targetSkill.currentHash !== MUST_NOT_EXIST) {
+    const currentCandidate = {
+      skillTarget: { canonicalRoot: targetSkill.canonicalRoot, relativePath: targetSkill.relativePath, currentHash: targetSkill.currentHash },
+      proposedContent: currentContent,
+      proposedContentHash: hashSkillContent(currentContent),
+    };
+    const targetValidation = (options.validateTarget ?? validateProposalTarget)(currentCandidate, inventory);
+    if (!targetValidation?.ok) return { ok: false, reason: (targetValidation?.errors ?? ["target-validation-failed"]).join(","), store };
+  } else if (target.exists !== false) {
+    return { ok: false, reason: "absent-target-inventory-mismatch", store };
+  }
   if (isBackedOff(store, "synthesis", cluster.id, timestamp)) return { ok: false, reason: "cluster-recently-failed", store };
   if (state.active) return { ok: false, reason: "synthesis-lease-busy", store };
   state.runs.splice(0, state.runs.length, ...state.runs.filter((time) => timestamp - time < DAY_MS));
-  if (state.runs.length >= (options.synthesisPerDay ?? DEFAULT_BUDGETS.synthesisPerDay)) return { ok: false, reason: "synthesis-budget-exhausted", store };
+  if (state.runs.length >= freshSynthesisPerDay(options)) {
+    return { ok: false, reason: "synthesis-budget-exhausted", store };
+  }
   return { ok: true, store, state };
 }
 
@@ -394,9 +497,10 @@ function synthesisAttempt(cluster, targetSkill, timestamp) {
 }
 
 export function synthesisLeaseKey(attempt) {
-  for (const value of [attempt?.projectFingerprint, attempt?.clusterId, attempt?.targetHash]) {
+  for (const value of [attempt?.projectFingerprint, attempt?.clusterId]) {
     if (!/^[a-f0-9]{64}$/.test(String(value))) throw new TypeError("invalid-synthesis-lease-binding");
   }
+  if (attempt?.targetHash !== MUST_NOT_EXIST && !/^[a-f0-9]{64}$/.test(String(attempt?.targetHash))) throw new TypeError("invalid-synthesis-lease-binding");
   return `synthesis_${sha256(`synthesis-lease-v1\n${attempt.projectFingerprint}\n${attempt.clusterId}\n${attempt.targetHash}`)}`;
 }
 
@@ -421,21 +525,44 @@ export async function runSynthesis({ ctx, cluster, targetSkill, inventory, priva
   const acquired = gate.store.acquireLease?.(key, { ttlMs: SYNTHESIS_LEASE_TTL_MS, actor: SYNTHESIS_AGENT_NAME });
   if (!acquired?.ok) return { ok: false, reason: acquired?.reason === "lease-busy" ? "synthesis-lease-busy" : acquired?.reason ?? "synthesis-lease-error" };
   const lease = Object.freeze({ key, nonce: acquired.nonce });
-  const admitted = gate.store.appendRecord(wrapRecord("synthesis-attempt", attempt, timestamp));
+  let admitted;
+  try {
+    if (typeof gate.store.admitSynthesisAttempt === "function") {
+      admitted = gate.store.admitSynthesisAttempt(wrapRecord("synthesis-attempt", attempt, timestamp), {
+        rootSessionIDHash: options.rootSessionIDHash,
+      });
+    } else {
+      admitted = gate.store.appendRecord(wrapRecord("synthesis-attempt", attempt, timestamp));
+    }
+  }
+  catch (error) {
+    try { releaseSynthesisLease(gate.store, lease); } catch {}
+    return { ok: false, reason: errorMessage(error) };
+  }
   if (!admitted?.ok || admitted.duplicate) {
-    releaseSynthesisLease(gate.store, lease);
+    try { releaseSynthesisLease(gate.store, lease); } catch {}
     return { ok: false, reason: admitted?.reason ?? "synthesis-attempt-admission-failed" };
   }
-  options.faultInjection?.("synthesis-after-admission", { attempt });
-  gate.state.active = true;
   gate.state.runs.push(timestamp);
+  gate.state.active = true;
   const currentContent = String(options.currentContent ?? targetSkill.currentContent ?? "");
+  let durableProposal = null;
   try {
+    options.faultInjection?.("synthesis-after-admission", { attempt });
     boundedCurrentContent(currentContent, targetSkill);
-    const prompt = buildSynthesizerPrompt({ cluster, currentContent, targetSkill, inventory, budget: { tokensPerSynthesis: options.tokensPerSynthesis ?? SYNTHESIS_TOKEN_BUDGET } });
-    const raw = await runHiddenSession(ctx, { agent: SYNTHESIS_AGENT_NAME, title: "Self-evolve synthesizer", prompt, schema: SYNTHESIS_OUTPUT_SCHEMA, options });
+    const tokensPerSynthesis = freshTokensPerSynthesis(options);
+    const prompt = buildSynthesizerPrompt({ cluster, currentContent, targetSkill, inventory, budget: { tokensPerSynthesis } });
+    const raw = await runHiddenSession(ctx, {
+      agent: SYNTHESIS_AGENT_NAME,
+      title: "Self-evolve synthesizer",
+      prompt,
+      schema: SYNTHESIS_OUTPUT_SCHEMA,
+      options,
+      tokensPerSynthesis,
+      reservationContext: { clusterID: cluster.id, projectFingerprint: cluster.projectFingerprint },
+    });
     options.faultInjection?.("synthesis-after-provider-return", { attempt });
-    const parsed = parseSynthesizerOutput(raw, { cluster, targetSkill: { ...targetSkill, currentContent }, inventory, expectedCurrentHash: targetSkill.currentHash });
+    const parsed = parseSynthesizerOutput(raw, { cluster, targetSkill: { ...targetSkill, currentContent }, inventory, expectedCurrentHash: targetSkill.currentHash, tokensPerSynthesis });
     if (!parsed.ok) throw new Error(parsed.errors.join(","));
     const result = parsed.result;
     if (result.action === "no-op") {
@@ -466,12 +593,22 @@ export async function runSynthesis({ ctx, cluster, targetSkill, inventory, priva
     });
     const saved = gate.store.appendRecord(wrapRecord("proposal", proposal, timestamp));
     if (!saved?.ok || saved.duplicate) throw new Error(saved?.reason ?? "proposal-not-persisted-exactly-once");
+    durableProposal = proposal;
     options.faultInjection?.("synthesis-after-draft-proposal", { attempt, proposal });
-    return { ok: true, proposal, attempt, lease, errors: [] };
+    const criticInput = Object.freeze({
+      proposedContent: result.proposedContent,
+      proposedContentHash: result.proposedContentHash,
+      currentContent,
+      currentContentHash: targetSkill.currentHash,
+    });
+    return { ok: true, proposal, criticInput, attempt, lease, errors: [] };
   } catch (error) {
     const reason = errorMessage(error);
-    persistFailedSynthesis(gate.store, cluster, targetSkill, timestamp, reason, options);
-    return { ok: false, reason, attempt, lease };
+    try {
+      if (durableProposal) recordFailure(gate.store, "synthesis", cluster.id, timestamp, reason);
+      else persistFailedSynthesis(gate.store, cluster, targetSkill, timestamp, reason, options);
+    } catch {}
+    return { ok: false, reason, attempt, lease, ...(durableProposal ? { proposal: durableProposal } : {}) };
   } finally {
     gate.state.active = false;
   }
@@ -498,7 +635,7 @@ async function updateCriticProposal(store, proposal, result, passed, state, time
   return committed?.ok ? { ok: true, newRecord: { payload: committed.proposal } } : committed;
 }
 
-export async function runCritic({ ctx, proposal, cluster, inventory, options = {}, now }) {
+export async function runCritic({ ctx, proposal, criticInput, cluster, inventory, options = {}, now }) {
   const timestamp = nowMs(now);
   let store;
   try { store = requireStore(options); }
@@ -509,9 +646,18 @@ export async function runCritic({ ctx, proposal, cluster, inventory, options = {
       const status = store.getLeaseStatus?.(options.attemptLease.key);
       if (!status?.held || status.lease?.nonce !== options.attemptLease.nonce || status.lease?.pid !== process.pid) throw new Error("synthesis-lease-lost");
     }
-    const prompt = buildCriticPrompt({ proposal, cluster, inventory });
-    const raw = await runHiddenSession(ctx, { agent: CRITIC_AGENT_NAME, title: "Self-evolve critic", prompt, schema: CRITIC_OUTPUT_SCHEMA, options });
-    const parsed = parseCriticOutput(raw);
+    const prompt = buildCriticPrompt({ proposal, criticInput, cluster, inventory });
+    const tokensPerSynthesis = freshTokensPerSynthesis(options);
+    const raw = await runHiddenSession(ctx, {
+      agent: CRITIC_AGENT_NAME,
+      title: "Self-evolve critic",
+      prompt,
+      schema: CRITIC_OUTPUT_SCHEMA,
+      options,
+      tokensPerSynthesis,
+      reservationContext: { clusterID: cluster.id, projectFingerprint: cluster.projectFingerprint, proposalID: proposal.id },
+    });
+    const parsed = parseCriticOutput(raw, { tokensPerSynthesis });
     if (!parsed.ok) throw new Error(parsed.errors.join(","));
     const result = parsed.result;
     const passed = result.score >= (options.criticThreshold ?? DEFAULT_CRITIC_THRESHOLD) && result.evidenceLinked && result.nonDuplicative && result.recommendedAction === "accept";
@@ -527,7 +673,9 @@ export async function runCritic({ ctx, proposal, cluster, inventory, options = {
   }
 }
 
-export function disposeSynthesis(store) {
-  if (store) synthesisStateByStore.delete(store);
-  else synthesisStateByStore.clear();
+// The arbiter is process-scoped so closing one pipeline or store cannot reset
+// another integration's concurrency or daily budget accounting. Only isolated
+// tests may reset it, and never while provider work remains active.
+export function resetSynthesisProcessStateForTests() {
+  if (!synthesisArbiter.active) synthesisArbiter.runs.length = 0;
 }

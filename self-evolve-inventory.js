@@ -7,6 +7,7 @@ const MUST_NOT_EXIST = "must-not-exist";
 const MAX_EDIT_GROWTH = 8 * 1024;
 const MAX_FILE_BYTES = 64 * 1024;
 const GLOB_RE = /[*?[]/;
+const LOGICAL_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u;
 const UNSAFE_SCHEME_RE = /(?:\]\(\s*|\b)(?:javascript|data|vbscript|file):/iu;
 const PRIVATE_KEY_MARKER_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----|-----END [A-Z ]*PRIVATE KEY-----/g;
@@ -19,6 +20,10 @@ const INJECTION_PATTERNS = [
 ];
 const rootScopes = new WeakMap();
 const inventoryScopes = new WeakMap();
+
+function compareCodepoints(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 
 function errorText(error) {
   return error instanceof Error ? error.message : String(error);
@@ -185,7 +190,7 @@ export function discoverSkills(canonicalRoots) {
     } catch {
       continue;
     }
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const entry of entries.sort((a, b) => compareCodepoints(a.name, b.name))) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       const absolutePath = path.join(canonicalRoot, entry.name, "SKILL.md");
       try {
@@ -277,18 +282,102 @@ function targetPath(relativePath) {
   return clean;
 }
 
-function absentRecord(root, relativePath, absolutePath) {
+function absentRecord(root, relativePath, absolutePath, currentHash = null) {
   return {
     canonicalRoot: root,
     relativePath,
     logicalName: relativePath.split("/")[0],
     absolutePath,
     exists: false,
-    currentHash: null,
+    currentHash,
     sizeBytes: 0,
     parsedFrontmatter: null,
     frontmatterErrors: [],
   };
+}
+
+function unresolvedTarget(reason) {
+  return { ok: false, reason, target: null, inventory: null };
+}
+
+function validExistingTarget(record, logicalName) {
+  if (!record || record.exists !== true || record.logicalName !== logicalName) return false;
+  if (record.relativePath !== `${logicalName}/SKILL.md`) return false;
+  if (typeof record.canonicalRoot !== "string" || typeof record.absolutePath !== "string") return false;
+  if (record.absolutePath !== path.join(record.canonicalRoot, record.relativePath)) return false;
+  if (!/^[a-f0-9]{64}$/u.test(record.currentHash)) return false;
+  if (!Number.isSafeInteger(record.sizeBytes) || record.sizeBytes < 0) return false;
+  if (!record.parsedFrontmatter || record.parsedFrontmatter.name !== logicalName) return false;
+  if (typeof record.parsedFrontmatter.description !== "string" || !record.parsedFrontmatter.description.trim()) return false;
+  return Array.isArray(record.frontmatterErrors) && record.frontmatterErrors.length === 0;
+}
+
+export function resolveSkillTarget(targetLogicalName, inventory) {
+  if (typeof targetLogicalName !== "string" || targetLogicalName.length > 64 || !LOGICAL_NAME_RE.test(targetLogicalName)) {
+    return unresolvedTarget(targetLogicalName === null || targetLogicalName === undefined
+      ? "target-logical-name-missing"
+      : "target-logical-name-invalid");
+  }
+  if (!Array.isArray(inventory)) return unresolvedTarget("target-inventory-invalid");
+
+  const matches = inventory.filter((record) => record?.logicalName === targetLogicalName);
+  if (matches.length > 1) return unresolvedTarget("target-inventory-match-ambiguous");
+  if (matches.length === 1) {
+    const target = matches[0];
+    if (!validExistingTarget(target, targetLogicalName)) return unresolvedTarget("target-inventory-record-invalid");
+    try {
+      if (fs.realpathSync(target.canonicalRoot) !== target.canonicalRoot || rejectSymlinked(target.canonicalRoot)) {
+        return unresolvedTarget("target-canonical-root-stale");
+      }
+      if (rejectSymlinked(target.absolutePath) || fs.realpathSync(target.absolutePath) !== target.absolutePath) {
+        return unresolvedTarget("target-inventory-path-stale");
+      }
+      const bytes = fs.readFileSync(target.absolutePath);
+      if (bytes.length !== target.sizeBytes || hashSkillContent(bytes) !== target.currentHash) {
+        return unresolvedTarget("target-inventory-hash-stale");
+      }
+      const parsed = parseSkillFrontmatter(bytes.toString("utf8"));
+      if (!parsed.ok || parsed.frontmatter?.name !== targetLogicalName) {
+        return unresolvedTarget("target-inventory-record-invalid");
+      }
+      return { ok: true, reason: null, target: { ...target, currentContent: bytes.toString("utf8") }, inventory };
+    } catch {
+      return unresolvedTarget("target-inventory-path-stale");
+    }
+  }
+
+  const scopeMap = inventoryScopes.get(inventory) ?? new Map();
+  const repositoryRoots = [...scopeMap].filter(([, scope]) => scope === "repo").map(([root]) => root);
+  if (repositoryRoots.length === 0) return unresolvedTarget("target-repository-root-unavailable");
+  if (repositoryRoots.length !== 1) return unresolvedTarget("target-repository-root-ambiguous");
+  const canonicalRoot = repositoryRoots[0];
+  const relativePath = `${targetLogicalName}/SKILL.md`;
+  const directory = path.join(canonicalRoot, targetLogicalName);
+  const absolutePath = path.join(canonicalRoot, relativePath);
+  try {
+    if (fs.realpathSync(canonicalRoot) !== canonicalRoot || rejectSymlinked(canonicalRoot)) {
+      return unresolvedTarget("target-canonical-root-stale");
+    }
+    if (rejectSymlinked(absolutePath)) return unresolvedTarget("target-absent-path-symlinked");
+    try {
+      fs.lstatSync(directory);
+      return unresolvedTarget("target-absent-path-collision");
+    } catch (error) {
+      if (error?.code !== "ENOENT") return unresolvedTarget("target-absent-path-unavailable");
+    }
+    try {
+      fs.lstatSync(absolutePath);
+      return unresolvedTarget("target-absent-path-collision");
+    } catch (error) {
+      if (error?.code !== "ENOENT") return unresolvedTarget("target-absent-path-unavailable");
+    }
+  } catch {
+    return unresolvedTarget("target-canonical-root-stale");
+  }
+  const target = absentRecord(canonicalRoot, relativePath, absolutePath, MUST_NOT_EXIST);
+  const resolvedInventory = [...inventory, target];
+  inventoryScopes.set(resolvedInventory, scopeMap);
+  return { ok: true, reason: null, target, inventory: resolvedInventory };
 }
 
 export function validateProposalTarget(proposal, inventory) {
@@ -330,7 +419,7 @@ export function validateProposalTarget(proposal, inventory) {
   const expectedHash = proposal?.skillTarget?.currentHash;
   if (expectedHash === MUST_NOT_EXIST) {
     if (existsNow || matches.some((record) => record.exists)) errors.push("proposal requires a target that must not exist");
-    canonicalTarget = absentRecord(requestedRoot, relativePath, candidate);
+    canonicalTarget = absentRecord(requestedRoot, relativePath, candidate, MUST_NOT_EXIST);
   } else {
     if (typeof expectedHash !== "string" || !/^[a-f0-9]{64}$/u.test(expectedHash)) errors.push("proposal currentHash must be a SHA-256 hash or must-not-exist");
     if (!existsNow || matches.length !== 1 || !matches[0].exists) errors.push("existing proposal target is missing from inventory or disk");

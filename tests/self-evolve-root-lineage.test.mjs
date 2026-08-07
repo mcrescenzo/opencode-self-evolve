@@ -22,7 +22,7 @@ const SCOPE = H("c");
 const SIGNATURE = H("d");
 const NOW = 2_100_000_000_000;
 
-function hostSession(id, { parentID, projectFingerprint = PROJECT, hidden, agent, createdBy } = {}) {
+function hostSession(id, { parentID, projectFingerprint = PROJECT, owned, trustworthy = true } = {}) {
   return {
     type: "session.idle",
     properties: {
@@ -31,9 +31,8 @@ function hostSession(id, { parentID, projectFingerprint = PROJECT, hidden, agent
         id,
         projectFingerprint,
         ...(parentID === undefined ? {} : { parentID }),
-        ...(hidden === undefined ? {} : { hidden }),
-        ...(agent === undefined ? {} : { agent }),
-        ...(createdBy === undefined ? {} : { createdBy }),
+        ...(owned === undefined ? {} : { owned }),
+        trustworthy,
       },
     },
   };
@@ -107,9 +106,9 @@ test("root hash is stable and domain-separated from child session lineage", () =
 test("parent, grandchild, and sibling descendants inherit one non-independent user root", () => {
   const sessions = [
     hostSession("root"),
-    hostSession("child", { parentID: "root", hidden: true }),
-    hostSession("grandchild", { parentID: "child", hidden: true }),
-    hostSession("sibling", { parentID: "root", hidden: true }),
+    hostSession("child", { parentID: "root" }),
+    hostSession("grandchild", { parentID: "child" }),
+    hostSession("sibling", { parentID: "root" }),
   ];
   const child = resolveRootLineage({ sessionID: "child", projectFingerprint: PROJECT, sessions });
   const grandchild = resolveRootLineage({ sessionID: "grandchild", projectFingerprint: PROJECT, sessions });
@@ -138,11 +137,23 @@ test("two unrelated direct user roots satisfy distinct-root eligibility", () => 
   assert.equal(result.eligible, true);
 });
 
+test("event-only roots without trustworthy host hydration remain unknown", () => {
+  const result = resolveRootLineage({
+    sessionID: "event-only-root",
+    projectFingerprint: PROJECT,
+    sessions: [hostSession("event-only-root", { trustworthy: false })],
+  });
+  assert.equal(result.resolved, false);
+  assert.equal(result.originKind, "unknown");
+  assert.equal(result.rootLineageHash, UNKNOWN_ROOT_LINEAGE_HASH);
+  assert.equal("rootSessionID" in result, false);
+});
+
 test("delegated evidence inherits its root and cannot add independent evidence", () => {
   const delegated = resolveRootLineage({
     sessionID: "subagent",
     projectFingerprint: PROJECT,
-    sessions: [hostSession("root"), hostSession("subagent", { parentID: "root", agent: "worker" })],
+    sessions: [hostSession("root"), hostSession("subagent", { parentID: "root" })],
   });
   assert.equal(delegated.rootLineageHash, hashRootLineage("root"));
   assert.equal(delegated.originKind, "delegated");
@@ -154,22 +165,16 @@ test("delegated evidence inherits its root and cannot add independent evidence",
   assert.match(result.thresholdsMissed.minDistinctSessions, /actual 1/u);
 });
 
-test("hidden and plugin-created roots cannot satisfy independent-root eligibility", () => {
-  const hidden = resolveRootLineage({
-    sessionID: "hidden-root",
-    projectFingerprint: PROJECT,
-    sessions: [hostSession("hidden-root", { hidden: true, agent: "analyzer" })],
-  });
+test("owner-backed plugin roots cannot satisfy independent-root eligibility", () => {
   const plugin = resolveRootLineage({
     sessionID: "plugin-root",
     projectFingerprint: PROJECT,
-    sessions: [hostSession("plugin-root", { createdBy: "plugin" })],
+    sessions: [hostSession("plugin-root", { owned: true })],
   });
-  assert.deepEqual([hidden.originKind, plugin.originKind], ["hidden", "plugin-created"]);
+  assert.equal(plugin.originKind, "plugin-created");
   const result = eligibility([
-    record("hidden-incident", "hidden-root", hidden.originKind),
     record("plugin-incident", "plugin-root", plugin.originKind),
-  ]);
+  ], { minIndependentIncidents: 1, minOccurrencesSum: 1, minDistinctSessions: 1 });
   assert.equal(result.eligible, false);
   assert.match(result.thresholdsMissed.minDistinctSessions, /actual 0/u);
 });

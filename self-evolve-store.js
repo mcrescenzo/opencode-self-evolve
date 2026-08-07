@@ -17,8 +17,13 @@ import {
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
-import { BRIDGE_CONTROL_STATE_RESERVE_BYTES, BRIDGE_RESPONSE_RESERVE_BYTES, validateBridgeExportMetadata } from "./self-evolve-bridge.js";
+import { BRIDGE_CONTROL_STATE_RESERVE_BYTES, BRIDGE_MAILBOX_DESCRIPTORS, validateBridgeExportMetadata } from "./self-evolve-bridge.js";
 import { processIsAlive, stateMutationLockHeld, withStateMutationLock } from "./self-evolve-lock.js";
+import {
+  revalidateStateRootBoundary,
+  validateStateRootBoundary,
+  walkStateRootDirectories,
+} from "./self-evolve-state-root.js";
 import {
   LEGACY_SELF_EVOLVE_AGENTS,
   SELF_EVOLVE_ANALYZER_AGENT,
@@ -34,9 +39,11 @@ import {
   makeAuditEvent,
   makeDecision,
   makeGlobalSettings,
+  migrateSettings,
   makeProposal,
   makeProposalContent,
   makeRepoSettings,
+  parseSynthesisOutcomeAuditEvent,
   stripUndefined,
   burnNonce,
   transitionProposalState,
@@ -50,10 +57,20 @@ const DEFAULT_STALE_LOCK_MS = 30_000;
 export const HOST_OWNER_TTL_MS = 15 * 60 * 1000;
 const DAY_MS = 86_400_000;
 const MANDATORY_AUDIT_MAX_BYTES = 4 * 1024;
+const QUARANTINE_EVIDENCE_MAX_BYTES = 64 * 1024;
+const GLOBAL_QUARANTINE_QUOTA_BYTES = 512 * 1024;
+const MAX_VERSION_MARKER_BYTES = 4 * 1024;
 const DECISION_TRANSACTION_VERSION = 2;
+const SETTINGS_TRANSACTION_VERSION = 2;
 const MAX_EXPORT_BYTES = 64 * 1024 * 1024;
 const EXPORT_NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) && constants.O_NOFOLLOW !== 0 ? constants.O_NOFOLLOW : null;
 const ACTIVE_PROPOSAL_STATES = new Set(["critic-pending", "pending", "approved", "applied"]);
+const ACTIVE_PROPOSAL_CHAIN_KINDS = new Set(["proposal", "proposal-content", "decision", "audit-event"]);
+const SYNTHESIS_FINALIZATION_AUDIT_ACTIONS = new Set([
+  "synthesis-outcome",
+  "synthesis-lease-cleanup-warning",
+  "synthesis-lease-cleanup-resolved",
+]);
 const HIDDEN_HOST_OWNER_AGENTS = new Set([
   SELF_EVOLVE_ANALYZER_AGENT,
   SELF_EVOLVE_SYNTHESIZER_AGENT,
@@ -72,6 +89,16 @@ const terminalRoots = new Set();
 
 export function hashContent(str) {
   return createHash("sha256").update(String(str)).digest("hex");
+}
+
+export function isActiveProposalState(state) {
+  return ACTIVE_PROPOSAL_STATES.has(state);
+}
+
+export function isActiveProposalChainRecord(record, activeProposalIds) {
+  if (!(activeProposalIds instanceof Set) || !ACTIVE_PROPOSAL_CHAIN_KINDS.has(record?.kind)) return false;
+  const proposalId = record.kind === "proposal" ? record.payload?.id : record.payload?.proposalId;
+  return typeof proposalId === "string" && activeProposalIds.has(proposalId);
 }
 
 function canonicalRemote(remoteUrl) {
@@ -137,13 +164,19 @@ function ensureDir(directory) {
   mkdirSync(directory, { recursive: true, mode: DIR_MODE });
 }
 
-function atomicWrite(filePath, contents) {
+function atomicFilesystemWrite(filePath, contents, syncFile = fsyncSync) {
   ensureDir(path.dirname(filePath));
   const temporary = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+  let descriptor;
   try {
-    writeFileSync(temporary, contents, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+    descriptor = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, FILE_MODE);
+    writeFileSync(descriptor, contents, "utf8");
+    syncFile(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
     renameSync(temporary, filePath);
   } catch (error) {
+    if (descriptor !== undefined) try { closeSync(descriptor); } catch {}
     try { unlinkSync(temporary); } catch {}
     throw error;
   }
@@ -160,39 +193,13 @@ export function quarantineRecord(record, reason, quarantineDir) {
   const recordPath = path.join(quarantineDir, `${stamp}.quarantined`);
   let serialized;
   try { serialized = typeof record === "string" ? record : JSON.stringify(record); } catch { serialized = String(record); }
-  atomicWrite(recordPath, `${serialized}\n`);
-  atomicWrite(`${recordPath}.reason.json`, json({ reason: String(reason) }));
+  atomicFilesystemWrite(recordPath, `${serialized}\n`);
+  atomicFilesystemWrite(`${recordPath}.reason.json`, json({ reason: String(reason) }));
   return recordPath;
 }
 
-function compareVersions(left, right) {
-  const parse = (value) => String(value).split(".").map((part) => Number(part));
-  const a = parse(left);
-  const b = parse(right);
-  if (a.length !== 3 || b.length !== 3 || [...a, ...b].some((part) => !Number.isInteger(part) || part < 0)) return null;
-  for (let index = 0; index < 3; index += 1) if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
-  return 0;
-}
-
 export function migrate(settings) {
-  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return null;
-  const comparison = compareVersions(settings.schemaVersion, SCHEMA_VERSION);
-  if (comparison === null || comparison > 0) return null;
-  if (comparison === 0) return settings;
-  const migrateRepo = (repo) => {
-    if (!repo || typeof repo !== "object" || Array.isArray(repo)) return repo;
-    const { consent: _removedConsent, ...rest } = repo;
-    return { ...rest, schemaVersion: SCHEMA_VERSION };
-  };
-  if ("projectFingerprint" in settings && !("global" in settings) && !("repo" in settings)) {
-    return migrateRepo(settings);
-  }
-  return {
-    ...settings,
-    schemaVersion: SCHEMA_VERSION,
-    ...(settings.global ? { global: { ...settings.global, schemaVersion: SCHEMA_VERSION } } : {}),
-    ...(settings.repo ? { repo: migrateRepo(settings.repo) } : {}),
-  };
+  return migrateSettings(settings);
 }
 
 function fileForKind(kind) {
@@ -217,13 +224,20 @@ export function openStore(rootDir, {
   staleLockMs = DEFAULT_STALE_LOCK_MS,
   faultInjection,
   processIsAlive: hostProcessIsAlive = processIsAlive,
+  filesystemSync = fsyncSync,
 } = {}) {
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
   if (!/^[a-f0-9]{64}$/.test(String(projectFingerprint))) throw new TypeError("invalid-project-fingerprint");
   if (!Number.isSafeInteger(lockTimeoutMs) || lockTimeoutMs < 1) throw new TypeError("invalid-lock-timeout");
   if (!Number.isSafeInteger(staleLockMs) || staleLockMs < 1) throw new TypeError("invalid-stale-lock-window");
   if (typeof hostProcessIsAlive !== "function") throw new TypeError("process-is-alive-must-be-function");
-  const root = path.resolve(String(rootDir));
+  if (typeof filesystemSync !== "function") throw new TypeError("filesystem-sync-must-be-function");
+  const rootBoundary = validateStateRootBoundary(rootDir, {
+    create: true,
+    beforeCreate: (details) => injectFault("state-root-before-create", details),
+  });
+  injectFault("state-root-after-boundary-validation", { stateRoot: rootBoundary.path });
+  const root = revalidateStateRootBoundary(rootBoundary);
   const baseDir = path.join(root, "self-evolve");
   const globalDir = path.join(baseDir, "global");
   const stateDir = path.join(baseDir, projectFingerprint);
@@ -237,6 +251,9 @@ export function openStore(rootDir, {
   const aggregatesPath = path.join(globalDir, "aggregates.jsonl");
   const aggregateIndexPath = path.join(stateDir, "aggregate-contributions.json");
   const decisionTransactionPath = path.join(stateDir, "decision-transaction.json");
+  const settingsTransactionPath = path.join(baseDir, "settings-transaction.json");
+  const requestTransactionPath = path.join(baseDir, "request-transaction.json");
+  const versionPath = path.join(baseDir, "version.json");
   const bridgeProjectDir = path.join(baseDir, "bridge", projectFingerprint);
   const exportProjectDir = path.join(baseDir, "exports", projectFingerprint);
   const ownedLeases = new Map();
@@ -247,17 +264,90 @@ export function openStore(rootDir, {
   const parsedFileCache = new Map();
   let exportInventory = null;
   let legacyProposalContentAbsent = false;
+  let lastKnownProjectQuotaBytes = null;
+  let startupCorruptionScope = null;
+  let partitionAdmissionError = null;
+  let partitionVersion = null;
   let closed = false;
   let terminal = false;
 
-  function ensureOpen() {
-    if (closed) throw new Error("store-closed");
-    if (terminal || terminalRoots.has(root)) throw new Error("restart-required-after-purge-all");
+  function boundaryComponents(directory) {
+    const resolved = path.resolve(directory);
+    const relative = path.relative(root, resolved);
+    if (relative === "") return [];
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error("state-root-path-escape-rejected");
+    }
+    return relative.split(path.sep);
   }
 
-  function withMutationLock(action) {
-    ensureOpen();
-    return withStateMutationLock(root, action, { lockTimeoutMs, staleLockMs });
+  function ensureDir(directory) {
+    const resolved = path.resolve(directory);
+    const walked = walkStateRootDirectories(rootBoundary, boundaryComponents(resolved), {
+      create: true,
+      beforeCreate: (details) => injectFault("state-root-before-create", details),
+    });
+    if (walked !== resolved) throw new Error("state-root-ancestor-rejected");
+  }
+
+  function revalidateStoreAncestors() {
+    for (const [components, expected] of [
+      [["self-evolve"], baseDir],
+      [["self-evolve", "global"], globalDir],
+      [["self-evolve", projectFingerprint], stateDir],
+    ]) {
+      if (walkStateRootDirectories(rootBoundary, components) !== expected) {
+        throw new Error("state-root-ancestor-rejected");
+      }
+    }
+  }
+
+  function preflightStoreAncestors() {
+    for (const components of [
+      ["self-evolve"],
+      ["self-evolve", "global"],
+      ["self-evolve", projectFingerprint],
+    ]) {
+      walkStateRootDirectories(rootBoundary, components);
+    }
+  }
+
+  function atomicWrite(filePath, contents) {
+    injectFault("state-root-before-atomic-write", { filePath });
+    revalidateStateRootBoundary(rootBoundary);
+    ensureDir(path.dirname(filePath));
+    revalidateStateRootBoundary(rootBoundary);
+    atomicFilesystemWrite(filePath, contents, filesystemSync);
+    revalidateStateRootBoundary(rootBoundary);
+  }
+
+  function ensureOpen({ allowIncompatible = false } = {}) {
+    if (closed) throw new Error("store-closed");
+    if (terminal || terminalRoots.has(root)) throw new Error("restart-required-after-purge-all");
+    if (partitionAdmissionError && !allowIncompatible) throw new Error(partitionAdmissionError);
+  }
+
+  function markStartupCorruption(scope) {
+    startupCorruptionScope = startupCorruptionScope && startupCorruptionScope !== scope
+      ? "all"
+      : scope;
+  }
+
+  function withMutationLock(action, {
+    requireStoreAncestors = true,
+    allowIncompatible = false,
+    recoverTransactions = true,
+  } = {}) {
+    ensureOpen({ allowIncompatible });
+    revalidateStateRootBoundary(rootBoundary);
+    return withStateMutationLock(root, () => {
+      revalidateStateRootBoundary(rootBoundary);
+      if (requireStoreAncestors) revalidateStoreAncestors();
+      if (recoverTransactions) recoverSettingsTransactionUnlocked();
+      const result = action();
+      revalidateStateRootBoundary(rootBoundary);
+      return result;
+    }, { lockTimeoutMs, staleLockMs });
   }
 
   function initializeDirs() {
@@ -269,17 +359,88 @@ export function openStore(rootDir, {
     ensureDir(quarantineDir);
     ensureDir(globalQuarantineDir);
     ensureDir(snapshotsDir);
-    const versionPath = path.join(baseDir, "version.json");
-    if (!existsSync(versionPath)) atomicWrite(versionPath, json({ schemaVersion: SCHEMA_VERSION }));
-    else {
-      // Upgrade a partition written by a compatible earlier release. Anything unreadable, newer, or
-      // unrecognized is left untouched so it stays visible rather than being silently rewritten.
-      let stored = null;
-      try { stored = JSON.parse(readFileSync(versionPath, "utf8"))?.schemaVersion ?? null; } catch { stored = null; }
-      if (typeof stored === "string" && stored !== SCHEMA_VERSION && SUPPORTED_SCHEMA_VERSIONS.includes(stored)) {
-        atomicWrite(versionPath, json({ schemaVersion: SCHEMA_VERSION }));
+    if (partitionVersion === null || partitionVersion !== SCHEMA_VERSION) {
+      atomicWrite(versionPath, json({ schemaVersion: SCHEMA_VERSION }));
+      partitionVersion = SCHEMA_VERSION;
+    }
+  }
+
+  function readStableRegularFile(filePath, maxBytes, faultPoint) {
+    let descriptor;
+    try {
+      const before = lstatSync(filePath);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > maxBytes) {
+        throw new Error("unsafe-state-file");
+      }
+      if (faultPoint) injectFault(faultPoint, { filePath });
+      descriptor = openSync(filePath, constants.O_RDONLY | (EXPORT_NOFOLLOW ?? 0));
+      const opened = fstatSync(descriptor);
+      if (!opened.isFile() || opened.nlink !== 1 || opened.size > maxBytes
+          || opened.dev !== before.dev || opened.ino !== before.ino) {
+        throw new Error("unsafe-state-file");
+      }
+      const source = readFileSync(descriptor, "utf8");
+      if (Buffer.byteLength(source, "utf8") > maxBytes) throw new Error("unsafe-state-file");
+      const after = lstatSync(filePath);
+      if (!after.isFile() || after.isSymbolicLink() || after.nlink !== 1
+          || after.dev !== opened.dev || after.ino !== opened.ino) {
+        throw new Error("unsafe-state-file");
+      }
+      return source;
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
+  }
+
+  function inspectUnversionedPartition() {
+    const entries = readdirSync(baseDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) return false;
+      if (entry.name === "bridge" || entry.name === "exports") {
+        if (walkStateRootDirectories(rootBoundary, ["self-evolve", entry.name]) !== path.join(baseDir, entry.name)) return false;
+        continue;
+      }
+      if (!/^[a-f0-9]{64}$/u.test(entry.name)) return false;
+      if (walkStateRootDirectories(rootBoundary, ["self-evolve", entry.name]) !== path.join(baseDir, entry.name)) return false;
+      try {
+        const source = readStableRegularFile(path.join(baseDir, entry.name, "settings.json"), QUARANTINE_EVIDENCE_MAX_BYTES);
+        const raw = JSON.parse(source);
+        if (!raw?.global || !raw?.repo || !SUPPORTED_SCHEMA_VERSIONS.includes(raw.schemaVersion)) return false;
+        const migrated = migrate(raw);
+        makeGlobalSettings(migrated?.global);
+        const repo = makeRepoSettings(migrated?.repo);
+        if (repo.projectFingerprint !== entry.name) return false;
+      } catch {
+        return false;
       }
     }
+    return true;
+  }
+
+  function inspectPartitionVersion() {
+    if (!existsSync(baseDir)) return Object.freeze({ ok: true, version: null });
+    if (!existsSync(versionPath)) {
+      return inspectUnversionedPartition()
+        ? Object.freeze({ ok: true, version: null })
+        : Object.freeze({ ok: false, reason: "malformed-state-version" });
+    }
+    let source;
+    let marker;
+    try {
+      source = readStableRegularFile(versionPath, MAX_VERSION_MARKER_BYTES, "state-version-before-open");
+      marker = JSON.parse(source);
+    } catch {
+      return Object.freeze({ ok: false, reason: "malformed-state-version" });
+    }
+    if (!marker || typeof marker !== "object" || Array.isArray(marker)
+        || Object.keys(marker).length !== 1 || !Object.hasOwn(marker, "schemaVersion")
+        || typeof marker.schemaVersion !== "string" || !marker.schemaVersion) {
+      return Object.freeze({ ok: false, reason: "malformed-state-version" });
+    }
+    if (!SUPPORTED_SCHEMA_VERSIONS.includes(marker.schemaVersion)) {
+      return Object.freeze({ ok: false, reason: "unsupported-state-version" });
+    }
+    return Object.freeze({ ok: true, version: marker.schemaVersion });
   }
 
   function safeTreeFiles(directory, { optional = true } = {}) {
@@ -310,14 +471,41 @@ export function openStore(rootDir, {
   function projectQuotaBytesUnlocked() {
     const global = loadGlobalSettingsUnlocked();
     if (!global) throw new Error("corrupt-settings");
-    if (!existsSync(repoSettingsPath)) return global.budgets.storageQuotaMiB * 1024 * 1024;
+    if (!existsSync(repoSettingsPath)) {
+      lastKnownProjectQuotaBytes = global.budgets.storageQuotaMiB * 1024 * 1024;
+      return lastKnownProjectQuotaBytes;
+    }
     const repo = loadRepoSettingsUnlocked();
     if (!repo) throw new Error("corrupt-settings");
-    return (repo.budgets.storageQuotaMiB ?? global.budgets.storageQuotaMiB) * 1024 * 1024;
+    lastKnownProjectQuotaBytes = (repo.budgets.storageQuotaMiB ?? global.budgets.storageQuotaMiB) * 1024 * 1024;
+    return lastKnownProjectQuotaBytes;
   }
 
-  function projectedProjectBytesUnlocked(changes = new Map()) {
-    const files = [...safeTreeFiles(stateDir), ...safeTreeFiles(bridgeProjectDir)];
+  function projectQuotaForStateDirUnlocked(targetStateDir) {
+    if (targetStateDir === stateDir) return projectQuotaBytesUnlocked();
+    const global = loadGlobalSettingsUnlocked();
+    if (!global) throw new Error("corrupt-settings");
+    const targetFingerprint = path.basename(targetStateDir);
+    const targetSettingsPath = path.join(targetStateDir, "settings.json");
+    if (!existsSync(targetSettingsPath)) return global.budgets.storageQuotaMiB * 1024 * 1024;
+    try {
+      const raw = JSON.parse(readFileSync(targetSettingsPath, "utf8"));
+      const legacy = raw?.repo ? migrate(raw) : null;
+      const candidate = legacy?.repo ?? migrate(raw);
+      if (!candidate) throw new Error("unsupported-version");
+      const clean = makeRepoSettings(candidate);
+      if (clean.projectFingerprint !== targetFingerprint) throw new Error("project-fingerprint-mismatch");
+      return (clean.budgets.storageQuotaMiB ?? global.budgets.storageQuotaMiB) * 1024 * 1024;
+    } catch {
+      throw new Error("corrupt-settings");
+    }
+  }
+
+  function projectedProjectBytesUnlocked(changes = new Map(), {
+    targetStateDir = stateDir,
+    targetBridgeDir = bridgeProjectDir,
+  } = {}) {
+    const files = [...safeTreeFiles(targetStateDir), ...safeTreeFiles(targetBridgeDir)];
     const seen = new Set();
     let bytes = 0;
     for (const filePath of files) {
@@ -329,23 +517,81 @@ export function openStore(rootDir, {
     for (const [filePath, contents] of changes) {
       if (contents !== null && !seen.has(filePath)) bytes += Buffer.byteLength(contents, "utf8");
     }
+    const requestDescriptors = new Map(BRIDGE_MAILBOX_DESCRIPTORS
+      .filter((descriptor) => descriptor.role === "request")
+      .map((descriptor) => [descriptor.directoryName, descriptor]));
     let pendingBridgeRequests = 0;
     for (const filePath of files) {
       const parent = path.basename(path.dirname(filePath));
-      if ((parent === "requests" || parent === "control-requests") && filePath.endsWith(".json")) {
+      const descriptor = requestDescriptors.get(parent);
+      if (descriptor && filePath.endsWith(".json")) {
         pendingBridgeRequests += 1;
-        bytes += BRIDGE_RESPONSE_RESERVE_BYTES;
+        bytes += descriptor.responseMaxBytes;
       }
     }
-    if (pendingBridgeRequests > 0 && !files.includes(path.join(bridgeProjectDir, "control-state.json"))) bytes += BRIDGE_CONTROL_STATE_RESERVE_BYTES;
+    if (pendingBridgeRequests > 0 && !files.includes(path.join(targetBridgeDir, "control-state.json"))) bytes += BRIDGE_CONTROL_STATE_RESERVE_BYTES;
     return bytes;
   }
 
-  function assertProjectQuotaUnlocked(changes, { mandatoryAuditBytes = 0, quotaBytes = projectQuotaBytesUnlocked() } = {}) {
-    const projectedBytes = projectedProjectBytesUnlocked(changes);
+  function assertProjectQuotaUnlocked(changes, {
+    mandatoryAuditBytes = 0,
+    quotaBytes = projectQuotaBytesUnlocked(),
+    targetStateDir = stateDir,
+    targetBridgeDir = bridgeProjectDir,
+  } = {}) {
+    const projectedBytes = projectedProjectBytesUnlocked(changes, { targetStateDir, targetBridgeDir });
     if (projectedBytes <= quotaBytes) return { projectedBytes, quotaBytes };
     if (mandatoryAuditBytes > 0 && mandatoryAuditBytes <= MANDATORY_AUDIT_MAX_BYTES) return { projectedBytes, quotaBytes, mandatoryAuditBypass: true };
     throw new Error("storage-quota-exceeded");
+  }
+
+  function assertGlobalQuarantineQuotaUnlocked(changes) {
+    const files = safeTreeFiles(globalQuarantineDir);
+    const seen = new Set();
+    let projectedBytes = 0;
+    for (const filePath of files) {
+      const resolved = path.resolve(filePath);
+      seen.add(resolved);
+      const replacement = changes.get(resolved);
+      projectedBytes += replacement === null
+        ? 0
+        : replacement === undefined
+          ? lstatSync(filePath).size
+          : Buffer.byteLength(replacement);
+    }
+    for (const [filePath, contents] of changes) {
+      if (contents !== null && !seen.has(filePath)) projectedBytes += Buffer.byteLength(contents);
+    }
+    if (projectedBytes > GLOBAL_QUARANTINE_QUOTA_BYTES) throw new Error("storage-quota-exceeded");
+    return { projectedBytes, quotaBytes: GLOBAL_QUARANTINE_QUOTA_BYTES };
+  }
+
+  function serializeQuarantineRecord(record) {
+    try { return typeof record === "string" ? record : JSON.stringify(record); } catch { return String(record); }
+  }
+
+  function boundedQuarantineEvidence(serialized) {
+    const source = Buffer.from(serialized, "utf8");
+    return Buffer.concat([
+      source.subarray(0, Math.max(0, QUARANTINE_EVIDENCE_MAX_BYTES - 1)),
+      Buffer.from("\n"),
+    ]);
+  }
+
+  function quarantineGlobal(record, reason, label = "global-record") {
+    const serialized = serializeQuarantineRecord(record);
+    const identity = hashContent(JSON.stringify([label, String(reason), hashContent(serialized)]));
+    const recordPath = path.join(globalQuarantineDir, `${label}-${identity}.quarantined`);
+    const reasonPath = `${recordPath}.reason.json`;
+    ensureDir(globalQuarantineDir);
+    const changes = new Map();
+    if (!existsSync(recordPath)) changes.set(path.resolve(recordPath), boundedQuarantineEvidence(serialized));
+    if (!existsSync(reasonPath)) changes.set(path.resolve(reasonPath), json({ reason: String(reason) }));
+    if (changes.size === 0) return recordPath;
+    assertGlobalQuarantineQuotaUnlocked(changes);
+    if (changes.has(path.resolve(recordPath))) atomicWrite(recordPath, changes.get(path.resolve(recordPath)));
+    if (changes.has(path.resolve(reasonPath))) atomicWrite(reasonPath, changes.get(path.resolve(reasonPath)));
+    return recordPath;
   }
 
   function atomicProjectWrite(filePath, contents, { allowNonGrowing = true, ...options } = {}) {
@@ -361,39 +607,71 @@ export function openStore(rootDir, {
   }
 
   function quarantine(record, reason, directory = quarantineDir) {
+    if (directory === globalQuarantineDir) return quarantineGlobal(record, reason);
     if (directory !== quarantineDir) return quarantineRecord(record, reason, directory);
     ensureDir(directory);
     const stamp = `${Date.now()}-${randomBytes(8).toString("hex")}`;
     const recordPath = path.join(directory, `${stamp}.quarantined`);
-    let serialized;
-    try { serialized = typeof record === "string" ? record : JSON.stringify(record); } catch { serialized = String(record); }
+    const serialized = serializeQuarantineRecord(record);
+    const evidence = boundedQuarantineEvidence(serialized);
     const changes = new Map([
-      [path.resolve(recordPath), `${serialized}\n`],
+      [path.resolve(recordPath), evidence],
       [path.resolve(`${recordPath}.reason.json`), json({ reason: String(reason) })],
     ]);
-    const global = loadGlobalSettingsUnlocked();
-    const quotaBytes = (global?.budgets.storageQuotaMiB ?? 8) * 1024 * 1024;
-    assertProjectQuotaUnlocked(changes, { quotaBytes });
+    assertProjectQuotaUnlocked(changes);
     atomicWrite(recordPath, changes.get(path.resolve(recordPath)));
     atomicWrite(`${recordPath}.reason.json`, changes.get(path.resolve(`${recordPath}.reason.json`)));
     return recordPath;
   }
 
-  function quarantineDeterministic(record, reason, label) {
-    let serialized;
-    try { serialized = typeof record === "string" ? record : JSON.stringify(record); } catch { serialized = String(record); }
-    const bounded = serialized.slice(0, 64 * 1024);
-    const identity = hashContent(JSON.stringify([String(label), String(reason), bounded]));
-    const recordPath = path.join(quarantineDir, `${label}-${identity}.quarantined`);
+  function quarantineProjectDeterministic(record, reason, label, targetStateDir = stateDir) {
+    const serialized = serializeQuarantineRecord(record);
+    const evidence = boundedQuarantineEvidence(serialized);
+    const identity = hashContent(JSON.stringify([String(label), String(reason), hashContent(serialized)]));
+    const targetQuarantineDir = path.join(targetStateDir, "quarantine");
+    const targetBridgeDir = path.join(baseDir, "bridge", path.basename(targetStateDir));
+    const recordPath = path.join(targetQuarantineDir, `${label}-${identity}.quarantined`);
     const reasonPath = `${recordPath}.reason.json`;
+    ensureDir(targetQuarantineDir);
     if (existsSync(recordPath) && existsSync(reasonPath)) return recordPath;
     const changes = new Map([
-      [path.resolve(recordPath), `${bounded}\n`],
+      [path.resolve(recordPath), evidence],
       [path.resolve(reasonPath), json({ reason: String(reason) })],
     ]);
-    assertProjectQuotaUnlocked(changes);
+    assertProjectQuotaUnlocked(changes, {
+      quotaBytes: projectQuotaForStateDirUnlocked(targetStateDir),
+      targetStateDir,
+      targetBridgeDir,
+    });
     if (!existsSync(recordPath)) atomicWrite(recordPath, changes.get(path.resolve(recordPath)));
     if (!existsSync(reasonPath)) atomicWrite(reasonPath, changes.get(path.resolve(reasonPath)));
+    return recordPath;
+  }
+
+  function quarantineDeterministic(record, reason, label) {
+    return quarantineProjectDeterministic(record, reason, label, stateDir);
+  }
+
+  function quarantineSettings(source, reason, scope) {
+    const serialized = typeof source === "string" ? source : String(source);
+    const evidence = boundedQuarantineEvidence(serialized);
+    const identity = hashContent(JSON.stringify([scope, String(reason), hashContent(serialized)]));
+    const directory = scope === "global-settings" ? globalQuarantineDir : quarantineDir;
+    const recordPath = path.join(directory, `${scope}-${identity}.quarantined`);
+    const reasonPath = `${recordPath}.reason.json`;
+    ensureDir(directory);
+    const changes = new Map();
+    if (!existsSync(recordPath)) changes.set(path.resolve(recordPath), evidence);
+    if (!existsSync(reasonPath)) changes.set(path.resolve(reasonPath), json({ reason: String(reason) }));
+    if (changes.size === 0) return recordPath;
+    if (scope === "global-settings") {
+      assertGlobalQuarantineQuotaUnlocked(changes);
+    } else {
+      if (!Number.isSafeInteger(lastKnownProjectQuotaBytes)) throw new Error("project-quota-unavailable");
+      assertProjectQuotaUnlocked(changes, { quotaBytes: lastKnownProjectQuotaBytes });
+    }
+    if (changes.has(path.resolve(recordPath))) atomicWrite(recordPath, changes.get(path.resolve(recordPath)));
+    if (changes.has(path.resolve(reasonPath))) atomicWrite(reasonPath, changes.get(path.resolve(reasonPath)));
     return recordPath;
   }
 
@@ -554,7 +832,7 @@ export function openStore(rootDir, {
       if (!proposal) {
         outcome = "orphan";
         reason = "proposal-not-found";
-      } else if (!ACTIVE_PROPOSAL_STATES.has(proposal.state)) {
+      } else if (!isActiveProposalState(proposal.state)) {
         const validation = validateActiveGroup(proposalId, proposal, entries);
         const quarantinePrefix = `legacy-proposal-${hashContent(proposalId).slice(0, 24)}-`;
         const priorInvalidMigration = proposal.state === "failed-closed"
@@ -617,8 +895,8 @@ export function openStore(rootDir, {
     return compactProposalContentUnlocked(terminalIds);
   }
 
-  function injectFault(point) {
-    if (typeof faultInjection === "function") faultInjection(point);
+  function injectFault(point, details) {
+    if (typeof faultInjection === "function") faultInjection(point, details);
   }
 
   function sameStateTransition(current, decision) {
@@ -784,15 +1062,17 @@ export function openStore(rootDir, {
       atomicWrite(globalSettingsPath, json(initial));
       return initial;
     }
+    let source;
     try {
-      const raw = JSON.parse(readFileSync(globalSettingsPath, "utf8"));
+      source = readFileSync(globalSettingsPath, "utf8");
+      const raw = JSON.parse(source);
       const migrated = migrate(raw);
-      if (!migrated) return null;
+      if (!migrated) throw new Error("unsupported-version");
       const clean = makeGlobalSettings(migrated);
       if (raw.schemaVersion !== SCHEMA_VERSION) atomicWrite(globalSettingsPath, json(clean));
       return clean;
     } catch (error) {
-      quarantine(readFileSync(globalSettingsPath, "utf8"), errorReasonCode(error, "corrupt-record"), globalQuarantineDir);
+      try { quarantineSettings(source ?? "unreadable global settings", errorReasonCode(error, "corrupt-record"), "global-settings"); } catch {}
       return null;
     }
   }
@@ -800,14 +1080,20 @@ export function openStore(rootDir, {
   function loadRepoSettingsUnlocked() {
     if (!existsSync(repoSettingsPath)) {
       const defaults = makeRepoSettings({ projectFingerprint });
-      atomicProjectWrite(repoSettingsPath, json(defaults));
-      return defaults;
+      try {
+        atomicProjectWrite(repoSettingsPath, json(defaults));
+        return defaults;
+      } catch {
+        return null;
+      }
     }
+    let source;
     try {
-      const raw = JSON.parse(readFileSync(repoSettingsPath, "utf8"));
+      source = readFileSync(repoSettingsPath, "utf8");
+      const raw = JSON.parse(source);
       const legacy = raw?.repo ? migrate(raw) : null;
       const candidate = legacy?.repo ?? migrate(raw);
-      if (!candidate) return null;
+      if (!candidate) throw new Error("unsupported-version");
       const clean = makeRepoSettings(candidate);
       if (raw.repo || raw.schemaVersion !== SCHEMA_VERSION) {
         const global = loadGlobalSettingsUnlocked();
@@ -815,15 +1101,17 @@ export function openStore(rootDir, {
       }
       return clean;
     } catch (error) {
-      quarantine(readFileSync(repoSettingsPath, "utf8"), errorReasonCode(error, "corrupt-record"));
+      try { quarantineSettings(source ?? "unreadable repository settings", errorReasonCode(error, "corrupt-record"), "repo-settings"); } catch {}
       return null;
     }
   }
 
   function getSettingsUnlocked() {
+    if (startupCorruptionScope) throw new Error("corrupt-state");
     const global = loadGlobalSettingsUnlocked();
     const repo = loadRepoSettingsUnlocked();
     if (!global || !repo) throw new Error("corrupt-settings");
+    lastKnownProjectQuotaBytes = (repo.budgets.storageQuotaMiB ?? global.budgets.storageQuotaMiB) * 1024 * 1024;
     return { global, repo };
   }
 
@@ -974,7 +1262,208 @@ export function openStore(rootDir, {
     return appendValidUnlocked(makeAudit(kind, details, proposalId, actor), { mandatoryAudit: true });
   }
 
-  function updateSettings(mutator, { expectedGlobalUpdatedAt } = {}) {
+  function validateRequestTransaction(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("malformed-request-transaction");
+    const expected = ["action", "expiresAt", "intentHash", "issuedAt", "nonceHash", "projectFingerprint", "requestDigest", "requestId", "type"];
+    if (Object.keys(value).sort().join(",") !== expected.sort().join(",")) throw new Error("malformed-request-transaction");
+    if (value.type !== "operation"
+        || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(value.requestId)
+        || !/^[a-f0-9]{64}$/u.test(value.projectFingerprint)
+        || !/^[a-f0-9]{64}$/u.test(value.requestDigest)
+        || !/^[a-f0-9]{64}$/u.test(value.nonceHash)
+        || typeof value.action !== "string" || value.action.length < 1 || value.action.length > 64
+        || !Number.isSafeInteger(value.issuedAt) || value.issuedAt < 0
+        || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= value.issuedAt) throw new Error("malformed-request-transaction");
+    const { intentHash, ...body } = value;
+    if (intentHash !== hashContent(JSON.stringify(body))) throw new Error("corrupt-request-transaction");
+    return Object.freeze({ ...body, intentHash });
+  }
+
+  function readRequestTransactionUnlocked({ expire = false } = {}) {
+    if (!existsSync(requestTransactionPath)) return null;
+    const transaction = validateRequestTransaction(JSON.parse(readFileSync(requestTransactionPath, "utf8")));
+    if (expire && transaction.expiresAt <= now()) {
+      rmSync(requestTransactionPath, { force: true });
+      return null;
+    }
+    return transaction;
+  }
+
+  function beginRequestTransaction(value) {
+    try {
+      return withMutationLock(() => {
+        const body = {
+          type: "operation",
+          requestId: value?.requestId,
+          projectFingerprint: value?.projectFingerprint,
+          requestDigest: value?.requestDigest,
+          nonceHash: value?.nonceHash,
+          action: value?.action,
+          issuedAt: value?.issuedAt,
+          expiresAt: value?.expiresAt,
+        };
+        const intent = validateRequestTransaction({ ...body, intentHash: hashContent(JSON.stringify(body)) });
+        const existing = readRequestTransactionUnlocked({ expire: true });
+        if (existing) return existing.intentHash === intent.intentHash
+          ? { ok: true, duplicate: true, transaction: existing }
+          : { ok: false, reason: "request-transaction-busy" };
+        atomicWrite(requestTransactionPath, json(intent));
+        return { ok: true, duplicate: false, transaction: intent };
+      });
+    } catch (error) {
+      return { ok: false, reason: errorReasonCode(error, "request-transaction-failed") };
+    }
+  }
+
+  function readRequestTransaction() {
+    return withMutationLock(() => readRequestTransactionUnlocked({ expire: true }));
+  }
+
+  function clearRequestTransaction(requestDigest) {
+    try {
+      return withMutationLock(() => {
+        const existing = readRequestTransactionUnlocked();
+        if (!existing) return { ok: true, absent: true };
+        if (existing.requestDigest !== requestDigest) return { ok: false, reason: "request-transaction-mismatch" };
+        rmSync(requestTransactionPath, { force: true });
+        return { ok: true, absent: false };
+      });
+    } catch (error) {
+      return { ok: false, reason: errorReasonCode(error, "request-transaction-failed") };
+    }
+  }
+
+  function hasPendingOperationRequest(requestId) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(String(requestId))) return false;
+    try {
+      const stat = lstatSync(path.join(bridgeProjectDir, "operation-requests", `${requestId}.json`));
+      return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1;
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  function purgeProjectBridgeUnlocked() {
+    if (!existsSync(bridgeProjectDir)) return;
+    const transaction = readRequestTransactionUnlocked();
+    const keep = transaction?.projectFingerprint === projectFingerprint
+      ? path.resolve(bridgeProjectDir, "operation-requests", `${transaction.requestId}.json`)
+      : null;
+    if (!keep) {
+      rmSync(bridgeProjectDir, { recursive: true, force: true });
+      return;
+    }
+    for (const filePath of safeTreeFiles(bridgeProjectDir)) {
+      if (keep && (path.resolve(filePath) === keep || path.resolve(filePath) === path.resolve(bridgeProjectDir, "consumer.lock"))) continue;
+      rmSync(filePath, { force: true });
+    }
+  }
+
+  function buildSettingsTransaction(current, nextGlobal, nextRepo, globalChanged, repoChanged, audits) {
+    const body = {
+      protocolVersion: SETTINGS_TRANSACTION_VERSION,
+      schemaVersion: SCHEMA_VERSION,
+      projectFingerprint,
+      global: { changed: globalChanged, prior: current.global, next: nextGlobal },
+      repo: { changed: repoChanged, prior: current.repo, next: nextRepo },
+      audits,
+    };
+    return { ...body, intentHash: hashContent(JSON.stringify(body)) };
+  }
+
+  function validateSettingsTransaction(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("malformed-settings-transaction");
+    const legacy = value.protocolVersion === 1;
+    const expectedKeys = [legacy ? "audit" : "audits", "global", "intentHash", "projectFingerprint", "protocolVersion", "repo", "schemaVersion"];
+    if (Object.keys(value).sort().join(",") !== expectedKeys.sort().join(",")) throw new Error("malformed-settings-transaction");
+    if (![1, SETTINGS_TRANSACTION_VERSION].includes(value.protocolVersion) || value.schemaVersion !== SCHEMA_VERSION) throw new Error("unsupported-settings-transaction");
+    if (!/^[a-f0-9]{64}$/.test(value.projectFingerprint)) throw new Error("malformed-settings-transaction");
+    const validateChange = (change, makeSettings) => {
+      if (!change || typeof change !== "object" || Array.isArray(change)) throw new Error("malformed-settings-transaction");
+      if (Object.keys(change).sort().join(",") !== "changed,next,prior") throw new Error("malformed-settings-transaction");
+      if (typeof change.changed !== "boolean") throw new Error("malformed-settings-transaction");
+      const prior = makeSettings(change.prior);
+      const next = makeSettings(change.next);
+      if (change.changed !== (JSON.stringify(prior) !== JSON.stringify(next))) throw new Error("malformed-settings-transaction");
+      return { changed: change.changed, prior, next };
+    };
+    const global = validateChange(value.global, makeGlobalSettings);
+    const repo = validateChange(value.repo, makeRepoSettings);
+    if (!global.changed && !repo.changed) throw new Error("malformed-settings-transaction");
+    if (repo.prior.projectFingerprint !== value.projectFingerprint || repo.next.projectFingerprint !== value.projectFingerprint) throw new Error("cross-scope");
+    const audits = (legacy ? [value.audit] : value.audits).map(assertRecord);
+    if (audits.length < 1 || audits.length > 8 || audits.some((audit) => audit.kind !== "audit-event")) throw new Error("malformed-settings-transaction");
+    const expectedAction = global.changed && repo.changed ? "global-repo-settings" : global.changed ? "global-settings" : "repo-settings";
+    if (audits[0].payload.kind !== "mode-change" || audits[0].payload.details?.action !== expectedAction) throw new Error("malformed-settings-transaction");
+    const { intentHash, ...body } = value;
+    if (intentHash !== hashContent(JSON.stringify(body))) throw new Error("corrupt-settings-transaction");
+    return { ...body, intentHash, global, repo, audits };
+  }
+
+  function recoverSettingsTransactionUnlocked({ inject = false } = {}) {
+    if (!existsSync(settingsTransactionPath)) return null;
+    let raw;
+    let intent;
+    try {
+      raw = readFileSync(settingsTransactionPath, "utf8");
+      intent = validateSettingsTransaction(JSON.parse(raw));
+    } catch (error) {
+      try { quarantineGlobal(raw ?? "unreadable settings transaction", errorReasonCode(error, "corrupt-record"), "settings-transaction"); }
+      finally { rmSync(settingsTransactionPath, { force: true }); }
+      throw new Error(errorReasonCode(error, "corrupt-record"));
+    }
+    const targetStateDir = path.join(baseDir, intent.projectFingerprint);
+    const targetRepoSettingsPath = path.join(targetStateDir, "settings.json");
+    const targetAuditPath = path.join(targetStateDir, STORE_FILES["audit-event"]);
+    ensureDir(targetStateDir);
+    const recoverSetting = (filePath, change, makeSettings, faultPoint) => {
+      if (!change.changed) return;
+      let current;
+      try { current = makeSettings(JSON.parse(readFileSync(filePath, "utf8"))); }
+      catch { throw new Error("settings-transaction-state-conflict"); }
+      const currentSource = JSON.stringify(current);
+      const priorSource = JSON.stringify(change.prior);
+      const nextSource = JSON.stringify(change.next);
+      if (currentSource === priorSource) atomicWrite(filePath, json(change.next));
+      else if (currentSource !== nextSource) throw new Error("settings-transaction-state-conflict");
+      if (inject) injectFault(faultPoint);
+    };
+    recoverSetting(globalSettingsPath, intent.global, makeGlobalSettings, "settings-after-global-write");
+    recoverSetting(targetRepoSettingsPath, intent.repo, makeRepoSettings, "settings-after-repo-write");
+    const parsedAudit = readValidatedSource(targetAuditPath);
+    if (parsedAudit.damaged.length) throw new Error("settings-transaction-audit-conflict");
+    let auditSource = parsedAudit.source ?? "";
+    let auditRecords = parsedAudit.records;
+    let auditChanged = false;
+    for (const audit of intent.audits) {
+      const matching = auditRecords.filter((record) => record.id === audit.id
+        || (record.kind === "audit-event" && record.payload.id === audit.payload.id));
+      if (matching.some((record) => JSON.stringify(record) !== JSON.stringify(audit)) || matching.length > 1) throw new Error("settings-transaction-audit-conflict");
+      if (matching.length !== 0) continue;
+      if (auditSource && !auditSource.endsWith("\n")) auditSource += "\n";
+      auditSource += `${JSON.stringify(audit)}\n`;
+      auditRecords = [...auditRecords, audit];
+      auditChanged = true;
+    }
+    if (auditChanged) {
+      atomicWrite(targetAuditPath, auditSource);
+      cacheParsedRecords(targetAuditPath, auditSource, auditRecords);
+    }
+    if (inject) injectFault("settings-after-audit-write");
+    rmSync(settingsTransactionPath, { force: true });
+    if (inject) injectFault("settings-after-transaction-remove");
+    return {
+      ok: true,
+      recovered: true,
+      changed: true,
+      settings: { global: intent.global.next, repo: intent.repo.next },
+      auditEvent: intent.audits[0].payload,
+      auditEvents: intent.audits.map((audit) => audit.payload),
+    };
+  }
+
+  function updateSettings(mutator, { expectedGlobalUpdatedAt, additionalAudits = [] } = {}) {
     if (typeof mutator !== "function") return { ok: false, reason: "settings-mutator-required" };
     try {
       return withMutationLock(() => {
@@ -993,19 +1482,30 @@ export function openStore(rootDir, {
           globalMode: nextGlobal.mode,
           repoMode: nextRepo.mode,
         });
+        const extraAudits = additionalAudits.map(assertRecord);
+        if (extraAudits.length > 7 || extraAudits.some((record) => record.kind !== "audit-event")) throw new Error("invalid-settings-audit");
+        const transactionAudits = [audit, ...extraAudits];
         const auditRecords = readFileRecords(STORE_FILES["audit-event"]);
-        const auditSource = [...auditRecords, audit].map((record) => JSON.stringify(record)).join("\n") + "\n";
-        const auditBytes = Buffer.byteLength(JSON.stringify(audit), "utf8") + 1;
+        const auditSource = [...auditRecords, ...transactionAudits].map((record) => JSON.stringify(record)).join("\n") + "\n";
+        const auditBytes = transactionAudits.reduce((total, record) => total + Buffer.byteLength(JSON.stringify(record), "utf8") + 1, 0);
         const changes = new Map([[path.resolve(path.join(stateDir, STORE_FILES["audit-event"])), auditSource]]);
         if (repoChanged) changes.set(path.resolve(repoSettingsPath), json(nextRepo));
         const quotaBytes = (nextRepo.budgets.storageQuotaMiB ?? nextGlobal.budgets.storageQuotaMiB) * 1024 * 1024;
         assertProjectQuotaUnlocked(changes, { mandatoryAuditBytes: auditBytes, quotaBytes });
-        if (globalChanged) atomicWrite(globalSettingsPath, json(nextGlobal));
-        if (repoChanged) atomicWrite(repoSettingsPath, json(nextRepo));
-        const auditPath = path.join(stateDir, STORE_FILES["audit-event"]);
-        atomicWrite(auditPath, auditSource);
-        cacheParsedRecords(auditPath, auditSource, [...auditRecords, audit]);
-        return { ok: true, changed: true, settings: { global: nextGlobal, repo: nextRepo }, auditEvent: audit.payload };
+        const intent = buildSettingsTransaction(current, nextGlobal, nextRepo, globalChanged, repoChanged, transactionAudits);
+        injectFault("settings-before-intent-write");
+        atomicWrite(settingsTransactionPath, json(intent));
+        try {
+          injectFault("settings-after-intent-write");
+          const committed = recoverSettingsTransactionUnlocked({ inject: true });
+          return { ...committed, recovered: false };
+        } catch (error) {
+          if (!existsSync(settingsTransactionPath)) {
+            return { ok: true, recovered: false, changed: true, settings: { global: nextGlobal, repo: nextRepo }, auditEvent: audit.payload };
+          }
+          const committed = recoverSettingsTransactionUnlocked();
+          return { ...committed, recovered: true };
+        }
       });
     } catch (error) {
       return { ok: false, reason: errorReasonCode(error, "corrupt-record") };
@@ -1033,6 +1533,123 @@ export function openStore(rootDir, {
     try { return withMutationLock(() => appendValidUnlocked(envelope)); }
     catch (error) {
       try { withMutationLock(() => quarantine(envelope, errorReasonCode(error, "corrupt-record"))); } catch {}
+      return { ok: false, reason: errorReasonCode(error, "corrupt-record") };
+    }
+  }
+
+  function admitSynthesisAttempt(envelope, { rootSessionIDHash } = {}) {
+    try {
+      return withMutationLock(() => {
+        const attempt = assertRecord(envelope);
+        if (attempt.kind !== "synthesis-attempt") return { ok: false, reason: "invalid-synthesis-attempt-admission" };
+        const fileName = fileForKind("synthesis-attempt");
+        const { records, source: currentSource } = readFileRecordsWithSource(fileName);
+        if (records.some((record) => record.id === attempt.id)) {
+          return { ok: true, duplicate: true, record: attempt };
+        }
+        const timestamp = attempt.payload.admittedAt;
+        const current = getSettingsUnlocked();
+        const limit = current.repo.budgets.synthesisPerDay ?? current.global.budgets.synthesisPerDay;
+        const used = records.filter((record) => record.kind === "audit-event"
+          && record.payload?.actor === "self-evolve-scheduler"
+          && record.payload.details?.action === "scheduler-budget"
+          && record.payload.details?.budgetType === "synthesis"
+          && record.payload.timestamp >= timestamp - DAY_MS).length;
+        if (used >= limit) return { ok: false, reason: "synthesis-budget-exhausted", remaining: 0 };
+        const lineageHash = /^[a-f0-9]{64}$/u.test(String(rootSessionIDHash))
+          ? String(rootSessionIDHash)
+          : hashContent("unknown-root-session");
+        const details = {
+          action: "scheduler-budget",
+          budgetType: "synthesis",
+          reservationId: hashContent(`synthesis-budget-admission-v1\n${attempt.payload.outcomeId}`),
+          rootSessionIDHash: lineageHash,
+        };
+        const payloadHash = hashContent(JSON.stringify(details));
+        const event = makeAuditEvent({
+          id: hashContent(`synthesis-budget-admission-audit-v1\n${attempt.payload.outcomeId}`),
+          kind: "decision",
+          actor: "self-evolve-scheduler",
+          timestamp,
+          payloadHash,
+          details,
+        });
+        const budget = assertRecord(wrapRecord("audit-event", event, timestamp));
+        if (records.some((record) => record.kind === "audit-event" && record.payload.id === event.id)) {
+          return { ok: false, reason: "synthesis-budget-admission-conflict" };
+        }
+        const base = currentSource === null
+          ? records.map((record) => JSON.stringify(record)).join("\n") + (records.length ? "\n" : "")
+          : currentSource && !currentSource.endsWith("\n") ? `${currentSource}\n` : currentSource;
+        const source = `${base}${JSON.stringify(attempt)}\n${JSON.stringify(budget)}\n`;
+        const filePath = path.join(stateDir, fileName);
+        assertProjectQuotaUnlocked(new Map([[path.resolve(filePath), source]]));
+        atomicWrite(filePath, source);
+        cacheParsedRecords(filePath, source, [...records, attempt, budget]);
+        return { ok: true, duplicate: false, record: attempt, budget: event, remaining: Math.max(0, limit - used - 1) };
+      });
+    } catch (error) {
+      return { ok: false, reason: errorReasonCode(error, "synthesis-attempt-admission-failed") };
+    }
+  }
+
+  function isSynthesisLeaseCleanupAudit(event) {
+    const details = event.details;
+    const warning = details?.action === "synthesis-lease-cleanup-warning";
+    const expectedKeys = warning
+      ? ["action", "cleanupOwner", "expectedLeaseActor", "expectedLeasePid", "leaseKey", "leaseNonceHash", "outcomeId", "reason", "retryable", "subjectId"]
+      : ["action", "cleanupOwner", "leaseKey", "leaseNonceHash", "outcomeId", "reason", "retryable", "subjectId"];
+    if (!warning && details?.action !== "synthesis-lease-cleanup-resolved") return false;
+    if (Object.keys(details).sort().join(",") !== expectedKeys.sort().join(",")
+        || event.kind !== "decision" || event.actor !== "self-evolve-pipeline" || event.proposalId !== undefined
+        || details.subjectId !== details.outcomeId || !/^[a-f0-9]{64}$/u.test(details.outcomeId)
+        || !/^synthesis_[a-f0-9]{64}$/u.test(details.leaseKey) || !/^[a-f0-9]{64}$/u.test(details.leaseNonceHash)
+        || details.cleanupOwner !== "self-evolve-pipeline" || details.retryable !== warning
+        || typeof details.reason !== "string" || details.reason.length < 1 || details.reason.length > 128) return false;
+    if (warning && (typeof details.expectedLeaseActor !== "string" || details.expectedLeaseActor.length < 1
+        || details.expectedLeaseActor.length > 128 || !Number.isSafeInteger(details.expectedLeasePid) || details.expectedLeasePid < 1)) return false;
+    const clean = warning
+      ? {
+          action: details.action,
+          subjectId: details.subjectId,
+          outcomeId: details.outcomeId,
+          leaseKey: details.leaseKey,
+          leaseNonceHash: details.leaseNonceHash,
+          cleanupOwner: details.cleanupOwner,
+          expectedLeaseActor: details.expectedLeaseActor,
+          expectedLeasePid: details.expectedLeasePid,
+          retryable: details.retryable,
+          reason: details.reason,
+        }
+      : {
+          action: details.action,
+          subjectId: details.subjectId,
+          outcomeId: details.outcomeId,
+          leaseKey: details.leaseKey,
+          leaseNonceHash: details.leaseNonceHash,
+          cleanupOwner: details.cleanupOwner,
+          retryable: details.retryable,
+          reason: details.reason,
+        };
+    const payloadHash = hashContent(JSON.stringify(clean));
+    const id = hashContent(JSON.stringify({ timestamp: event.timestamp, payloadHash, clean }));
+    return event.payloadHash === payloadHash && event.id === id;
+  }
+
+  function appendSynthesisFinalizationAudit(envelope) {
+    try {
+      return withMutationLock(() => {
+        const clean = assertRecord(envelope);
+        const action = clean.payload?.details?.action;
+        if (clean.kind !== "audit-event" || !SYNTHESIS_FINALIZATION_AUDIT_ACTIONS.has(action)
+            || (action === "synthesis-outcome"
+              ? parseSynthesisOutcomeAuditEvent(clean.payload) === null
+              : !isSynthesisLeaseCleanupAudit(clean.payload))) {
+          return { ok: false, reason: "invalid-synthesis-finalization-audit" };
+        }
+        return appendValidUnlocked(clean, { mandatoryAudit: true });
+      });
+    } catch (error) {
       return { ok: false, reason: errorReasonCode(error, "corrupt-record") };
     }
   }
@@ -1138,7 +1755,20 @@ export function openStore(rootDir, {
       if (status.lease) removeLeaseUnlocked(leaseKey, status.lease);
       const source = json({ pid: process.pid, actor: cleanActor, acquiredAt, expiresAt: acquiredAt + ttlMs, nonce });
       assertProjectQuotaUnlocked(new Map([[path.resolve(filePath), source]]));
-      writeFileSync(filePath, source, { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+      let descriptor;
+      let createdLeaseFile = false;
+      try {
+        descriptor = openSync(filePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, FILE_MODE);
+        createdLeaseFile = true;
+        injectFault("lease-after-create", { filePath, descriptor, source });
+        writeFileSync(descriptor, source, "utf8");
+        closeSync(descriptor);
+        descriptor = undefined;
+      } catch (error) {
+        if (descriptor !== undefined) try { closeSync(descriptor); } catch {}
+        if (createdLeaseFile) try { unlinkSync(filePath); } catch {}
+        throw error;
+      }
       ownedLeases.set(leaseKey, nonce);
       return { ok: true, nonce, expiresAt: acquiredAt + ttlMs, ...(repairedCorruptLease ? { repairedCorruptLease: true } : {}) };
       });
@@ -1349,6 +1979,13 @@ export function openStore(rootDir, {
     }
   }
 
+  function retainHostOwner(sessionId, nonce) {
+    const owned = ownedHostOwners.get(hostOwnerKey(sessionId));
+    if (!owned || owned.nonce !== nonce) return { ok: false, reason: "nonce-mismatch" };
+    owned.retainOnClose = true;
+    return { ok: true };
+  }
+
   function hostOwnerStatus(sessionId, options) {
     try { return withMutationLock(() => hostOwnerStatusUnlocked(sessionId, options)); }
     catch (error) { return { classification: "unknown", reason: "host-owner-status-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) }; }
@@ -1488,7 +2125,7 @@ export function openStore(rootDir, {
       for (const record of files.get(STORE_FILES.proposal)) {
         if (record.kind === "proposal") latestProposals.set(record.payload.id, record.payload);
       }
-      const activeProposalIds = new Set([...latestProposals].filter(([, proposal]) => ACTIVE_PROPOSAL_STATES.has(proposal.state)).map(([id]) => id));
+      const activeProposalIds = new Set([...latestProposals].filter(([, proposal]) => isActiveProposalState(proposal.state)).map(([id]) => id));
 
       const aggregateRecords = readAggregatesUnlocked();
       const keptAggregates = aggregateRecords.filter((record) => record.expiresAt > nowMs);
@@ -1534,8 +2171,7 @@ export function openStore(rootDir, {
             if (!keep) removed.applyClaims += 1;
             return keep;
           }
-          const proposalId = record.kind === "proposal" ? record.payload.id : record.payload?.proposalId;
-          if (proposalId && activeProposalIds.has(proposalId) && ["proposal", "proposal-content", "decision", "audit-event"].includes(record.kind)) return true;
+          if (isActiveProposalChainRecord(record, activeProposalIds)) return true;
           // Content-free busy diagnostics do not participate in authority or
           // decision history and are drained independent of record age.
           if (record.kind === "audit-event"
@@ -1592,7 +2228,12 @@ export function openStore(rootDir, {
       if (ids.some((id) => !/^[a-f0-9]{64}$/.test(id))) throw new Error("corrupt-aggregate-index");
       return ids;
     } catch (error) {
-      quarantine(readFileSync(filePath, "utf8"), errorReasonCode(error, "corrupt-record"), path.join(path.dirname(filePath), "quarantine"));
+      quarantineProjectDeterministic(
+        readFileSync(filePath, "utf8"),
+        errorReasonCode(error, "corrupt-record"),
+        "aggregate-index",
+        path.dirname(filePath),
+      );
       throw new Error("corrupt-aggregate-index");
     }
   }
@@ -1620,6 +2261,13 @@ export function openStore(rootDir, {
     writeJsonl(aggregatesPath, kept);
     repairAggregateIndexesUnlocked(new Set(kept.map((record) => record.aggregateId)));
     return { removed: records.length - kept.length, records: kept };
+  }
+
+  function removeAggregateContributionsUnlocked(aggregateIds) {
+    const records = readAggregatesUnlocked();
+    const kept = records.filter((record) => !aggregateIds.has(record.aggregateId));
+    if (kept.length !== records.length) writeJsonl(aggregatesPath, kept);
+    return records.length - kept.length;
   }
 
   function appendAggregate(record) {
@@ -1798,28 +2446,37 @@ export function openStore(rootDir, {
   }
 
   function exportBridgeUnlocked(directory) {
-    const result = { requests: [], responses: [], controlRequests: [], controlResponses: [], controlState: null };
+    const result = Object.fromEntries([
+      ...BRIDGE_MAILBOX_DESCRIPTORS.map((descriptor) => [descriptor.exportField, []]),
+      ["controlState", null],
+    ]);
     if (!existsSync(directory)) return result;
     safeTreeFiles(directory);
-    const classes = [
-      ["requests", "requests", "decision-request", "sensitive-decision-request-metadata", 8 * 1024],
-      ["responses", "responses", "decision-response", "sensitive-decision-response-metadata", 4 * 1024],
-      ["control-requests", "controlRequests", "control-request", "sensitive-control-request-metadata", 8 * 1024],
-      ["control-responses", "controlResponses", "control-response", "sensitive-control-response-metadata", 4 * 1024],
-    ];
     const fingerprint = path.basename(directory);
-    for (const [directoryName, field, type, classification, maxBytes] of classes) {
-      const child = path.join(directory, directoryName);
+    const requestMetadata = new Map();
+    for (const descriptor of BRIDGE_MAILBOX_DESCRIPTORS) {
+      const child = path.join(directory, descriptor.directoryName);
       if (!existsSync(child)) continue;
       for (const filePath of safeTreeFiles(child)) {
         if (!filePath.endsWith(".json")) continue;
         const relativePath = path.relative(child, filePath).split(path.sep).join("/");
         if (relativePath.includes("/")) throw new Error("export-bridge-path-rejected");
         const requestId = relativePath.slice(0, -".json".length);
-        const read = secureExportRead(baseDir, filePath, maxBytes);
-        const metadata = validateBridgeExportMetadata(type, JSON.parse(read.content.toString("utf8")), { projectFingerprint: fingerprint, requestId });
-        result[field].push({
-          classification,
+        const read = secureExportRead(baseDir, filePath, descriptor.maxBytes);
+        const metadata = validateBridgeExportMetadata(
+          descriptor.type,
+          JSON.parse(read.content.toString("utf8")),
+          {
+            projectFingerprint: fingerprint,
+            requestId,
+            request: descriptor.requestType
+              ? requestMetadata.get(`${descriptor.requestType}:${requestId}`)
+              : undefined,
+          },
+        );
+        if (descriptor.role === "request") requestMetadata.set(`${descriptor.type}:${requestId}`, metadata);
+        result[descriptor.exportField].push({
+          classification: descriptor.classification,
           file: relativePath,
           bytes: read.stat.size,
           metadata,
@@ -1916,11 +2573,46 @@ export function openStore(rootDir, {
   }
 
   function purge({ scope }) {
+    const validScopes = new Set(["observations", "proposals", "project", "all"]);
+    if (!validScopes.has(scope)) return { ok: false, reason: "invalid-scope", counts: countKinds([]) };
+    if (partitionAdmissionError && scope !== "all") {
+      return { ok: false, reason: partitionAdmissionError, counts: countKinds([]) };
+    }
     try {
       return withMutationLock(() => {
+        if (partitionAdmissionError) {
+          rmSync(baseDir, { recursive: true, force: true });
+          ownedLeases.clear();
+          ownedHostOwners.clear();
+          parsedFileCache.clear();
+          terminal = true;
+          terminalRoots.add(root);
+          return { ok: true, counts: countKinds([]) };
+        }
+        if (startupCorruptionScope && scope === "all") {
+          rmSync(baseDir, { recursive: true, force: true });
+          ownedLeases.clear();
+          ownedHostOwners.clear();
+          parsedFileCache.clear();
+          terminal = true;
+          terminalRoots.add(root);
+          return { ok: true, counts: countKinds([]) };
+        }
+        if (startupCorruptionScope === "project" && scope === "project") {
+          rmSync(exportProjectDir, { recursive: true, force: true });
+          const contributed = new Set(readAggregateIndexUnlocked());
+          if (contributed.size) removeAggregateContributionsUnlocked(contributed);
+          rmSync(stateDir, { recursive: true, force: true });
+          purgeProjectBridgeUnlocked();
+          parsedFileCache.clear();
+          startupCorruptionScope = null;
+          initializeDirs();
+          getSettingsUnlocked();
+          appendAuditUnlocked("purge", { action: scope, removed: 0 });
+          return { ok: true, counts: countKinds([]) };
+        }
         recoverDecisionTransactionUnlocked();
         recoverTerminalProposalContentUnlocked();
-        if (!new Set(["observations", "proposals", "project", "all"]).has(scope)) return { ok: false, reason: "invalid-scope" };
         const before = allRecords();
         let removed = [];
         rmSync(exportProjectDir, { recursive: true, force: true });
@@ -1936,9 +2628,9 @@ export function openStore(rootDir, {
         } else if (scope === "project") {
           removed = before;
           const contributed = new Set(readAggregateIndexUnlocked());
-          if (contributed.size) compactAggregatesUnlocked((record) => !contributed.has(record.aggregateId));
+          if (contributed.size) removeAggregateContributionsUnlocked(contributed);
           rmSync(stateDir, { recursive: true, force: true });
-          rmSync(bridgeProjectDir, { recursive: true, force: true });
+          purgeProjectBridgeUnlocked();
           parsedFileCache.clear();
           initializeDirs();
           getSettingsUnlocked();
@@ -1955,7 +2647,11 @@ export function openStore(rootDir, {
         const counts = countKinds(removed);
         appendAuditUnlocked("purge", { action: scope, removed: removed.length });
         return { ok: true, counts };
-      });
+      }, partitionAdmissionError ? {
+        requireStoreAncestors: false,
+        allowIncompatible: true,
+        recoverTransactions: false,
+      } : undefined);
     } catch (error) { return { ok: false, reason: errorReasonCode(error, "corrupt-record"), counts: countKinds([]) }; }
   }
 
@@ -1973,6 +2669,12 @@ export function openStore(rootDir, {
   function close() {
     parsedFileCache.clear();
     if (closed) return { ok: true, released: 0 };
+    if (partitionAdmissionError) {
+      ownedLeases.clear();
+      ownedHostOwners.clear();
+      closed = true;
+      return { ok: true, released: 0 };
+    }
     if (terminal || terminalRoots.has(root)) {
       ownedLeases.clear();
       ownedHostOwners.clear();
@@ -2006,6 +2708,28 @@ export function openStore(rootDir, {
             else failures.push({ leaseKey, reason: "lease-release-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) });
           }
         }
+        for (const [sessionKey, owned] of ownedHostOwners) {
+          if (owned.retainOnClose) continue;
+          const read = readHostOwnerState(owned.sessionId);
+          if (read.state === "absent") {
+            ownedHostOwners.delete(sessionKey);
+            continue;
+          }
+          if (read.state !== "valid") {
+            failures.push({ sessionKey, reason: read.state === "error" ? read.reason : `host-owner-${read.state}`, ...(read.code ? { code: read.code } : {}) });
+            continue;
+          }
+          if (read.owner.nonce !== owned.nonce) {
+            failures.push({ sessionKey, reason: "nonce-mismatch" });
+            continue;
+          }
+          try {
+            removeHostOwnerUnlocked(owned.sessionId, read.owner);
+            released += 1;
+          } catch (error) {
+            failures.push({ sessionKey, reason: "host-owner-release-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) });
+          }
+        }
       });
     } catch (error) {
       failures.push({ leaseKey: null, reason: "lease-release-error", code: String(error?.code ?? errorReasonCode(error, "corrupt-record")) });
@@ -2015,25 +2739,65 @@ export function openStore(rootDir, {
     return { ok: true, released };
   }
 
+  preflightStoreAncestors();
+  const partitionAdmission = inspectPartitionVersion();
+  if (!partitionAdmission.ok) {
+    partitionAdmissionError = partitionAdmission.reason;
+  } else {
+    partitionVersion = partitionAdmission.version;
+  }
+  // The first inspection is advisory only: another process may be between
+  // creating the admitted preboot/base directories and publishing version.json.
+  // Serialize the authoritative inspection before either rejecting or writing.
   withMutationLock(() => {
+    const lockedAdmission = inspectPartitionVersion();
+    if (!lockedAdmission.ok) {
+      partitionAdmissionError = lockedAdmission.reason;
+      if (partitionAdmission.ok) throw new Error(lockedAdmission.reason);
+      return;
+    }
+    partitionAdmissionError = null;
+    partitionVersion = lockedAdmission.version;
     initializeDirs();
-    loadGlobalSettingsUnlocked();
-    loadRepoSettingsUnlocked();
-    for (const fileName of new Set(Object.values(STORE_FILES))) readFileRecords(fileName);
-    recoverDecisionTransactionUnlocked();
-    recoverTerminalProposalContentUnlocked();
-    readAggregatesUnlocked();
-  });
+    recoverSettingsTransactionUnlocked();
+    const global = loadGlobalSettingsUnlocked();
+    const repo = loadRepoSettingsUnlocked();
+    if (global && repo) {
+      lastKnownProjectQuotaBytes = (repo.budgets.storageQuotaMiB ?? global.budgets.storageQuotaMiB) * 1024 * 1024;
+    }
+    for (const fileName of new Set(Object.values(STORE_FILES))) {
+      try { readFileRecords(fileName); }
+      catch (error) {
+        if (!["storage-quota-exceeded", "corrupt-settings", "project-quota-unavailable"].includes(errorReasonCode(error))) throw error;
+        markStartupCorruption(global ? "project" : "all");
+      }
+    }
+    if (startupCorruptionScope !== "project") {
+      recoverDecisionTransactionUnlocked();
+      recoverTerminalProposalContentUnlocked();
+    }
+    try { readAggregatesUnlocked(); }
+    catch (error) {
+      if (!["storage-quota-exceeded", "corrupt-settings", "project-quota-unavailable"].includes(errorReasonCode(error))) throw error;
+      markStartupCorruption(repo ? "global" : "all");
+    }
+  }, { requireStoreAncestors: false, allowIncompatible: true, recoverTransactions: false });
 
   return Object.freeze({
     getSettings,
     updateSettings,
     updateGlobalSettings,
     updateRepoSettings,
+    beginRequestTransaction,
+    readRequestTransaction,
+    clearRequestTransaction,
+    hasPendingOperationRequest,
     setGlobalSettings: (settings) => setSettings("global", settings),
     setRepoSettings: (settings) => setSettings("repo", settings),
     readProjectionSnapshot,
     appendRecord,
+    admitSynthesisAttempt,
+    appendSynthesisFinalizationAudit,
     readRecords,
     getRecord,
     acquireLease,
@@ -2043,6 +2807,7 @@ export function openStore(rootDir, {
     cleanupExpiredLeases,
     acquireHostOwner,
     releaseHostOwner,
+    retainHostOwner,
     hostOwnerStatus,
     releaseOwnedHostOwners,
     cleanupExpiredHostOwners,
@@ -2076,6 +2841,7 @@ export function openStore(rootDir, {
     get snapshotRoot() { return snapshotsDir; },
     get stateDir() { return stateDir; },
     get projectFingerprint() { return projectFingerprint; },
-    get rootIdentity() { return hashContent(JSON.stringify(["self-evolve-state-root-v1", root])); },
+    get rootPath() { return rootBoundary.path; },
+    get rootIdentity() { return rootBoundary.identity; },
   });
 }
