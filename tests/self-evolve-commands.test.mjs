@@ -124,9 +124,28 @@ test("parser covers the complete command surface and rejects malformed input", (
     ["consent passive on", "consent"], ["allowlist list", "allowlist"],
     ["allowlist add /skills --confirm UPDATE ALLOWLIST", "allowlist"], ["inspect observations 3", "inspect"],
     ["inspect eligibility", "inspect"], ["inbox", "inbox"], ["export all", "export"],
-    ["purge --all", "purge"], ["budget", "budget"], ["health", "health"], ["kill-switch on", "kill-switch"],
+    ["export global-recommendations", "export"], ["purge global-recommendations", "purge"],
+    [`purge global-recommendation ${HASH_A}`, "purge"],
+    ["purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0", "purge"],
+    ["budget", "budget"], ["health", "health"], ["kill-switch on", "kill-switch"],
   ];
   for (const [input, verb] of cases) assert.equal(command(input).verb, verb, input);
+  assert.deepEqual(command(`purge global-recommendation ${HASH_A}`), {
+    verb: "purge",
+    scope: "global-recommendation",
+    recommendationId: HASH_A,
+  });
+  assert.deepEqual(command("purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0"), {
+    verb: "purge",
+    scope: "all",
+    confirmation: "PURGE ALL SELF-EVOLVE 0.3.0",
+  });
+  for (const input of [
+    "purge --all",
+    "purge all",
+    "purge --all --confirm PURGE ALL SELF-EVOLVE 0.2.0",
+    "purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0 extra",
+  ]) assert.equal(parseSelfEvolveCommand(input).ok, false, input);
   assert.equal(parseSelfEvolveCommand("approve").ok, false);
   assert.equal(parseSelfEvolveCommand("allowlist add /skills").ok, false);
   assert.equal(parseSelfEvolveCommand("purge").ok, false);
@@ -134,19 +153,14 @@ test("parser covers the complete command surface and rejects malformed input", (
 });
 
 test("path-valued commands accept quoted and escaped spaces without consuming trailing flags", () => {
-  assert.deepEqual(command('yolo confirm --allowlist "/skills/team tools"'), {
-    verb: "mode", mode: "yolo", confirmed: true, allowlist: ["/skills/team tools"],
-  });
   assert.deepEqual(command("allowlist add '/skills/team tools' --confirm UPDATE ALLOWLIST"), {
     verb: "allowlist", action: "add", path: "/skills/team tools", confirmation: "UPDATE ALLOWLIST",
   });
   assert.equal(command("allowlist remove /skills/team\\ tools --confirm UPDATE ALLOWLIST").path, "/skills/team tools");
   assert.equal(command('allowlist add "/skills/\\"quoted\\" tools" --confirm UPDATE ALLOWLIST').path, '/skills/"quoted" tools');
-  assert.equal(command("yolo confirm --allowlist /skills").allowlist[0], "/skills");
   assert.equal(command("allowlist add /skills --confirm UPDATE ALLOWLIST").path, "/skills");
 
   for (const input of [
-    'yolo confirm --allowlist "/skills/team tools" --extra',
     "allowlist add '/skills/team tools' --confirm UPDATE ALLOWLIST --extra",
     "allowlist add /skills team --confirm UPDATE ALLOWLIST",
   ]) assert.equal(parseSelfEvolveCommand(input).ok, false, input);
@@ -154,7 +168,7 @@ test("path-valued commands accept quoted and escaped spaces without consuming tr
 
 test("command tokenizer rejects malformed quoting and escaping fail closed", () => {
   for (const input of [
-    'yolo confirm --allowlist "/skills/team tools',
+    'allowlist add "/skills/team tools',
     "allowlist add '/skills/team tools --confirm UPDATE ALLOWLIST",
     "allowlist add /skills/team\\",
     'allowlist add "/skills/team tools\\',
@@ -166,9 +180,10 @@ test("command tokenizer rejects malformed quoting and escaping fail closed", () 
 });
 
 test("status exposes consent and approved skill folders headlessly", (t) => {
-  const { policy } = fixture(t);
+  const { policy, store } = fixture(t);
   policy.execute(command("consent passive on"), { projectFingerprint: FINGERPRINT });
-  policy.execute(command("yolo confirm --allowlist /skills"), { projectFingerprint: FINGERPRINT });
+  const current = store.getSettings().global;
+  assert.equal(store.updateGlobalSettings(() => ({ ...current, allowedSkillRoots: ["/skills"], updatedAt: current.updatedAt + 1 })).ok, true);
   const status = policy.execute(command("status"), { projectFingerprint: FINGERPRINT }).responseText;
   assert.match(status, /Consent: passive on; observations off; excerpts off; cross-repo off/u);
   assert.match(status, /Approved skill folders \(1\):\n- \/skills/u);
@@ -192,6 +207,9 @@ test("approval parser requires one exact tuple and rejects every malformed shape
   assert.deepEqual(command(approvalInput()), {
     verb: "approve", proposalId: "se-1", targetHash: HASH_A, proposedContentHash: HASH_B, decisionVersion: 1, nonce: NONCE,
   });
+  assert.deepEqual(command(approvalInput("se-new", { targetHash: "must-not-exist", decisionVersion: 2 })), {
+    verb: "approve", proposalId: "se-new", targetHash: "must-not-exist", proposedContentHash: HASH_B, decisionVersion: 2, nonce: NONCE,
+  });
   for (const input of [
     "approve se-1",
     approvalInput().replace(` --target-hash ${HASH_A}`, ""),
@@ -202,6 +220,7 @@ test("approval parser requires one exact tuple and rejects every malformed shape
     approvalInput().replace("--nonce", "--unknown"),
     approvalInput().replace(`--nonce ${NONCE}`, `--target-hash ${HASH_A}`),
     approvalInput("se-1", { targetHash: "A".repeat(64) }),
+    approvalInput("se-1", { targetHash: "must-not-exists" }),
     approvalInput("se-1", { proposedContentHash: "abc" }),
     approvalInput("se-1", { decisionVersion: 0 }),
     approvalInput("se-1", { decisionVersion: "1.5" }),
@@ -221,44 +240,53 @@ test("bare command migration and help preserve legacy mappings", () => {
   assert.match(help, new RegExp(MIGRATION_NOTE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
-test("global modes transition both directions and mode changes require restart", (t) => {
+test("global modes transition both directions and lifecycle admission changes immediately", (t) => {
   const { policy } = fixture(t);
   let result = policy.execute(command("auto"), { projectFingerprint: FINGERPRINT });
   assert.equal(policy.getMode(), "auto");
-  assert.match(result.responseText, /restarted for the new mode/i);
+  assert.match(result.responseText, /next eligible lifecycle event observes the new analysis mode/i);
   policy.execute(command("manual"), { projectFingerprint: FINGERPRINT });
   assert.equal(policy.getMode(), "manual");
-  policy.execute(command("auto"), { projectFingerprint: FINGERPRINT });
-  result = policy.execute(command("yolo confirm --allowlist /skills"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getMode(), "yolo");
+  result = policy.execute(command("auto"), { projectFingerprint: FINGERPRINT });
+  assert.equal(policy.getMode(), "auto");
   assert.match(result.responseText, /No proposal was accepted and no files were applied/);
   policy.execute(command("manual"), { projectFingerprint: FINGERPRINT });
   assert.equal(policy.getMode(), "manual");
 });
 
-test("yolo confirmation and allowlist fail closed until the elevated command is valid", (t) => {
-  const { policy } = fixture(t);
-  const first = command("yolo");
-  assert.equal(first.requiresConfirmation, true);
-  assert.match(first.confirmationPrompt, /--allowlist/);
-  assert.match(policy.execute(first, { projectFingerprint: FINGERPRINT }).responseText, /No mode change/);
+test("yolo is retired and can never be configured or stored in v0.3", (t) => {
+  const { policy, store } = fixture(t);
+  for (const input of ["yolo", "yolo confirm", "yolo confirm --allowlist /skills", "repo yolo"]) {
+    const parsedCommand = parseSelfEvolveCommand(input);
+    assert.equal(parsedCommand.ok, false, input);
+    assert.match(parsedCommand.error, /retired in v0\.3|Usage: \/self-evolve repo/u, input);
+  }
+  assert.equal(policy.setMode("yolo").ok, false);
   assert.equal(policy.getMode(), "manual");
-  assert.equal(parseSelfEvolveCommand("yolo confirm").ok, false);
-  const invalid = policy.setMode("yolo", { confirmed: true, allowlist: [] });
-  assert.equal(invalid.ok, false);
-  assert.equal(policy.getMode(), "manual");
+  assert.equal(store.getSettings().global.mode, "manual");
+  assert.equal(buildResponse(command("help")).includes("yolo"), false);
 });
 
-test("kill switch downgrades effective mode without rewriting stored yolo preference", (t) => {
+test("a stored legacy yolo preference narrows to auto without unattended write authority", (t) => {
+  const { policy, store } = fixture(t);
+  const current = store.getSettings().global;
+  const saved = store.updateGlobalSettings(() => ({ ...current, mode: "yolo", updatedAt: current.updatedAt + 1 }));
+  assert.equal(saved.ok, true, saved.reason);
+  assert.equal(store.getSettings().global.mode, "auto");
+  assert.equal(policy.getMode(), "auto");
+  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "auto");
+});
+
+test("kill switch downgrades effective mode without rewriting the stored analysis mode", (t) => {
   const { policy } = fixture(t);
-  policy.execute(command("yolo confirm --allowlist /skills"), { projectFingerprint: FINGERPRINT });
+  policy.execute(command("auto"), { projectFingerprint: FINGERPRINT });
   const result = policy.execute(command("kill-switch on"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getMode(), "yolo");
+  assert.equal(policy.getMode(), "auto");
   assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "manual");
   assert.equal(policy.getHealth().killSwitchActive, true);
-  assert.match(result.responseText, /Stored mode remains yolo/);
+  assert.match(result.responseText, /Stored mode remains auto/);
   policy.execute(command("kill-switch off"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "yolo");
+  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "auto");
 });
 
 test("repo mode precedence and exclusion coexist with the global preference", (t) => {
@@ -267,9 +295,8 @@ test("repo mode precedence and exclusion coexist with the global preference", (t
   policy.execute(command("repo manual"), { projectFingerprint: FINGERPRINT });
   assert.equal(policy.getMode(), "auto");
   assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "manual");
-  policy.execute(command("repo yolo"), { projectFingerprint: FINGERPRINT });
+  assert.equal(parseSelfEvolveCommand("repo yolo").ok, false);
   assert.equal(store.getSettings().repo.mode, "manual", "repo yolo must fail without changing the existing override");
-  policy.execute(command("yolo confirm --allowlist /skills"), { projectFingerprint: FINGERPRINT });
   policy.execute(command("repo auto"), { projectFingerprint: FINGERPRINT });
   assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "auto");
   const excluded = policy.execute(command("exclude"), { projectFingerprint: FINGERPRINT });
@@ -297,17 +324,16 @@ test("all consent keys toggle with first-enable disclosures and cross-repo requi
   assert.equal(policy.getConsent().crossRepoAggregation, false);
 });
 
-test("disabling sanitized excerpts while cross-repo aggregation is enabled is rejected", (t) => {
+test("disabling sanitized excerpts also revokes dependent cross-repo aggregation", (t) => {
   const { policy } = fixture(t);
   policy.execute(command("consent excerpts on"), { projectFingerprint: FINGERPRINT });
   const enabled = policy.execute(command("consent cross-repo on"), { projectFingerprint: FINGERPRINT });
   assert.match(enabled.responseText, /Disclosure:/);
   assert.equal(policy.getConsent().crossRepoAggregation, true);
-  const blocked = policy.execute(command("consent excerpts off"), { projectFingerprint: FINGERPRINT });
-  assert.match(blocked.responseText, /cross-repository-aggregation-requires-excerpts/u);
-  // The privacy invariant survives: excerpts remain on and aggregation stays consistent.
-  assert.equal(policy.getConsent().sanitizedExcerpts, true);
-  assert.equal(policy.getConsent().crossRepoAggregation, true);
+  const revoked = policy.execute(command("consent excerpts off"), { projectFingerprint: FINGERPRINT });
+  assert.match(revoked.responseText, /disabled/u);
+  assert.equal(policy.getConsent().sanitizedExcerpts, false);
+  assert.equal(policy.getConsent().crossRepoAggregation, false);
 });
 
 test("newer settings fail closed to manual and refuse writes with a health message", (t) => {
@@ -383,8 +409,8 @@ test("observation export is scrubbed and scoped exports contain only requested r
   assert.doesNotMatch(JSON.stringify(archive), /rawMessage|transcript|messageBody/);
 });
 
-test("purge observations, proposals, project, and all report correct counts", (t) => {
-  for (const scope of ["observations", "proposals", "project", "all"]) {
+test("purge observations, proposals, and project report correct counts while purge-all remains integration-owned", (t) => {
+  for (const scope of ["observations", "proposals", "project"]) {
     const nested = awaitFixture(t);
     seedObservation(nested.store, `obs-${scope}`);
     seedProposal(nested.store, `se-${scope}`);
@@ -392,11 +418,17 @@ test("purge observations, proposals, project, and all report correct counts", (t
     assert.match(result.responseText, new RegExp(`Purge ${scope} completed`));
     if (scope === "observations") assert.match(result.responseText, /"observations":1/);
     if (scope === "proposals") assert.match(result.responseText, /"proposals":1/);
-    if (scope === "project" || scope === "all") {
+    if (scope === "project") {
       assert.match(result.responseText, /"observations":1/);
       assert.match(result.responseText, /"proposals":1/);
     }
   }
+  const terminal = awaitFixture(t);
+  seedObservation(terminal.store, "obs-all");
+  const result = terminal.policy.execute(command("purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0"), { projectFingerprint: FINGERPRINT });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "purge-all-requires-terminal-integration");
+  assert.equal(terminal.store.readRecords("observation").length, 1, "command policy cannot delete before integration accepts terminal");
 });
 
 function awaitFixture(t) {
@@ -442,4 +474,17 @@ test("disable response is deprecated pause and the new default opens status plus
   const opened = policy.execute(command("/self-evolve"), { projectFingerprint: FINGERPRINT });
   assert.match(opened.responseText, /Self-evolve status/);
   assert.match(opened.responseText, /Inbox: 1 pending proposal/);
+});
+
+test("v0.3 keeps scan headless and command-driven while retiring unattended write copy", (t) => {
+  const { policy } = fixture(t);
+  const parsedScan = parseSelfEvolveCommand("scan");
+  assert.deepEqual(parsedScan, { ok: true, command: { verb: "scan" } });
+  const scan = policy.execute(command("scan"), { projectFingerprint: FINGERPRINT });
+  assert.match(scan.responseText, /schedules no passive work and applies no files/u);
+  const help = buildResponse(command("help"));
+  assert.match(help, /\/self-evolve manual \| auto/u);
+  assert.match(help, /repo <manual\|auto\|inherit>/u);
+  assert.equal(/yolo/iu.test(help), false);
+  assert.equal(/unattended/iu.test(help), false);
 });

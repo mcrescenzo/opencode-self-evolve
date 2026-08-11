@@ -129,12 +129,12 @@ test("duplicate idle signals debounce to one work item", async (t) => {
   scheduler.dispose();
 });
 
-test("one admitted episode uses one settings snapshot", async (t) => {
+test("one admitted episode checks settings at event and work-admission boundaries", async (t) => {
   const { scheduler, work, calls } = fixture(t);
   const baseline = calls.settingsReads;
   await scheduler.handleEvent(idle("single-settings-read", { projectFingerprint: PROJECT }));
   await waitFor(() => work.length === 1, "one admitted episode");
-  assert.equal(calls.settingsReads - baseline, 1);
+  assert.equal(calls.settingsReads - baseline, 2);
   scheduler.dispose();
 });
 
@@ -317,6 +317,25 @@ test("manual mode returns without scheduling or durable writes", async (t) => {
   assert.equal(calls.append.length, 0);
   assert.equal(calls.acquire.length, 0);
   scheduler.dispose();
+});
+
+test("fresh Manual and pause changes override an earlier scheduler mode observation", async (t) => {
+  for (const suppress of [
+    (settings) => { settings.repo.mode = "manual"; },
+    (settings) => { settings.global.paused = true; },
+  ]) {
+    await t.test(suppress.toString().includes("paused") ? "pause" : "manual", async (t) => {
+      const { scheduler, settings, work, calls } = fixture(t, { budgets: { idleDebounceMs: 20 } });
+      scheduler.setMode("auto", "integration-observed-auto");
+      await scheduler.handleEvent(idle("fresh-suppressor"));
+      suppress(settings);
+      await wait(35);
+      assert.equal(work.length, 0);
+      assert.equal(calls.acquire.length, 0);
+      assert.equal(calls.append.length, 0);
+      scheduler.dispose();
+    });
+  }
 });
 
 test("missing background consent is durably visible as a scheduling suppression", async (t) => {
@@ -639,10 +658,11 @@ test("handleEvent returns within 50ms even when debounce is immediate", async (t
 });
 
 test("mode downgrade cancels pending work but does not cancel in-flight work", async (t) => {
-  const { scheduler, work, records } = fixture(t);
+  const { scheduler, settings, work, records } = fixture(t);
   await scheduler.handleEvent(idle("downgrade"));
   await waitFor(() => work.length === 1, "in-flight work");
   await scheduler.handleEvent(idle("downgrade"));
+  settings.repo.mode = "manual";
   scheduler.setMode("manual", "operator-downgrade");
   await wait(15);
   assert.equal(work.length, 1);

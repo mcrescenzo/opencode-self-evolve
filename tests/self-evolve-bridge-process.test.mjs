@@ -12,7 +12,7 @@ import {
   createDecisionRequest,
   pollDecisionResponse,
 } from "../self-evolve-bridge.js";
-import { SCHEMA_VERSION } from "../self-evolve-schemas.js";
+import { BRIDGE_SCHEMA_VERSION } from "../self-evolve-bridge.js";
 
 const execFileAsync = promisify(execFile);
 const HERE = import.meta.dirname;
@@ -178,7 +178,7 @@ test("a process death after hard-link publication recovers the request and respo
   fs.unlinkSync(responsePath);
   fs.writeFileSync(responseSource, `${JSON.stringify({
     ...response,
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
   })}\n`, { mode: 0o600 });
   fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`, { mode: 0o600, flag: "wx" });
   await assert.rejects(
@@ -201,7 +201,7 @@ test("a process death after hard-link publication recovers the request and respo
   assert.equal(fs.statSync(responsePath).nlink, 1);
 });
 
-test("fresh TUI clients use authenticated server controls and persist every allowlisted setting", async (t) => {
+test("fresh TUI clients use authenticated controls and native project analysis operations", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-control-process-"));
   const skillRoot = path.join(root, "skills");
   const secondRoot = path.join(root, "other-skills");
@@ -219,11 +219,14 @@ test("fresh TUI clients use authenticated server controls and persist every allo
     assert.equal((await controlClient(root, "consent", `${key}=true`)).response.ok, true, key);
   }
   const yolo = await controlClient(root, "mode", "yolo", skillRoot);
-  assert.equal(yolo.response.ok, true, yolo.response.reason);
+  assert.equal(yolo.response.ok, false, "a real v0.2 peer cannot enable yolo through the live bridge");
+  assert.equal(yolo.response.reason, "yolo-retired");
   assert.equal((await controlClient(root, "exclude", "true")).response.ok, true);
   assert.equal((await controlClient(root, "exclude", "false")).response.ok, true);
-  assert.equal((await controlClient(root, "repo-mode", "auto")).response.ok, true);
-  assert.equal((await controlClient(root, "repo-mode", "inherit")).response.ok, true);
+  const repoAuto = await controlClient(root, "repo-mode", "auto");
+  assert.equal(repoAuto.response.ok, true, repoAuto.response.reason);
+  const repoInherit = await controlClient(root, "repo-mode", "inherit");
+  assert.equal(repoInherit.response.ok, true, repoInherit.response.reason);
   const allowlist = await controlClient(root, "allowlist", secondRoot);
   assert.equal(allowlist.response.ok, true, allowlist.response.reason);
   assert.deepEqual(allowlist.next.allowedSkillRoots, [secondRoot]);
@@ -269,7 +272,7 @@ test("fresh TUI clients use authenticated server controls and persist every allo
   await stopServer(server);
   const store = openStore(root, { projectFingerprint: PROJECT });
   const settings = store.getSettings();
-  assert.equal(settings.global.mode, "yolo");
+  assert.equal(settings.global.mode, "auto", "the rejected yolo request left the prior auto mode intact");
   assert.deepEqual(settings.global.allowedSkillRoots, [secondRoot]);
   assert.deepEqual(settings.global.consent, { passiveCalls: false, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false });
   assert.equal(settings.repo.excluded, false);
@@ -278,7 +281,7 @@ test("fresh TUI clients use authenticated server controls and persist every allo
 
   server = await startServer(root, skillRoot);
   const afterRestart = await controlClient(root, "exclude", "true");
-  assert.equal(afterRestart.state.mode, "yolo");
+  assert.equal(afterRestart.state.mode, "auto");
   assert.deepEqual(afterRestart.state.allowedSkillRoots, [secondRoot]);
   assert.equal(afterRestart.response.ok, true);
 });

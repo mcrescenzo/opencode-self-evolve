@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { scanForSecretCanaries, scanForUnsafeContent } from "./self-evolve-inventory.js";
-import { deepFreeze, resolveMode } from "./self-evolve-schemas.js";
+import { deepFreeze, resolveConfiguredProjectAnalysisMode } from "./self-evolve-schemas.js";
+import { effectiveTokensPerSynthesis } from "./self-evolve-synthesis.js";
 import {
   UI_ACTION_CAPABILITIES,
   UI_CAPABILITIES,
@@ -13,13 +14,23 @@ import {
   UI_DASHBOARD_VERSION,
   UI_PROJECTION_VERSION,
   UI_PROTOCOL_LIMITS,
+  GLOBAL_CAPABILITIES,
+  GLOBAL_PROJECTION_VERSION,
+  GLOBAL_PROTOCOL_LIMITS,
+  PROJECT_PARTICIPATION_VERSION,
   assertUiProjectionFootprint,
   canonicalUiJson,
+  globalRootPolicyConfirmation,
   hashUiProtocol,
   makeUiDashboard,
   makeUiOverflowMarker,
   makeUiProjectionIndex,
   makeUiReviewDetail,
+  hashGlobalProtocol,
+  makeGlobalActionGrant,
+  makeGlobalRecommendationDetail,
+  makeGlobalRecommendationIndex,
+  makeProjectParticipationSidecar,
 } from "./self-evolve-ui-protocol.js";
 
 const REVIEWABLE_STATES = new Set(["pending", "approved", "applied", "failed-closed"]);
@@ -53,7 +64,10 @@ function truncateUtf8(value, maxBytes) {
 function safeText(value, fallback = "Unavailable.", maxBytes = UI_PROTOCOL_LIMITS.summaryBytes) {
   if (typeof value !== "string") return fallback;
   const clean = value.replace(CONTROL_RE, "\uFFFD");
-  return truncateUtf8(clean || fallback, maxBytes);
+  const source = clean || fallback;
+  if (Buffer.byteLength(source, "utf8") <= maxBytes) return source;
+  const marker = " [truncated]";
+  return `${truncateUtf8(source, Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8")))}${marker}`;
 }
 
 export function containsPrivateMaterial(value) {
@@ -583,6 +597,7 @@ function indexAllowedActions(operationGrants, expiresAt, statusState) {
     "purge-scope",
     "set-kill-switch",
     "set-paused",
+    "set-repo-mode",
   ]) {
     const grant = operationGrants.get(`\n${action}`);
     if (grant) output.push(actionGrant(action, grant, expiresAt));
@@ -613,6 +628,7 @@ function cycleAuditValue(record) {
       || !exactFieldSet(details, fields)
       || details.action !== "cycle-outcome"
       || !CYCLE_OUTCOMES.has(details.outcome)
+      // A v0.2 partition can still hold `yolo` cycle-outcome audits; they stay readable history.
       || !["manual", "auto", "yolo"].includes(details.mode)
       || !Number.isSafeInteger(details.observationCount)
       || details.observationCount < 0
@@ -943,11 +959,8 @@ function dashboardBlockers(snapshot, health, breakerOpen, effectiveMode) {
     if (!snapshot.settings.global.consent.passiveCalls) add("passive-consent", "Background AI analysis is not allowed.");
     if (!snapshot.settings.global.consent.durableObservations) add("observation-consent", "Saved structured patterns are not allowed.");
   }
-  if (effectiveMode === "yolo" && !snapshot.settings.global.allowedSkillRoots.length) {
-    add("approved-skill-folders", "No approved skill folder is configured.");
-  }
-  const rollout = rolloutSummary(snapshot.records, health);
-  if (effectiveMode === "yolo" && !rollout.ready) add("yolo-rollout", "Automatic apply rollout evidence is not ready.");
+  // v0.3 has no unattended apply mode, so the approved-skill-folder and
+  // automatic-rollout blockers that only ever fired for yolo are gone.
   const order = new Map(UI_DASHBOARD_BLOCKER_CODES.map((code, index) => [code, index]));
   return output
     .filter((item, index, values) => values.findIndex((candidate) => candidate.code === item.code) === index)
@@ -1000,6 +1013,8 @@ function buildDashboard(snapshot, {
   health,
   supportedCapabilities,
   dashboardCapabilities,
+  operationGrants,
+  expiresAt,
   hiddenProposalIds,
   dashboardVersion,
 }) {
@@ -1034,6 +1049,26 @@ function buildDashboard(snapshot, {
     snapshot.usage.synthesis.remaining === 0 ? snapshot.usage.synthesis.resetAt ?? 0 : 0,
     Number.isSafeInteger(health.nextEligibleAt) ? health.nextEligibleAt : 0,
   ) || null;
+  const globalSettingsVersion = sha256(JSON.stringify({
+    global: snapshot.settings.global,
+    repo: snapshot.settings.repo,
+  }));
+  const globalRootPolicy = snapshot.settings.global.globalRootPolicy === null
+    ? null
+    : {
+        roots: [...snapshot.settings.global.globalRootPolicy.roots]
+          .sort((left, right) => left.canonicalPath.localeCompare(right.canonicalPath))
+          .map((root) => ({
+            canonicalPath: root.canonicalPath,
+            canUpdate: root.canUpdate,
+            canCreate: root.canCreate,
+          })),
+        creationRootPath: snapshot.settings.global.globalRootPolicy.roots.find(
+          (root) => root.rootId === snapshot.settings.global.globalRootPolicy.creationRootId,
+        )?.canonicalPath ?? null,
+        rootSetHash: snapshot.settings.global.globalRootPolicy.rootSetHash,
+        updatedAt: snapshot.settings.global.globalRootPolicy.updatedAt,
+      };
   const body = {
     dashboardVersion,
     projectFingerprint: snapshot.projectFingerprint,
@@ -1063,15 +1098,29 @@ function buildDashboard(snapshot, {
       repositoryExcluded: snapshot.settings.repo.excluded,
       consent: snapshot.settings.global.consent,
       approvedSkillFolderCount: snapshot.settings.global.allowedSkillRoots.length,
+      ...(dashboardVersion === 2 ? {
+        globalSettingsVersion,
+        globalRootPolicy,
+        globalRootPolicyConfirmation: globalRootPolicyConfirmation(globalSettingsVersion),
+        globalRootPolicyAction: status.state === "ready"
+          && dashboardCapabilities.includes(UI_ACTION_CAPABILITIES["replace-global-root-policy"])
+          && operationGrants.get("\nreplace-global-root-policy")
+          ? actionGrant(
+              "replace-global-root-policy",
+              operationGrants.get("\nreplace-global-root-policy"),
+              expiresAt,
+            )
+          : null,
+      } : {}),
     },
     retention: {
       observationsDays: snapshot.settings.global.retentionDays,
       operationalDays: dashboardVersion === 1 ? 90 : snapshot.settings.global.retentionDays * 3,
     },
     supportedControls: Object.entries(UI_ACTION_CAPABILITIES)
-      .filter(([, capability]) => (
-        supportedCapabilities.includes(capability) || dashboardCapabilities.includes(capability)
-      ))
+      .filter(([action, capability]) => action === "set-repo-mode"
+        ? dashboardCapabilities.includes("project-analysis-control-v1")
+        : supportedCapabilities.includes(capability) || dashboardCapabilities.includes(capability))
       .map(([action]) => action)
       .sort(),
     activity: boundedActivity.included,
@@ -1138,15 +1187,10 @@ export function buildUiProjection(snapshot, {
     auditByProposal.set(proposalId, grouped);
   }
   const breakerOpen = (byKind.get("circuit-breaker") ?? []).at(-1)?.payload?.open === true;
-  const effectiveMode = resolveMode(snapshot.settings.global.mode, snapshot.settings.repo.mode, {
-    killSwitchActive: snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true,
-    paused: snapshot.settings.global.paused,
-    circuitBreakerOpen: breakerOpen,
-    processExcluded: health.processExcluded === true,
-    repoOptOut: snapshot.settings.repo.excluded,
-    hostSupported: health.hostSupported !== false,
-    corrupt: health.corrupt === true,
-  });
+  const effectiveMode = resolveConfiguredProjectAnalysisMode(
+    snapshot.settings.global.mode,
+    snapshot.settings.repo.mode,
+  );
   const status = statusFrom(snapshot.settings, health, breakerOpen, effectiveMode);
   const issuedAt = now;
   const expiresAt = now + UI_PROTOCOL_LIMITS.projectionTtlMs;
@@ -1155,7 +1199,7 @@ export function buildUiProjection(snapshot, {
     stateRootIdentity,
     generation,
     now,
-    capabilities: supportedCapabilities,
+    capabilities: [...supportedCapabilities, ...supportedDashboardCapabilities],
   });
   const operations = operationsFor(auditRecords);
   const detailCandidates = [];
@@ -1217,7 +1261,7 @@ export function buildUiProjection(snapshot, {
         injectionFlagged: proposal.injectionFlagged,
         tokenImpact: {
           estimatedTokens: content.ok ? Math.ceil(Buffer.byteLength(content.content, "utf8") / 4) : 0,
-          budgetTokens: mergedBudgets(snapshot.settings).tokensPerSynthesis,
+          budgetTokens: effectiveTokensPerSynthesis(mergedBudgets(snapshot.settings).tokensPerSynthesis),
         },
         eligibility: eligibilityFor(proposal, byKind.get("eligibility-explanation")),
         rollback: rollbackFor(proposal, target, appliedAudit),
@@ -1309,6 +1353,8 @@ export function buildUiProjection(snapshot, {
     health,
     supportedCapabilities,
     dashboardCapabilities: supportedDashboardCapabilities,
+    operationGrants,
+    expiresAt,
     hiddenProposalIds,
   };
   const dashboard = buildDashboard(snapshot, {
@@ -1317,6 +1363,7 @@ export function buildUiProjection(snapshot, {
   });
   const dashboardV1 = buildDashboard(snapshot, {
     ...dashboardOptions,
+    dashboardCapabilities: supportedDashboardCapabilities.filter((capability) => capability !== "project-analysis-control-v1"),
     dashboardVersion: 1,
   });
   const requested = [...new Set(detailProposalIds)].slice(0, UI_PROTOCOL_LIMITS.residentDetails);
@@ -1351,4 +1398,406 @@ export function buildUiProjection(snapshot, {
     details: footprint.details,
     unavailableDetailIds: unavailableDetailIds.sort(),
   });
+}
+
+const GLOBAL_PROJECTED_STATES = new Set(["pending", "approved", "applied", "undo-approved", "failed-closed"]);
+
+function normalizeGlobalTargetRead(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { available: false, exists: null, hash: null, content: null };
+  }
+  const exists = value.exists === true;
+  const content = typeof value.content === "string"
+    ? value.content
+    : Buffer.isBuffer(value.content) ? value.content.toString("utf8") : null;
+  const calculated = content === null ? null : sha256(content);
+  const hash = HASH_RE.test(String(value.hash ?? "")) ? String(value.hash) : calculated;
+  if ((exists && (content === null || hash !== calculated)) || (!exists && content !== null)) {
+    return { available: false, exists, hash: null, content: null };
+  }
+  return { available: true, exists, hash: exists ? hash : null, content };
+}
+
+function globalTargetRead(recommendation, targetReader) {
+  try { return normalizeGlobalTargetRead(targetReader?.(recommendation)); }
+  catch { return { available: false, exists: null, hash: null, content: null }; }
+}
+
+function globalTargetFresh(recommendation, target) {
+  const expected = recommendation.state === "applied"
+    ? recommendation.proposedContentHash
+    : recommendation.targetBinding.currentHash;
+  if (!target.available || (target.content !== null && containsPrivateMaterial(target.content))) return false;
+  return expected === "must-not-exist"
+    ? target.exists === false
+    : target.exists === true && target.hash === expected;
+}
+
+function globalAvailableActions(recommendation, { contentValid, targetFresh, writeAuthorityReady }) {
+  if (recommendation.state === "pending") {
+    return [
+      ...(writeAuthorityReady && contentValid && targetFresh
+        && recommendation.criticPassed && recommendation.validDeterministic ? ["apply"] : []),
+      "reject",
+    ];
+  }
+  if (recommendation.state === "superseded") return ["reject"];
+  if (recommendation.state === "applied" && writeAuthorityReady && contentValid && targetFresh) return ["undo"];
+  return [];
+}
+
+function globalProjectedDiff(recommendation, target, content, contentValid, targetFresh) {
+  if (!contentValid || !targetFresh || (target.content !== null && containsPrivateMaterial(target.content))) {
+    return { kind: "unavailable", lines: [], overflow: makeUiOverflowMarker(0) };
+  }
+  const source = rawDiffLines(
+    recommendation.targetBinding.relativePath,
+    target.content ?? "",
+    content,
+    recommendation.targetBinding.currentHash === "must-not-exist",
+  );
+  const included = [];
+  let bytes = 0;
+  for (const line of source) {
+    const width = Buffer.byteLength(line, "utf8");
+    if (included.length >= GLOBAL_PROTOCOL_LIMITS.diffLines || bytes + width > GLOBAL_PROTOCOL_LIMITS.diffBytes) break;
+    included.push(line);
+    bytes += width;
+  }
+  const omitted = source.slice(included.length);
+  return {
+    kind: recommendation.targetBinding.currentHash === "must-not-exist" ? "new-file" : "unified",
+    lines: included,
+    overflow: overflowMarker(
+      included.length,
+      omitted,
+      included.length >= GLOBAL_PROTOCOL_LIMITS.diffLines ? "item-limit" : "byte-limit",
+    ),
+  };
+}
+
+function globalProjectionSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("global-projection-snapshot-required");
+  for (const field of ["recommendations", "supportSets", "candidates", "audits"]) {
+    if (!Array.isArray(value[field])) throw new TypeError(`global-projection-${field}-required`);
+  }
+  if (!value.contentByRecommendation || typeof value.contentByRecommendation !== "object"
+      || Array.isArray(value.contentByRecommendation)) throw new TypeError("global-projection-content-required");
+  return value;
+}
+
+function globalGeneration(snapshot, stateRootIdentity, issuedAt, targets) {
+  return sha256(`self-evolve-global-projection-generation-v1\n${canonicalUiJson({
+    stateRootIdentity,
+    issuedAt,
+    recommendations: snapshot.recommendations.map((recommendation) => ({
+      recommendationId: recommendation.recommendationId,
+      supportSetHash: recommendation.supportSetHash,
+      targetBindingHash: recommendation.targetBinding?.bindingHash,
+      proposedContentHash: recommendation.proposedContentHash,
+      state: recommendation.state,
+      decisionVersion: recommendation.decisionVersion,
+      target: targets.get(recommendation.recommendationId),
+    })).sort((left, right) => left.recommendationId.localeCompare(right.recommendationId)),
+  })}`);
+}
+
+function globalProjectionOverflow(included, omitted) {
+  return overflowMarker(included.length, omitted, omitted.length ? "item-limit" : "none");
+}
+
+export function buildGlobalRecommendationProjection(snapshotValue, {
+  stateRootIdentity,
+  now = Date.now(),
+  targetReader,
+  detailRecommendationIds,
+  capabilities = GLOBAL_CAPABILITIES,
+  writeAuthorityReady = true,
+  nonceFactory = randomUUID,
+} = {}) {
+  const snapshot = globalProjectionSnapshot(snapshotValue);
+  if (!HASH_RE.test(String(stateRootIdentity ?? ""))) throw new TypeError("invalid-state-root-identity");
+  if (!Number.isSafeInteger(now) || now < 0) throw new TypeError("invalid-global-projection-time");
+  if (typeof nonceFactory !== "function") throw new TypeError("global-projection-nonce-factory-required");
+  if (typeof writeAuthorityReady !== "boolean") throw new TypeError("invalid-global-write-authority-state");
+  const supportedCapabilities = [...new Set(capabilities)].sort();
+  const supportByHash = new Map(snapshot.supportSets.map((support) => [support.supportSetHash, support]));
+  const candidateById = new Map(snapshot.candidates.map((candidate) => [candidate.candidateId, candidate]));
+  const auditByRecommendation = new Map();
+  for (const audit of snapshot.audits) {
+    if (!audit?.recommendationId) continue;
+    const values = auditByRecommendation.get(audit.recommendationId) ?? [];
+    values.push(audit);
+    auditByRecommendation.set(audit.recommendationId, values);
+  }
+  const recommendations = snapshot.recommendations
+    .filter((recommendation) => GLOBAL_PROJECTED_STATES.has(recommendation?.state))
+    .sort((left, right) => left.recommendationId.localeCompare(right.recommendationId));
+  const targetReads = new Map(recommendations.map((recommendation) => [
+    recommendation.recommendationId,
+    globalTargetRead(recommendation, targetReader),
+  ]));
+  const generation = globalGeneration(
+    { ...snapshot, recommendations },
+    stateRootIdentity,
+    now,
+    new Map([...targetReads].map(([id, target]) => [id, { available: target.available, exists: target.exists, hash: target.hash }])) ,
+  );
+  const expiresAt = now + GLOBAL_PROTOCOL_LIMITS.projectionTtlMs;
+  const detailCandidates = [];
+  for (const recommendation of recommendations) {
+    const support = supportByHash.get(recommendation.supportSetHash);
+    const candidate = candidateById.get(recommendation.candidateId);
+    if (!support || support.candidateId !== recommendation.candidateId
+        || !candidate || candidate.supportSetHash !== recommendation.supportSetHash) continue;
+    const content = snapshot.contentByRecommendation[recommendation.recommendationId];
+    const contentValid = typeof content === "string"
+      && sha256(content) === recommendation.proposedContentHash
+      && !containsPrivateMaterial(content);
+    const target = targetReads.get(recommendation.recommendationId);
+    const targetFresh = globalTargetFresh(recommendation, target);
+    const availableActions = globalAvailableActions(recommendation, {
+      contentValid,
+      targetFresh,
+      writeAuthorityReady,
+    });
+    const recommendationVersion = recommendation.decisionVersion + 1;
+    const tier = candidate.eligibilityRoute === "distributed" ? "distributed" : "single-domain";
+    const updatedAt = Math.max(
+      recommendation.synthesizedAt,
+      candidate.updatedAt ?? recommendation.synthesizedAt,
+      ...(auditByRecommendation.get(recommendation.recommendationId) ?? [])
+        .map((audit) => audit.timestamp)
+        .filter(Number.isSafeInteger),
+    );
+    const detailBody = {
+      projectionVersion: GLOBAL_PROJECTION_VERSION,
+      stateRootIdentity,
+      generation,
+      recommendationId: recommendation.recommendationId,
+      recommendationVersion,
+      supportSetHash: recommendation.supportSetHash,
+      targetBindingHash: recommendation.targetBinding.bindingHash,
+      targetHash: recommendation.state === "applied"
+        ? recommendation.proposedContentHash
+        : recommendation.targetBinding.currentHash,
+      proposedContentHash: recommendation.proposedContentHash,
+      priorState: recommendation.state,
+      issuedAt: now,
+      expiresAt,
+      target: {
+        kind: recommendation.targetBinding.targetKind,
+        label: recommendation.targetBinding.logicalName,
+      },
+      support: {
+        tier,
+        independentDomainCount: candidate.independentDomainCount,
+        independentIncidentCount: candidate.independentIncidentCount,
+        occurrenceCount: candidate.occurrenceCount,
+        firstSeenDay: support.firstSeenDay,
+        lastSeenDay: support.lastSeenDay,
+      },
+      safety: {
+        criticScoreBasisPoints: Math.max(0, Math.min(10_000, Math.round(recommendation.criticScore * 10_000))),
+        criticPassed: recommendation.criticPassed === true,
+        validDeterministic: recommendation.validDeterministic === true,
+      },
+      generality: {
+        passed: true,
+        basis: "deterministic-generality-gate-v1",
+      },
+      rationale: containsPrivateMaterial(recommendation.rationaleText)
+        ? "Rationale unavailable after privacy validation."
+        : safeText(recommendation.rationaleText, "Rationale unavailable.", GLOBAL_PROTOCOL_LIMITS.rationaleBytes),
+      diff: globalProjectedDiff(recommendation, target, content, contentValid, targetFresh),
+      evidenceSummary: [
+        { kind: "independent-domains", count: candidate.independentDomainCount },
+        { kind: "independent-incidents", count: candidate.independentIncidentCount },
+        { kind: "occurrences", count: candidate.occurrenceCount },
+      ],
+      availableActions,
+    };
+    const detailValue = { ...detailBody, detailHash: hashGlobalProtocol("recommendation-detail", detailBody) };
+    const detail = makeGlobalRecommendationDetail(detailValue, {
+      stateRootIdentity,
+      generation,
+      recommendationId: recommendation.recommendationId,
+      recommendationVersion,
+      detailHash: detailValue.detailHash,
+      now,
+    });
+    detailCandidates.push({
+      recommendation,
+      support,
+      candidate,
+      detail,
+      updatedAt,
+      indexEntry: {
+        recommendationId: recommendation.recommendationId,
+        recommendationVersion,
+        supportSetHash: recommendation.supportSetHash,
+        state: recommendation.state,
+        target: detail.target,
+        support: {
+          tier,
+          independentDomainCount: candidate.independentDomainCount,
+          independentIncidentCount: candidate.independentIncidentCount,
+          occurrenceCount: candidate.occurrenceCount,
+        },
+        dates: {
+          firstSeenDay: support.firstSeenDay,
+          lastSeenDay: support.lastSeenDay,
+          synthesizedAt: recommendation.synthesizedAt,
+          updatedAt,
+        },
+        safety: detail.safety,
+        availableActions,
+        detailHash: detail.detailHash,
+      },
+    });
+  }
+  detailCandidates.sort((left, right) => right.updatedAt - left.updatedAt
+    || left.recommendation.recommendationId.localeCompare(right.recommendation.recommendationId));
+  const sourceCandidates = detailCandidates;
+  let includedCandidates = sourceCandidates.slice(0, GLOBAL_PROTOCOL_LIMITS.recommendationIndexEntries);
+  let index;
+  while (true) {
+    const omittedCandidates = sourceCandidates.slice(includedCandidates.length);
+    const indexBody = {
+      projectionVersion: GLOBAL_PROJECTION_VERSION,
+      stateRootIdentity,
+      generation,
+      issuedAt: now,
+      expiresAt,
+      capabilities: supportedCapabilities,
+      recommendations: includedCandidates.map((candidate) => candidate.indexEntry),
+      overflow: globalProjectionOverflow(
+        includedCandidates.map((candidate) => candidate.indexEntry),
+        omittedCandidates.map((candidate) => candidate.indexEntry),
+      ),
+    };
+    const indexValue = { ...indexBody, indexHash: hashGlobalProtocol("recommendation-index", indexBody) };
+    try {
+      index = makeGlobalRecommendationIndex(indexValue, {
+        stateRootIdentity,
+        generation,
+        now,
+        supportedCapabilities,
+      });
+      break;
+    } catch (error) {
+      if (error?.message !== "global-index-footprint-exceeded" || includedCandidates.length === 0) throw error;
+      includedCandidates = includedCandidates.slice(0, -1);
+    }
+  }
+  const includedById = new Map(includedCandidates.map((candidate) => [candidate.recommendation.recommendationId, candidate]));
+  const requestedIds = detailRecommendationIds === undefined
+    ? includedCandidates.slice(0, GLOBAL_PROTOCOL_LIMITS.residentDetails).map((candidate) => candidate.recommendation.recommendationId)
+    : detailRecommendationIds;
+  if (!Array.isArray(requestedIds) || requestedIds.length > GLOBAL_PROTOCOL_LIMITS.residentDetails
+      || new Set(requestedIds).size !== requestedIds.length) throw new TypeError("global-resident-details-out-of-bounds");
+  const unavailableDetailIds = requestedIds.filter((id) => !includedById.has(id));
+  const details = requestedIds.map((id) => includedById.get(id)?.detail).filter(Boolean);
+  while (details.length && Buffer.byteLength(canonicalUiJson(index), "utf8")
+      + details.reduce((total, detail) => total + Buffer.byteLength(canonicalUiJson(detail), "utf8"), 0)
+      > GLOBAL_PROTOCOL_LIMITS.totalProjectionBytes) {
+    unavailableDetailIds.push(details.pop().recommendationId);
+  }
+  const grants = [];
+  for (const detail of details) {
+    for (const action of detail.availableActions) {
+      const body = {
+        grantVersion: 1,
+        capability: "global-action-grant-v1",
+        stateRootIdentity,
+        generation,
+        indexHash: index.indexHash,
+        detailHash: detail.detailHash,
+        recommendationId: detail.recommendationId,
+        recommendationVersion: detail.recommendationVersion,
+        supportSetHash: detail.supportSetHash,
+        targetBindingHash: detail.targetBindingHash,
+        targetHash: detail.targetHash,
+        proposedContentHash: detail.proposedContentHash,
+        priorState: detail.priorState,
+        action,
+        nonce: nonceFactory(),
+        issuedAt: now,
+        expiresAt: Math.min(expiresAt, now + GLOBAL_PROTOCOL_LIMITS.operationTtlMs),
+      };
+      grants.push(makeGlobalActionGrant({ ...body, grantHash: hashGlobalProtocol("action-grant", body) }, {
+        stateRootIdentity,
+        generation,
+        indexHash: index.indexHash,
+        detailHash: detail.detailHash,
+        now,
+      }));
+    }
+  }
+  return deepFreeze({
+    generation,
+    index,
+    details,
+    grants: grants.sort((left, right) => left.recommendationId.localeCompare(right.recommendationId)
+      || left.action.localeCompare(right.action)),
+    unavailableDetailIds: unavailableDetailIds.sort(),
+    bytes: Buffer.byteLength(canonicalUiJson(index), "utf8")
+      + details.reduce((total, detail) => total + Buffer.byteLength(canonicalUiJson(detail), "utf8"), 0),
+  });
+}
+
+export function buildProjectParticipationSidecars(snapshotValue, {
+  projectFingerprint,
+  stateRootIdentity,
+  now = Date.now(),
+} = {}) {
+  if (!snapshotValue || typeof snapshotValue !== "object" || Array.isArray(snapshotValue)
+      || !Array.isArray(snapshotValue.recommendations) || !Array.isArray(snapshotValue.supportSets)
+      || !Array.isArray(snapshotValue.contributionLinks)) throw new TypeError("project-participation-snapshot-required");
+  if (!HASH_RE.test(String(projectFingerprint ?? ""))) throw new TypeError("invalid-project-fingerprint");
+  if (!HASH_RE.test(String(stateRootIdentity ?? ""))) throw new TypeError("invalid-state-root-identity");
+  if (!Number.isSafeInteger(now) || now < 0) throw new TypeError("invalid-participation-time");
+  const index = snapshotValue.index;
+  if (!index || index.stateRootIdentity !== stateRootIdentity || index.expiresAt <= now) {
+    throw new Error("stale-global-index");
+  }
+  const recommendationById = new Map(snapshotValue.recommendations.map((recommendation) => [
+    recommendation.recommendationId,
+    recommendation,
+  ]));
+  const supportByHash = new Map(snapshotValue.supportSets.map((support) => [support.supportSetHash, support]));
+  const activeContributionIds = new Set(snapshotValue.contributionLinks
+    .filter((link) => link?.state === "active")
+    .map((link) => link.contributionId));
+  return deepFreeze(index.recommendations.map((entry) => {
+    const recommendation = recommendationById.get(entry.recommendationId);
+    const support = supportByHash.get(recommendation?.supportSetHash);
+    if (!recommendation || !support || support.supportSetHash !== recommendation.supportSetHash) {
+      throw new Error("participation-support-unavailable");
+    }
+    const body = {
+      participationVersion: PROJECT_PARTICIPATION_VERSION,
+      projectFingerprint,
+      stateRootIdentity,
+      generation: index.generation,
+      indexHash: index.indexHash,
+      recommendationId: recommendation.recommendationId,
+      supportSetHash: support.supportSetHash,
+      currentProjectContributed: support.contributionIds.some((id) => activeContributionIds.has(id)),
+      issuedAt: index.issuedAt,
+      expiresAt: index.expiresAt,
+    };
+    return makeProjectParticipationSidecar({
+      ...body,
+      participationHash: hashGlobalProtocol("project-participation", body),
+    }, {
+      projectFingerprint,
+      stateRootIdentity,
+      generation: index.generation,
+      indexHash: index.indexHash,
+      recommendationId: recommendation.recommendationId,
+      supportSetHash: support.supportSetHash,
+      now,
+    });
+  }));
 }

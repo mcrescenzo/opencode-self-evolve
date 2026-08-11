@@ -1,22 +1,23 @@
 # Autonomous Skill Evolution: Evidence-Backed Design Plan
 
-**Status:** Historical discussion draft. **Superseded for v0.2 by
+**Status:** Historical discussion draft. **Superseded for v0.3 by
 `docs/autonomy-contract.md` (normative).**
 
 **Date:** 2026-07-15
 
 **Decision state:** This document does not authorize implementation. The
-locked product/authority/privacy/lifecycle contract for v0.2 lives in
+locked product/authority/privacy/lifecycle contract for v0.3 lives in
 `docs/autonomy-contract.md`. Where this draft conflicts with the contract
-(notably: the permanent no-auto-apply boundary, the four rollout modes
+(notably: project-local targets, unattended writes, the four rollout modes
 manual/shadow/review/advisory, and "manual mode performs no durable writes"),
 **`docs/autonomy-contract.md` wins**. This draft remains useful as
 evidence-architecture background; it is not normative.
 
 **Conflict summary (superseded statements):**
-- "Permanent no-auto-apply boundary" -> superseded by §1.3 `yolo` allowlisted apply.
+- Model-selected project-local targets -> superseded by exact operator-approved global roots.
+- Unattended or retired `yolo` writes -> superseded by explicit approval for every Apply and Undo.
 - "manual / shadow / review / advisory" four-mode progression -> superseded by
-  §1 three-mode manual/auto/yolo contract.
+  project analysis modes Manual and Auto.
 - "Manual mode performs no passive model calls or durable observation writes"
   -> refined: manual performs no *passive* calls or writes, but does write
   bounded structured observations *when `/self-evolve` is invoked*.

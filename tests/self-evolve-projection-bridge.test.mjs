@@ -219,15 +219,27 @@ function bundle(root, {
         crossRepoAggregation: false,
       },
       approvedSkillFolderCount: 1,
+      globalSettingsVersion: "9".repeat(64),
+      globalRootPolicy: null,
+      globalRootPolicyConfirmation: "REPLACE GLOBAL ROOT POLICY 999999999999",
+      globalRootPolicyAction: null,
     },
     retention: { observationsDays: retentionDays, operationalDays: retentionDays * 3 },
     supportedControls: ["set-paused"],
     activity: [],
     overflow: { activity: overflow(0) },
   };
+  const {
+    globalSettingsVersion: _globalSettingsVersion,
+    globalRootPolicy: _globalRootPolicy,
+    globalRootPolicyConfirmation: _globalRootPolicyConfirmation,
+    globalRootPolicyAction: _globalRootPolicyAction,
+    ...dashboardV1Settings
+  } = dashboardBody.settings;
   const dashboardV1Body = {
     ...dashboardBody,
     dashboardVersion: 1,
+    settings: dashboardV1Settings,
     retention: { observationsDays: retentionDays, operationalDays: 90 },
   };
   return {

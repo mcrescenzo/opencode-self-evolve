@@ -35,7 +35,6 @@ appear only as secondary technical detail.
 |---|---|---|
 | `manual` | On demand | Self-evolve analyzes only when the user runs the headless scan command. |
 | `auto` | Recommend automatically | Self-evolve may analyze at safe idle points and prepare recommendations, but cannot apply them without approval. |
-| `yolo` | Apply automatically (YOLO) | Self-evolve may apply an eligible allowlisted recommendation only after every consent, evidence, safety, budget, and rollout gate passes. |
 | durable observations | Saved structured patterns | Bounded structured facts retained for evidence; never transcript text. |
 | passive provider calls | Background AI analysis | Hidden analysis that may run at safe idle points when consent and budget allow it. |
 | allowlist | Approved skill folders | The only canonical skill roots eligible for writes. |
@@ -65,7 +64,7 @@ action remains in Settings.
 | 5 | Paused | Self-evolve is paused | Scheduling is paused without changing configured mode or consent. | Home | Resume. |
 | 6 | Repository excluded | Disabled for this project | Global settings remain intact, but this project is excluded. | Settings | Include this project if automatic work is wanted here. |
 | 7 | Effective mode is manual | Runs on demand | Manual mode runs only explicit scans. Auto mode also needs Background analysis and Saved observations consent. | Settings / mode | Choose Auto and enable both required consents, or run `/self-evolve scan` on demand. |
-| 8 | Required setup missing | Setup needed | The current mode lacks one or more consent, provider, approved-folder, rollout, or host prerequisites. | Settings | Complete the first missing prerequisite. |
+| 8 | Required setup missing | Setup needed | The current analysis mode lacks one or more consent, provider, state-root, or host prerequisites. | Settings | Complete the first missing prerequisite. |
 | 9 | Work in flight | Analysis in progress / Applying safely | One admitted cycle or operation is active. | Home | Wait; the mounted view updates in place. |
 | 10 | Backoff active | Waiting after a failure | Automatic work will retry after the bounded backoff. | Activity | Review the last failure or wait until the shown time. |
 | 11 | Budget exhausted | Budget used for now | The relevant rolling or daily budget has no remaining capacity. | Home | Wait until the shown reset time. |
@@ -73,11 +72,11 @@ action remains in Settings.
 | 13 | Recommendation needs review | Recommendation ready | A safe bounded recommendation is waiting for a decision. | Recommendations, selected item | Review the selected recommendation. |
 | 14 | Applied result needs acknowledgement | Change applied | A verified Self-evolve change has not yet been acknowledged locally. | Recommendations, selected item | Review and acknowledge or undo while eligible. |
 | 15 | Startup checks pending | Starting Self-evolve | Compatibility and state checks are still running; no authority is available yet. | Home | Wait for Startup checks. |
-| 16 | Healthy auto/yolo | Ready | Self-evolve is ready and will act only within the displayed mode and safeguards. | Home | No action required. |
+| 16 | Healthy Auto | Ready | Self-evolve is ready to analyze and recommend within the displayed safeguards. | Home | No action required. |
 
 Within priority 8, missing prerequisites use this stable order: supported host
-and validated state root; usable provider; required consent; included project;
-non-empty approved skill folders; YOLO rollout and confirmation gates. The UI
+and validated state root; usable provider; required consent; included project.
+Approved skill folders affect explicit Apply target authority, not analysis. The UI
 shows all blockers but offers only the first as the primary action.
 
 A recommendation or applied acknowledgement may be shown as secondary
@@ -252,7 +251,7 @@ The diagnostics panel shows:
 
 ### Settings
 
-Settings is ordered as Modes, Privacy and scope, Approved skill folders, Limits
+Settings is ordered as Project analysis, Privacy and scope, Approved skill folders, Limits
 and retention, Maintenance, then a compact version/help footer.
 
 #### Mode cards
@@ -261,12 +260,11 @@ and retention, Maintenance, then a compact version/help footer.
 |---|---|---|---|---|
 | On demand | Runs only from a source-session scan command. | No passive calls or passive writes; an invoked scan may save bounded structured observations. | Requires an explicit decision for each apply. | Choose maximum control or hosts without passive setup. |
 | Recommend automatically | Analyzes at safe idle points and prepares recommendations. | Requires Background AI analysis and the relevant Saved structured patterns consent. | Cannot apply without explicit approval. | Choose proactive review without automatic writes. |
-| Apply automatically (YOLO) | May analyze, recommend, and apply only after every gate passes. | Same provider/data requirements as automatic recommendations. | Restricted to Approved skill folders, deterministic validation, critic approval, budgets, rollout history, and fresh server authority. | Choose hands-off application only after accepting the expanded risk. |
 
-The UI shows **Global default**, **This project**, and **Effective mode**
-together. This-project choices are Inherit global default, On demand, Recommend
-automatically, or Apply automatically (YOLO). YOLO is unavailable with its
-blockers listed until all prerequisites pass.
+The UI shows **Installation default**, **This project override**, **Configured
+analysis**, and the separate **Operational state** together. This-project choices
+are Inherit global default, On demand, or Recommend automatically. Pause,
+exclusion, and other temporary suppressors never rewrite configured analysis.
 
 #### Privacy and scope settings
 
@@ -276,12 +274,12 @@ blockers listed until all prerequisites pass.
 | Background AI analysis | `passiveCalls` | Global | Required for automatic hidden provider calls; does not itself allow durable evidence or writes. | Control passive provider use. |
 | Saved structured patterns | `durableObservations` | Global | Required for passive structured observations; never stores transcripts. | Control whether learning persists across sessions. |
 | Sanitized evidence excerpts | `sanitizedExcerpts` | Global | Optional bounded evidence text; redaction is not a secrecy guarantee. Required by cross-project learning. | Allow richer evidence with an explicit privacy tradeoff. |
-| Cross-project learning (not active yet) | `crossRepoAggregation` | Global | No production path currently consumes cross-project claims. An already-enabled stored value may be turned off, but the UI does not offer activation until the capability is active. | Avoid implying an inert privacy control provides working cross-project learning. |
+| Cross-project learning | `crossRepoAggregation` | Global | Requires sanitized excerpts. The server publishes immutable identity-free contributions; UI activation remains hidden until the current projection advertises the capability. | Allow bounded cross-project pattern support without contributor identity. |
 | Emergency stop | `killSwitch` | Global | Overrides every automatic mode and provider/write path. | Immediately stop autonomous authority. |
 | Pause automatic work | `paused` | Global | Temporarily stops scheduling without changing mode or consent. | Temporarily stop automatic work while preserving configuration. |
 
-Consent is never enabled as a side effect of choosing a mode. Dependencies and
-the resulting effective mode are visible before confirmation.
+Consent is never enabled as a side effect of choosing a mode. Dependencies,
+configured analysis, and separate operational suppressors are visible before confirmation.
 
 The fresh-install Home card follows the same rule: **Turn on automatic
 recommendations** changes only the global mode, while **Allow sanitized
@@ -300,7 +298,7 @@ the server-projected operation.
 Limits are read-only in Release B. Show actual and configured values together:
 passive calls per rolling hour and reset, synthesis per day and reset, storage
 bytes and quota, observation retention, proposal/audit retention, concurrency,
-quiet periods, and YOLO rollout progress. Explain what each limit bounds and
+quiet periods, and retained compatibility rollout diagnostics. Explain what each limit bounds and
 whether changing it requires startup configuration. Do not introduce a general
 numeric settings API.
 
@@ -347,7 +345,7 @@ polling-triggered dialogs, or automatically opened routes.
 |---|---|---|
 | Immediate | Execute once through the current grant and show lifecycle inline. | Pause, Resume, enable Emergency stop, snooze, acknowledge, open/deep-link, risk-reducing mode or consent changes. |
 | Simple confirm | Explain the additional authority or privacy exposure and require Confirm/Cancel. | Disable Emergency stop; enable a consent; change On demand to Recommend automatically; other risk-increasing non-destructive scope changes. |
-| Exact typed confirm | Display the exact server-required phrase and affected scope. | Approved skill folder replacement, destructive purge, purge-all, sensitive export where already required, and any change that grants Apply automatically (YOLO) authority. |
+| Exact typed confirm | Display the exact server-required phrase and affected scope. | Approved skill folder replacement, destructive purge, purge-all, and sensitive export where required. |
 
 Reject is immediate unless optional free-text feedback is present, in which
 case submission remains one explicit action. Apply uses the existing explicit

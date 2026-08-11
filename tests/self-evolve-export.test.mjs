@@ -42,7 +42,7 @@ test("sensitive export streams to one private artifact and publishes bounded met
       schemaVersion: 2,
       projectFingerprint: PROJECT,
       records: [{ kind: "observation", payload: { summary: "sanitized" } }],
-      snapshots: [{ sensitivity: "active-skill-and-rollback-snapshot" }],
+      snapshots: [{ classification: "sensitive-skill-snapshot" }],
     },
   });
   assert.equal(result.ok, true);
@@ -307,7 +307,7 @@ test("release is nonce-bound and failure cleanup removes only owned files", (t) 
 });
 
 test("store purge removes sensitive artifacts for every data scope", (t) => {
-  for (const scope of ["observations", "proposals", "project", "all"]) {
+  for (const scope of ["observations", "proposals", "global-recommendations", "project", "all"]) {
     const root = fixture(t);
     const store = openStore(root, { projectFingerprint: PROJECT, projectName: "export-purge" });
     const manager = createSensitiveExportManager({ stateRoot: root, projectFingerprint: PROJECT });
@@ -327,4 +327,29 @@ test("foreign or permissive export artifacts fail closed", (t) => {
     stateRoot: root,
     projectFingerprint: PROJECT,
   }), /export-metadata-rejected/u);
+});
+
+test("sensitive export authorization rejects cross-project archives before artifact creation", (t) => {
+  const root = fixture(t);
+  const manager = createSensitiveExportManager({ stateRoot: root, projectFingerprint: PROJECT });
+  assert.deepEqual(manager.run({
+    scope: "project",
+    archive: { projectFingerprint: "b".repeat(64), records: [] },
+  }), { ok: false, reason: "cross-project-export-forbidden" });
+  assert.deepEqual(readdirSync(manager.root), []);
+});
+
+test("sensitive export schema rejects forbidden identity metadata in the global member", (t) => {
+  const root = fixture(t);
+  const manager = createSensitiveExportManager({ stateRoot: root, projectFingerprint: PROJECT });
+  assert.deepEqual(manager.run({
+    scope: "all",
+    archive: {
+      projectFingerprint: PROJECT,
+      records: [],
+      projects: [{ projectFingerprint: PROJECT, records: [], capsules: [], snapshots: [] }],
+      global: { recommendations: [{ projectFingerprint: PROJECT }] },
+    },
+  }), { ok: false, reason: "forbidden-global-identity" });
+  assert.deepEqual(readdirSync(manager.root), []);
 });

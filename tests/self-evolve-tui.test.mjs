@@ -19,7 +19,7 @@ import {
   shouldShowProposal,
 } from "../self-evolve-tui.js";
 import tuiModule, { TUI_KV_KEYS, TUI_LEGACY_KV_KEYS } from "../self-evolve-tui.js";
-import { publishControlState, readTuiHostHealth } from "../self-evolve-bridge.js";
+import { BRIDGE_SCHEMA_VERSION, publishControlState, readTuiHostHealth } from "../self-evolve-bridge.js";
 import { openStore, projectFingerprintFor } from "../self-evolve-store.js";
 import * as schemas from "../self-evolve-schemas.js";
 import { resolveStateRoot, stateRootIdentity } from "../self-evolve-state-root.js";
@@ -311,6 +311,52 @@ test("TUI publishes current api.app.version as a root-bound host-health runtime 
   assert.equal(health.projectFingerprint, projectFingerprint);
   await h.dispose();
   assert.equal(readTuiHostHealth(stateRoot, projectFingerprint, { now: 2_000, stateRootIdentity: stateRootIdentity(stateRoot) }), null);
+});
+
+test("accepted-terminal native state revokes host health and later callbacks cannot recreate it", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-terminal-health-"));
+  const stateRoot = path.join(root, "state");
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(worktree, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const h = harness({ kv: enabledKv(), clock: 2_000 });
+  t.after(async () => h.dispose());
+  h.api.app = { version: "1.18.3" };
+  h.api.state.path = { state: stateRoot, config: path.join(root, "config"), worktree, directory: worktree };
+  const projectFingerprint = projectFingerprintFor("", worktree);
+  const ready = {
+    phase: "ready",
+    projectFingerprint,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  };
+  let listener;
+  let unsubscribed = false;
+  const projectStore = {
+    refresh() { return Promise.resolve(ready); },
+    subscribe(callback) {
+      listener = callback;
+      callback(ready);
+      return () => { unsubscribed = true; };
+    },
+  };
+  await SelfEvolveTuiPlugin(h.api, { __testTuiStoreFactory: () => projectStore });
+  assert.equal(readTuiHostHealth(stateRoot, projectFingerprint, {
+    now: 2_000,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }).hostVersion, "1.18.3");
+
+  listener({ ...ready, phase: "terminal" });
+  assert.equal(unsubscribed, true);
+  assert.equal(readTuiHostHealth(stateRoot, projectFingerprint, {
+    now: 2_000,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }), null);
+  listener(ready);
+  assert.equal(readTuiHostHealth(stateRoot, projectFingerprint, {
+    now: 2_000,
+    stateRootIdentity: stateRootIdentity(stateRoot),
+  }), null);
 });
 
 test("TUI boot uses the v2 official path result before reactive path state is populated", async (t) => {
@@ -824,42 +870,50 @@ test("review bookkeeping prunes stale and absent entries to a fixed cap", () => 
   assert.equal(Object.hasOwn(result.lastShownAt, "absent"), false);
 });
 
-test("applied acknowledgement KV migrates the Release A string into the current project", () => {
+test("applied acknowledgement KV is project-local, version-bound, and audit-bound", () => {
   const kv = new Map([[TUI_LEGACY_KV_KEYS.acknowledgedAudits, "legacy-applied-proposal"]]);
   const acknowledgements = createTuiAcknowledgementStore(kv, { now: () => 1_000 });
-  assert.deepEqual(acknowledgements.read(HASH_A), ["legacy-applied-proposal"]);
+  const binding = {
+    scope: "project",
+    subjectId: "proposal-one",
+    version: "1".repeat(64),
+    auditIds: ["audit-one"],
+  };
+  assert.deepEqual(acknowledgements.acknowledge(HASH_A, binding), [{ ...binding, acknowledgedAt: 1_000 }]);
   assert.deepEqual(acknowledgements.read(HASH_B), []);
-  assert.deepEqual(kv.get(TUI_KV_KEYS.acknowledgedAudits), [{
-    projectFingerprint: HASH_A,
-    auditId: "legacy-applied-proposal",
-    acknowledgedAt: 0,
-  }]);
+  assert.deepEqual(kv.get(`${TUI_KV_KEYS.acknowledgedOutcomes}:${HASH_A}`), [{ ...binding, acknowledgedAt: 1_000 }]);
   assert.equal(kv.get(TUI_LEGACY_KV_KEYS.acknowledgedAudits), "legacy-applied-proposal");
 });
 
-test("applied acknowledgement KV retains multiple projects and deterministically caps the newest 256 entries", () => {
+test("applied acknowledgement KV deterministically caps each project at the newest 256 outcomes", () => {
   const kv = new Map();
   let clock = 0;
   const acknowledgements = createTuiAcknowledgementStore(kv, { now: () => ++clock });
   for (let index = 0; index < 300; index += 1) {
-    const projectFingerprint = index % 2 === 0 ? HASH_A : HASH_B;
-    acknowledgements.acknowledge(projectFingerprint, `audit-${String(index).padStart(3, "0")}`);
+    acknowledgements.acknowledge(HASH_A, {
+      scope: index % 2 === 0 ? "project" : "global",
+      subjectId: `subject-${String(index).padStart(3, "0")}`,
+      version: `version-${String(index).padStart(3, "0")}`,
+      auditIds: [`audit-${String(index).padStart(3, "0")}`],
+    });
   }
-  const stored = kv.get(TUI_KV_KEYS.acknowledgedAudits);
+  const stored = kv.get(`${TUI_KV_KEYS.acknowledgedOutcomes}:${HASH_A}`);
   assert.equal(stored.length, 256);
-  assert.equal(stored[0].auditId, "audit-044");
-  assert.equal(stored.at(-1).auditId, "audit-299");
-  assert.equal(acknowledgements.read(HASH_A).every((id) => Number(id.slice(-3)) % 2 === 0), true);
-  assert.equal(acknowledgements.read(HASH_B).every((id) => Number(id.slice(-3)) % 2 === 1), true);
+  assert.deepEqual(stored[0].auditIds, ["audit-044"]);
+  assert.deepEqual(stored.at(-1).auditIds, ["audit-299"]);
+  assert.deepEqual(acknowledgements.read(HASH_B), []);
 });
 
 test("foreign or corrupt canonical acknowledgement KV is preserved with a conservative empty view", () => {
   const foreign = { owner: "another-plugin" };
-  const kv = new Map([[TUI_KV_KEYS.acknowledgedAudits, foreign]]);
+  const key = `${TUI_KV_KEYS.acknowledgedOutcomes}:${HASH_A}`;
+  const kv = new Map([[key, foreign]]);
   const acknowledgements = createTuiAcknowledgementStore(kv);
   assert.deepEqual(acknowledgements.read(HASH_A), []);
-  assert.deepEqual(acknowledgements.acknowledge(HASH_A, "audit-one"), []);
-  assert.equal(kv.get(TUI_KV_KEYS.acknowledgedAudits), foreign);
+  assert.deepEqual(acknowledgements.acknowledge(HASH_A, {
+    scope: "project", subjectId: "proposal", version: "version", auditIds: ["audit-one"],
+  }), []);
+  assert.equal(kv.get(key), foreign);
 });
 
 test("busy refresh bursts coalesce and late inbox completion is inert after dispose", async () => {
@@ -924,7 +978,7 @@ test("registered native settings command creates strict filesystem controls with
   const projectFingerprint = projectFingerprintFor("", worktree);
   const now = Date.now();
   publishControlState(root, {
-    schemaVersion: schemas.SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     projectFingerprint,
     actor: "self-evolve-integration",
     issuedAt: now,
@@ -965,18 +1019,10 @@ test("registered native settings command creates strict filesystem controls with
     h.confirms.at(-1).onConfirm();
   }
 
+  // v0.3 offers no unattended mode in the native settings flow.
   (await settingsDialog()).onSelect({ value: "mode" });
-  const yoloDialog = h.selects.at(-1);
-  yoloDialog.onSelect(yoloDialog.options.find((item) => item.value === "yolo"));
-  h.prompts.at(-1).onConfirm(`${skillRoot}\n${secondRoot}`);
-  const firstYoloConfirm = h.confirms.at(-1);
-  assert.match(firstYoloConfirm.title, /1 of 2/u);
-  assert.equal(firstYoloConfirm.message.includes(skillRoot), true);
-  firstYoloConfirm.onConfirm();
-  const secondYoloConfirm = h.confirms.at(-1);
-  assert.match(secondYoloConfirm.title, /2 of 2/u);
-  assert.equal(secondYoloConfirm.message.includes(secondRoot), true);
-  secondYoloConfirm.onConfirm();
+  const modeOptions = h.selects.at(-1).options.map((item) => item.value);
+  assert.deepEqual(modeOptions, ["manual", "auto"]);
 
   (await settingsDialog()).onSelect({ value: "allowlist" });
   h.prompts.at(-1).onConfirm(secondRoot);
@@ -994,8 +1040,8 @@ test("registered native settings command creates strict filesystem controls with
 
   const requestDir = path.join(root, "self-evolve", "bridge", projectFingerprint, "control-requests");
   const requests = fs.readdirSync(requestDir).map((name) => JSON.parse(fs.readFileSync(path.join(requestDir, name), "utf8")));
-  assert.equal(requests.length, 9);
-  assert.equal(requests.filter((item) => item.action === "set-mode").length, 3);
+  assert.equal(requests.length, 8);
+  assert.equal(requests.filter((item) => item.action === "set-mode").length, 2);
   assert.equal(requests.filter((item) => item.action === "set-consent").length, 4);
   assert.equal(requests.filter((item) => item.action === "update-allowlist").length, 1);
   assert.equal(requests.filter((item) => item.action === "set-repo-excluded").length, 1);
@@ -1012,7 +1058,7 @@ test("TUI fails closed when the server root projection disagrees", async (t) => 
   const projectFingerprint = projectFingerprintFor("", worktree);
   const now = Date.now();
   publishControlState(root, {
-    schemaVersion: schemas.SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     projectFingerprint,
     actor: "self-evolve-integration",
     issuedAt: now,
@@ -1041,7 +1087,7 @@ test("TUI fails closed when the server root projection disagrees", async (t) => 
 test("native cross-repository consent refuses enablement until excerpts are enabled", async () => {
   const now = Date.now();
   const state = {
-    schemaVersion: schemas.SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     projectFingerprint: "c".repeat(64),
     actor: "self-evolve-integration",
     issuedAt: now,
@@ -1114,7 +1160,7 @@ test("production TUI client resolves real state-root and worktree inputs without
     details,
   }), 1_000));
   publishControlState(root, {
-    schemaVersion: schemas.SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     projectFingerprint,
     actor: "self-evolve-integration",
     issuedAt: 1_000,

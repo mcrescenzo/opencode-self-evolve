@@ -3,14 +3,31 @@ import test from "node:test";
 import {
   cleanupSession,
   createSession,
+  deleteSession,
   listSessions,
   promptSession,
   readSessionMessages,
+  sessionOutput,
 } from "../self-evolve-client.js";
 
 function context(session) {
   return { directory: "/workspace/project", client: { session } };
 }
+
+test("session output excludes hidden reasoning parts from text fallback", () => {
+  const json = JSON.stringify({ action: "no-op" });
+  const result = {
+    data: {
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", text: "private chain of thought" },
+        { type: "text", text: json },
+        { type: "step-finish" },
+      ],
+    },
+  };
+  assert.equal(sessionOutput(result), json);
+});
 
 test("OpenCode client adapter uses 1.18.3 request shapes and normalizes responses", async () => {
   const calls = [];
@@ -20,15 +37,31 @@ test("OpenCode client adapter uses 1.18.3 request shapes and normalizes response
     async prompt(input) { calls.push(["prompt", input]); return { data: { parts: [{ type: "text", text: "ok" }] } }; },
     async list(input) { calls.push(["list", input]); return { data: { sessions: [{ id: "hidden" }] } }; },
     async abort(input) { calls.push(["abort", input]); return { data: {} }; },
+    async delete(input) { calls.push(["delete", input]); return { data: {} }; },
   });
   assert.equal((await createSession(ctx, { title: "hidden" })).data.id, "hidden");
   assert.deepEqual(await readSessionMessages(ctx, "root", 10), [{ id: "one" }]);
   await promptSession(ctx, "hidden", { parts: [] });
   assert.deepEqual(await listSessions(ctx), [{ id: "hidden" }]);
   await cleanupSession(ctx, "hidden");
-  assert.deepEqual(calls.map(([name]) => name), ["create", "messages", "prompt", "list", "abort"]);
+  await deleteSession(ctx, "hidden");
+  assert.deepEqual(calls.map(([name]) => name), ["create", "messages", "prompt", "list", "abort", "delete"]);
   assert.deepEqual(calls[0][1], { body: { title: "hidden" }, query: { directory: "/workspace/project" } });
   assert.deepEqual(calls[1][1], { path: { id: "root" }, query: { directory: "/workspace/project", limit: 10 } });
+  assert.deepEqual(calls[5][1], { path: { id: "hidden" }, query: { directory: "/workspace/project" } });
+});
+
+test("session deletion is strict, bounded, and never retries host errors", async () => {
+  const calls = [];
+  const ctx = context({
+    async delete(input) {
+      calls.push(input);
+      return { error: { message: "delete rejected" } };
+    },
+  });
+  await assert.rejects(deleteSession(ctx, "hidden", { timeoutMs: 20 }), /delete rejected/u);
+  assert.deepEqual(calls, [{ path: { id: "hidden" }, query: { directory: "/workspace/project" } }]);
+  await assert.rejects(deleteSession(context({}), "hidden"), /session\.delete is unavailable/u);
 });
 
 test("read-only compatibility fallback occurs after rejection but never after timeout", async () => {

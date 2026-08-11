@@ -1,4 +1,7 @@
-# Release B Automated Operator Evidence
+# Release B Automated Operator Evidence (historical)
+
+Superseded by `docs/v03-operator-evidence.md` for the v0.3 global-first
+candidate. This record is retained as the Release B history.
 
 This record covers the opt-in automated local operator witness for the
 unpublished Release B working-tree candidate. It does not claim independent

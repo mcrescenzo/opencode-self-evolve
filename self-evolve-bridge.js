@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -22,10 +22,13 @@ import {
   assertRecord,
   errorReasonCode,
   makeDecision,
+  makeGlobalActionRequest as makeGlobalActionRequestSchema,
+  makeGlobalConsumerClaim,
   makeGlobalSettings,
   migrateSettings,
   makeProposal,
   makeRepoSettings,
+  validateGlobalActionAuthority,
 } from "./self-evolve-schemas.js";
 import { processIsAlive, withStateMutationLock } from "./self-evolve-lock.js";
 import {
@@ -36,10 +39,26 @@ import {
 } from "./self-evolve-state-root.js";
 import {
   UI_CAPABILITIES,
+  UI_DASHBOARD_CAPABILITIES,
   UI_OPERATION_PROTOCOL_VERSION,
   UI_PROJECTION_VERSION,
   UI_PROTOCOL_LIMITS,
+  GLOBAL_BRIDGE_SCHEMA_VERSION,
+  GLOBAL_CAPABILITIES,
+  GLOBAL_OPERATION_PROTOCOL_VERSION,
+  GLOBAL_PROJECTION_VERSION,
+  GLOBAL_PROTOCOL_LIMITS,
+  canonicalUiJson,
   hashUiProtocol,
+  hashGlobalProtocol,
+  makeGlobalActionGrant,
+  makeGlobalActionRequestEnvelope,
+  makeGlobalActionResponse,
+  makeGlobalProtocolOffer,
+  makeGlobalRecommendationDetail,
+  makeGlobalRecommendationIndex,
+  makeProjectParticipationSidecar,
+  negotiateGlobalProtocol,
   makeUiDashboard,
   makeUiOperationRequest,
   makeUiOperationResponse,
@@ -110,6 +129,17 @@ const NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) && constants.O_NOFOLLOW 
 const validatedStateBoundaries = new Map();
 export const BRIDGE_RESPONSE_RESERVE_BYTES = MAX_RESPONSE_BYTES;
 export const BRIDGE_CONTROL_STATE_RESERVE_BYTES = MAX_CONTROL_STATE_BYTES;
+export const GLOBAL_PROJECTION_LEASE_KEY = createHash("sha256")
+  .update("self-evolve-global-projection-writer-v1")
+  .digest("hex");
+export const GLOBAL_MAILBOX_LEASE_KEY = createHash("sha256")
+  .update("self-evolve-global-mailbox-consumer-v1")
+  .digest("hex");
+
+const GLOBAL_PROJECTION_LEASE_TTL_MS = 10_000;
+const GLOBAL_BRIDGE_TRANSIENT_BYTES = 1024 * 1024;
+const GLOBAL_BRIDGE_MAX_FILES = 256;
+const GLOBAL_MAX_RESIDENT_GRANTS = GLOBAL_PROTOCOL_LIMITS.residentDetails * 2;
 
 function mailboxDescriptor(value) {
   return Object.freeze(value);
@@ -307,6 +337,72 @@ function projectionDetailPath(projectionPathsValue, proposalId) {
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(id)) throw new TypeError("invalid-proposal-id");
   const fileName = createHash("sha256").update(`self-evolve-ui-detail-path-v1\n${id}`).digest("hex");
   return path.join(projectionPathsValue.details, `${fileName}.json`);
+}
+
+function globalBridgePaths(stateRoot, { create = false, generation } = {}) {
+  const boundary = stateBoundary(stateRoot);
+  const root = walkDirectories(boundary, ["self-evolve", "bridge", "global"], { create });
+  if (!root) return null;
+  const generations = walkDirectories(boundary, ["self-evolve", "bridge", "global", "generations"], { create });
+  const requests = walkDirectories(boundary, ["self-evolve", "bridge", "global", "requests"], { create });
+  const responses = walkDirectories(boundary, ["self-evolve", "bridge", "global", "responses"], { create });
+  const nonceClaims = walkDirectories(boundary, ["self-evolve", "bridge", "global", "nonce-claims"], { create });
+  if (!generations || !requests || !responses || !nonceClaims) return null;
+  let generationRoot = null;
+  let details = null;
+  let grants = null;
+  if (generation !== undefined) {
+    const cleanGeneration = validHash(generation, "global-generation");
+    generationRoot = walkDirectories(boundary, [
+      "self-evolve", "bridge", "global", "generations", cleanGeneration,
+    ], { create });
+    if (generationRoot) {
+      details = walkDirectories(boundary, [
+        "self-evolve", "bridge", "global", "generations", cleanGeneration, "details",
+      ], { create });
+      grants = walkDirectories(boundary, [
+        "self-evolve", "bridge", "global", "generations", cleanGeneration, "grants",
+      ], { create });
+    }
+    if (!generationRoot || !details || !grants) return null;
+  }
+  return {
+    boundary,
+    root,
+    generations,
+    requests,
+    responses,
+    nonceClaims,
+    generationRoot,
+    details,
+    grants,
+    offer: path.join(root, "protocol-offer.json"),
+    index: path.join(root, "index.json"),
+  };
+}
+
+function globalDetailPath(paths, recommendationId) {
+  if (!paths?.details) throw new Error("global-projection-generation-unavailable");
+  return path.join(paths.details, `${validHash(recommendationId, "global-recommendation-id")}.json`);
+}
+
+function globalGrantPath(paths, grantHash) {
+  if (!paths?.grants) throw new Error("global-projection-generation-unavailable");
+  return path.join(paths.grants, `${validHash(grantHash, "global-grant-hash")}.json`);
+}
+
+function participationPaths(stateRoot, projectFingerprint, { create = false } = {}) {
+  const paths = bridgePaths(stateRoot, projectFingerprint, { create });
+  if (!paths) return null;
+  const participation = walkDirectories(paths.boundary, [
+    "self-evolve", "bridge", paths.fingerprint, "global-participation",
+  ], { create });
+  if (!participation) return null;
+  return { ...paths, participation };
+}
+
+function participationPath(paths, recommendationId) {
+  return path.join(paths.participation, `${validHash(recommendationId, "global-recommendation-id")}.json`);
 }
 
 function revalidateDirectory(boundary, directory) {
@@ -1088,7 +1184,7 @@ function operationRequestContext(value, nowValue = Date.now()) {
     generation: value?.generation,
     projectionHash: value?.projectionHash,
     now: nowValue,
-    supportedCapabilities: UI_CAPABILITIES,
+    supportedCapabilities: [...UI_CAPABILITIES, ...UI_DASHBOARD_CAPABILITIES].sort(),
     grant: {
       action: value?.action,
       capability: value?.capability,
@@ -1170,7 +1266,10 @@ export function createUiOperationRequest({
     generation: projection?.generation,
     projectionHash: projection?.projectionHash,
     now: timestamp,
-    supportedCapabilities: projection?.capabilities ?? UI_CAPABILITIES,
+    supportedCapabilities: [...new Set([
+      ...(projection?.capabilities ?? UI_CAPABILITIES),
+      ...(UI_DASHBOARD_CAPABILITIES.includes(grant?.capability) ? [grant.capability] : []),
+    ])].sort(),
     grant,
   });
 }
@@ -1619,6 +1718,9 @@ export function readUiProjection(stateRoot, projectFingerprint, {
     }
   }
   const effectiveCapabilities = new Set(negotiation.capabilities);
+  const dashboardRootPolicyAction = dashboard?.capabilities?.includes("operation-global-root-policy-v1")
+    ? dashboard.settings?.globalRootPolicyAction ?? null
+    : null;
   const effectiveDetailActions = Object.fromEntries(details.map((detail) => [
     detail.proposalId,
     Object.freeze(detail.allowedActions.filter((action) => effectiveCapabilities.has(action.capability))),
@@ -1629,9 +1731,951 @@ export function readUiProjection(stateRoot, projectFingerprint, {
     dashboard,
     dashboardError,
     details: Object.freeze(details),
-    effectiveIndexActions: Object.freeze(index.allowedActions.filter((action) => effectiveCapabilities.has(action.capability))),
+    effectiveIndexActions: Object.freeze([
+      ...index.allowedActions.filter((action) => effectiveCapabilities.has(action.capability)),
+      ...(dashboardRootPolicyAction ? [dashboardRootPolicyAction] : []),
+    ].sort((left, right) => left.action.localeCompare(right.action))),
     effectiveDetailActions: Object.freeze(effectiveDetailActions),
   });
+}
+
+function defaultGlobalProtocolOffer() {
+  return makeGlobalProtocolOffer({
+    bridgeSchemaVersions: [GLOBAL_BRIDGE_SCHEMA_VERSION],
+    projectionVersions: [GLOBAL_PROJECTION_VERSION],
+    operationProtocolVersions: [GLOBAL_OPERATION_PROTOCOL_VERSION],
+    capabilities: GLOBAL_CAPABILITIES,
+  });
+}
+
+function validateGlobalProjectionBindings(index, details, grants) {
+  if (!index.capabilities.includes("global-generality-v1")) {
+    throw new Error("global-generality-capability-unavailable");
+  }
+  const indexById = new Map(index.recommendations.map((entry) => [entry.recommendationId, entry]));
+  const detailByHash = new Map();
+  for (const detail of details) {
+    const entry = indexById.get(detail.recommendationId);
+    if (!entry
+        || detail.stateRootIdentity !== index.stateRootIdentity
+        || detail.generation !== index.generation
+        || detail.recommendationVersion !== entry.recommendationVersion
+        || detail.supportSetHash !== entry.supportSetHash
+        || detail.priorState !== entry.state
+        || detail.detailHash !== entry.detailHash
+        || detail.issuedAt !== index.issuedAt
+        || detail.expiresAt !== index.expiresAt
+        || canonicalUiJson(detail.target) !== canonicalUiJson(entry.target)
+        || detail.support.tier !== entry.support.tier
+        || detail.support.independentDomainCount !== entry.support.independentDomainCount
+        || detail.support.independentIncidentCount !== entry.support.independentIncidentCount
+        || detail.support.occurrenceCount !== entry.support.occurrenceCount
+        || detail.support.firstSeenDay !== entry.dates.firstSeenDay
+        || detail.support.lastSeenDay !== entry.dates.lastSeenDay
+        || canonicalUiJson(detail.safety) !== canonicalUiJson(entry.safety)
+        || detail.generality.passed !== true
+        || detail.generality.basis !== "deterministic-generality-gate-v1"
+        || canonicalUiJson(detail.availableActions) !== canonicalUiJson(entry.availableActions)) {
+      throw new Error("global-detail-index-mismatch");
+    }
+    const evidence = new Map(detail.evidenceSummary.map((value) => [value.kind, value.count]));
+    if (evidence.size !== 3
+        || evidence.get("independent-domains") !== detail.support.independentDomainCount
+        || evidence.get("independent-incidents") !== detail.support.independentIncidentCount
+        || evidence.get("occurrences") !== detail.support.occurrenceCount) {
+      throw new Error("global-detail-support-mismatch");
+    }
+    detailByHash.set(detail.detailHash, detail);
+  }
+  const actionsByDetail = new Map(details.map((detail) => [detail.detailHash, []]));
+  for (const grant of grants) {
+    const detail = detailByHash.get(grant.detailHash);
+    if (!detail
+        || grant.stateRootIdentity !== index.stateRootIdentity
+        || grant.generation !== index.generation
+        || grant.indexHash !== index.indexHash
+        || grant.recommendationId !== detail.recommendationId
+        || grant.recommendationVersion !== detail.recommendationVersion
+        || grant.supportSetHash !== detail.supportSetHash
+        || grant.targetBindingHash !== detail.targetBindingHash
+        || grant.targetHash !== detail.targetHash
+        || grant.proposedContentHash !== detail.proposedContentHash
+        || grant.priorState !== detail.priorState
+        || grant.issuedAt !== detail.issuedAt
+        || grant.expiresAt !== Math.min(detail.expiresAt, detail.issuedAt + GLOBAL_PROTOCOL_LIMITS.operationTtlMs)
+        || !detail.availableActions.includes(grant.action)) {
+      throw new Error("global-grant-detail-mismatch");
+    }
+    actionsByDetail.get(detail.detailHash).push(grant.action);
+  }
+  for (const detail of details) {
+    const actions = actionsByDetail.get(detail.detailHash).sort();
+    if (canonicalUiJson(actions) !== canonicalUiJson(detail.availableActions)) {
+      throw new Error("global-grant-actions-mismatch");
+    }
+  }
+  return true;
+}
+
+function validateGlobalProjectionBundle(value, stateRootIdentity, now) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("global-projection-bundle-required");
+  const allowed = new Set(["index", "details", "grants", "generation", "bytes", "unavailableDetailIds"]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) throw new TypeError("global-projection-bundle-unknown-field");
+  if (!Array.isArray(value.details) || value.details.length > GLOBAL_PROTOCOL_LIMITS.residentDetails) {
+    throw new TypeError("global-resident-details-out-of-bounds");
+  }
+  if (!Array.isArray(value.grants)
+      || value.grants.length > GLOBAL_MAX_RESIDENT_GRANTS) {
+    throw new TypeError("global-grants-out-of-bounds");
+  }
+  const offer = defaultGlobalProtocolOffer();
+  const index = makeGlobalRecommendationIndex(value.index, {
+    stateRootIdentity,
+    generation: value.index?.generation,
+    now,
+    supportedCapabilities: offer.capabilities,
+  });
+  const indexEntries = new Map(index.recommendations.map((entry) => [entry.recommendationId, entry]));
+  const details = value.details.map((detailValue) => {
+    const entry = indexEntries.get(detailValue?.recommendationId);
+    if (!entry) throw new Error("global-detail-unlisted");
+    const detail = makeGlobalRecommendationDetail(detailValue, {
+      stateRootIdentity,
+      generation: index.generation,
+      recommendationId: entry.recommendationId,
+      recommendationVersion: entry.recommendationVersion,
+      detailHash: entry.detailHash,
+      now,
+    });
+    if (detail.priorState !== entry.state || detail.supportSetHash !== entry.supportSetHash
+        || detail.target.kind !== entry.target.kind || detail.target.label !== entry.target.label
+        || canonicalUiJson(detail.availableActions) !== canonicalUiJson(entry.availableActions)) {
+      throw new Error("global-detail-index-mismatch");
+    }
+    return detail;
+  });
+  if (new Set(details.map((detail) => detail.recommendationId)).size !== details.length) {
+    throw new Error("duplicate-global-detail");
+  }
+  const detailByHash = new Map(details.map((detail) => [detail.detailHash, detail]));
+  const grants = value.grants.map((grantValue) => {
+    const detail = detailByHash.get(grantValue?.detailHash);
+    if (!detail) throw new Error("global-grant-detail-unavailable");
+    const grant = makeGlobalActionGrant(grantValue, {
+      stateRootIdentity,
+      generation: index.generation,
+      indexHash: index.indexHash,
+      detailHash: detail.detailHash,
+      now,
+    });
+    if (grant.recommendationId !== detail.recommendationId
+        || grant.recommendationVersion !== detail.recommendationVersion
+        || grant.supportSetHash !== detail.supportSetHash
+        || grant.targetBindingHash !== detail.targetBindingHash
+        || grant.targetHash !== detail.targetHash
+        || grant.proposedContentHash !== detail.proposedContentHash
+        || grant.priorState !== detail.priorState
+        || !detail.availableActions.includes(grant.action)) {
+      throw new Error("global-grant-detail-mismatch");
+    }
+    return grant;
+  });
+  if (new Set(grants.map((grant) => grant.grantHash)).size !== grants.length
+      || new Set(grants.map((grant) => grant.nonce)).size !== grants.length) {
+    throw new Error("duplicate-global-grant");
+  }
+  validateGlobalProjectionBindings(index, details, grants);
+  const bytes = Buffer.byteLength(canonicalUiJson(index), "utf8")
+    + details.reduce((total, detail) => total + Buffer.byteLength(canonicalUiJson(detail), "utf8"), 0);
+  if (bytes > GLOBAL_PROTOCOL_LIMITS.totalProjectionBytes) throw new Error("global-projection-footprint-exceeded");
+  return Object.freeze({ offer, index, details: Object.freeze(details), grants: Object.freeze(grants), bytes });
+}
+
+function currentGlobalProjectionUnlocked(paths, now) {
+  const offerRead = secureProjectionRead(paths, paths.offer, GLOBAL_PROTOCOL_LIMITS.grantBytes, "global-protocol-offer");
+  const indexRead = secureProjectionRead(paths, paths.index, GLOBAL_PROTOCOL_LIMITS.indexBytes, "global-recommendation-index");
+  if (!offerRead && !indexRead) return null;
+  if (offerRead && !indexRead) {
+    makeGlobalProtocolOffer(JSON.parse(offerRead.source));
+    return null;
+  }
+  if (!offerRead) throw new Error("global-projection-incomplete");
+  const offer = makeGlobalProtocolOffer(JSON.parse(offerRead.source));
+  const value = JSON.parse(indexRead.source);
+  const validationNow = Number.isSafeInteger(value?.expiresAt)
+    ? Math.max(value.issuedAt ?? 0, Math.min(now, value.expiresAt - 1))
+    : now;
+  const index = makeGlobalRecommendationIndex(value, {
+    stateRootIdentity: computeStateRootIdentity(paths.boundary),
+    generation: value?.generation,
+    now: validationNow,
+    supportedCapabilities: offer.capabilities,
+  });
+  return { offer, offerRead, index, indexRead };
+}
+
+function assertGlobalBridgePublication(paths, planned) {
+  if (!(planned instanceof Map) || planned.size < 1 || planned.size > 16) throw new Error("global-projection-file-count-exceeded");
+  const globalUsage = safeTreeUsage(paths, path.join(paths.boundary, "self-evolve", "global"));
+  const bridgeUsage = safeTreeUsage(paths, paths.root);
+  let replacedBytes = 0;
+  let sourceBytes = 0;
+  let newFiles = 0;
+  for (const [filePath, source] of planned) {
+    assertInside(paths.root, filePath);
+    if (typeof source !== "string") throw new TypeError("global-projection-source-required");
+    const existing = lstatOptional(filePath);
+    if (existing) {
+      assertRegularSingleLink(existing, "global-projection-publication");
+      replacedBytes += existing.size;
+    } else newFiles += 1;
+    sourceBytes += Buffer.byteLength(source, "utf8");
+  }
+  const projectedBridgeBytes = bridgeUsage.bytes - replacedBytes + sourceBytes;
+  const projectedBridgeFiles = bridgeUsage.files.length + newFiles;
+  if (projectedBridgeBytes > GLOBAL_BRIDGE_TRANSIENT_BYTES) throw new Error("global-bridge-byte-cap-exceeded");
+  if (projectedBridgeFiles > GLOBAL_BRIDGE_MAX_FILES) throw new Error("global-bridge-file-cap-exceeded");
+  if (globalUsage.bytes + projectedBridgeBytes > 64 * 1024 * 1024
+      || globalUsage.files.length + projectedBridgeFiles > 16 * 1024) {
+    throw new Error("global-storage-capacity");
+  }
+}
+
+function cleanupGlobalProjectionGenerations(paths, activeGeneration) {
+  let removed = 0;
+  for (const entry of readdirSync(paths.generations, { withFileTypes: true })) {
+    if (entry.name === activeGeneration) continue;
+    removed += removePrivateProjectionTree(paths, path.join(paths.generations, entry.name));
+  }
+  return removed;
+}
+
+export function publishGlobalRecommendationProjection(stateRoot, bundle, {
+  store,
+  expectedGeneration,
+  now = Date.now(),
+} = {}) {
+  if (!store || typeof store.acquireGlobalLease !== "function" || typeof store.releaseGlobalLease !== "function") {
+    throw new TypeError("global-projection-lease-store-required");
+  }
+  const boundary = stateBoundary(stateRoot);
+  const rootIdentity = computeStateRootIdentity(boundary);
+  if (store.rootIdentity !== rootIdentity) throw new Error("state-root-store-mismatch");
+  if (expectedGeneration !== null && expectedGeneration !== undefined) validHash(expectedGeneration, "expected-global-generation");
+  const clean = validateGlobalProjectionBundle(bundle, rootIdentity, now);
+  const acquired = store.acquireGlobalLease({
+    leaseKind: "global-projection",
+    leaseKeyHash: GLOBAL_PROJECTION_LEASE_KEY,
+    ttlMs: GLOBAL_PROJECTION_LEASE_TTL_MS,
+  });
+  if (!acquired?.ok) throw new Error(acquired?.reason ?? "global-projection-lease-failed");
+  try {
+    return withStateMutationLock(boundary, () => {
+      const paths = globalBridgePaths(boundary, { create: true });
+      const current = currentGlobalProjectionUnlocked(paths, now);
+      const currentGeneration = current?.index.generation ?? null;
+      const expected = expectedGeneration === undefined ? currentGeneration : expectedGeneration;
+      if (currentGeneration !== expected) throw new Error("stale-global-projection-cas");
+      if (currentGeneration === clean.index.generation && current.indexRead.source === boundedJson(clean.index, GLOBAL_PROTOCOL_LIMITS.indexBytes, "global-recommendation-index")) {
+        return Object.freeze({ ...clean, indexBytes: current.indexRead.source, staleFilesRemoved: 0 });
+      }
+      const generationDirectory = path.join(paths.generations, clean.index.generation);
+      if (lstatOptional(generationDirectory)) removePrivateProjectionTree(paths, generationDirectory);
+      const generation = globalBridgePaths(boundary, { create: true, generation: clean.index.generation });
+      const sources = new Map([
+        ...clean.details.map((detail) => [
+          globalDetailPath(generation, detail.recommendationId),
+          boundedJson(detail, GLOBAL_PROTOCOL_LIMITS.detailBytes, "global-recommendation-detail"),
+        ]),
+        ...clean.grants.map((grant) => [
+          globalGrantPath(generation, grant.grantHash),
+          boundedJson(grant, GLOBAL_PROTOCOL_LIMITS.grantBytes, "global-action-grant"),
+        ]),
+      ]);
+      const offerSource = boundedJson(clean.offer, GLOBAL_PROTOCOL_LIMITS.grantBytes, "global-protocol-offer");
+      const indexSource = boundedJson(clean.index, GLOBAL_PROTOCOL_LIMITS.indexBytes, "global-recommendation-index");
+      assertGlobalBridgePublication(paths, new Map([[paths.offer, offerSource], [paths.index, indexSource], ...sources]));
+      for (const [filePath, source] of sources) atomicWrite(generation, filePath, source, { exclusive: true });
+      atomicWrite(paths, paths.offer, offerSource);
+      atomicWrite(paths, paths.index, indexSource);
+      const staleFilesRemoved = cleanupGlobalProjectionGenerations(paths, clean.index.generation);
+      return Object.freeze({ ...clean, indexBytes: indexSource, staleFilesRemoved });
+    });
+  } finally {
+    store.releaseGlobalLease({
+      leaseKeyHash: GLOBAL_PROJECTION_LEASE_KEY,
+      ownerToken: acquired.lease.ownerToken,
+    });
+  }
+}
+
+function globalLimitedResult(negotiation) {
+  return Object.freeze({
+    ...negotiation,
+    index: null,
+    indexBytes: null,
+    details: Object.freeze([]),
+    grants: Object.freeze([]),
+  });
+}
+
+export function readGlobalRecommendationProjection(stateRoot, options = {}) {
+  const now = options.now ?? Date.now();
+  const clientOffer = Object.hasOwn(options, "clientOffer") ? options.clientOffer : defaultGlobalProtocolOffer();
+  const boundary = stateBoundary(stateRoot);
+  return withStateMutationLock(boundary, () => {
+    const paths = globalBridgePaths(boundary);
+    if (!paths) return globalLimitedResult(negotiateGlobalProtocol(null, clientOffer));
+    const offerRead = secureProjectionRead(paths, paths.offer, GLOBAL_PROTOCOL_LIMITS.grantBytes, "global-protocol-offer");
+    if (!offerRead) return globalLimitedResult(negotiateGlobalProtocol(null, clientOffer));
+    const serverOffer = makeGlobalProtocolOffer(JSON.parse(offerRead.source));
+    const negotiation = negotiateGlobalProtocol(serverOffer, clientOffer);
+    if (negotiation.mode !== "native") return globalLimitedResult(negotiation);
+    const indexRead = secureProjectionRead(paths, paths.index, GLOBAL_PROTOCOL_LIMITS.indexBytes, "global-recommendation-index");
+    if (!indexRead) throw new Error("global-recommendation-index-unavailable");
+    const indexValue = JSON.parse(indexRead.source);
+    const index = makeGlobalRecommendationIndex(indexValue, {
+      stateRootIdentity: computeStateRootIdentity(boundary),
+      generation: indexValue?.generation,
+      now,
+      supportedCapabilities: serverOffer.capabilities,
+    });
+    const generation = globalBridgePaths(boundary, { generation: index.generation });
+    if (!generation) throw new Error("global-projection-generation-unavailable");
+    const detailEntries = readdirSync(generation.details, { withFileTypes: true });
+    if (detailEntries.length > GLOBAL_PROTOCOL_LIMITS.residentDetails) throw new Error("global-resident-details-out-of-bounds");
+    const indexById = new Map(index.recommendations.map((entry) => [entry.recommendationId, entry]));
+    const details = detailEntries.map((entry) => {
+      if (!entry.isFile() || entry.isSymbolicLink() || !/^[a-f0-9]{64}\.json$/u.test(entry.name)) {
+        throw new Error("global-detail-path-rejected");
+      }
+      const recommendationId = entry.name.slice(0, -5);
+      const indexed = indexById.get(recommendationId);
+      if (!indexed) throw new Error("global-detail-unlisted");
+      const read = secureProjectionRead(paths, path.join(generation.details, entry.name), GLOBAL_PROTOCOL_LIMITS.detailBytes, "global-recommendation-detail");
+      const detail = makeGlobalRecommendationDetail(JSON.parse(read.source), {
+        stateRootIdentity: index.stateRootIdentity,
+        generation: index.generation,
+        recommendationId,
+        recommendationVersion: indexed.recommendationVersion,
+        detailHash: indexed.detailHash,
+        now,
+      });
+      if (detail.supportSetHash !== indexed.supportSetHash || detail.priorState !== indexed.state) {
+        throw new Error("global-detail-index-mismatch");
+      }
+      return detail;
+    }).sort((left, right) => left.recommendationId.localeCompare(right.recommendationId));
+    const detailByHash = new Map(details.map((detail) => [detail.detailHash, detail]));
+    const grantEntries = readdirSync(generation.grants, { withFileTypes: true });
+    if (grantEntries.length > GLOBAL_MAX_RESIDENT_GRANTS) {
+      throw new Error("global-grants-out-of-bounds");
+    }
+    const grants = [];
+    const freshGrants = [];
+    for (const entry of grantEntries) {
+      if (!entry.isFile() || entry.isSymbolicLink() || !/^[a-f0-9]{64}\.json$/u.test(entry.name)) {
+        throw new Error("global-grant-path-rejected");
+      }
+      const read = secureProjectionRead(paths, path.join(generation.grants, entry.name), GLOBAL_PROTOCOL_LIMITS.grantBytes, "global-action-grant");
+      const raw = JSON.parse(read.source);
+      const detail = detailByHash.get(raw.detailHash);
+      if (!detail) throw new Error("global-grant-detail-unavailable");
+      const validationNow = Number.isSafeInteger(raw.expiresAt)
+        ? Math.max(raw.issuedAt ?? 0, Math.min(now, raw.expiresAt - 1))
+        : now;
+      const grant = makeGlobalActionGrant(raw, {
+        stateRootIdentity: index.stateRootIdentity,
+        generation: index.generation,
+        indexHash: index.indexHash,
+        detailHash: detail.detailHash,
+        now: validationNow,
+      });
+      if (entry.name !== `${grant.grantHash}.json` || grant.recommendationId !== detail.recommendationId
+          || !detail.availableActions.includes(grant.action)) throw new Error("global-grant-binding-mismatch");
+      grants.push(grant);
+      if (grant.expiresAt > now) freshGrants.push(grant);
+    }
+    validateGlobalProjectionBindings(index, details, grants);
+    const indexReadback = secureProjectionRead(paths, paths.index, GLOBAL_PROTOCOL_LIMITS.indexBytes, "global-recommendation-index");
+    if (!indexReadback || !sameInode(indexRead.stat, indexReadback.stat) || indexRead.source !== indexReadback.source) {
+      throw new Error("global-recommendation-index-replaced");
+    }
+    return Object.freeze({
+      ...negotiation,
+      index,
+      indexBytes: indexRead.source,
+      details: Object.freeze(details),
+      grants: Object.freeze(freshGrants.sort((left, right) => left.recommendationId.localeCompare(right.recommendationId)
+        || left.action.localeCompare(right.action))),
+    });
+  });
+}
+
+export function publishProjectParticipationSidecars(stateRoot, projectFingerprint, sidecars, { now = Date.now() } = {}) {
+  if (!Array.isArray(sidecars) || sidecars.length > GLOBAL_PROTOCOL_LIMITS.recommendationIndexEntries) {
+    throw new TypeError("project-participation-out-of-bounds");
+  }
+  const projection = readGlobalRecommendationProjection(stateRoot, { now });
+  if (projection.mode !== "native" || !projection.index) throw new Error("global-projection-unavailable");
+  const indexById = new Map(projection.index.recommendations.map((entry) => [entry.recommendationId, entry]));
+  const clean = sidecars.map((value) => {
+    const entry = indexById.get(value?.recommendationId);
+    if (!entry) throw new Error("project-participation-recommendation-unavailable");
+    return makeProjectParticipationSidecar(value, {
+      projectFingerprint,
+      stateRootIdentity: projection.index.stateRootIdentity,
+      generation: projection.index.generation,
+      indexHash: projection.index.indexHash,
+      recommendationId: entry.recommendationId,
+      supportSetHash: entry.supportSetHash,
+      now,
+    });
+  });
+  if (new Set(clean.map((value) => value.recommendationId)).size !== clean.length) {
+    throw new Error("duplicate-project-participation");
+  }
+  const paths = participationPaths(stateRoot, projectFingerprint, { create: true });
+  return withStateMutationLock(paths.boundary, () => {
+    const retained = new Set(clean.map((value) => `${value.recommendationId}.json`));
+    for (const entry of readdirSync(paths.participation, { withFileTypes: true })) {
+      if (retained.has(entry.name)) continue;
+      const filePath = path.join(paths.participation, entry.name);
+      const stat = lstatSync(filePath);
+      if (!entry.isFile() || entry.isSymbolicLink() || stat.nlink !== 1) throw new Error("project-participation-path-rejected");
+      secureUnlink(paths, filePath, stat);
+    }
+    for (const value of clean) {
+      const filePath = participationPath(paths, value.recommendationId);
+      const source = boundedJson(value, GLOBAL_PROTOCOL_LIMITS.grantBytes, "project-participation");
+      assertMailboxPublication(paths, filePath, source);
+      atomicWrite(paths, filePath, source);
+    }
+    return Object.freeze(clean);
+  });
+}
+
+export function readProjectParticipationSidecar(stateRoot, projectFingerprint, recommendationId, { now = Date.now() } = {}) {
+  const bundle = readProjectParticipationSidecars(stateRoot, projectFingerprint, { now });
+  return bundle?.entries.find((entry) => entry.recommendationId === recommendationId) ?? null;
+}
+
+export function readProjectParticipationSidecars(stateRoot, projectFingerprint, { now = Date.now() } = {}) {
+  const projection = readGlobalRecommendationProjection(stateRoot, { now });
+  if (projection.mode !== "native" || !projection.index) return null;
+  const paths = participationPaths(stateRoot, projectFingerprint);
+  const entries = paths ? projection.index.recommendations.flatMap((entry) => {
+    const read = secureRead(
+      paths,
+      participationPath(paths, entry.recommendationId),
+      GLOBAL_PROTOCOL_LIMITS.grantBytes,
+      "project-participation",
+    );
+    if (!read) return [];
+    return [makeProjectParticipationSidecar(JSON.parse(read.source), {
+      projectFingerprint,
+      stateRootIdentity: projection.index.stateRootIdentity,
+      generation: projection.index.generation,
+      indexHash: projection.index.indexHash,
+      recommendationId: entry.recommendationId,
+      supportSetHash: entry.supportSetHash,
+      now,
+    })];
+  }) : [];
+  return Object.freeze({
+    stateRootIdentity: projection.index.stateRootIdentity,
+    generation: projection.index.generation,
+    indexHash: projection.index.indexHash,
+    entries: Object.freeze(entries),
+  });
+}
+
+export function hashTuiHostHealth(value) {
+  const clean = makeTuiHostHealth(value, {
+    now: value?.issuedAt,
+    projectFingerprint: value?.projectFingerprint,
+    stateRootIdentity: value?.stateRootIdentity,
+  });
+  return createHash("sha256")
+    .update(`self-evolve-tui-host-health-v1\n${canonicalUiJson(clean)}`)
+    .digest("hex");
+}
+
+export function createGlobalActionRequest({
+  grant,
+  actingProjectFingerprint,
+  actingHealth,
+  timestamp = Date.now(),
+  requestId = randomUUID(),
+} = {}) {
+  const health = makeTuiHostHealth(actingHealth, {
+    now: timestamp,
+    projectFingerprint: actingProjectFingerprint,
+    stateRootIdentity: grant?.stateRootIdentity,
+  });
+  const cleanGrant = makeGlobalActionGrant(grant, {
+    stateRootIdentity: grant?.stateRootIdentity,
+    generation: grant?.generation,
+    indexHash: grant?.indexHash,
+    detailHash: grant?.detailHash,
+    now: timestamp,
+  });
+  const body = {
+    protocolVersion: GLOBAL_OPERATION_PROTOCOL_VERSION,
+    capability: "global-action-request-v1",
+    requestId,
+    stateRootIdentity: cleanGrant.stateRootIdentity,
+    actingProjectFingerprint,
+    actingHealthHash: hashTuiHostHealth(health),
+    projectionGenerationHash: cleanGrant.generation,
+    indexHash: cleanGrant.indexHash,
+    detailHash: cleanGrant.detailHash,
+    grantHash: cleanGrant.grantHash,
+    recommendationId: cleanGrant.recommendationId,
+    recommendationVersion: cleanGrant.recommendationVersion,
+    supportSetHash: cleanGrant.supportSetHash,
+    targetBindingHash: cleanGrant.targetBindingHash,
+    targetHash: cleanGrant.targetHash,
+    proposedContentHash: cleanGrant.proposedContentHash,
+    priorState: cleanGrant.priorState,
+    action: cleanGrant.action,
+    actorRole: "operator",
+    issuedAt: timestamp,
+    expiresAt: Math.min(cleanGrant.expiresAt, timestamp + GLOBAL_PROTOCOL_LIMITS.operationTtlMs),
+    nonce: cleanGrant.nonce,
+  };
+  return makeGlobalActionRequestEnvelope({
+    ...body,
+    requestHash: hashGlobalProtocol("action-request", body),
+  }, {
+    now: timestamp,
+    stateRootIdentity: cleanGrant.stateRootIdentity,
+    grant: cleanGrant,
+  });
+}
+
+function globalRequestFiles(paths) {
+  return requestFiles(paths, paths.requests);
+}
+
+function globalResponsePath(paths, requestId) {
+  return path.join(paths.responses, `${validId(requestId, "global-request-id")}.json`);
+}
+
+function globalRequestPath(paths, requestId) {
+  return path.join(paths.requests, `${validId(requestId, "global-request-id")}.json`);
+}
+
+function cleanupGlobalMailboxArtifactsUnlocked(paths, now) {
+  let removed = 0;
+  for (const item of globalRequestFiles(paths)) {
+    const read = secureProjectionRead(paths, item.filePath, GLOBAL_PROTOCOL_LIMITS.operationBytes, "global-action-request");
+    if (!read) continue;
+    let expiresAt = 0;
+    try { expiresAt = makeGlobalActionRequestSchema(JSON.parse(read.source)).expiresAt; } catch {}
+    if (expiresAt > now) continue;
+    secureUnlink(paths, item.filePath, read.stat);
+    removed += 1;
+  }
+  for (const entry of readdirSync(paths.nonceClaims, { withFileTypes: true })) {
+    if (!entry.isFile() || entry.isSymbolicLink() || !/^[a-f0-9]{64}\.json$/u.test(entry.name)) {
+      throw new Error("global-nonce-claim-path-rejected");
+    }
+    const filePath = path.join(paths.nonceClaims, entry.name);
+    const read = secureProjectionRead(paths, filePath, GLOBAL_PROTOCOL_LIMITS.operationBytes, "global-nonce-claim");
+    const claim = makeGlobalNonceClaim(JSON.parse(read.source));
+    const retainedAt = claim.completedAt ?? claim.claimedAt;
+    if (retainedAt + BRIDGE_TTL_MS > now) continue;
+    secureUnlink(paths, filePath, read.stat);
+    removed += 1;
+  }
+  for (const entry of readdirSync(paths.responses, { withFileTypes: true })) {
+    if (!entry.isFile() || entry.isSymbolicLink() || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json$/u.test(entry.name)) {
+      throw new Error("global-action-response-path-rejected");
+    }
+    const filePath = path.join(paths.responses, entry.name);
+    const read = secureProjectionRead(paths, filePath, GLOBAL_PROTOCOL_LIMITS.responseBytes, "global-action-response");
+    let processedAt = 0;
+    try { processedAt = JSON.parse(read.source)?.processedAt ?? 0; } catch {}
+    if (Number.isSafeInteger(processedAt) && processedAt + BRIDGE_TTL_MS > now) continue;
+    secureUnlink(paths, filePath, read.stat);
+    removed += 1;
+  }
+  return removed;
+}
+
+export function submitGlobalActionRequest(stateRoot, value) {
+  const preliminary = makeGlobalActionRequestSchema(value);
+  const projection = readGlobalRecommendationProjection(stateRoot, { now: preliminary.issuedAt });
+  if (projection.mode !== "native" || !projection.index) throw new Error("global-projection-unavailable");
+  const grant = projection.grants.find((candidate) => candidate.grantHash === preliminary.grantHash);
+  if (!grant) throw new Error("global-grant-unavailable");
+  const request = makeGlobalActionRequestEnvelope(preliminary, {
+    now: preliminary.issuedAt,
+    stateRootIdentity: computeStateRootIdentity(stateRoot),
+    grant,
+  });
+  const source = boundedJson(request, GLOBAL_PROTOCOL_LIMITS.operationBytes, "global-action-request");
+  const paths = globalBridgePaths(stateRoot, { create: true });
+  return withStateMutationLock(paths.boundary, () => {
+    cleanupGlobalMailboxArtifactsUnlocked(paths, request.issuedAt);
+    if (globalRequestFiles(paths).length >= MAX_MAILBOX_FILES) throw new Error("global-mailbox-file-count-exceeded");
+    const responsePath = globalResponsePath(paths, request.requestId);
+    if (lstatOptional(responsePath)) throw new Error("global-response-already-exists");
+    const target = globalRequestPath(paths, request.requestId);
+    claimGlobalActionNonceUnlocked(paths, request, request.issuedAt, { rejectExisting: true });
+    assertGlobalBridgePublication(paths, new Map([[target, source]]));
+    atomicWrite(paths, target, source, { exclusive: true });
+    return Object.freeze({ ok: true, requestId: request.requestId, path: target });
+  });
+}
+
+export function pollGlobalActionResponse(stateRoot, requestValue, { now = Date.now() } = {}) {
+  const request = makeGlobalActionRequestSchema(requestValue);
+  const paths = globalBridgePaths(stateRoot);
+  if (!paths) return null;
+  const read = secureProjectionRead(
+    paths,
+    globalResponsePath(paths, request.requestId),
+    GLOBAL_PROTOCOL_LIMITS.responseBytes,
+    "global-action-response",
+  );
+  if (!read) return null;
+  return makeGlobalActionResponse(JSON.parse(read.source), {
+    stateRootIdentity: request.stateRootIdentity,
+    requestId: request.requestId,
+    recommendationId: request.recommendationId,
+    recommendationVersion: request.recommendationVersion,
+    action: request.action,
+    requestHash: request.requestHash,
+    requestIssuedAt: request.issuedAt,
+    requestExpiresAt: request.expiresAt,
+    now,
+  });
+}
+
+export function pendingGlobalActionRequestCount(stateRoot) {
+  const paths = globalBridgePaths(stateRoot, { create: true });
+  return globalRequestFiles(paths).length;
+}
+
+const GLOBAL_NONCE_CLAIM_FIELDS = Object.freeze([
+  "nonceHash", "requestId", "requestHash", "state", "claimedAt", "completedAt", "response",
+]);
+
+function globalNonceClaimPath(paths, nonce) {
+  const nonceHash = createHash("sha256").update(`self-evolve-global-action-nonce-v1\n${nonce}`).digest("hex");
+  return { nonceHash, filePath: path.join(paths.nonceClaims, `${nonceHash}.json`) };
+}
+
+function makeGlobalNonceClaim(value) {
+  exactKeys(value, GLOBAL_NONCE_CLAIM_FIELDS, "global-nonce-claim");
+  const state = value.state === "claimed" || value.state === "completed"
+    ? value.state
+    : (() => { throw new TypeError("invalid-global-nonce-claim-state"); })();
+  const claim = Object.freeze({
+    nonceHash: validHash(value.nonceHash, "global-nonce-hash"),
+    requestId: validId(value.requestId, "global-request-id"),
+    requestHash: validHash(value.requestHash, "global-request-hash"),
+    state,
+    claimedAt: validTimestamp(value.claimedAt, "global-nonce-claimed-at"),
+    completedAt: value.completedAt === null ? null : validTimestamp(value.completedAt, "global-nonce-completed-at"),
+    response: value.response === null ? null : value.response,
+  });
+  if ((state === "claimed") !== (claim.completedAt === null && claim.response === null)) {
+    throw new TypeError("global-nonce-claim-state-mismatch");
+  }
+  return claim;
+}
+
+function claimGlobalActionNonceUnlocked(paths, request, now, { rejectExisting = false } = {}) {
+  const { nonceHash, filePath } = globalNonceClaimPath(paths, request.nonce);
+  const read = secureProjectionRead(paths, filePath, GLOBAL_PROTOCOL_LIMITS.operationBytes, "global-nonce-claim");
+  if (read) {
+    const claim = makeGlobalNonceClaim(JSON.parse(read.source));
+    if (claim.nonceHash !== nonceHash || claim.requestId !== request.requestId || claim.requestHash !== request.requestHash) {
+      throw new Error("replayed-global-action-nonce");
+    }
+    if (rejectExisting) throw new Error("global-action-nonce-already-submitted");
+    return { claim, filePath, duplicate: true };
+  }
+  const claim = makeGlobalNonceClaim({
+    nonceHash,
+    requestId: request.requestId,
+    requestHash: request.requestHash,
+    state: "claimed",
+    claimedAt: now,
+    completedAt: null,
+    response: null,
+  });
+  const source = boundedJson(claim, GLOBAL_PROTOCOL_LIMITS.operationBytes, "global-nonce-claim");
+  assertGlobalBridgePublication(paths, new Map([[filePath, source]]));
+  atomicWrite(paths, filePath, source, { exclusive: true });
+  return { claim, filePath, duplicate: false };
+}
+
+function claimGlobalActionNonce(paths, request, now) {
+  return withStateMutationLock(paths.boundary, () => claimGlobalActionNonceUnlocked(paths, request, now));
+}
+
+function completeGlobalActionRequest(paths, request, requestRead, claimRecord, result, now) {
+  const processedAt = Math.max(request.issuedAt, Math.min(now, request.expiresAt - 1));
+  const body = {
+    protocolVersion: GLOBAL_OPERATION_PROTOCOL_VERSION,
+    requestId: request.requestId,
+    stateRootIdentity: request.stateRootIdentity,
+    recommendationId: request.recommendationId,
+    recommendationVersion: request.recommendationVersion,
+    action: request.action,
+    requestHash: request.requestHash,
+    ok: result?.ok === true,
+    status: result?.ok === true ? "accepted" : "rejected",
+    processedAt,
+    reason: result?.ok === true ? null : String(result?.reason ?? "global-action-rejected").slice(0, UI_PROTOCOL_LIMITS.reasonBytes),
+  };
+  const response = makeGlobalActionResponse({
+    ...body,
+    responseHash: hashGlobalProtocol("action-response", body),
+  }, {
+    stateRootIdentity: request.stateRootIdentity,
+    requestId: request.requestId,
+    recommendationId: request.recommendationId,
+    recommendationVersion: request.recommendationVersion,
+    action: request.action,
+    requestHash: request.requestHash,
+    requestIssuedAt: request.issuedAt,
+    requestExpiresAt: request.expiresAt,
+    now: processedAt,
+  });
+  const responseSource = boundedJson(response, GLOBAL_PROTOCOL_LIMITS.responseBytes, "global-action-response");
+  const completedClaim = makeGlobalNonceClaim({
+    ...claimRecord.claim,
+    state: "completed",
+    completedAt: processedAt,
+    response,
+  });
+  const claimSource = boundedJson(completedClaim, GLOBAL_PROTOCOL_LIMITS.operationBytes, "global-nonce-claim");
+  return withStateMutationLock(paths.boundary, () => {
+    const requestPath = globalRequestPath(paths, request.requestId);
+    const currentRequest = lstatOptional(requestPath);
+    if (currentRequest && (!requestRead || !sameInode(currentRequest, requestRead.stat))) {
+      throw new Error("global-action-request-replaced");
+    }
+    const responsePath = globalResponsePath(paths, request.requestId);
+    if (!lstatOptional(responsePath)) {
+      assertGlobalBridgePublication(paths, new Map([[responsePath, responseSource], [claimRecord.filePath, claimSource]]));
+      atomicWrite(paths, responsePath, responseSource, { exclusive: true });
+    }
+    atomicWrite(paths, claimRecord.filePath, claimSource);
+    if (currentRequest) secureUnlink(paths, requestPath, requestRead.stat);
+    return response;
+  });
+}
+
+function finalizeCompletedGlobalActionRequest(paths, request, requestRead, response) {
+  return withStateMutationLock(paths.boundary, () => {
+    const claimRecord = claimGlobalActionNonceUnlocked(paths, request, request.issuedAt);
+    if (claimRecord.claim.state !== "completed") {
+      const completedClaim = makeGlobalNonceClaim({
+        ...claimRecord.claim,
+        state: "completed",
+        completedAt: response.processedAt,
+        response,
+      });
+      atomicWrite(
+        paths,
+        claimRecord.filePath,
+        boundedJson(completedClaim, GLOBAL_PROTOCOL_LIMITS.operationBytes, "global-nonce-claim"),
+      );
+    }
+    const requestPath = globalRequestPath(paths, request.requestId);
+    const current = lstatOptional(requestPath);
+    if (current && (!requestRead || !sameInode(current, requestRead.stat))) {
+      throw new Error("global-action-request-replaced");
+    }
+    if (current) secureUnlink(paths, requestPath, requestRead.stat);
+    return response;
+  });
+}
+
+function globalActionAuthority({
+  stateRoot,
+  request,
+  consumerProjectFingerprint,
+  consumerInstanceId,
+  consumerBootValidated,
+  lease,
+  now,
+}) {
+  const projection = readGlobalRecommendationProjection(stateRoot, { now });
+  if (projection.mode !== "native" || !projection.index) throw new Error("global-projection-unavailable");
+  const grant = projection.grants.find((value) => value.grantHash === request.grantHash);
+  if (!grant) throw new Error("global-grant-unavailable");
+  const clean = makeGlobalActionRequestEnvelope(request, {
+    now,
+    stateRootIdentity: projection.index.stateRootIdentity,
+    grant,
+  });
+  const detail = projection.details.find((value) => value.detailHash === clean.detailHash);
+  if (!detail || detail.recommendationId !== clean.recommendationId) throw new Error("global-detail-unavailable");
+  const health = readTuiHostHealth(stateRoot, clean.actingProjectFingerprint, {
+    now,
+    stateRootIdentity: clean.stateRootIdentity,
+    requireLivePublisher: true,
+  });
+  if (!health) throw new Error("missing-acting-project-health");
+  const actingHealthHash = hashTuiHostHealth(health);
+  if (actingHealthHash !== clean.actingHealthHash) throw new Error("stale-acting-project-health");
+  const consumerClaim = makeGlobalConsumerClaim({
+    claimId: randomUUID(),
+    requestId: clean.requestId,
+    consumerInstanceId,
+    consumerProjectFingerprint,
+    state: "active",
+    acquiredAt: now,
+    expiresAt: Math.min(clean.expiresAt, lease.expiresAt),
+    releasedAt: null,
+  });
+  validateGlobalActionAuthority(clean, consumerClaim, {
+    now,
+    consumerBootValidated,
+    stateRootIdentity: projection.index.stateRootIdentity,
+    actingProjectFingerprint: health.projectFingerprint,
+    actingHealthHash,
+    projectionGenerationHash: projection.index.generation,
+    indexHash: projection.index.indexHash,
+    detailHash: detail.detailHash,
+    grantHash: grant.grantHash,
+    recommendationId: detail.recommendationId,
+    recommendationVersion: detail.recommendationVersion,
+    supportSetHash: detail.supportSetHash,
+    targetBindingHash: detail.targetBindingHash,
+    targetHash: detail.targetHash,
+    proposedContentHash: detail.proposedContentHash,
+    priorState: detail.priorState,
+    action: grant.action,
+  });
+  return Object.freeze({ grant, detail, health, consumerClaim });
+}
+
+export async function consumeGlobalActionRequests({
+  stateRoot,
+  consumerProjectFingerprint,
+  consumerInstanceId,
+  store,
+  now = () => Date.now(),
+  consumerBootValidated = false,
+  validateAndDecide,
+  recoverCompletedRequest,
+  maxRequests = 32,
+} = {}) {
+  if (!store || typeof store.acquireGlobalLease !== "function" || typeof store.releaseGlobalLease !== "function") {
+    throw new TypeError("global-mailbox-lease-store-required");
+  }
+  validHash(consumerProjectFingerprint, "consumer-project-fingerprint");
+  makeGlobalConsumerClaim({
+    claimId: randomUUID(),
+    requestId: randomUUID(),
+    consumerInstanceId,
+    consumerProjectFingerprint,
+    state: "active",
+    acquiredAt: 0,
+    expiresAt: 1,
+    releasedAt: null,
+  });
+  if (typeof now !== "function" || typeof validateAndDecide !== "function"
+      || (recoverCompletedRequest !== undefined && typeof recoverCompletedRequest !== "function")) {
+    throw new TypeError("global-mailbox-handler-required");
+  }
+  if (!Number.isSafeInteger(maxRequests) || maxRequests < 1 || maxRequests > 32) throw new TypeError("global-mailbox-limit-out-of-bounds");
+  const paths = globalBridgePaths(stateRoot, { create: true });
+  const items = globalRequestFiles(paths).slice(0, maxRequests);
+  if (!items.length) return { ok: true, processed: [] };
+  const acquired = store.acquireGlobalLease({
+    leaseKind: "global-mailbox",
+    leaseKeyHash: GLOBAL_MAILBOX_LEASE_KEY,
+    ttlMs: GLOBAL_PROJECTION_LEASE_TTL_MS,
+  });
+  if (!acquired?.ok) return { ok: false, reason: acquired?.reason ?? "global-mailbox-lease-failed", processed: [] };
+  const processed = [];
+  try {
+    for (const item of items) {
+      let request;
+      let requestRead;
+      let result;
+      let claimRecord;
+      try {
+        requestRead = secureProjectionRead(paths, item.filePath, GLOBAL_PROTOCOL_LIMITS.operationBytes, "global-action-request");
+        if (!requestRead) continue;
+        request = makeGlobalActionRequestSchema(JSON.parse(requestRead.source));
+        if (request.requestId !== item.requestId) throw new Error("global-request-id-path-mismatch");
+        const existingResponse = secureProjectionRead(
+          paths,
+          globalResponsePath(paths, request.requestId),
+          GLOBAL_PROTOCOL_LIMITS.responseBytes,
+          "global-action-response",
+        );
+        if (existingResponse) {
+          const response = makeGlobalActionResponse(JSON.parse(existingResponse.source), {
+            stateRootIdentity: request.stateRootIdentity,
+            requestId: request.requestId,
+            recommendationId: request.recommendationId,
+            recommendationVersion: request.recommendationVersion,
+            action: request.action,
+            requestHash: request.requestHash,
+            requestIssuedAt: request.issuedAt,
+            requestExpiresAt: request.expiresAt,
+            now: Math.max(request.issuedAt, Math.min(now(), request.expiresAt - 1)),
+          });
+          processed.push(finalizeCompletedGlobalActionRequest(paths, request, requestRead, response));
+          continue;
+        }
+        const timestamp = now();
+        claimRecord = claimGlobalActionNonce(paths, request, timestamp);
+        if (claimRecord.claim.state === "completed") {
+          result = claimRecord.claim.response;
+        } else {
+          const recovered = recoverCompletedRequest === undefined
+            ? null
+            : await recoverCompletedRequest(request);
+          if (recovered !== null && recovered !== undefined) {
+            result = recovered;
+          } else {
+            const authority = globalActionAuthority({
+              stateRoot,
+              request,
+              consumerProjectFingerprint,
+              consumerInstanceId,
+              consumerBootValidated,
+              lease: acquired.lease,
+              now: timestamp,
+            });
+            try { result = await validateAndDecide(request, authority); }
+            catch (error) { result = { ok: false, reason: errorReasonCode(error, "global-action-rejected") }; }
+          }
+        }
+      } catch (error) {
+        result = { ok: false, reason: errorReasonCode(error, "global-action-rejected") };
+      }
+      if (request && claimRecord) {
+        processed.push(completeGlobalActionRequest(paths, request, requestRead, claimRecord, result, now()));
+      } else {
+        if (requestRead) {
+          withStateMutationLock(paths.boundary, () => {
+            const current = lstatOptional(item.filePath);
+            if (current && sameInode(current, requestRead.stat)) secureUnlink(paths, item.filePath, requestRead.stat);
+          });
+        }
+        processed.push(Object.freeze({ requestId: item.requestId, ok: false, reason: result.reason }));
+      }
+    }
+    return { ok: true, processed };
+  } finally {
+    store.releaseGlobalLease({
+      leaseKeyHash: GLOBAL_MAILBOX_LEASE_KEY,
+      ownerToken: acquired.lease.ownerToken,
+    });
+  }
 }
 
 export function publishTuiHostHealth(stateRoot, {
@@ -2267,6 +3311,8 @@ export function cleanupBridge(stateRoot, projectFingerprint, { now = Date.now(),
         if (health?.isFile() && health.nlink === 1 && secureUnlink(paths, paths.tuiHostHealth, health)) removed += 1;
       }
       removed += cleanupUiProjectionUnlocked(paths, projectFingerprint, now);
+      const globalPaths = globalBridgePaths(paths.boundary);
+      if (globalPaths) removed += cleanupGlobalMailboxArtifactsUnlocked(globalPaths, now);
     });
     return { ok: true, removed };
   } finally {

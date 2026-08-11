@@ -19,6 +19,11 @@ mkdirSync(skillDir, { recursive: true });
 writeFileSync(path.join(skillDir, "SKILL.md"), current);
 let clock = 2_200_000_000_000;
 const store = openStore(root, { projectFingerprint, now: () => ++clock, staleLockMs: 1 });
+store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+  ...global,
+  consent: { ...global.consent, durableObservations: true },
+  updatedAt: global.updatedAt + 1,
+}));
 const roots = inventory.loadAllowlist({ globalSkillRoots: [skillRoot] }).canonicalRoots;
 const records = inventory.discoverSkills(roots);
 const privacy = createPrivacyGuard({ consent: {}, projectFingerprint, store, now: () => ++clock });
@@ -41,15 +46,13 @@ const ctx = {
       const evidence = JSON.parse(/<UNTRUSTED_EVIDENCE_METADATA>\n([^\n]+)\n<\/UNTRUSTED_EVIDENCE_METADATA>/u.exec(prompt)[1]);
       return { data: { info: { structured_output: {
         action: "rewrite", targetLogicalName: "recovery", proposedContent: proposed,
-        proposedContentHash: inventory.hashSkillContent(proposed),
         evidenceMapping: [{ claim: "Repeated recovery commands need verification.", observationIds: evidence.observations.map((item) => item.id) }],
         expectedBehavior: "Recovered results are verified.", counterExamples: ["One command is insufficient."],
         overlap: [], riskNotes: "Bounded guidance.", evaluationScenarios: ["Three independent episodes."],
-        sizeDeltaBytes: Buffer.byteLength(proposed) - Buffer.byteLength(current),
-        approxTokenDelta: Math.ceil(Buffer.byteLength(proposed) / 4) - Math.ceil(Buffer.byteLength(current) / 4),
       } } } };
     },
     abort: async () => ({ data: {} }),
+    delete: async () => ({ data: {} }),
   } },
 };
 const pipeline = createPipeline({ store, inventory, privacy, synthesis, applier, commands, schemas, observation, now: () => ++clock });
@@ -65,7 +68,8 @@ for (let index = 1; index <= 3; index += 1) {
   await pipeline.runEvolutionCycle({
     ctx, sessionID, projectFingerprint, scopeFingerprint: inventory.hashSkillContent("recovery-scope"),
     trigger: "process-fixture", mode: "manual",
-    options: { inventoryRecords: records, targetSkill: records[0], currentContent: current, faultInjection },
+    // Exercises the compatibility-only legacy project-proposal synthesis path.
+    options: { inventoryRecords: records, targetSkill: records[0], currentContent: current, faultInjection, legacyProjectProposals: true },
   });
 }
 process.exitCode = 2;

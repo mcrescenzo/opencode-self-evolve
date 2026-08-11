@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  buildGlobalSkillCatalog,
   discoverSkills,
   estimateGrowth,
   hashSkillContent,
@@ -11,11 +12,18 @@ import {
   loadAllowlist,
   parseSkillFrontmatter,
   rejectSymlinked,
+  resolveGlobalSkillCandidate,
+  resolveGlobalRecommendationTarget,
+  resolveNewGlobalSkillTarget,
   resolveSkillTarget,
+  scopeOf,
   scanForSecretCanaries,
   scanForUnsafeContent,
   validateProposalTarget,
 } from "../self-evolve-inventory.js";
+import { makeApprovedGlobalRoot, makeGlobalRootPolicy, makeRecommendationTargetBinding } from "../self-evolve-schemas.js";
+
+const COLLECTION_FIXTURE = path.join(import.meta.dirname, "fixtures", "global-skill-collections");
 
 function tempTree(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-inventory-"));
@@ -47,6 +55,208 @@ function proposal(record, proposedContent, overrides = {}) {
     ...overrides,
   };
 }
+
+function rootPolicy(entries, creationRoot = null) {
+  const roots = entries.map((entry) => makeApprovedGlobalRoot(entry));
+  const selected = creationRoot === null ? null : roots[creationRoot].rootId;
+  return makeGlobalRootPolicy({ roots, creationRootId: selected, selectedBy: "operator", updatedAt: 100 });
+}
+
+test("global catalog discovers exact direct children and blocks a nested collection parent", () => {
+  const exactRoot = fs.realpathSync(path.join(COLLECTION_FIXTURE, "exact-collection"));
+  const exactPolicy = rootPolicy([{ canonicalPath: exactRoot, canUpdate: true, canCreate: true }], 0);
+  const exact = buildGlobalSkillCatalog(exactPolicy);
+
+  assert.equal(exact.ok, true, JSON.stringify(exact.blockers));
+  assert.deepEqual(exact.records.map((record) => record.logicalName), ["direct-review"]);
+  assert.equal(exact.records[0].rootId, exactPolicy.roots[0].rootId);
+  assert.equal(exact.records[0].canonicalRoot, exactRoot);
+
+  const nestedParent = fs.realpathSync(path.join(COLLECTION_FIXTURE, "nested-parent"));
+  const nestedPolicy = rootPolicy([{ canonicalPath: nestedParent, canUpdate: true, canCreate: false }]);
+  const nested = buildGlobalSkillCatalog(nestedPolicy);
+  assert.equal(nested.ok, false);
+  assert.deepEqual(nested.records, []);
+  assert.deepEqual(nested.blockers.map(({ code, collectionName }) => ({ code, collectionName })), [{
+    code: "nested-skill-collection-not-approved",
+    collectionName: "team-collection",
+  }]);
+  assert.match(nested.blockers[0].message, /approve the exact collection root/u);
+});
+
+test("global catalog blocks duplicate logical names across approved roots", (t) => {
+  const temp = tempTree(t);
+  const firstRoot = path.join(temp, "first-collection");
+  const secondRoot = path.join(temp, "second-collection");
+  fs.mkdirSync(firstRoot);
+  fs.mkdirSync(secondRoot);
+  writeSkill(firstRoot, "shared-review");
+  writeSkill(secondRoot, "shared-review");
+  const policy = rootPolicy([
+    { canonicalPath: firstRoot, canUpdate: true, canCreate: false },
+    { canonicalPath: secondRoot, canUpdate: true, canCreate: false },
+  ]);
+
+  const catalog = buildGlobalSkillCatalog(policy);
+  assert.equal(catalog.ok, false);
+  assert.deepEqual(catalog.records, []);
+  assert.deepEqual(catalog.blockers.map(({ code, logicalName }) => ({ code, logicalName })), [{
+    code: "duplicate-global-skill-name",
+    logicalName: "shared-review",
+  }]);
+});
+
+test("existing global candidates bind one update-capable hash-current catalog record", (t) => {
+  const temp = tempTree(t);
+  const root = path.join(temp, "collection");
+  fs.mkdirSync(root);
+  const file = writeSkill(root, "stable-review");
+  const policy = rootPolicy([{ canonicalPath: root, canUpdate: true, canCreate: false }]);
+  const catalog = buildGlobalSkillCatalog(policy);
+
+  const resolved = resolveGlobalSkillCandidate("stable-review", catalog);
+  assert.equal(resolved.ok, true, resolved.reason);
+  assert.equal(resolved.targetKind, "existing-global-skill");
+  assert.equal(resolved.target.absolutePath, file);
+  assert.deepEqual(resolved.binding, {
+    targetKind: "existing-global-skill",
+    rootId: policy.roots[0].rootId,
+    logicalName: "stable-review",
+    relativePath: "stable-review/SKILL.md",
+    currentHash: catalog.records[0].currentHash,
+    catalogGenerationHash: catalog.catalogGenerationHash,
+    rootSetHash: policy.rootSetHash,
+    bindingHash: resolved.binding.bindingHash,
+  });
+  assert.match(resolved.binding.bindingHash, /^[a-f0-9]{64}$/u);
+
+  fs.writeFileSync(file, skillContent("stable-review", "Changed after catalog discovery."));
+  assert.equal(resolveGlobalSkillCandidate("stable-review", catalog).reason, "global-skill-catalog-stale");
+});
+
+test("global recommendation targets freshly prove Apply and Undo catalog state", (t) => {
+  const temp = tempTree(t);
+  const root = path.join(temp, "collection");
+  fs.mkdirSync(root);
+  const targetPath = writeSkill(root, "stable-review");
+  const policy = rootPolicy([{ canonicalPath: root, canUpdate: true, canCreate: false }]);
+  const candidate = resolveGlobalSkillCandidate("stable-review", buildGlobalSkillCatalog(policy));
+  const binding = makeRecommendationTargetBinding({
+    targetKind: candidate.binding.targetKind,
+    rootId: candidate.binding.rootId,
+    logicalName: candidate.binding.logicalName,
+    relativePath: candidate.binding.relativePath,
+    currentHash: candidate.binding.currentHash,
+    catalogGenerationHash: candidate.binding.catalogGenerationHash,
+    rootSetHash: candidate.binding.rootSetHash,
+    candidateBindingHash: candidate.binding.bindingHash,
+  }, candidate.binding, policy);
+  const proposed = skillContent("stable-review", "Reviews freshly bound global decisions safely.");
+  const proposedContentHash = hashSkillContent(proposed);
+
+  const apply = resolveGlobalRecommendationTarget(binding, policy, { action: "apply", proposedContentHash });
+  assert.equal(apply.ok, true, apply.reason);
+  assert.equal(apply.target.currentHash, binding.currentHash);
+
+  fs.writeFileSync(targetPath, proposed);
+  const undo = resolveGlobalRecommendationTarget(binding, policy, { action: "undo", proposedContentHash });
+  assert.equal(undo.ok, true, undo.reason);
+  assert.equal(undo.target.currentHash, proposedContentHash);
+
+  writeSkill(root, "unrelated-review");
+  assert.equal(
+    resolveGlobalRecommendationTarget(binding, policy, { action: "undo", proposedContentHash }).reason,
+    "global-skill-catalog-stale",
+  );
+});
+
+test("new global candidates bind the primary root before accepting a model-suggested name", (t) => {
+  const temp = tempTree(t);
+  const root = path.join(temp, "creation-collection");
+  fs.mkdirSync(root);
+  writeSkill(root, "existing-review");
+  fs.mkdirSync(path.join(root, "occupied-name"));
+  const policy = rootPolicy([{ canonicalPath: root, canUpdate: true, canCreate: true }], 0);
+  const catalog = buildGlobalSkillCatalog(policy);
+
+  const candidate = resolveGlobalSkillCandidate(null, catalog);
+  assert.equal(candidate.ok, true, candidate.reason);
+  assert.equal(candidate.target, null);
+  assert.deepEqual({
+    targetKind: candidate.binding.targetKind,
+    rootId: candidate.binding.rootId,
+    logicalName: candidate.binding.logicalName,
+    relativePath: candidate.binding.relativePath,
+    currentHash: candidate.binding.currentHash,
+  }, {
+    targetKind: "new-global-skill",
+    rootId: policy.creationRootId,
+    logicalName: null,
+    relativePath: null,
+    currentHash: "must-not-exist",
+  });
+
+  const resolved = resolveNewGlobalSkillTarget(candidate.binding, "model-suggested-review", candidate.catalog);
+  assert.equal(resolved.ok, true, resolved.reason);
+  assert.equal(resolved.target.rootId, policy.creationRootId);
+  assert.equal(resolved.target.absolutePath, path.join(root, "model-suggested-review", "SKILL.md"));
+  assert.equal(resolved.target.currentHash, "must-not-exist");
+  assert.equal(resolved.binding.relativePath, "model-suggested-review/SKILL.md");
+  assert.equal(resolved.binding.candidateBindingHash, candidate.binding.bindingHash);
+
+  assert.equal(resolveNewGlobalSkillTarget(candidate.binding, "existing-review", candidate.catalog).reason, "new-global-skill-logical-name-collision");
+  assert.equal(resolveNewGlobalSkillTarget(candidate.binding, "occupied-name", candidate.catalog).reason, "new-global-skill-path-collision");
+  assert.equal(resolveNewGlobalSkillTarget(candidate.binding, "Model-Suggested", candidate.catalog).reason, "target-logical-name-invalid");
+
+  const updateOnly = buildGlobalSkillCatalog(rootPolicy([{ canonicalPath: root, canUpdate: true, canCreate: false }]));
+  assert.equal(resolveGlobalSkillCandidate(null, updateOnly).reason, "primary-creation-root-required");
+});
+
+test("global catalog rejects missing, symlinked, relocated, and malformed direct skill paths", (t) => {
+  const temp = tempTree(t);
+  const missing = path.join(temp, "missing-collection");
+  const missingCatalog = buildGlobalSkillCatalog(rootPolicy([{ canonicalPath: missing, canUpdate: true, canCreate: false }]));
+  assert.equal(missingCatalog.ok, false);
+  assert.equal(missingCatalog.blockers[0].code, "approved-root-noncanonical");
+
+  const outside = path.join(temp, "outside");
+  const root = path.join(temp, "collection");
+  fs.mkdirSync(outside);
+  fs.mkdirSync(root);
+  writeSkill(outside, "linked-review");
+  fs.symlinkSync(path.join(outside, "linked-review"), path.join(root, "linked-review"), "dir");
+  let catalog = buildGlobalSkillCatalog(rootPolicy([{ canonicalPath: root, canUpdate: true, canCreate: false }]));
+  assert.equal(catalog.ok, false);
+  assert.equal(catalog.blockers[0].code, "approved-root-symlink-entry");
+
+  fs.unlinkSync(path.join(root, "linked-review"));
+  writeSkill(root, "Bad_Name");
+  catalog = buildGlobalSkillCatalog(rootPolicy([{ canonicalPath: root, canUpdate: true, canCreate: false }]));
+  assert.equal(catalog.ok, false);
+  assert.equal(catalog.blockers[0].code, "global-skill-record-invalid");
+
+  fs.rmSync(path.join(root, "Bad_Name"), { recursive: true });
+  writeSkill(root, "stable-review");
+  catalog = buildGlobalSkillCatalog(rootPolicy([{ canonicalPath: root, canUpdate: true, canCreate: false }]));
+  assert.equal(catalog.ok, true);
+  fs.renameSync(root, path.join(temp, "relocated-collection"));
+  assert.equal(resolveGlobalSkillCandidate("stable-review", catalog).reason, "approved-root-noncanonical");
+});
+
+test("global catalog rejects any project's exact local skill root even when policy-approved", (t) => {
+  const temp = tempTree(t);
+  const projectRoot = path.join(temp, "project");
+  const projectSkillRoot = path.join(projectRoot, ".opencode", "skills");
+  fs.mkdirSync(projectSkillRoot, { recursive: true });
+  writeSkill(projectSkillRoot, "repo-review");
+  const policy = rootPolicy([{ canonicalPath: projectSkillRoot, canUpdate: true, canCreate: true }], 0);
+
+  const catalog = buildGlobalSkillCatalog(policy);
+  assert.equal(catalog.ok, false);
+  assert.deepEqual(catalog.canonicalRoots, []);
+  assert.equal(catalog.blockers[0].code, "project-skill-root-prohibited");
+  assert.equal(buildGlobalSkillCatalog(policy, { projectRoot }).blockers[0].code, "project-skill-root-prohibited");
+});
 
 test("allowlist loads canonical global and contained repo roots", (t) => {
   const temp = tempTree(t);
@@ -85,6 +295,56 @@ test("allowlist reports missing, globbed, symlinked, and escaping roots", (t) =>
   assert.match(loaded.errors.join("\n"), /glob/);
   assert.match(loaded.errors.join("\n"), /escapes/);
   assert.match(loaded.errors.join("\n"), /symlink/);
+});
+
+test("a prospective repository skill root resolves an absent new-skill target", (t) => {
+  const temp = tempTree(t);
+  const project = path.join(temp, "project");
+  const repoSkills = path.join(project, ".opencode", "skills");
+  fs.mkdirSync(project);
+
+  const loaded = loadAllowlist({ globalSkillRoots: [], repoSkillRoots: [repoSkills], projectRoot: project });
+  assert.deepEqual(loaded.errors, []);
+  assert.deepEqual(loaded.canonicalRoots, [repoSkills]);
+  const inventory = discoverSkills(loaded.canonicalRoots);
+  assert.equal(scopeOf(inventory, repoSkills), "repo");
+  const resolved = resolveSkillTarget("some-new-skill", inventory);
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.target.canonicalRoot, repoSkills);
+  assert.equal(resolved.target.relativePath, "some-new-skill/SKILL.md");
+  assert.equal(resolved.target.exists, false);
+  assert.equal(resolved.target.currentHash, "must-not-exist");
+  const generated = resolveSkillTarget("self-evolve-tool-error-b5c93699", inventory);
+  assert.equal(generated.ok, true);
+  assert.equal(generated.target.currentHash, "must-not-exist");
+  assert.equal(generated.target.relativePath, "self-evolve-tool-error-b5c93699/SKILL.md");
+  const content = skillContent(
+    "self-evolve-tool-error-b5c93699",
+    "Handles repeated tool errors from repository evidence safely.",
+  );
+  const validation = validateProposalTarget(proposal(generated.target, content), generated.inventory);
+  assert.equal(validation.ok, true, validation.errors.join("\n"));
+  assert.equal(validation.canonicalTarget.currentHash, "must-not-exist");
+  assert.equal(resolveSkillTarget("self-evolve-Tool-error-b5c93699", inventory).ok, false);
+  assert.equal(resolveSkillTarget("self-evolve-tool-error-../b5c93699", inventory).ok, false);
+});
+
+test("a prospective repository skill root still rejects an existing symlink ancestor", (t) => {
+  const temp = tempTree(t);
+  const project = path.join(temp, "project");
+  const outside = path.join(temp, "outside");
+  const linked = path.join(project, ".opencode");
+  fs.mkdirSync(project);
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, linked, "dir");
+
+  const loaded = loadAllowlist({
+    globalSkillRoots: [],
+    repoSkillRoots: [path.join(linked, "skills")],
+    projectRoot: project,
+  });
+  assert.deepEqual(loaded.canonicalRoots, []);
+  assert.match(loaded.errors.join("\n"), /cannot be canonicalized/u);
 });
 
 test("discovery identifies existing skills and hashes exact bytes", (t) => {
@@ -334,7 +594,7 @@ test("frontmatter parser handles block descriptions and reports body start", () 
   assert.equal(content.slice(parsed.bodyStart), "# Body\n");
 });
 
-test("growth estimation enforces 8 KiB edit and 64 KiB file limits", (t) => {
+test("growth estimation distinguishes new-skill, edit, and absolute file limits", (t) => {
   const temp = tempTree(t);
   const root = path.join(temp, "skills");
   fs.mkdirSync(root);
@@ -348,11 +608,39 @@ test("growth estimation enforces 8 KiB edit and 64 KiB file limits", (t) => {
   assert.equal(result.ok, false);
   assert.match(result.errors.join("\n"), /growth budget/);
 
+  const existingContent = skillContent("large", "Reviews deterministic checks safely.", "x".repeat(40_000));
+  writeSkill(root, "large", existingContent);
+  const existingInventory = discoverSkills(loadAllowlist({ globalSkillRoots: [root] }).canonicalRoots);
+  const existing = existingInventory.find((record) => record.logicalName === "large");
+  assert.equal(estimateGrowth(proposal(existing, `${existingContent}${"y".repeat(2_680)}`), existingInventory).withinBudget, true);
+  assert.equal(estimateGrowth(proposal(existing, `${existingContent}${"y".repeat(9_000)}`), existingInventory).withinBudget, false);
+
+  const newRoot = path.join(temp, "repo-skills");
+  fs.mkdirSync(newRoot);
+  const newInventory = discoverSkills(loadAllowlist({ repoSkillRoots: [newRoot], projectRoot: temp }).canonicalRoots);
+  const resolved = resolveSkillTarget("new-skill", newInventory);
+  assert.equal(resolved.ok, true);
+  const atBytes = (size) => {
+    const header = skillContent("new-skill", "Reviews deterministic checks safely.", "");
+    return `${header}${"n".repeat(size - Buffer.byteLength(header))}`;
+  };
+  assert.deepEqual(
+    { withinBudget: estimateGrowth(proposal(resolved.target, atBytes(12_000)), resolved.inventory).withinBudget,
+      budgetMax: estimateGrowth(proposal(resolved.target, atBytes(12_000)), resolved.inventory).budgetMax },
+    { withinBudget: true, budgetMax: 24 * 1024 },
+  );
+  assert.equal(estimateGrowth(proposal(resolved.target, atBytes(25_000)), resolved.inventory).withinBudget, false);
+  const newTooLarge = validateProposalTarget(proposal(resolved.target, atBytes(25_000)), resolved.inventory);
+  assert.equal(newTooLarge.ok, false);
+  assert.match(newTooLarge.errors.join("\n"), /24576 byte budget/u);
+  assert.equal(estimateGrowth(proposal(resolved.target, atBytes(65_537)), resolved.inventory).withinBudget, false);
+
   const hugeBefore = skillContent("huge", "Reviews deterministic checks safely.", "x".repeat(65 * 1024));
   writeSkill(root, "huge", hugeBefore);
   const refreshed = discoverSkills(loadAllowlist({ globalSkillRoots: [root] }).canonicalRoots);
   const huge = refreshed.find((record) => record.logicalName === "huge");
   assert.equal(estimateGrowth(proposal(huge, hugeBefore), refreshed).withinBudget, false);
+  assert.equal(estimateGrowth(proposal(huge, `${hugeBefore}x`), refreshed).withinBudget, false);
 });
 
 test("global proposals reject cross-repository identifiers without leaking paths", (t) => {
@@ -386,6 +674,42 @@ test("unsafe content flags controls, unsafe links, and authority escalation", ()
   assert.ok(result.issues.includes("apply-authority-escalation"));
   assert.ok(result.issues.includes("system-override"));
   assert.ok(scanForUnsafeContent("nul\0byte").issues.includes("nul-byte"));
+
+  const flaggedSchemes = [
+    "[click](javascript:alert(document.cookie))",
+    '<a href="javascript:alert(1)">',
+    "payload: javascript: alert(1)",
+    "file:///etc/passwd",
+    '<img src="data:text/html;base64,...">',
+    "vbscript:msgbox(1)",
+    "javascript:(function(){alert(1)})()",
+    "Click javascript:(alert)(1) now",
+    '<a href="javascript:(alert)(1)">',
+    "[x](javascript:(alert)(1))",
+    "javascript:\talert(1)",
+    "JaVaScRiPt:alert(1)",
+    "[x](data:text/html;base64,...)",
+    "![i](data:image/svg+xml,<svg onload=alert(1)>)",
+    "see file:///home/u/.ssh/id_rsa",
+    '<iframe src="data:text/html,<script>alert(1)</script>">',
+    "vbscript: msgbox 1",
+    // This conservative false positive is the cost of retaining horizontal-whitespace evasion detection.
+    "Do not use javascript: URIs in skill links.",
+  ];
+  for (const text of flaggedSchemes) assert.equal(scanForUnsafeContent(text).flagged, true, text);
+
+  const prose = [
+    "**File:** `tests/x.spec.ts`",
+    "testing a specific plugin file:",
+    "{ data: { parts: [] } }",
+    "Prefer the output file: report.txt over stdout.",
+    "Serialize with data: {x:1} before sending.",
+    "a file:\n\nBackground: opencode does not...",
+    "see the data: section",
+    "Return data: one row per user.",
+    "Open the file: it is in /tmp.",
+  ];
+  for (const text of prose) assert.equal(scanForUnsafeContent(text).flagged, false, text);
 });
 
 test("unsafe proposed content fails closed with no canonical target", (t) => {
@@ -400,6 +724,7 @@ test("unsafe proposed content fails closed with no canonical target", (t) => {
   assert.match(result.errors.join("\n"), /secret canaries/);
   assert.match(result.errors.join("\n"), /unsafe/);
   assert.equal(result.canonicalTarget, null);
+  assert.deepEqual(result.contentAdvisories, []);
 });
 
 test("ambiguous duplicate target records fail closed", (t) => {

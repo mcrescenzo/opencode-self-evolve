@@ -12,7 +12,8 @@ import {
 } from "../self-evolve-core.js";
 import { publishTuiHostHealth } from "../self-evolve-bridge.js";
 import DefaultSelfEvolvePlugin from "../self-evolve.js";
-import { makeGlobalSettings } from "../self-evolve-schemas.js";
+import * as inventoryModule from "../self-evolve-inventory.js";
+import { makeApprovedGlobalRoot, makeGlobalRootPolicy, makeGlobalSettings } from "../self-evolve-schemas.js";
 import { stateRootIdentity } from "../self-evolve-state-root.js";
 import { openStore, projectFingerprintFor } from "../self-evolve-store.js";
 
@@ -21,9 +22,44 @@ const SelfEvolvePlugin = Object.assign(
   { __test: DefaultSelfEvolvePlugin.__test },
 );
 
-test("public trigger guidance preserves the provisional event-hook boundary", () => {
+test("durable inventory uses explicit global root policy and never project roots or folder suggestions", (t) => {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-runtime-inventory-"));
+  t.after(() => fs.rmSync(projectRoot, { recursive: true, force: true }));
+  const globalRoot = path.join(projectRoot, "global-skills");
+  const suggestedRoot = path.join(projectRoot, "suggested-skills");
+  const repoRoot = path.join(projectRoot, ".opencode", "skills");
+  for (const [root, name] of [[globalRoot, "global-review"], [suggestedRoot, "suggested-review"], [repoRoot, "repo-review"]]) {
+    fs.mkdirSync(path.join(root, name), { recursive: true });
+    fs.writeFileSync(path.join(root, name, "SKILL.md"), `---\nname: ${name}\ndescription: Reviews exact durable inventory roots safely.\n---\n# Guidance\n`);
+  }
+  const approvedRoot = makeApprovedGlobalRoot({ canonicalPath: globalRoot, canUpdate: true, canCreate: true });
+  const globalRootPolicy = makeGlobalRootPolicy({
+    roots: [approvedRoot],
+    creationRootId: approvedRoot.rootId,
+    selectedBy: "operator",
+    updatedAt: 100,
+  });
+  const loaded = SelfEvolvePlugin.__test.durableInventory(inventoryModule, {
+    global: { allowedSkillRoots: [suggestedRoot, repoRoot], globalRootPolicy },
+  }, projectRoot);
+  assert.equal(loaded.ok, true, JSON.stringify(loaded.blockers));
+  assert.deepEqual(loaded.canonicalRoots, [globalRoot]);
+  assert.deepEqual(loaded.records.map((record) => record.logicalName), ["global-review"]);
+  assert.equal(loaded.records.some((record) => record.canonicalRoot === repoRoot), false);
+  assert.equal(loaded.records.some((record) => record.canonicalRoot === suggestedRoot), false);
+
+  const suggestionsOnly = SelfEvolvePlugin.__test.durableInventory(inventoryModule, {
+    global: { allowedSkillRoots: [globalRoot], globalRootPolicy: null },
+  }, projectRoot);
+  assert.equal(suggestionsOnly.ok, false);
+  assert.equal(suggestionsOnly.blockers[0].code, "global-root-policy-required");
+  assert.deepEqual(suggestionsOnly.canonicalRoots, []);
+});
+
+test("public trigger guidance preserves the stable v0.3 event-hook boundary", () => {
   const guidance = fs.readFileSync(new URL("../CLAUDE.md", import.meta.url), "utf8");
-  assert.match(guidance, /Persisted auto\/yolo configuration may register a provisional authority-free `event` hook before official state-root validation; that hook must perform no integration, provider call, persistence, or effect until validated boot\./u);
+  assert.match(guidance, /durable mode always exposes exactly one lifecycle `event` hook, including configured Manual and preboot validation\./u);
+  assert.match(guidance, /Before validated boot and whenever configured project analysis mode is `manual`, return before source-lineage hydration, session\/message reads, provider calls, durable observation, contribution, or scheduler admission\./u);
 });
 
 function proposalPayload(overrides = {}) {
@@ -1763,7 +1799,7 @@ test("hostSupported false narrows actual supported health and spoof options neve
   spoofed.ctx.client.global.health = async () => ({ data: { healthy: true, version: "1.17.7" } });
   const spoofedHooks = await DefaultSelfEvolvePlugin(spoofed.ctx, { hostVersion: "1.99.0", hostSupported: true });
   await waitForDurableStartup(spoofedHooks, "startup-spoofed");
-  assert.equal(spoofedHooks.event, undefined);
+  assert.equal(typeof spoofedHooks.event, "function");
   const spoofedOutput = { parts: [] };
   await spoofedHooks["command.execute.before"]({ command: "self-evolve", sessionID: "health-spoofed", arguments: "health" }, spoofedOutput);
   assert.match(spoofedOutput.parts.at(-1).text, /host 1\.17\.7/u);
@@ -2115,6 +2151,88 @@ test("deferred health grants no integration authority before resolution and disp
   assert.ok(Date.now() - started < 500, "dispose must abort and settle pending startup");
 });
 
+test("one durable lifecycle hook stays inert before boot and follows fresh project analysis state", async (t) => {
+  const f = durableFixture(t);
+  const calls = {
+    operationalState: 0,
+    integrationEvents: 0,
+    lineage: 0,
+    sessionReads: 0,
+    providerCalls: 0,
+    storeEffects: 0,
+    schedulerAdmissions: 0,
+  };
+  f.ctx.client.session = {
+    async get() { calls.sessionReads += 1; return { data: {} }; },
+    async messages() { calls.sessionReads += 1; return { data: [] }; },
+    async create() { calls.providerCalls += 1; return { data: { id: "unexpected" } }; },
+    async prompt() { calls.providerCalls += 1; return { data: {} }; },
+  };
+  let operationalState = {
+    configuredMode: "manual",
+    passiveAnalysisAllowed: false,
+    reason: "manual",
+  };
+  const integration = {
+    async boot() { return { ok: true }; },
+    getProjectOperationalState() {
+      calls.operationalState += 1;
+      return operationalState;
+    },
+    async handleEvent() {
+      calls.integrationEvents += 1;
+      calls.lineage += 1;
+      calls.storeEffects += 1;
+      calls.schedulerAdmissions += 1;
+    },
+    async handleCommand() { return { responseText: "ready" }; },
+    async shutdown() {},
+  };
+  const hooks = await DefaultSelfEvolvePlugin(f.ctx, {
+    hostRecoveryDelayMs: 25,
+    pipelineFactory: async () => integration,
+  });
+  t.after(async () => hooks.dispose());
+
+  assert.equal(typeof hooks.event, "function");
+  assert.equal(hooks["chat.message"], undefined);
+  hooks.event({ type: "session.idle", properties: { sessionID: "preboot" } });
+  await tick();
+  assert.deepEqual(calls, {
+    operationalState: 0,
+    integrationEvents: 0,
+    lineage: 0,
+    sessionReads: 0,
+    providerCalls: 0,
+    storeEffects: 0,
+    schedulerAdmissions: 0,
+  });
+
+  await waitForDurableStartup(hooks, "stable-manual-hook");
+  hooks.event({ type: "session.idle", properties: { sessionID: "manual" } });
+  await tick();
+  assert.equal(calls.operationalState, 1);
+  assert.equal(calls.integrationEvents, 0);
+  assert.equal(calls.sessionReads, 0);
+  assert.equal(calls.providerCalls, 0);
+  assert.equal(calls.storeEffects, 0);
+  assert.equal(calls.schedulerAdmissions, 0);
+
+  operationalState = { configuredMode: "auto", passiveAnalysisAllowed: true, reason: null };
+  hooks.event({ type: "session.idle", properties: { sessionID: "auto" } });
+  await tick();
+  assert.equal(calls.integrationEvents, 1, "Manual to Auto admits the next eligible event without restart");
+
+  operationalState = { configuredMode: "auto", passiveAnalysisAllowed: false, reason: "paused" };
+  hooks.event({ type: "session.idle", properties: { sessionID: "paused" } });
+  await tick();
+  operationalState = { configuredMode: "manual", passiveAnalysisAllowed: false, reason: "manual" };
+  hooks.event({ type: "session.idle", properties: { sessionID: "manual-again" } });
+  await tick();
+  assert.equal(calls.operationalState, 4);
+  assert.equal(calls.integrationEvents, 1, "fresh suppressors and Auto to Manual block more work");
+});
+
 test("dispose interrupts host-health retry backoff before another attempt starts", async (t) => {
   const f = durableFixture(t);
   let healthCalls = 0;
@@ -2136,10 +2254,10 @@ test("dispose interrupts host-health retry backoff before another attempt starts
   assert.equal(healthCalls, 1, "disposal must not permit another health attempt");
 });
 
-test("plain registration boots durable v0.2 in persisted manual mode", async (t) => {
+test("plain registration boots durable state with an inert manual event hook", async (t) => {
   const f = durableFixture(t);
   const hooks = await DefaultSelfEvolvePlugin(f.ctx);
-  assert.equal(hooks.event, undefined);
+  assert.equal(typeof hooks.event, "function");
   assert.equal(hooks["chat.message"], undefined);
   await waitForDurableStartup(hooks, "plain-registration");
   const store = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
@@ -2149,30 +2267,52 @@ test("plain registration boots durable v0.2 in persisted manual mode", async (t)
   await hooks.dispose();
 });
 
-for (const mode of ["auto", "yolo"]) {
-  test(`persisted ${mode} registers the passive event hook after an options-free restart`, async (t) => {
-    const f = durableFixture(t);
-    const first = await DefaultSelfEvolvePlugin(f.ctx);
-    await waitForDurableStartup(first, `${mode}-startup-first`);
-    const output = { parts: [] };
-    if (mode === "auto") {
-      await first["command.execute.before"]({ command: "self-evolve", sessionID: `${mode}-first`, arguments: "auto" }, output);
-    } else {
-      const skillRoot = path.join(f.root, "skills");
-      fs.mkdirSync(skillRoot, { recursive: true });
-      await first["command.execute.before"]({ command: "self-evolve", sessionID: `${mode}-first`, arguments: `yolo confirm --allowlist ${skillRoot}` }, output);
-    }
-    assert.match(output.parts.at(-1).text, new RegExp(`changed to ${mode}`, "i"));
-    await first.dispose();
+test("persisted auto registers the passive event hook after an options-free restart", async (t) => {
+  const f = durableFixture(t);
+  const first = await DefaultSelfEvolvePlugin(f.ctx);
+  await waitForDurableStartup(first, "auto-startup-first");
+  const output = { parts: [] };
+  await first["command.execute.before"]({ command: "self-evolve", sessionID: "auto-first", arguments: "auto" }, output);
+  assert.match(output.parts.at(-1).text, /changed to auto/i);
+  await first.dispose();
 
-    const restarted = await DefaultSelfEvolvePlugin(f.ctx);
-    assert.equal(typeof restarted.event, "function");
-    assert.equal(restarted["chat.message"], undefined);
-    await restarted.dispose();
-  });
-}
+  const restarted = await DefaultSelfEvolvePlugin(f.ctx);
+  assert.equal(typeof restarted.event, "function");
+  assert.equal(restarted["chat.message"], undefined);
+  await restarted.dispose();
+});
 
-test("persisted manual returns no passive hook after restart", async (t) => {
+test("a retired yolo command changes nothing and a persisted yolo preference restarts as auto", async (t) => {
+  const f = durableFixture(t);
+  const first = await DefaultSelfEvolvePlugin(f.ctx);
+  await waitForDurableStartup(first, "yolo-retired-startup");
+  const skillRoot = path.join(f.root, "skills");
+  fs.mkdirSync(skillRoot, { recursive: true });
+  const output = { parts: [] };
+  await first["command.execute.before"]({ command: "self-evolve", sessionID: "yolo-retired", arguments: `yolo confirm --allowlist ${skillRoot}` }, output);
+  assert.match(output.parts.at(-1).text, /retired in v0\.3/i);
+  await first.dispose();
+
+  const store = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+  assert.equal(store.getSettings().global.mode, "manual");
+  const settings = store.getSettings();
+  // A partition written by v0.2 can still hold `yolo`; it must read back as auto.
+  fs.writeFileSync(
+    path.join(f.stateRoot, "self-evolve", "global", "settings.json"),
+    `${JSON.stringify({ ...settings.global, mode: "yolo", updatedAt: settings.global.updatedAt + 1 })}\n`,
+  );
+  store.close();
+
+  const restarted = await DefaultSelfEvolvePlugin(f.ctx);
+  assert.equal(typeof restarted.event, "function");
+  assert.equal(restarted["chat.message"], undefined);
+  const reopened = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
+  assert.equal(reopened.getSettings().global.mode, "auto");
+  reopened.close();
+  await restarted.dispose();
+});
+
+test("persisted manual keeps the stable inert event hook after restart", async (t) => {
   const f = durableFixture(t);
   const store = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
   const settings = store.getSettings();
@@ -2185,14 +2325,14 @@ test("persisted manual returns no passive hook after restart", async (t) => {
   await automatic["command.execute.before"]({ command: "self-evolve", sessionID: "manual-reset", arguments: "manual" }, output);
   await automatic.dispose();
   const restarted = await DefaultSelfEvolvePlugin(f.ctx);
-  assert.equal(restarted.event, undefined);
+  assert.equal(typeof restarted.event, "function");
   await restarted.dispose();
 });
 
 test("startup mode is not authority and cannot override an existing durable preference", async (t) => {
   const f = durableFixture(t);
   const hooks = await DefaultSelfEvolvePlugin(f.ctx, { mode: "auto" });
-  assert.equal(hooks.event, undefined);
+  assert.equal(typeof hooks.event, "function");
   await waitForDurableStartup(hooks, "startup-mode-not-authority");
   const store = openStore(f.stateRoot, { projectFingerprint: f.projectFingerprint });
   assert.equal(store.getSettings().global.mode, "manual");
@@ -2200,9 +2340,9 @@ test("startup mode is not authority and cannot override an existing durable pref
   await hooks.dispose();
 });
 
-test("unavailable or corrupt durable state fails closed to no passive hook", async (t) => {
+test("unavailable or corrupt durable state keeps the event hook inert", async (t) => {
   const unavailable = await DefaultSelfEvolvePlugin({ directory: "/workspace/unavailable", client: {} }, { env: {} });
-  assert.equal(unavailable.event, undefined);
+  assert.equal(typeof unavailable.event, "function");
   await unavailable.dispose();
 
   const f = durableFixture(t);
@@ -2211,7 +2351,7 @@ test("unavailable or corrupt durable state fails closed to no passive hook", asy
   await initialized.dispose();
   fs.writeFileSync(path.join(f.stateRoot, "self-evolve", "global", "settings.json"), "{corrupt", "utf8");
   const corrupt = await DefaultSelfEvolvePlugin(f.ctx);
-  assert.equal(corrupt.event, undefined);
+  assert.equal(typeof corrupt.event, "function");
   await waitForDurableStartup(corrupt, "corrupt-startup");
   const output = { parts: [] };
   await corrupt["command.execute.before"]({ command: "self-evolve", sessionID: "corrupt", arguments: "auto" }, output);

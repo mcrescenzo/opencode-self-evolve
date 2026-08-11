@@ -32,7 +32,7 @@ const PROPOSAL_ACTION_LABELS = Object.freeze({
   "failed-closed": "Critical failed-closed record",
 });
 export const SELF_EVOLVE_MODULE_ID = "mcrescenzo.self-evolve";
-export const SELF_EVOLVE_PLUGIN_VERSION = "0.2.0";
+export const SELF_EVOLVE_PLUGIN_VERSION = "0.3.0";
 export const TUI_IDENTITIES = Object.freeze({
   command: `${SELF_EVOLVE_MODULE_ID}.control-center`,
   route: `${SELF_EVOLVE_MODULE_ID}.control-center.route`,
@@ -47,7 +47,7 @@ export const TUI_KV_KEYS = Object.freeze({
   dismissed: `${SELF_EVOLVE_MODULE_ID}:dismissed-ids`,
   lastShown: `${SELF_EVOLVE_MODULE_ID}:last-shown-at`,
   pendingRequests: `${SELF_EVOLVE_MODULE_ID}:pending-request-ids`,
-  acknowledgedAudits: `${SELF_EVOLVE_MODULE_ID}:acknowledged-audits-v1`,
+  acknowledgedOutcomes: `${SELF_EVOLVE_MODULE_ID}:acknowledged-outcomes-v2`,
 });
 export const TUI_LEGACY_KV_KEYS = Object.freeze({
   notificationHistory: "self-evolve:notification-history",
@@ -117,17 +117,36 @@ function validPendingRequests(value) {
   });
 }
 
-function validAcknowledgedAudits(value) {
+function validAcknowledgementBinding(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).sort().join(",") === "auditIds,scope,subjectId,version"
+    && ["project", "global"].includes(value.scope)
+    && boundedString(value.subjectId)
+    && boundedString(value.version)
+    && Array.isArray(value.auditIds)
+    && value.auditIds.length > 0
+    && value.auditIds.length <= 64
+    && value.auditIds.every((auditId) => boundedString(auditId))
+    && new Set(value.auditIds).size === value.auditIds.length
+    && value.auditIds.every((auditId, index) => index === 0 || value.auditIds[index - 1] < auditId);
+}
+
+function validAcknowledgedOutcomes(value) {
   return Array.isArray(value) && value.length <= REVIEW_BOOKKEEPING_CAP && value.every((entry) =>
     entry && typeof entry === "object" && !Array.isArray(entry)
-      && /^[a-f0-9]{64}$/u.test(entry.projectFingerprint)
-      && boundedString(entry.auditId)
+      && Object.keys(entry).sort().join(",") === "acknowledgedAt,auditIds,scope,subjectId,version"
+      && validAcknowledgementBinding({
+        scope: entry.scope,
+        subjectId: entry.subjectId,
+        version: entry.version,
+        auditIds: entry.auditIds,
+      })
       && Number.isSafeInteger(entry.acknowledgedAt)
       && entry.acknowledgedAt >= 0);
 }
 
-function boundedAcknowledgedAudits(value) {
-  if (!validAcknowledgedAudits(value)) return false;
+function boundedAcknowledgedOutcomes(value) {
+  if (!validAcknowledgedOutcomes(value)) return false;
   try {
     return Buffer.byteLength(JSON.stringify(value), "utf8") <= TUI_ACKNOWLEDGEMENT_MAX_BYTES;
   } catch {
@@ -188,10 +207,9 @@ export function createOwnedKv(rawKv) {
   return ownedKv;
 }
 
-// Applied-result acknowledgement is presentation-only. It is deliberately
-// project-partitioned in the host KV, never sent to the server, and bounded
-// across all projects. The Release A single-string value is claimed by the
-// first current project that reads it during the one-release migration window.
+// Applied-result acknowledgement is presentation-only. Each project has one
+// bounded host-KV key, and every entry binds an exact outcome version plus the
+// authoritative audit/detail hashes that justified the acknowledgement.
 export function createTuiAcknowledgementStore(rawKv, { now = Date.now } = {}) {
   if (!rawKv || typeof rawKv.get !== "function" || typeof rawKv.set !== "function") {
     throw new TypeError("tui-kv-unavailable");
@@ -199,61 +217,53 @@ export function createTuiAcknowledgementStore(rawKv, { now = Date.now } = {}) {
   if (typeof now !== "function") throw new TypeError("tui-acknowledgement-clock-required");
   const cached = acknowledgementStoreCache.get(rawKv);
   if (cached) return cached;
-  let legacyRead = false;
+  function projectKey(projectFingerprint) {
+    return `${TUI_KV_KEYS.acknowledgedOutcomes}:${projectFingerprint}`;
+  }
 
   function readCanonical(projectFingerprint) {
-    let stored = rawKv.get(TUI_KV_KEYS.acknowledgedAudits);
-    if (stored === undefined && !legacyRead) {
-      legacyRead = true;
-      const legacy = rawKv.get(TUI_LEGACY_KV_KEYS.acknowledgedAudits);
-      if (boundedString(legacy)) {
-        const migrated = [{
-          projectFingerprint,
-          auditId: legacy,
-          acknowledgedAt: 0,
-        }];
-        if (boundedAcknowledgedAudits(migrated)) {
-          rawKv.set(TUI_KV_KEYS.acknowledgedAudits, migrated);
-          stored = migrated;
-        }
-      }
-    }
-    return boundedAcknowledgedAudits(stored) ? stored : [];
+    const stored = rawKv.get(projectKey(projectFingerprint));
+    return boundedAcknowledgedOutcomes(stored) ? stored : [];
   }
 
   const store = Object.freeze({
     read(projectFingerprint) {
       if (!/^[a-f0-9]{64}$/u.test(String(projectFingerprint ?? ""))) return Object.freeze([]);
-      return Object.freeze(readCanonical(projectFingerprint)
-        .filter((entry) => entry.projectFingerprint === projectFingerprint)
-        .map((entry) => entry.auditId));
+      return Object.freeze(readCanonical(projectFingerprint).map((entry) => Object.freeze({
+        ...entry,
+        auditIds: Object.freeze([...entry.auditIds]),
+      })));
     },
-    acknowledge(projectFingerprint, auditIds) {
+    acknowledge(projectFingerprint, binding) {
       if (!/^[a-f0-9]{64}$/u.test(String(projectFingerprint ?? ""))) return Object.freeze([]);
-      const cleanIds = [...new Set((Array.isArray(auditIds) ? auditIds : [auditIds])
-        .filter((auditId) => boundedString(auditId)))].sort();
-      if (!cleanIds.length) return this.read(projectFingerprint);
+      const clean = binding && typeof binding === "object" ? {
+        scope: binding.scope,
+        subjectId: binding.subjectId,
+        version: binding.version,
+        auditIds: [...new Set(Array.isArray(binding.auditIds) ? binding.auditIds : [])].sort(),
+      } : null;
+      if (!validAcknowledgementBinding(clean)) return this.read(projectFingerprint);
       const current = readCanonical(projectFingerprint);
-      const canonical = rawKv.get(TUI_KV_KEYS.acknowledgedAudits);
-      if (canonical !== undefined && !boundedAcknowledgedAudits(canonical)) {
+      const key = projectKey(projectFingerprint);
+      const canonical = rawKv.get(key);
+      if (canonical !== undefined && !boundedAcknowledgedOutcomes(canonical)) {
         return Object.freeze([]);
       }
       const acknowledgedAt = Math.max(0, Math.trunc(now()));
       const merged = new Map(current.map((entry) => [
-        `${entry.projectFingerprint}\n${entry.auditId}`,
+        `${entry.scope}\n${entry.subjectId}\n${entry.version}\n${entry.auditIds.join("\n")}`,
         entry,
       ]));
-      for (const auditId of cleanIds) {
-        const entry = { projectFingerprint, auditId, acknowledgedAt };
-        merged.set(`${projectFingerprint}\n${auditId}`, entry);
-      }
+      const entry = { ...clean, acknowledgedAt };
+      merged.set(`${clean.scope}\n${clean.subjectId}\n${clean.version}\n${clean.auditIds.join("\n")}`, entry);
       const next = [...merged.values()]
         .sort((left, right) => left.acknowledgedAt - right.acknowledgedAt
-          || left.projectFingerprint.localeCompare(right.projectFingerprint)
-          || left.auditId.localeCompare(right.auditId))
+          || left.scope.localeCompare(right.scope)
+          || left.subjectId.localeCompare(right.subjectId)
+          || left.version.localeCompare(right.version))
         .slice(-REVIEW_BOOKKEEPING_CAP);
-      if (!boundedAcknowledgedAudits(next)) return Object.freeze([]);
-      rawKv.set(TUI_KV_KEYS.acknowledgedAudits, next);
+      if (!boundedAcknowledgedOutcomes(next)) return Object.freeze([]);
+      rawKv.set(key, next);
       return this.read(projectFingerprint);
     },
   });
@@ -610,6 +620,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         startupWorktree: identity.worktreePath,
       },
       clientFactory: options?.__testTuiStoreClientFactory,
+      globalClientFactory: options?.__testTuiGlobalStoreClientFactory,
       acknowledgementStore: createTuiAcknowledgementStore(api.kv, {
         now: () => nowFor(api),
       }),
@@ -623,6 +634,15 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     console.warn(`self-evolve native projection store disabled: ${error instanceof Error ? error.message : String(error)}`);
   }
   const tuiHostVersion = typeof api.app?.version === "string" ? api.app.version.trim() : "";
+  const inFlight = new Set();
+  const unsubscribers = [];
+  let disposed = false;
+  let terminalStopped = false;
+  let refreshPending = false;
+  let refreshInFlight = false;
+  let refreshMicrotaskQueued = false;
+  let refreshTimer = null;
+  let pollTimer;
   let hostHealthTimer;
   let hostHealthContext = { stateRoot, projectFingerprint, nonce: undefined };
   let hostHealthStopped = false;
@@ -683,12 +703,35 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     hostHealthSuspended = true;
     try { revokeCurrentHostHealth(); } catch (error) { warnHostHealth(error); }
   };
+  const stopHostHealth = () => {
+    if (hostHealthStopped) return;
+    hostHealthStopped = true;
+    clearInterval(hostHealthTimer);
+    try { hostHealthStoreUnsubscribe?.(); } catch {}
+    hostHealthStoreUnsubscribe = undefined;
+    try { revokeCurrentHostHealth(); } catch {}
+  };
+  const stopStateRootActivity = (terminal = false) => {
+    if (terminal) terminalStopped = true;
+    disposed = true;
+    refreshPending = false;
+    refreshMicrotaskQueued = false;
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+    clearInterval(pollTimer);
+    pollTimer = undefined;
+    for (const unsubscribe of unsubscribers.splice(0)) {
+      try { unsubscribe(); } catch {}
+    }
+    stopHostHealth();
+  };
   if (tuiHostVersion) {
-    publishHostHealth();
-    hostHealthTimer = setInterval(publishHostHealth, HOST_HEALTH_REFRESH_MS);
-    hostHealthTimer.unref?.();
     if (typeof projectStore?.subscribe === "function") {
       hostHealthStoreUnsubscribe = projectStore.subscribe((snapshot) => {
+        if (snapshot?.phase === "terminal") {
+          stopStateRootActivity(true);
+          return;
+        }
         if (!snapshot?.projectFingerprint || !snapshot?.stateRootIdentity) {
           if (snapshot?.phase === "error") suspendHostHealth();
           return;
@@ -701,16 +744,13 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         publishHostHealth({ stateRoot: currentStateRoot, projectFingerprint: snapshot.projectFingerprint });
       });
     }
+    if (!terminalStopped) {
+      if (!hostHealthContext.nonce) publishHostHealth();
+      hostHealthTimer = setInterval(publishHostHealth, HOST_HEALTH_REFRESH_MS);
+      hostHealthTimer.unref?.();
+    }
   }
-  const stopHostHealth = () => {
-    if (hostHealthStopped) return;
-    hostHealthStopped = true;
-    clearInterval(hostHealthTimer);
-    try { hostHealthStoreUnsubscribe?.(); } catch {}
-    hostHealthStoreUnsubscribe = undefined;
-    try { revokeCurrentHostHealth(); } catch {}
-  };
-  void projectStore?.refresh();
+  if (!terminalStopped) void projectStore?.refresh();
   if (typeof api.ui?.dialog?.replace !== "function"
       || typeof api.ui?.DialogConfirm !== "function"
       || typeof api.ui?.DialogSelect !== "function") {
@@ -741,15 +781,6 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   } : null);
   const idle = safeIdlePredicate(api, debounceMs);
   const testLimiter = testAutoReview ? notificationRateLimiter(api, testNotificationBudget) : null;
-  const inFlight = new Set();
-  const unsubscribers = [];
-  let disposed = false;
-  let refreshPending = false;
-  let refreshInFlight = false;
-  let refreshMicrotaskQueued = false;
-  let refreshTimer = null;
-  let pollTimer;
-
   const dismissedIds = () => {
     const value = kv.get(DISMISSED_KEY, []);
     return Array.isArray(value) ? value : [];
@@ -773,6 +804,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   }
 
   async function boundedMailboxCall(task) {
+    if (terminalStopped) throw new Error("restart-required-after-purge-all");
     let timeout;
     try {
       return await Promise.race([
@@ -911,42 +943,14 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     }
   }
 
-  function confirmYolo(allowlist) {
-    const visible = allowlist.map((root) => `- ${root}`).join("\n");
-    showConfirm(api, {
-      title: "Yolo risk confirmation 1 of 2",
-      message: `Yolo may apply validated skill changes without per-change approval, only under this exact allowlist:\n${visible}`,
-      onConfirm: () => showConfirm(api, {
-        title: "Yolo risk confirmation 2 of 2",
-        message: `Confirm unattended skill writes to exactly:\n${visible}`,
-        onConfirm: () => { void submitControl("set-mode", { mode: "yolo", allowlist, confirmation: "ENABLE YOLO" }); },
-      }),
-    });
-  }
-
-  function promptYoloAllowlist(state) {
-    showPrompt(api, {
-      title: "Yolo allowlist",
-      placeholder: "/canonical/skill/root (one per line)",
-      value: state.allowedSkillRoots.join("\n"),
-      onConfirm: (value) => {
-        try {
-          const allowlist = parseAllowlistInput(value);
-          if (!allowlist.length) throw new Error("yolo-requires-a-non-empty-allowlist");
-          confirmYolo(allowlist);
-        } catch (error) { dialogError(api, error instanceof Error ? error.message : String(error)); }
-      },
-    });
-  }
-
   function showModeFlow(state) {
-    const options = ["manual", "auto", "yolo"].map((mode) => ({
+    // v0.3 project analysis is Manual or Auto only; no mode grants a write.
+    const options = ["manual", "auto"].map((mode) => ({
       title: mode,
       value: mode,
-      description: mode === "manual" ? "No passive work" : mode === "auto" ? "Draft automatically; approve each write" : "Allow unattended validated writes",
+      description: mode === "manual" ? "No passive work" : "Draft automatically; approve each write",
     }));
     const onSelect = (option) => {
-      if (option.value === "yolo") return promptYoloAllowlist(state);
       showConfirm(api, {
         title: `Set self-evolve mode to ${option.value}?`,
         message: option.value === "auto" ? "Auto may make passive provider calls only when the separate consent controls permit it." : "Manual disables passive work.",
@@ -959,7 +963,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   function showAllowlistFlow(state) {
     showPrompt(api, {
       title: "Edit canonical skill-root allowlist",
-      description: () => "This changes the only roots eligible for yolo writes. Review every path before confirming.",
+      description: () => "This changes the approved project skill-root allowlist used by legacy explicit applies. Review every path before confirming.",
       placeholder: "/canonical/skill/root (one per line)",
       value: state.allowedSkillRoots.join("\n"),
       onConfirm: (value) => {
@@ -968,7 +972,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
           const visible = allowlist.length ? allowlist.map((root) => `- ${root}`).join("\n") : "(empty)";
           showConfirm(api, {
             title: "Elevated allowlist confirmation",
-            message: `Replace the yolo allowlist with exactly:\n${visible}`,
+            message: `Replace the approved skill-root allowlist with exactly:\n${visible}`,
             onConfirm: () => { void submitControl("update-allowlist", { allowlist, confirmation: "UPDATE ALLOWLIST" }); },
           });
         } catch (error) { dialogError(api, error instanceof Error ? error.message : String(error)); }
@@ -1125,7 +1129,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     scheduleRefresh(0);
   }
 
-  if (testAutoReview && kv.get(FIRST_USE_KEY) === undefined) {
+  if (!terminalStopped && testAutoReview && kv.get(FIRST_USE_KEY) === undefined) {
     showConfirm(api, {
       title: "Enable self-evolve proposal dialogs?",
       message: "Test-only compatibility review opt-in.",
@@ -1141,7 +1145,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     ...(typeof api.keymap?.registerLayer === "function" ? [] : ["keymap.registerLayer"]),
     ...(typeof api.ui?.DialogPrompt === "function" ? [] : ["ui.DialogPrompt"]),
   ];
-  if (!nativeSurface && missingLegacySettingsCapabilities.length === 0) {
+  if (!terminalStopped && !nativeSurface && missingLegacySettingsCapabilities.length === 0) {
     api.keymap.registerLayer({
       mode: "base",
       commands: [{
@@ -1152,11 +1156,11 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
         run: () => { void openSettings(); },
       }],
     });
-  } else if (!nativeSurface) {
+  } else if (!terminalStopped && !nativeSurface) {
     console.warn(`self-evolve legacy settings command disabled: missing ${missingLegacySettingsCapabilities.join(", ")}; update external tui.json to load the package root (@mcrescenzo/opencode-self-evolve).`.slice(0, 240));
   }
 
-  if (testAutoReview) {
+  if (!terminalStopped && testAutoReview) {
     unsubscribers.push(api.event.on(testEventType, queueRefresh));
     unsubscribers.push(api.event.on("session.idle", queueRefresh));
     unsubscribers.push(api.event.on("session.status", queueRefresh));
@@ -1164,13 +1168,7 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   }
 
   const abort = () => {
-    disposed = true;
-    refreshPending = false;
-    refreshMicrotaskQueued = false;
-    clearTimeout(refreshTimer);
-    refreshTimer = null;
-    clearInterval(pollTimer);
-    stopHostHealth();
+    stopStateRootActivity(false);
   };
   api.lifecycle.signal.addEventListener("abort", abort, { once: true });
   api.lifecycle.onDispose(() => {

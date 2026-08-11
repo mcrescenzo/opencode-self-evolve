@@ -53,7 +53,7 @@ function fixture(t, { mode = "auto" } = {}) {
     mode,
     allowedSkillRoots: [skillRoot],
     updatedAt: NOW,
-  })).mode, mode);
+  })).mode, mode === "yolo" ? "auto" : mode);
   t.after(() => {
     try { store.close(); } catch {}
     rmSync(root, { recursive: true, force: true });
@@ -229,7 +229,7 @@ test("dashboard retention derives operational records from the configured store 
   }
 });
 
-test("approved skill folders block automatic apply but not automatic recommendations", (t) => {
+test("approved skill folders do not block analysis-only Auto or legacy yolo", (t) => {
   const f = fixture(t, { mode: "auto" });
   const current = f.store.getSettings();
   assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
@@ -250,9 +250,10 @@ test("approved skill folders block automatic apply but not automatic recommendat
     ...f.store.getSettings().global,
     mode: "yolo",
     updatedAt: NOW + 2,
-  })).mode, "yolo");
+  })).mode, "auto", "a stored legacy yolo preference narrows to auto");
   const yolo = build(f);
-  assert.equal(yolo.dashboard.blockers.some((blocker) => blocker.code === "approved-skill-folders"), true);
+  assert.equal(yolo.dashboard.settings.effectiveMode, "auto");
+  assert.equal(yolo.dashboard.blockers.some((blocker) => blocker.code === "approved-skill-folders"), false);
 });
 
 function treeSnapshot(root) {
@@ -298,7 +299,7 @@ test("pending projections render bounded diff, evidence, eligibility, budgets, a
   assert.equal(detail.detailHash, result.index.reviews[0].detailHash);
   assert.equal(detail.revision, result.index.reviews[0].detailRevision);
   assert.equal(detail.summary.tokenImpact.estimatedTokens, Math.ceil(Buffer.byteLength(PROPOSED) / 4));
-  assert.equal(detail.summary.tokenImpact.budgetTokens, 8_000);
+  assert.equal(detail.summary.tokenImpact.budgetTokens, 24_576);
   assert.equal(detail.summary.eligibility.eligible, true);
   assert.deepEqual(detail.summary.eligibility.checks.map((check) => check.name), [
     "minIndependentIncidents",
@@ -346,7 +347,7 @@ test("critic-pending stays internal until one pending review is published, while
   assert.deepEqual(failed.details[0].allowedActions, []);
 });
 
-test("manual and yolo pending projections remain reviewable without inferring Apply authority", (t) => {
+test("manual stays advisory while legacy yolo narrows to explicit-review Auto", (t) => {
   for (const mode of ["manual", "yolo"]) {
     const f = fixture(t, { mode });
     const item = proposal(f.skillRoot, { id: `proposal-${mode}` });
@@ -354,8 +355,11 @@ test("manual and yolo pending projections remain reviewable without inferring Ap
     seedContent(f.store, item);
     seedLegacyGrant(f.store, item);
     const result = build(f, { detailProposalIds: [item.id] });
-    assert.equal(result.details[0].summary.effectiveMode, mode);
-    assert.deepEqual(result.details[0].allowedActions.map((action) => action.action), ["reject-proposal"]);
+    assert.equal(result.details[0].summary.effectiveMode, mode === "yolo" ? "auto" : "manual");
+    assert.deepEqual(
+      result.details[0].allowedActions.map((action) => action.action),
+      mode === "yolo" ? ["apply-proposal", "reject-proposal"] : ["reject-proposal"],
+    );
   }
 });
 
@@ -474,6 +478,36 @@ test("automatic mode reports when background analysis awaits restart", (t) => {
   );
 });
 
+test("configured Auto remains visible while pause and exclusion are operational states", (t) => {
+  const f = fixture(t, { mode: "auto" });
+  const paused = f.store.updateGlobalSettings((global) => makeGlobalSettings({
+    ...global,
+    paused: true,
+    updatedAt: global.updatedAt + 1,
+  }));
+  assert.equal(paused.ok, true);
+  let result = build(f);
+  assert.equal(result.index.status.effectiveMode, "auto");
+  assert.equal(result.dashboard.settings.effectiveMode, "auto");
+  assert.equal(result.dashboard.automation.state, "paused");
+
+  assert.equal(f.store.updateGlobalSettings((global) => makeGlobalSettings({
+    ...global,
+    paused: false,
+    updatedAt: global.updatedAt + 1,
+  })).ok, true);
+  assert.equal(f.store.updateRepoSettings((repo) => ({ ...repo, excluded: true })).ok, true);
+  result = build(f);
+  assert.equal(result.index.status.effectiveMode, "auto");
+  assert.equal(result.dashboard.settings.effectiveMode, "auto");
+  assert.equal(result.dashboard.automation.state, "excluded");
+
+  assert.equal(f.store.updateRepoSettings((repo) => ({ ...repo, excluded: false, mode: "yolo" })).ok, true);
+  result = build(f);
+  assert.equal(result.index.status.effectiveMode, "auto", "legacy yolo projects display analysis-only Auto");
+  assert.equal(result.dashboard.settings.effectiveMode, "auto");
+});
+
 test("operation grants bind the exact project, root, and target-derived generation without circular store hashes", (t) => {
   const f = fixture(t);
   const item = proposal(f.skillRoot);
@@ -486,6 +520,9 @@ test("operation grants bind the exact project, root, and target-derived generati
     targetReader: f.targetReader,
     inventory: f.inventory(),
   });
+  assert.equal(first.dashboard.settings.globalRootPolicy, null);
+  assert.match(first.dashboard.settings.globalRootPolicyConfirmation, /^REPLACE GLOBAL ROOT POLICY [a-f0-9]{12}$/u);
+  assert.equal(first.dashboard.settings.globalRootPolicyAction, null);
   append(f.store, "audit-event", audit("decision", item.id, {
     action: "ui-operation-nonce",
     projectFingerprint: PROJECT,
@@ -524,6 +561,16 @@ test("operation grants bind the exact project, root, and target-derived generati
     projectFingerprint: PROJECT,
     stateRootIdentity: ROOT_IDENTITY,
     generation: second.generation,
+    uiAction: "replace-global-root-policy",
+    capability: "operation-global-root-policy-v1",
+    nonce: hash("root-policy"),
+    expiresAt: NOW + 30_000,
+  }, NOW - 1_950));
+  append(f.store, "audit-event", audit("decision", null, {
+    action: "ui-operation-nonce",
+    projectFingerprint: PROJECT,
+    stateRootIdentity: ROOT_IDENTITY,
+    generation: second.generation,
     uiAction: "retry-bootstrap",
     capability: "operation-retry-bootstrap-v1",
     nonce: hash("retry"),
@@ -531,6 +578,7 @@ test("operation grants bind the exact project, root, and target-derived generati
   }, NOW - 1_900));
   const third = build(f);
   assert.deepEqual(third.index.allowedActions.map((action) => action.action), ["set-paused"]);
+  assert.equal(third.dashboard.settings.globalRootPolicyAction.action, "replace-global-root-policy");
 });
 
 test("dashboard activity is allowlisted and usage-only audits do not churn the core generation", (t) => {

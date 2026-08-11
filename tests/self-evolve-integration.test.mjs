@@ -1,30 +1,39 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { createIntegration, recoverOrphanedAnalyzerSessions, ROLLOUT_GATES } from "../self-evolve-integration.js";
 import {
   createControlRequest,
   createDecisionRequest,
+  createGlobalActionRequest,
   createUiOperationRequest,
   makeBridgeRequest,
   makeControlRequest,
   pollControlResponse,
   pollDecisionResponse,
+  pollGlobalActionResponse,
+  pendingGlobalActionRequestCount,
   pollUiOperationResponse,
+  publishGlobalRecommendationProjection,
+  publishTuiHostHealth,
+  readGlobalRecommendationProjection,
   readControlState,
   readProjectInbox,
   readUiProjection,
   submitControlRequest,
   submitDecisionRequest,
+  submitGlobalActionRequest,
   submitUiOperationRequest,
 } from "../self-evolve-bridge.js";
+import { buildGlobalRecommendationProjection } from "../self-evolve-projection.js";
 import * as inventoryModule from "../self-evolve-inventory.js";
 import * as observationModule from "../self-evolve-observation.js";
 import { createSensitiveExportManager } from "../self-evolve-export.js";
+import { createPrivacyGuard } from "../self-evolve-privacy.js";
 import { openStore } from "../self-evolve-store.js";
 import { spawnSync } from "node:child_process";
 
@@ -43,6 +52,7 @@ function seedDeadHostOwner(root, sessionId, agent) {
 import * as schemas from "../self-evolve-schemas.js";
 import * as commandModule from "../self-evolve-commands.js";
 import {
+  GLOBAL_PROTOCOL_LIMITS,
   UI_CAPABILITIES,
   UI_DASHBOARD_VERSION,
   UI_OPERATION_PROTOCOL_VERSION,
@@ -123,6 +133,66 @@ function seedOutcome(store, index, status = "accepted", timestamp = 10 + index, 
   return store.appendRecord(schemas.wrapRecord("audit-event", event, timestamp));
 }
 
+function globalActionSubject(action, stateRootIdentity, now) {
+  const hash = (value) => createHash("sha256").update(String(value)).digest("hex");
+  const currentContent = "---\nname: shared-review\ndescription: Reviews failures.\n---\n\n# Shared Review\n";
+  const proposedContent = `${currentContent}\nVerify the exact failure before changing guidance.\n`;
+  const candidateId = hash(`global-candidate:${action}`);
+  const supportSetHash = hash(`global-support:${action}`);
+  const state = action === "undo" ? "applied" : "pending";
+  const recommendation = {
+    recommendationId: hash(`global-recommendation:${action}`),
+    candidateId,
+    supportSetHash,
+    targetBinding: {
+      targetKind: "existing-global-skill",
+      logicalName: "shared-review",
+      relativePath: "shared-review/SKILL.md",
+      currentHash: hash(currentContent),
+      bindingHash: hash(`global-binding:${action}`),
+    },
+    proposedContentHash: hash(proposedContent),
+    rationaleText: "Independent support warrants one bounded global correction.",
+    synthesizedAt: now - 1,
+    criticScore: 0.99,
+    criticPassed: true,
+    validDeterministic: true,
+    state,
+    decisionVersion: state === "applied" ? 1 : 0,
+  };
+  const supportSet = {
+    supportSetHash,
+    candidateId,
+    contributionIds: [randomUUID()],
+    strongestSingleDomain: { independentIncidentCount: 2, occurrenceCount: 3 },
+    distributed: { independentKnownDomainCount: 1, independentIncidentCount: 2 },
+    firstSeenDay: "2026-08-01",
+    lastSeenDay: "2026-08-11",
+  };
+  const candidate = {
+    candidateId,
+    supportSetHash,
+    eligibilityRoute: "single-domain",
+    independentDomainCount: 1,
+    independentIncidentCount: 2,
+    occurrenceCount: 3,
+    updatedAt: now,
+  };
+  const targetContent = state === "applied" ? proposedContent : currentContent;
+  const projection = buildGlobalRecommendationProjection({
+    recommendations: [recommendation],
+    supportSets: [supportSet],
+    candidates: [candidate],
+    audits: [],
+    contentByRecommendation: { [recommendation.recommendationId]: proposedContent },
+  }, {
+    stateRootIdentity,
+    now,
+    targetReader: () => ({ exists: true, content: targetContent, hash: hash(targetContent) }),
+  });
+  return { recommendation, projection };
+}
+
 function harness(t, config = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-integration-"));
   let clock = config.initialClock ?? 100;
@@ -149,6 +219,7 @@ function harness(t, config = {}) {
     reservations: [],
     episodeLeases: [],
     recoveries: 0,
+    contributionRecoveries: 0,
     synthesisRecoveries: 0,
     published: [],
     settingsReads: 0,
@@ -179,6 +250,7 @@ function harness(t, config = {}) {
       releaseOwnedHostOwners: (...args) => config.releaseOwnedHostOwners(store, ...args),
     };
   }
+  if (config.decorateStore) integrationStore = config.decorateStore(integrationStore, store);
   const privacy = config.privacy?.(store, root) ?? {
     exportScope: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
     purgeScope: () => ({ ok: true, counts: {} }),
@@ -252,6 +324,11 @@ function harness(t, config = {}) {
           config.recoveryOrder?.push("synthesis-recovery");
           return config.synthesisRecovery ?? [];
         },
+        recoverContributionTransactions() {
+          calls.contributionRecoveries += 1;
+          config.recoveryOrder?.push("contribution-recovery");
+          return config.contributionRecovery ?? { ok: true, recovered: 0, failed: 0, outcomes: [] };
+        },
       };
     },
   };
@@ -282,8 +359,10 @@ function harness(t, config = {}) {
     },
   };
 
+  const projectDirectory = config.useFixtureProjectDirectory ? path.join(root, "project") : "/workspace/project";
+  if (config.useFixtureProjectDirectory) mkdirSync(projectDirectory);
   const ctx = {
-    directory: "/workspace/project",
+    directory: projectDirectory,
     client: {
       tui: { publish(value) { calls.published.push(value); } },
       session: {
@@ -421,17 +500,35 @@ test("server integration boot exposes incompatible state health without mutating
   assert.deepEqual(exactTree(root), before);
 });
 
+test("global bridge publication failure does not corrupt project-local boot authority", async (t) => {
+  const h = harness(t, {
+    initialClock: Date.now(),
+    inventory: inventoryModule,
+    integrationOptions: { stateRoot: true },
+  });
+  const globalBridge = path.join(h.root, "self-evolve", "bridge", "global");
+  mkdirSync(globalBridge, { recursive: true, mode: 0o700 });
+  chmodSync(globalBridge, 0o770);
+
+  const result = await h.integration.boot({ processMailbox: false, recoverHostSessions: false });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.health.lastError, "ui-projection-ancestor-permissions-rejected");
+  assert.equal(result.health.mode, "manual");
+});
+
 function headlessCommand(store, item, overrides = {}) {
   const grant = store.readRecords("audit-event").map((record) => record.payload).findLast((event) =>
     event.proposalId === item.id && event.details?.action === "headless-approval-nonce").details;
   return `/self-evolve approve ${item.id} --target-hash ${overrides.targetHash ?? grant.targetHash} --proposed-content-hash ${overrides.proposedContentHash ?? grant.proposedContentHash} --decision-version ${overrides.decisionVersion ?? grant.decisionVersion} --nonce ${overrides.nonce ?? grant.nonce}`;
 }
 
-test("all three modes preserve identical evidence and proposal thresholds", async (t) => {
+test("both project analysis modes preserve identical evidence and proposal thresholds", async (t) => {
+  assert.deepEqual(schemas.Mode.values, ["manual", "auto"]);
   for (const mode of schemas.Mode.values) {
     await t.test(mode, async (t) => {
       const h = harness(t, { rolloutMetrics: { synthesesObserved: 0, successRate: 0 } });
-      const set = h.integration.__testBridge.setMode(mode, mode === "yolo" ? { confirmed: true, allowlist: [h.root] } : {});
+      const set = h.integration.__testBridge.setMode(mode);
       assert.equal(set.ok, true);
       const result = await h.integration.runEvolutionCycle({ sessionID: `session-${mode}`, projectFingerprint: FINGERPRINT, scopeFingerprint: FINGERPRINT });
       assert.deepEqual(result.observations, [{ id: "observation-shared", incidentId: "incident-shared" }]);
@@ -488,12 +585,69 @@ test("every admitted cycle records one bounded semantic terminal outcome", async
 });
 
 test("manual mode has no passive scheduler activity or writes", async (t) => {
-  const h = harness(t);
+  const h = harness(t, { instrumentStore: true });
   const before = h.store.exportAll().records.length;
+  const beforeReads = h.calls.settingsReads;
+  const beforeWrites = h.calls.recordWrites;
   const result = await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "manual-session" } });
   assert.deepEqual(result, { scheduled: false, reason: "manual-mode" });
+  assert.equal(h.calls.settingsReads - beforeReads, 1, "the configured-mode gate performs one fresh settings read");
+  assert.equal(h.calls.recordWrites, beforeWrites);
+  assert.equal(h.calls.sessionGets, undefined);
   assert.equal(h.calls.events.length, 0);
   assert.equal(h.store.exportAll().records.length, before);
+});
+
+test("configured project mode stays separate from fresh operational suppressors", async (t) => {
+  const h = harness(t, { instrumentStore: true, enqueueOnEvent: false });
+  const setProjectMode = (mode) => {
+    const saved = h.store.updateRepoSettings((repo) => schemas.makeRepoSettings({ ...repo, mode }));
+    assert.equal(saved.ok, true);
+  };
+  setProjectMode("auto");
+  assert.deepEqual(h.integration.getProjectOperationalState(), {
+    configuredMode: "auto",
+    passiveAnalysisAllowed: true,
+    reason: null,
+  });
+  assert.equal((await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "auto-next" } })).scheduled, true);
+  assert.equal(h.calls.events.length, 1);
+
+  const paused = h.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+    ...global,
+    paused: true,
+    updatedAt: h.now(),
+  }));
+  assert.equal(paused.ok, true);
+  assert.deepEqual(h.integration.getProjectOperationalState(), {
+    configuredMode: "auto",
+    passiveAnalysisAllowed: false,
+    reason: "paused",
+  });
+  const sessionReads = h.calls.sessionGets?.length ?? 0;
+  assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "paused-next" } }), {
+    scheduled: false,
+    reason: "paused",
+  });
+  assert.equal(h.calls.sessionGets?.length ?? 0, sessionReads);
+  assert.equal(h.calls.events.length, 1);
+
+  const resumed = h.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+    ...global,
+    paused: false,
+    updatedAt: h.now(),
+  }));
+  assert.equal(resumed.ok, true);
+  setProjectMode("manual");
+  assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "manual-next" } }), {
+    scheduled: false,
+    reason: "manual-mode",
+  });
+  assert.equal(h.calls.sessionGets?.length ?? 0, sessionReads);
+  assert.equal(h.calls.events.length, 1);
+
+  setProjectMode("yolo");
+  assert.equal(h.integration.getProjectOperationalState().configuredMode, "auto", "legacy yolo narrows to analysis-only Auto");
 });
 
 test("passive scheduling hydrates only trustworthy direct roots through supported 1.18.x session reads", async (t) => {
@@ -660,11 +814,10 @@ test("stream delta bursts perform zero durable integration work in every mode", 
   }
 });
 
-test("admitted event bursts reuse a bounded routing settings snapshot", async (t) => {
+test("admitted event bursts read fresh routing settings", async (t) => {
   const h = harness(t, {
     instrumentStore: true,
     enqueueOnEvent: false,
-    integrationOptions: { __testRoutingSettingsTtlMs: 250 },
   });
   assert.equal(h.integration.__testBridge.setMode("auto").ok, true);
   const baseline = h.calls.settingsReads;
@@ -677,7 +830,7 @@ test("admitted event bursts reuse a bounded routing settings snapshot", async (t
     });
     assert.equal(result.scheduled, true);
   }
-  assert.equal(h.calls.settingsReads - baseline, 1);
+  assert.equal(h.calls.settingsReads - baseline, 100);
 
   const current = h.store.getSettings();
   h.store.setGlobalSettings(schemas.makeGlobalSettings({
@@ -685,10 +838,8 @@ test("admitted event bursts reuse a bounded routing settings snapshot", async (t
     mode: "manual",
     updatedAt: current.global.updatedAt + 1,
   }));
-  assert.equal((await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "cached" } })).scheduled, true);
-  for (let index = 0; index < 251; index += 1) h.now();
   assert.deepEqual(
-    await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "refreshed" } }),
+    await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "fresh" } }),
     { scheduled: false, reason: "manual-mode" },
   );
 });
@@ -778,16 +929,149 @@ test("the production integration publishes a negotiated server-authored UI proje
   ));
   assert.equal(generationFiles.includes("dashboard-v1.json"), true);
   assert.equal(generationFiles.includes(`dashboard-v${UI_DASHBOARD_VERSION}.json`), true);
+  const globalProjection = readGlobalRecommendationProjection(h.root, { now: h.now() });
+  assert.equal(globalProjection.mode, "native");
+  assert.equal(globalProjection.index.stateRootIdentity, h.store.rootIdentity);
+  assert.deepEqual(globalProjection.index.recommendations, []);
 });
 
-test("repository mode control is capability-advertised, exact, version-bound, replay-safe, and yolo-gated", async (t) => {
+for (const action of ["apply", "reject", "undo"]) {
+  test(`global ${action} requests enter the direct identity-free decision API`, async (t) => {
+    let recommendation;
+    let directCall;
+    let rejectCall;
+    const h = harness(t, {
+      initialClock: Date.now(),
+      decorateStore: (integrationStore) => ({
+        ...integrationStore,
+        readGlobalRecommendations: () => recommendation ? [recommendation] : [],
+        rejectGlobalRecommendation(request) {
+          rejectCall = request;
+          return { ok: true };
+        },
+      }),
+      integrationOptions: {
+        stateRoot: true,
+        __testGlobalDecisionDomain: {
+          async decide(request) { directCall = request; return { ok: true }; },
+          async recover() { return []; },
+        },
+      },
+    });
+    const timestamp = h.now();
+    const subject = globalActionSubject(action, h.store.rootIdentity, timestamp);
+    recommendation = subject.recommendation;
+    publishGlobalRecommendationProjection(h.root, subject.projection, {
+      store: h.store,
+      expectedGeneration: null,
+      now: timestamp,
+    });
+    const projected = readGlobalRecommendationProjection(h.root, { now: timestamp });
+    const grant = projected.grants.find((value) => value.action === action);
+    assert.ok(grant);
+    const actingProjectFingerprint = createHash("sha256").update(`acting:${action}`).digest("hex");
+    const health = publishTuiHostHealth(h.root, {
+      projectFingerprint: actingProjectFingerprint,
+      stateRootIdentity: h.store.rootIdentity,
+      hostVersion: "0.3.0",
+      issuedAt: timestamp,
+      expiresAt: timestamp + GLOBAL_PROTOCOL_LIMITS.operationTtlMs,
+    });
+    const request = createGlobalActionRequest({
+      grant,
+      actingProjectFingerprint,
+      actingHealth: health,
+      timestamp,
+      requestId: randomUUID(),
+    });
+    submitGlobalActionRequest(h.root, request);
+
+    const pass = await h.integration.processMailbox();
+    assert.equal(pass.globalActions.ok, true);
+    assert.equal(pass.globalActions.processed.length, 1);
+    const response = pollGlobalActionResponse(h.root, request, { now: h.now() });
+    assert.equal(response.ok, true, response.reason);
+    const decisionRequest = action === "reject" ? rejectCall : directCall;
+    assert.ok(decisionRequest);
+    if (action !== "reject") assert.equal(decisionRequest.action, action);
+    const decision = decisionRequest.decision;
+    assert.equal(decision.recommendationId, recommendation.recommendationId);
+    assert.equal(decision.priorState, recommendation.state);
+    assert.equal(decision.newState, action === "apply" ? "approved" : action === "undo" ? "undo-approved" : "rejected");
+    assert.doesNotMatch(JSON.stringify(decision), new RegExp(`${actingProjectFingerprint}|${FINGERPRINT}`, "u"));
+    assert.equal(action === "reject" ? directCall : rejectCall, undefined);
+  });
+}
+
+test("a failed Reject sweep fences global mailbox actions before consumption", async (t) => {
+  let recommendation;
+  let decisions = 0;
+  let recoveryCalls = 0;
+  const h = harness(t, {
+    initialClock: Date.now(),
+    decorateStore: (integrationStore) => ({
+      ...integrationStore,
+      readGlobalRecommendations: () => recommendation ? [recommendation] : [],
+      recoverGlobalRejections() {
+        recoveryCalls += 1;
+        return { ok: false, reason: "global-rejection-decision-conflict", recovered: [] };
+      },
+    }),
+    integrationOptions: {
+      stateRoot: true,
+      __testGlobalDecisionDomain: {
+        async decide() { decisions += 1; return { ok: true }; },
+        async recover() { return []; },
+      },
+    },
+  });
+  const timestamp = h.now();
+  const subject = globalActionSubject("apply", h.store.rootIdentity, timestamp);
+  recommendation = subject.recommendation;
+  publishGlobalRecommendationProjection(h.root, subject.projection, {
+    store: h.store,
+    expectedGeneration: null,
+    now: timestamp,
+  });
+  const projected = readGlobalRecommendationProjection(h.root, { now: timestamp });
+  const grant = projected.grants.find((value) => value.action === "apply");
+  const actingProjectFingerprint = createHash("sha256").update("failed-reject-sweep-acting").digest("hex");
+  const health = publishTuiHostHealth(h.root, {
+    projectFingerprint: actingProjectFingerprint,
+    stateRootIdentity: h.store.rootIdentity,
+    hostVersion: "0.3.0",
+    issuedAt: timestamp,
+    expiresAt: timestamp + GLOBAL_PROTOCOL_LIMITS.operationTtlMs,
+  });
+  const request = createGlobalActionRequest({
+    grant,
+    actingProjectFingerprint,
+    actingHealth: health,
+    timestamp,
+    requestId: randomUUID(),
+  });
+  submitGlobalActionRequest(h.root, request);
+
+  const pass = await h.integration.processMailbox();
+
+  assert.equal(pass.ok, true);
+  assert.equal(pass.globalActions.ok, false);
+  assert.equal(pass.globalActions.reason, "global-rejection-decision-conflict");
+  assert.deepEqual(pass.globalActions.processed, []);
+  assert.equal(recoveryCalls >= 1, true);
+  assert.equal(decisions, 0);
+  assert.equal(pendingGlobalActionRequestCount(h.root), 1);
+  assert.equal(pollGlobalActionResponse(h.root, request, { now: h.now() }), null);
+});
+
+test("project analysis control is project-scoped, projection-bound, replay-safe, and legacy-control inert", async (t) => {
   const h = harness(t, {
     initialClock: Date.now(),
     inventory: inventoryModule,
     integrationOptions: { stateRoot: true },
   });
   await h.integration.processMailbox();
-  let projected = readUiProjection(h.root, FINGERPRINT, {
+  const projected = readUiProjection(h.root, FINGERPRINT, {
     now: h.now(),
     clientOffer: {
       projectionVersions: [UI_PROJECTION_VERSION],
@@ -795,51 +1079,33 @@ test("repository mode control is capability-advertised, exact, version-bound, re
       capabilities: UI_CAPABILITIES,
     },
   });
-  assert.equal(projected.capabilities.includes("control-repo-mode-v1"), false);
-  assert.equal(projected.dashboard.capabilities.includes("control-repo-mode-v1"), true);
+  assert.equal(projected.dashboard.capabilities.includes("project-analysis-control-v1"), true);
   assert.equal(projected.dashboard.supportedControls.includes("set-repo-mode"), true);
+  const grant = projected.index.allowedActions.find((action) => action.action === "set-repo-mode");
+  assert.ok(grant);
+  const before = h.store.getSettings();
+  const control = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant,
+    action: "set-repo-mode",
+    payload: { mode: "auto", settingsVersion: control.settingsVersion },
+    timestamp: h.now(),
+    requestId: "project-analysis-auto",
+  });
+  submitUiOperationRequest(h.root, request);
+  await h.integration.processMailbox();
+  const response = pollUiOperationResponse(h.root, request, { now: h.now() });
+  assert.equal(response.ok, true, response.reason);
+  const after = h.store.getSettings();
+  assert.equal(after.repo.mode, "auto");
+  assert.deepEqual(after.global, before.global, "project analysis control changes no global default or consent");
 
-  for (const mode of ["manual", "auto", "yolo", "inherit"]) {
-    const controlState = readControlState(h.root, FINGERPRINT, { now: h.now() });
-    const request = createControlRequest({
-      controlState,
-      action: "set-repo-mode",
-      payload: { mode },
-      timestamp: h.now(),
-      requestId: `repository-mode-${mode}`,
-    });
-    submitControlRequest(h.root, request);
-    const pass = await h.integration.processMailbox();
-    assert.equal(pass.controls.length, 1);
-    const response = pollControlResponse(h.root, FINGERPRINT, request.requestId);
-    assert.equal(response.ok, true, `${mode}: ${response.reason}`);
-    assert.equal(h.store.getSettings().repo.mode, mode);
-    submitControlRequest(h.root, request);
-    await h.integration.processMailbox();
-    assert.equal(h.store.getSettings().repo.mode, mode, "replay recovery must not repeat the settings mutation");
-    if (mode === "yolo") {
-      const yoloState = readControlState(h.root, FINGERPRINT, { now: h.now() });
-      const empty = createControlRequest({
-        controlState: yoloState,
-        action: "update-allowlist",
-        payload: { allowlist: [], confirmation: "UPDATE ALLOWLIST" },
-        timestamp: h.now(),
-        requestId: "repository-yolo-empty-allowlist",
-      });
-      submitControlRequest(h.root, empty);
-      await h.integration.processMailbox();
-      assert.equal(pollControlResponse(h.root, FINGERPRINT, empty.requestId).reason, "yolo-allowlist-required");
-      assert.deepEqual(h.store.getSettings().global.allowedSkillRoots, [h.root]);
-    }
-  }
-  const repoTransitions = h.store.readRecords("audit-event")
-    .map((record) => record.payload)
-    .filter((event) => event.kind === "mode-change" && event.details?.scope === "repo");
-  assert.deepEqual(repoTransitions.map((event) => event.details.requestedMode), [
-    "manual", "auto", "yolo", "inherit",
-  ]);
+  assert.throws(() => submitUiOperationRequest(h.root, request), /operation-response-already-exists/u);
+  assert.equal(h.store.getSettings().repo.mode, "auto", "replay recovery does not repeat the mutation");
 
-  projected = readUiProjection(h.root, FINGERPRINT, {
+  await h.integration.processMailbox();
+  const staleProjection = readUiProjection(h.root, FINGERPRINT, {
     now: h.now(),
     clientOffer: {
       projectionVersions: [UI_PROJECTION_VERSION],
@@ -847,161 +1113,68 @@ test("repository mode control is capability-advertised, exact, version-bound, re
       capabilities: UI_CAPABILITIES,
     },
   });
-  assert.equal(projected.dashboard.settings.repositoryMode, "inherit");
+  const staleGrant = staleProjection.index.allowedActions.find((action) => action.action === "set-repo-mode");
+  const staleControl = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  const stale = createUiOperationRequest({
+    projection: staleProjection.index,
+    grant: staleGrant,
+    action: "set-repo-mode",
+    payload: { mode: "auto", settingsVersion: staleControl.settingsVersion },
+    timestamp: h.now(),
+    requestId: "project-analysis-stale",
+  });
+  assert.equal(h.store.updateRepoSettings((repo) => schemas.makeRepoSettings({ ...repo, mode: "manual" })).ok, true);
+  submitUiOperationRequest(h.root, stale);
+  await h.integration.processMailbox();
+  assert.equal(pollUiOperationResponse(h.root, stale, { now: h.now() }).ok, false);
+  assert.equal(h.store.getSettings().repo.mode, "manual");
 
-  const staleState = readControlState(h.root, FINGERPRINT, { now: h.now() });
-  assert.equal(h.integration.__testBridge.setMode("manual").ok, true);
-  const stale = createControlRequest({
-    controlState: staleState,
+  const legacyState = readControlState(h.root, FINGERPRINT, { now: h.now() });
+  const legacy = createControlRequest({
+    controlState: legacyState,
     action: "set-repo-mode",
     payload: { mode: "auto" },
     timestamp: h.now(),
-    requestId: "repository-mode-stale",
+    requestId: "legacy-project-analysis",
   });
-  submitControlRequest(h.root, stale);
+  submitControlRequest(h.root, legacy);
   await h.integration.processMailbox();
-  assert.equal(pollControlResponse(h.root, FINGERPRINT, stale.requestId).ok, false);
-  assert.match(pollControlResponse(h.root, FINGERPRINT, stale.requestId).reason, /stale|nonce/u);
-
-  const canonicalState = readControlState(h.root, FINGERPRINT, { now: h.now() });
-  const canonical = createControlRequest({
-    controlState: canonicalState,
-    action: "update-allowlist",
-    payload: {
-      allowlist: [path.join(h.root, "missing-skill-folder")],
-      confirmation: "UPDATE ALLOWLIST",
-    },
-    timestamp: h.now(),
-    requestId: "repository-invalid-folder",
-  });
-  submitControlRequest(h.root, canonical);
-  await h.integration.processMailbox();
-  assert.equal(pollControlResponse(h.root, FINGERPRINT, canonical.requestId).reason,
-    "invalid-or-unsupported-skill-folder");
-  assert.deepEqual(h.store.getSettings().global.allowedSkillRoots, [h.root]);
-
-  const blockedCases = [
-    {
-      name: "allowlist",
-      config: { allowlisted: false, rolloutOutcomes: 0 },
-      reason: "yolo-allowlist-required",
-    },
-    {
-      name: "consent",
-      mutate(blocked) {
-        blocked.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-          ...global,
-          consent: { ...global.consent, passiveCalls: false },
-          updatedAt: blocked.now(),
-        }));
-      },
-      reason: "passive-consent-required",
-    },
-    {
-      name: "rollout",
-      config: { rolloutOutcomes: 0 },
-      reason: "yolo-rollout-not-ready",
-    },
-    {
-      name: "breaker",
-      config: { breakerOpen: true },
-      reason: "circuit-breaker-open",
-    },
-  ];
-  for (const blockedCase of blockedCases) {
-    const blocked = harness(t, {
-      initialClock: Date.now(),
-      inventory: inventoryModule,
-      integrationOptions: { stateRoot: true },
-      ...blockedCase.config,
-    });
-    blockedCase.mutate?.(blocked);
-    await blocked.integration.processMailbox();
-    const blockedState = readControlState(blocked.root, FINGERPRINT, { now: blocked.now() });
-    const yolo = createControlRequest({
-      controlState: blockedState,
-      action: "set-repo-mode",
-      payload: { mode: "yolo" },
-      timestamp: blocked.now(),
-      requestId: `repository-yolo-blocked-${blockedCase.name}`,
-    });
-    submitControlRequest(blocked.root, yolo);
-    await blocked.integration.processMailbox();
-    const blockedResponse = pollControlResponse(blocked.root, FINGERPRINT, yolo.requestId);
-    assert.equal(blockedResponse.ok, false);
-    assert.equal(blockedResponse.reason, blockedCase.reason);
-    assert.equal(blocked.store.getSettings().repo.mode, "inherit");
-  }
+  assert.equal(pollControlResponse(h.root, FINGERPRINT, legacy.requestId).ok, false);
+  assert.equal(h.store.getSettings().repo.mode, "manual");
 });
 
-test("global yolo control enforces consent, rollout, and breaker admission", async (t) => {
-  const blockedCases = [
-    {
-      name: "passive-consent",
-      mutate(blocked) {
-        blocked.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-          ...global,
-          consent: { ...global.consent, passiveCalls: false },
-          updatedAt: blocked.now(),
-        }));
-      },
-      reason: "passive-consent-required",
-    },
-    {
-      name: "observation-consent",
-      mutate(blocked) {
-        blocked.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-          ...global,
-          consent: { ...global.consent, durableObservations: false },
-          updatedAt: blocked.now(),
-        }));
-      },
-      reason: "observation-consent-required",
-    },
-    {
-      name: "rollout",
-      config: { rolloutOutcomes: 0 },
-      reason: "yolo-rollout-not-ready",
-    },
-    {
-      name: "breaker",
-      config: { breakerOpen: true },
-      reason: "circuit-breaker-open",
-    },
-  ];
-  for (const blockedCase of blockedCases) {
+test("a legacy yolo control request is rejected outright and never changes the stored mode", async (t) => {
+  for (const action of ["set-mode", "set-repo-mode"]) {
     const blocked = harness(t, {
       initialClock: Date.now(),
       inventory: inventoryModule,
       integrationOptions: { stateRoot: true },
-      ...blockedCase.config,
     });
-    blockedCase.mutate?.(blocked);
     await blocked.integration.processMailbox();
     const controlState = readControlState(blocked.root, FINGERPRINT, { now: blocked.now() });
     const request = createControlRequest({
       controlState,
-      action: "set-mode",
-      payload: blockedCase.payload ?? {
-        mode: "yolo",
-        confirmation: "ENABLE YOLO",
-        allowlist: [blocked.root],
-      },
+      action,
+      payload: action === "set-mode"
+        ? { mode: "yolo", confirmation: "ENABLE YOLO", allowlist: [blocked.root] }
+        : { mode: "yolo" },
       timestamp: blocked.now(),
-      requestId: `global-yolo-blocked-${blockedCase.name}`,
+      requestId: `legacy-yolo-${action}`,
     });
     submitControlRequest(blocked.root, request);
     await blocked.integration.processMailbox();
     const response = pollControlResponse(blocked.root, FINGERPRINT, request.requestId);
     assert.equal(response.ok, false);
-    assert.equal(response.reason, blockedCase.reason);
+    // Legacy project-mode control is already inert in v0.3; a yolo payload is
+    // rejected either by that gate or by the explicit yolo retirement.
+    assert.match(response.reason, /legacy-project-analysis-control-disabled|yolo-retired/u);
     assert.equal(blocked.store.getSettings().global.mode, "manual");
+    assert.equal(blocked.store.getSettings().repo.mode, "inherit");
   }
 });
 
 for (const controlCase of [
   { action: "set-mode", payload: { mode: "auto" } },
-  { action: "set-repo-mode", payload: { mode: "auto" } },
   { action: "set-consent", payload: { key: "sanitizedExcerpts", enabled: true } },
   { action: "set-repo-excluded", payload: { excluded: true } },
   { action: "update-allowlist", payload: (root) => ({ allowlist: [root], confirmation: "UPDATE ALLOWLIST" }) },
@@ -1085,6 +1258,247 @@ test("native operation mailbox version-binds pause and recovers one exact respon
     .map((details) => details.status);
   assert.deepEqual(statuses, ["queued", "running", "completed"]);
   assert.throws(() => submitUiOperationRequest(h.root, request), /operation-response-already-exists/u);
+});
+
+test("native root-policy replacement revalidates canonical global roots and commits exact capabilities", async (t) => {
+  const h = harness(t, {
+    inventory: inventoryModule,
+    useFixtureProjectDirectory: true,
+    integrationOptions: { stateRoot: true },
+  });
+  const approvedRoot = path.join(h.root, "approved-global-skills");
+  mkdirSync(approvedRoot);
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  const grant = projected.effectiveIndexActions.find((action) => action.action === "replace-global-root-policy");
+  assert.ok(grant);
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant,
+    payload: {
+      roots: [{ canonicalPath: approvedRoot, canUpdate: true, canCreate: true }],
+      creationRootPath: approvedRoot,
+      confirmation: projected.dashboard.settings.globalRootPolicyConfirmation,
+      settingsVersion: projected.dashboard.settings.globalSettingsVersion,
+    },
+    timestamp: h.now(),
+    requestId: "native-root-policy-request",
+  });
+  submitUiOperationRequest(h.root, request);
+  await h.integration.processMailbox();
+
+  const response = pollUiOperationResponse(h.root, request, { now: h.now() });
+  assert.equal(response.ok, true, response.reason);
+  assert.deepEqual(h.store.getSettings().global.globalRootPolicy.roots.map((root) => ({
+    canonicalPath: root.canonicalPath,
+    canUpdate: root.canUpdate,
+    canCreate: root.canCreate,
+  })), [{ canonicalPath: approvedRoot, canUpdate: true, canCreate: true }]);
+});
+
+test("native root-policy replacement rejects missing, project-local, and symlinked roots without mutation", async (t) => {
+  for (const invalidCase of ["missing", "project-local", "symlinked"]) {
+    const h = harness(t, {
+      inventory: inventoryModule,
+      useFixtureProjectDirectory: true,
+      integrationOptions: { stateRoot: true },
+    });
+    let candidate;
+    if (invalidCase === "missing") {
+      candidate = path.join(h.root, "missing-global-skills");
+    } else if (invalidCase === "project-local") {
+      candidate = path.join(h.ctx.directory, ".opencode", "skills");
+      mkdirSync(candidate, { recursive: true });
+    } else {
+      const real = path.join(h.root, "real-global-skills");
+      candidate = path.join(h.root, "linked-global-skills");
+      mkdirSync(real);
+      symlinkSync(real, candidate);
+    }
+    await h.integration.processMailbox();
+    const projected = readUiProjection(h.root, FINGERPRINT, {
+      now: h.now(),
+      clientOffer: {
+        projectionVersions: [UI_PROJECTION_VERSION],
+        operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+        capabilities: UI_CAPABILITIES,
+      },
+    });
+    const request = createUiOperationRequest({
+      projection: projected.index,
+      grant: projected.effectiveIndexActions.find((action) => action.action === "replace-global-root-policy"),
+      payload: {
+        roots: [{ canonicalPath: candidate, canUpdate: true, canCreate: false }],
+        creationRootPath: null,
+        confirmation: projected.dashboard.settings.globalRootPolicyConfirmation,
+        settingsVersion: projected.dashboard.settings.globalSettingsVersion,
+      },
+      timestamp: h.now(),
+      requestId: `invalid-root-policy-${invalidCase}`,
+    });
+    submitUiOperationRequest(h.root, request);
+    await h.integration.processMailbox();
+    const response = pollUiOperationResponse(h.root, request, { now: h.now() });
+    assert.equal(response.ok, false, invalidCase);
+    assert.match(response.reason, invalidCase === "project-local" ? /project-skill-root-prohibited/u : /approved-root-noncanonical/u);
+    assert.equal(h.store.getSettings().global.globalRootPolicy, null);
+  }
+});
+
+test("native root-policy replacement aborts when locked catalog revalidation observes drift", async (t) => {
+  let rejectLockedValidation = false;
+  const inventory = {
+    ...inventoryModule,
+    buildGlobalSkillCatalog(...args) {
+      if (rejectLockedValidation) {
+        return { ok: false, blockers: [{ code: "global-root-drift-during-commit" }] };
+      }
+      return inventoryModule.buildGlobalSkillCatalog(...args);
+    },
+  };
+  const h = harness(t, {
+    inventory,
+    useFixtureProjectDirectory: true,
+    integrationOptions: {
+      stateRoot: true,
+      __testAfterRootPolicyPrevalidation() {
+        rejectLockedValidation = true;
+      },
+    },
+  });
+  const approvedRoot = path.join(h.root, "race-global-skills");
+  mkdirSync(approvedRoot);
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.effectiveIndexActions.find((action) => action.action === "replace-global-root-policy"),
+    payload: {
+      roots: [{ canonicalPath: approvedRoot, canUpdate: true, canCreate: true }],
+      creationRootPath: approvedRoot,
+      confirmation: projected.dashboard.settings.globalRootPolicyConfirmation,
+      settingsVersion: projected.dashboard.settings.globalSettingsVersion,
+    },
+    timestamp: h.now(),
+    requestId: "root-policy-locked-revalidation-race",
+  });
+  submitUiOperationRequest(h.root, request);
+  await h.integration.processMailbox();
+
+  const response = pollUiOperationResponse(h.root, request, { now: h.now() });
+  assert.equal(response.ok, false);
+  assert.equal(response.reason, "global-root-drift-during-commit");
+  assert.equal(h.store.getSettings().global.globalRootPolicy, null);
+  const audits = h.store.readRecords("audit-event").map((record) => record.payload.details);
+  assert.equal(audits.filter((details) => details?.action === "replace-global-root-policy").length, 0);
+  const completions = audits.filter((details) => details?.action === "ui-operation-complete"
+    && details.requestId === request.requestId);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].accepted, false);
+  assert.equal(completions[0].terminal, false);
+  assert.equal(completions[0].reason, "global-root-drift-during-commit");
+  assert.equal(completions[0].uiAction, "replace-global-root-policy");
+  assert.equal(completions[0].nonceHash, createHash("sha256").update(request.nonce).digest("hex"));
+  assert.equal(completions[0].requestDigest, createHash("sha256")
+    .update(`self-evolve-operation-request-completion-v1\n${JSON.stringify(request)}`).digest("hex"));
+});
+
+test("root-policy validation rejection survives response-publication crash without re-entering authority", async (t) => {
+  let rejectLockedValidation = false;
+  let prevalidationHooks = 0;
+  let effectCalls = 0;
+  let interruptResponse = true;
+  const inventory = {
+    ...inventoryModule,
+    buildGlobalSkillCatalog(...args) {
+      if (rejectLockedValidation) {
+        return { ok: false, blockers: [{ code: "global-root-drift-during-commit" }] };
+      }
+      return inventoryModule.buildGlobalSkillCatalog(...args);
+    },
+  };
+  const h = harness(t, {
+    inventory,
+    useFixtureProjectDirectory: true,
+    integrationOptions: {
+      stateRoot: true,
+      __testAfterRootPolicyPrevalidation() {
+        prevalidationHooks += 1;
+        if (prevalidationHooks === 1) rejectLockedValidation = true;
+      },
+      __testAfterOperationEffect({ request }) {
+        if (request.action === "replace-global-root-policy") effectCalls += 1;
+      },
+      __testAfterRequestHandled({ type, request }) {
+        if (!interruptResponse || type !== "operation" || request?.action !== "replace-global-root-policy") return;
+        interruptResponse = false;
+        rejectLockedValidation = false;
+        throw new Error("simulated-root-policy-response-crash");
+      },
+    },
+  });
+  const approvedRoot = path.join(h.root, "recoverable-race-global-skills");
+  mkdirSync(approvedRoot);
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: {
+      projectionVersions: [UI_PROJECTION_VERSION],
+      operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+      capabilities: UI_CAPABILITIES,
+    },
+  });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.effectiveIndexActions.find((action) => action.action === "replace-global-root-policy"),
+    payload: {
+      roots: [{ canonicalPath: approvedRoot, canUpdate: true, canCreate: true }],
+      creationRootPath: approvedRoot,
+      confirmation: projected.dashboard.settings.globalRootPolicyConfirmation,
+      settingsVersion: projected.dashboard.settings.globalSettingsVersion,
+    },
+    timestamp: h.now(),
+    requestId: "root-policy-rejection-response-crash",
+  });
+  submitUiOperationRequest(h.root, request);
+
+  const interrupted = await h.integration.processMailbox();
+  assert.equal(interrupted.ok, false);
+  assert.equal(pollUiOperationResponse(h.root, request, { now: h.now() }), null);
+  let completions = h.store.readRecords("audit-event")
+    .map((record) => record.payload.details)
+    .filter((details) => details?.action === "ui-operation-complete" && details.requestId === request.requestId);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].accepted, false);
+  assert.equal(completions[0].reason, "global-root-drift-during-commit");
+  assert.equal(h.store.getSettings().global.globalRootPolicy, null);
+
+  await h.integration.processMailbox();
+  const recovered = pollUiOperationResponse(h.root, request, { now: h.now() });
+  assert.equal(recovered.ok, false);
+  assert.equal(recovered.reason, "global-root-drift-during-commit");
+  assert.equal(prevalidationHooks, 1);
+  assert.equal(effectCalls, 1);
+  assert.equal(h.store.getSettings().global.globalRootPolicy, null);
+  const audits = h.store.readRecords("audit-event").map((record) => record.payload.details);
+  completions = audits.filter((details) => details?.action === "ui-operation-complete"
+    && details.requestId === request.requestId);
+  assert.equal(completions.length, 1);
+  assert.equal(audits.filter((details) => details?.action === "replace-global-root-policy").length, 0);
 });
 
 test("a settings operation killed after its effect replays its transactional completion without mutation", async (t) => {
@@ -1173,6 +1587,41 @@ test("an export killed after publication recovers exact metadata without creatin
   const completion = h.store.readRecords("audit-event").map((record) => record.payload).findLast((event) => event.details?.action === "ui-operation-complete" && event.details.requestId === request.requestId);
   assert.match(completion.details.exportPath, /\.json$/u);
   assert.match(completion.details.exportSha256, /^[a-f0-9]{64}$/u);
+});
+
+test("native global recommendation export omits project and unrelated global state", async (t) => {
+  const h = harness(t, {
+    inventory: inventoryModule,
+    privacy: (store) => createPrivacyGuard({ projectFingerprint: FINGERPRINT, store }),
+    integrationOptions: { stateRoot: true },
+  });
+  await h.integration.processMailbox();
+  const projected = readUiProjection(h.root, FINGERPRINT, {
+    now: h.now(),
+    clientOffer: { projectionVersions: [UI_PROJECTION_VERSION], operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION], capabilities: UI_CAPABILITIES },
+  });
+  const request = createUiOperationRequest({
+    projection: projected.index,
+    grant: projected.index.allowedActions.find((action) => action.action === "export-data"),
+    payload: { scope: "global-recommendations", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" },
+    timestamp: h.now(),
+    requestId: "global-recommendations-export",
+  });
+  submitUiOperationRequest(h.root, request);
+
+  await h.integration.processMailbox();
+  const response = pollUiOperationResponse(h.root, request, { now: h.now() });
+  assert.equal(response.ok, true);
+  const completion = h.store.readRecords("audit-event").map((record) => record.payload).findLast((event) =>
+    event.details?.action === "ui-operation-complete" && event.details.requestId === request.requestId);
+  const archive = JSON.parse(readFileSync(completion.details.exportPath, "utf8"));
+  assert.equal(archive.exportScope, "global-recommendations");
+  assert.deepEqual(archive.records, []);
+  assert.deepEqual(archive.projects, []);
+  assert.deepEqual(archive.bridge, []);
+  assert.equal("settings" in archive.global, false);
+  assert.equal("contributions" in archive.global, false);
+  assert.equal("aggregates" in archive.global, false);
 });
 
 test("a slash-command purge invalidates the cached sensitive export manager", async (t) => {
@@ -1364,7 +1813,7 @@ test("project purge preserves only its in-flight request and reconstructs comple
   assert.equal(existsSync(path.join(h.root, "self-evolve", "request-transaction.json")), false);
 });
 
-for (const scope of ["observations", "proposals"]) {
+for (const scope of ["observations", "global-recommendations"]) {
   test(`${scope} purge reconstructs completion after an effect crash without repurge`, async (t) => {
     let interrupt = true;
     const h = harness(t, {
@@ -1485,7 +1934,7 @@ test("native purge-all acknowledges accepted-terminal before bounded destructive
   const request = createUiOperationRequest({
     projection: projected.index,
     grant,
-    payload: { confirmation: "PURGE ALL SELF-EVOLVE DATA" },
+    payload: { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" },
     timestamp: h.now(),
   });
   submitUiOperationRequest(h.root, request);
@@ -1554,7 +2003,7 @@ test("purge-all boot recovery republishes accepted-terminal before destructive m
   const request = createUiOperationRequest({
     projection: projected.index,
     grant: projected.index.allowedActions.find((action) => action.action === "purge-all"),
-    payload: { confirmation: "PURGE ALL SELF-EVOLVE DATA" },
+    payload: { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" },
     timestamp: h.now(),
     requestId: "purge-all-response-crash",
   });
@@ -1613,7 +2062,7 @@ test("a real process kill after purge-all completion republishes accepted-termin
   const request = createUiOperationRequest({
     projection: projected.index,
     grant: projected.index.allowedActions.find((action) => action.action === "purge-all"),
-    payload: { confirmation: "PURGE ALL SELF-EVOLVE DATA" },
+    payload: { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" },
     timestamp: h.now(),
     requestId: "purge-all-process-kill",
   });
@@ -1648,6 +2097,7 @@ for (const action of [
   "export-data",
   "purge-all",
   "purge-scope",
+  "replace-global-root-policy",
   "retry-bootstrap",
   "rollback-proposal",
   "set-kill-switch",
@@ -1661,6 +2111,7 @@ for (const action of [
     const h = harness(t, {
       initialClock: Date.now(),
       inventory: inventoryModule,
+      useFixtureProjectDirectory: action === "replace-global-root-policy",
       privacy: (store) => ({
         exportScope: () => store.exportProject(),
         exportAll: () => store.exportAll(),
@@ -1685,6 +2136,8 @@ for (const action of [
       },
     });
     let subject;
+    const approvedRoot = path.join(h.root, "approved-global-skills");
+    if (action === "replace-global-root-policy") mkdirSync(approvedRoot);
     if (action === "snooze-proposal" || action === "rollback-proposal") {
       const currentContent = "---\nname: demo\ndescription: Existing demo skill.\n---\n# Demo\n";
       const proposedContent = "---\nname: demo\ndescription: Improved demo skill.\n---\n# Demo improved\n";
@@ -1722,12 +2175,18 @@ for (const action of [
     });
     const grant = subject
       ? projected.details.find((detail) => detail.proposalId === subject.id).allowedActions.find((item) => item.action === action)
-      : projected.index.allowedActions.find((item) => item.action === action);
+      : projected.effectiveIndexActions.find((item) => item.action === action);
     assert.ok(grant, JSON.stringify({ action, status: projected.index.status, allowed: projected.index.allowedActions, details: projected.details }));
     const control = readControlState(h.root, FINGERPRINT, { now: h.now() });
     const payload = action === "export-data" ? { scope: "project", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" }
-      : action === "purge-all" ? { confirmation: "PURGE ALL SELF-EVOLVE DATA" }
+      : action === "purge-all" ? { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" }
         : action === "purge-scope" ? { scope: "observations", confirmation: "PURGE OBSERVATIONS" }
+          : action === "replace-global-root-policy" ? {
+            roots: [{ canonicalPath: approvedRoot, canUpdate: true, canCreate: true }],
+            creationRootPath: approvedRoot,
+            confirmation: projected.dashboard.settings.globalRootPolicyConfirmation,
+            settingsVersion: projected.dashboard.settings.globalSettingsVersion,
+          }
           : action === "rollback-proposal" ? { proposalId: subject.id, appliedHash: subject.proposedContentHash, decisionVersion: 2 }
             : action === "set-kill-switch" ? { enabled: true, settingsVersion: control.settingsVersion }
               : action === "set-paused" ? { paused: true, settingsVersion: control.settingsVersion }
@@ -1755,7 +2214,7 @@ for (const action of [
 
     await h.integration.processMailbox();
     const response = pollUiOperationResponse(h.root, request, { now: h.now() });
-    assert.equal(response.ok, true);
+    assert.equal(response.ok, true, JSON.stringify(response));
     if (action === "purge-all") {
       assert.equal(response.status, "accepted-terminal");
       assert.equal(typeof terminalPurgeCallback, "function");
@@ -1893,13 +2352,12 @@ test("headless approval mismatches and manual mode fail closed without apply", a
   });
 });
 
-test("yolo auto-applies only an allowlisted validated proposal after rollout threshold", async (t) => {
+test("legacy yolo narrows to explicit-review auto after rollout threshold", async (t) => {
   const h = harness(t);
   h.integration.__testBridge.setMode("yolo", { confirmed: true, allowlist: [h.root] });
   const result = await h.integration.runEvolutionCycle({ sessionID: "yolo", projectFingerprint: FINGERPRINT, scopeFingerprint: FINGERPRINT });
-  assert.equal(result.result, "applied");
-  assert.equal(h.calls.applies.length, 1);
-  assert.match(result.responseText, /OpenCode must be restarted/u);
+  assert.equal(result.result, "proposal-ready");
+  assert.equal(h.calls.applies.length, 0);
 });
 
 test("unknown scopes and below-threshold yolo remain pending", async (t) => {
@@ -1926,7 +2384,7 @@ test("unknown scopes and below-threshold yolo remain pending", async (t) => {
   });
 });
 
-test("only validated, project-bound, deduplicated synthesis outcomes grant yolo authority", async (t) => {
+test("validated rollout outcomes never grant legacy yolo unattended write authority", async (t) => {
   const h = harness(t, {
     rolloutOutcomes: 0,
     rolloutMetrics: { synthesesObserved: 1_000, successRate: 1 },
@@ -1952,8 +2410,8 @@ test("only validated, project-bound, deduplicated synthesis outcomes grant yolo 
   assert.equal(h.calls.applies.length, 0);
 
   seedOutcome(h.store, 9, "no-change", 2_020);
-  assert.equal((await h.integration.runEvolutionCycle({ sessionID: "enabled", projectFingerprint: FINGERPRINT })).result, "applied");
-  assert.equal(h.calls.applies.length, 1);
+  assert.equal((await h.integration.runEvolutionCycle({ sessionID: "enabled", projectFingerprint: FINGERPRINT })).result, "proposal-ready");
+  assert.equal(h.calls.applies.length, 0);
 });
 
 test("mode changes converge across integrations on the next event", async (t) => {
@@ -1998,16 +2456,16 @@ test("pause, exclusion, circuit breaker, and kill switch override stored authori
   });
   await t.test("kill switch", async (t) => {
     const h = harness(t);
-    h.integration.__testBridge.setMode("yolo", { confirmed: true, allowlist: [h.root] });
+    h.integration.__testBridge.setMode("auto");
     const stopped = h.integration.triggerKillSwitch("test");
     assert.equal(stopped.auditEvent.details.reason, "test");
     const persistedStop = h.store.readRecords("audit-event").map((record) => record.payload).findLast((event) => event.kind === "kill-switch");
     assert.equal(persistedStop.details.reason, "test");
-    assert.equal(h.integration.__testBridge.getMode().storedMode, "yolo");
+    assert.equal(h.integration.__testBridge.getMode().storedMode, "auto");
     assert.equal(h.integration.__testBridge.getMode().effectiveMode, "manual");
     assert.equal((await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "killed" } })).scheduled, false);
     h.integration.clearKillSwitch("test-clear");
-    assert.equal(h.integration.__testBridge.getMode().effectiveMode, "yolo");
+    assert.equal(h.integration.__testBridge.getMode().effectiveMode, "auto");
   });
   await t.test("slash command clears an environment-sourced runtime kill switch", async (t) => {
     const prior = process.env.SELF_EVOLVE_KILL;
@@ -2017,14 +2475,14 @@ test("pause, exclusion, circuit breaker, and kill switch override stored authori
       else process.env.SELF_EVOLVE_KILL = prior;
     });
     const h = harness(t);
-    h.integration.__testBridge.setMode("yolo", { confirmed: true, allowlist: [h.root] });
+    h.integration.__testBridge.setMode("auto");
     assert.equal(h.integration.__testBridge.getMode().effectiveMode, "manual");
 
     const cleared = await h.integration.handleCommand("/self-evolve kill-switch off");
 
     assert.equal(cleared.ok, true);
     assert.match(cleared.responseText, /Kill switch disabled/u);
-    assert.equal(h.integration.__testBridge.getMode().effectiveMode, "yolo");
+    assert.equal(h.integration.__testBridge.getMode().effectiveMode, "auto");
     assert.equal(h.store.getSettings().global.killSwitchActive, false);
   });
 });
@@ -2357,7 +2815,7 @@ test("apply and rollback each produce audited state and rollback CAS", async (t)
 
 test("internal rollout gates remain hidden and gate shadow and application behavior", async (t) => {
   assert.deepEqual(Object.keys(ROLLOUT_GATES).sort(), ["autoReviewRollout", "automaticSynthesisApplicationDisabled", "offlineCorpus", "passiveShadowObservation", "yoloEnablementThreshold"].sort());
-  assert.deepEqual(schemas.Mode.values, ["manual", "auto", "yolo"]);
+  assert.deepEqual(schemas.Mode.values, ["manual", "auto"]);
   await t.test("passive shadow stops before synthesis", async (t) => {
     const h = harness(t, { rolloutGates: { passiveShadowObservation: true } });
     h.integration.__testBridge.setMode("auto");
@@ -2367,7 +2825,7 @@ test("internal rollout gates remain hidden and gate shadow and application behav
   });
   await t.test("application-disabled forces pending review", async (t) => {
     const h = harness(t, { rolloutGates: { automaticSynthesisApplicationDisabled: true } });
-    h.integration.__testBridge.setMode("yolo", { confirmed: true, allowlist: [h.root] });
+    h.integration.__testBridge.setMode("auto");
     const result = await h.integration.runEvolutionCycle({ sessionID: "disabled", projectFingerprint: FINGERPRINT });
     assert.equal(result.result, "proposal-ready");
     assert.equal(h.calls.cycles[0].mode, "manual");
@@ -2481,7 +2939,8 @@ test("boot synthesis recovery runs before retention and one unrefed daily timer 
   assert.equal(h.store.readRecords("observation").length, 0);
   assert.equal(h.calls.recoveries, 1);
   assert.equal(h.calls.synthesisRecoveries, 1);
-  assert.deepEqual(recoveryOrder.slice(0, 2), ["synthesis-recovery", "retention"]);
+  assert.equal(h.calls.contributionRecoveries, 1);
+  assert.deepEqual(recoveryOrder.slice(0, 3), ["contribution-recovery", "synthesis-recovery", "retention"]);
   assert.equal(delay, day);
   assert.equal(unrefed, true);
   assert.deepEqual(h.integration.getRetentionState(), { scheduled: true, inFlight: false });
@@ -2543,8 +3002,25 @@ test("shutdown remains closed while retrying a degraded applier lease release", 
   assert.equal(h.calls.applierCloses, 2);
 });
 
+test("headless purge-all rejects missing and wrong durable confirmation without stopping authority", async (t) => {
+  const h = harness(t);
+  for (const command of [
+    "purge --all",
+    "purge all",
+    "purge --all --confirm PURGE ALL SELF-EVOLVE 0.2.0",
+  ]) {
+    const result = await h.integration.handleCommand({ command, projectFingerprint: FINGERPRINT });
+    assert.equal(result.ok, false, command);
+    assert.match(result.responseText, /Usage:.*PURGE ALL SELF-EVOLVE 0\.3\.0/u);
+  }
+  assert.equal(existsSync(path.join(h.root, "self-evolve")), true);
+  assert.match((await h.integration.handleCommand("status")).responseText, /Self-evolve status/u);
+});
+
 test("purge all is terminal through timer ticks, later events and commands, and shutdown", async (t) => {
   let retentionCallback;
+  let terminalPurgeCallback;
+  let responseAssignedWhenScheduled = false;
   let timerCleared = false;
   let resolveCycle;
   const deferredCycle = { promise: new Promise((resolve) => { resolveCycle = resolve; }) };
@@ -2561,6 +3037,11 @@ test("purge all is terminal through timer ticks, later events and commands, and 
       __testSetInterval(callback) { retentionCallback = callback; return timer; },
       __testClearInterval(value) { if (value === timer) timerCleared = true; },
       __testRetentionIntervalMs: 5,
+      __testSetTerminalPurgeTimeout(callback) {
+        responseAssignedWhenScheduled = /accepted-terminal/u.test(commandOutput.responseText ?? "");
+        terminalPurgeCallback = callback;
+        return timer;
+      },
     },
   });
   await h.integration.boot({ ctx: h.ctx, hostVersion: "1.18.3", recoverHostSessions: false });
@@ -2570,31 +3051,44 @@ test("purge all is terminal through timer ticks, later events and commands, and 
   h.integration.__testBridge.setMode("auto");
   const running = h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "headless-purge-drain" } });
   await new Promise((resolve) => setImmediate(resolve));
-  const purge = h.integration.handleCommand({ command: "purge --all", projectFingerprint: FINGERPRINT });
-  await new Promise((resolve) => setImmediate(resolve));
+  const commandOutput = {};
+  const purged = await h.integration.handleCommand({
+    command: "purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0",
+    projectFingerprint: FINGERPRINT,
+  }, commandOutput);
   assert.equal(deferredCycle.signal.aborted, true);
+  assert.equal(purged.status, "accepted-terminal");
+  assert.equal(purged.terminalPurge, true);
+  assert.match(commandOutput.responseText, /accepted-terminal/u);
+  assert.equal(responseAssignedWhenScheduled, true);
+  assert.equal(typeof terminalPurgeCallback, "function");
   assert.equal(existsSync(subtree), true);
+  assert.equal(h.store.readRecords("audit-event").some((record) =>
+    record.payload.details?.action === "headless-purge-all-accepted"
+      && record.payload.details?.status === "accepted-terminal"
+      && record.payload.details?.terminal === true), true);
   assert.equal(h.calls.schedulerDisposals ?? 0, 0);
+  assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "after-acceptance" } }), { scheduled: false, reason: "restart-required-after-purge-all" });
+  assert.match((await h.integration.handleCommand({ command: "status" })).responseText, /Restart OpenCode/u);
   resolveCycle({ result: "failed-closed", cycleOutcome: "failed-closed", reason: "autonomous-work-cancelled" });
   await running;
-  const purged = await purge;
-  assert.equal(purged.terminalPurge, true);
   assert.equal(timerCleared, true);
+  assert.equal(existsSync(subtree), true);
+  terminalPurgeCallback();
+  await h.integration.shutdown();
   assert.equal(existsSync(subtree), false);
 
   retentionCallback();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(existsSync(subtree), false);
-  assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "after-purge" } }), { scheduled: false, reason: "restart-required-after-purge-all" });
-  assert.match((await h.integration.handleCommand({ command: "status" })).responseText, /Restart OpenCode/u);
+  assert.deepEqual(await h.integration.handleEvent({ type: "session.idle", properties: { sessionID: "after-purge" } }), { scheduled: false, reason: "integration-closing" });
+  assert.equal((await h.integration.handleCommand({ command: "status" })).reason, "integration-closed");
   assert.throws(() => secondStore.getSettings(), /restart-required-after-purge-all/u);
   secondStore.close();
   assert.equal(existsSync(subtree), false);
-  await h.integration.shutdown();
-  assert.equal(existsSync(subtree), false);
 });
 
-test("mode changes publish a TUI event and consent remains command-policy managed", (t) => {
+test("mode changes publish a TUI event and consent revocation deletes local capsules", (t) => {
   const h = harness(t);
   const mode = h.integration.__testBridge.setMode("auto");
   assert.equal(mode.ok, true);
@@ -2602,6 +3096,23 @@ test("mode changes publish a TUI event and consent remains command-policy manage
   const consent = h.integration.__testBridge.setConsent("sanitizedExcerpts", true);
   assert.equal(consent.ok, true);
   assert.equal(h.integration.__testBridge.getConsent().sanitizedExcerpts, true);
+  const createdAt = h.now();
+  assert.equal(h.store.appendEvidenceCapsule(schemas.makeEvidenceCapsule({
+    capsuleId: "11111111-1111-4111-8111-111111111111",
+    incidentId: "integration-consent-capsule",
+    receiptType: "repeated-command",
+    targetLogicalName: null,
+    summary: "Command verify recurred 2 times and required repeated handling.",
+    createdAt,
+    expiresAt: createdAt + 30 * 86_400_000,
+  })).ok, true);
+  assert.equal(existsSync(path.join(h.store.stateDir, "evidence-capsules.jsonl")), true);
+
+  const revoked = h.integration.__testBridge.setConsent("sanitizedExcerpts", false);
+  assert.equal(revoked.ok, true);
+  assert.equal(h.integration.__testBridge.getConsent().sanitizedExcerpts, false);
+  assert.deepEqual(h.store.readEvidenceCapsules({ includeExpired: true }), []);
+  assert.equal(existsSync(path.join(h.store.stateDir, "evidence-capsules.jsonl")), false);
 });
 
 test("a synchronous TUI publish failure does not reject the settings mutation", async (t) => {
@@ -2616,6 +3127,7 @@ test("host session recovery is bounded, selective, and idempotent", async (t) =>
   const h = harness(t);
   let lists = 0;
   const aborted = [];
+  const deleted = [];
   h.ctx.directory = h.root;
   h.ctx.client.session = {
     list: async () => {
@@ -2627,11 +3139,12 @@ test("host session recovery is bounded, selective, and idempotent", async (t) =>
       ] };
     },
     abort: async (args) => { aborted.push(args?.path?.id ?? args?.path?.sessionID ?? args?.sessionID); return { data: {} }; },
+    delete: async (args) => { deleted.push(args?.path?.id); return { data: {} }; },
   };
-  // Recovery (self-evolve-3r4) aborts only a session with a provably DEAD self-evolve
-  // owner record matching this project/root. "terminal"/"other" are not candidates;
-  // a same-name session without an owner record is foreign/unknown and never aborted.
+  // Recovery mutates only sessions with a provably dead self-evolve owner record
+  // matching this project/root. Unknown same-name and foreign sessions stay untouched.
   assert.equal(seedDeadHostOwner(h.root, "active", "self-evolve-analyzer").ok, true);
+  assert.equal(seedDeadHostOwner(h.root, "terminal", "self-evolve-critic").ok, true);
   const [first, concurrent] = await Promise.all([
     h.integration.recoverHostSessions({ timeoutMs: 20, retries: 1, backoffMs: 1 }),
     h.integration.recoverHostSessions({ timeoutMs: 20, retries: 1, backoffMs: 1 }),
@@ -2641,15 +3154,16 @@ test("host session recovery is bounded, selective, and idempotent", async (t) =>
   assert.deepEqual(repeated, first);
   assert.equal(lists, 1);
   assert.deepEqual(aborted, ["active"]);
-  assert.deepEqual(h.integration.__testBridge.getHealth().hostSessionRecovery, { ok: true, cancelled: false, attempts: 1, aborted: 1, failed: 0 });
+  assert.deepEqual(deleted, ["active", "terminal"]);
+  assert.deepEqual(h.integration.__testBridge.getHealth().hostSessionRecovery, { ok: true, cancelled: false, attempts: 1, aborted: 2, failed: 0 });
   await h.integration.shutdown();
 });
 
-test("failed orphan abort retains its owner for one successful recovery retry", async () => {
+test("failed orphan deletion retains its owner for one successful recovery retry", async () => {
   const sessionId = "retry-hidden-session";
   const ownerNonce = "ab".repeat(24);
   let owner = ownerNonce;
-  let aborts = 0;
+  let deletions = 0;
   const leases = new Map();
   const store = {
     hostOwnerStatus(id) {
@@ -2676,22 +3190,23 @@ test("failed orphan abort retains its owner for one successful recovery retry", 
   };
   const client = { session: {
     list: async () => ({ data: [{ id: sessionId, agent: "self-evolve-synthesizer", state: "running" }] }),
-    abort: async () => {
-      aborts += 1;
-      if (aborts === 1) throw new Error("fail-once");
+    abort: async () => ({ data: {} }),
+    delete: async () => {
+      deletions += 1;
+      if (deletions === 1) throw new Error("fail-once");
       return { data: {} };
     },
   } };
   const recovery = { store, projectFingerprint: FINGERPRINT, rootIdentity: "d".repeat(64), now: 100 };
 
   const failed = await recoverOrphanedAnalyzerSessions(client, "/workspace", recovery);
-  assert.equal(failed[0].action, "abort-failed");
+  assert.equal(failed[0].action, "delete-failed");
   assert.equal(store.hostOwnerStatus(sessionId).nonce, ownerNonce);
 
   const succeeded = await recoverOrphanedAnalyzerSessions(client, "/workspace", recovery);
-  assert.equal(succeeded[0].action, "aborted");
+  assert.equal(succeeded[0].action, "deleted");
   assert.equal(store.hostOwnerStatus(sessionId).classification, "unknown");
-  assert.equal(aborts, 2);
+  assert.equal(deletions, 2);
 });
 
 test("concurrent orphan recovery claims one abort and never claims live or foreign owners", async () => {
@@ -2699,6 +3214,7 @@ test("concurrent orphan recovery claims one abort and never claims live or forei
   let owner = ownerNonce;
   let claimNonce;
   let aborts = 0;
+  let deletions = 0;
   let startAbort;
   let finishAbort;
   const abortStarted = new Promise((resolve) => { startAbort = resolve; });
@@ -2737,6 +3253,7 @@ test("concurrent orphan recovery claims one abort and never claims live or forei
       await abortFinished;
       return { data: {} };
     },
+    delete: async () => { deletions += 1; return { data: {} }; },
   } };
   const recovery = { store, projectFingerprint: FINGERPRINT, rootIdentity: "d".repeat(64), now: 100 };
 
@@ -2747,7 +3264,8 @@ test("concurrent orphan recovery claims one abort and never claims live or forei
   const completed = await first;
 
   assert.equal(aborts, 1);
-  assert.equal(completed.find((item) => item.id === "dead").action, "aborted");
+  assert.equal(deletions, 1);
+  assert.equal(completed.find((item) => item.id === "dead").action, "deleted");
   assert.equal(second.find((item) => item.id === "dead").action, "deferred");
   assert.equal(completed.find((item) => item.id === "live").action, "deferred");
   assert.equal(completed.find((item) => item.id === "foreign").action, "foreign");

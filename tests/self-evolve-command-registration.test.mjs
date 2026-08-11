@@ -47,7 +47,8 @@ test("packed standalone config registers and owns the bundled /self-evolve comma
   const command = cfg.command["self-evolve"];
   assert.equal(command.description, "Inspect or control durable self-evolve behavior");
   assert.match(command.template, /status \| health \| budget \| scan/u);
-  assert.match(command.template, /yolo confirm --allowlist/u);
+  assert.match(command.template, /manual \| auto/u);
+  assert.doesNotMatch(command.template, /yolo/u);
   assert.match(command.template, /review \[id\]/u);
   assert.equal(command.metadata.owner, SELF_EVOLVE_MODULE_ID);
   assert.equal(command.metadata.definitionFingerprint, commandDefinitionFingerprint(command));

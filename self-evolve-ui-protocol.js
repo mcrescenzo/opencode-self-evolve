@@ -1,10 +1,38 @@
 import { createHash } from "node:crypto";
-import { deepFreeze } from "./self-evolve-schemas.js";
+import { deepFreeze, makeApprovedGlobalRoot } from "./self-evolve-schemas.js";
 
 export const UI_PROJECTION_VERSION = 1;
 export const UI_DASHBOARD_VERSION = 2;
 export const UI_DASHBOARD_VERSIONS = Object.freeze([1, UI_DASHBOARD_VERSION]);
 export const UI_OPERATION_PROTOCOL_VERSION = 1;
+export const GLOBAL_BRIDGE_SCHEMA_VERSION = 1;
+export const GLOBAL_PROJECTION_VERSION = 1;
+export const GLOBAL_OPERATION_PROTOCOL_VERSION = 1;
+export const PROJECT_PARTICIPATION_VERSION = 1;
+export const GLOBAL_CAPABILITIES = Object.freeze([
+  "global-action-grant-v1",
+  "global-action-request-v1",
+  "global-generality-v1",
+  "global-recommendation-detail-v1",
+  "global-recommendation-index-v1",
+  "global-transaction-v1",
+  "project-analysis-control-v1",
+  "project-participation-v1",
+]);
+const GLOBAL_AUTHORITATIVE_CAPABILITIES = Object.freeze([
+  "global-action-grant-v1",
+  "global-action-request-v1",
+  "global-generality-v1",
+  "global-recommendation-detail-v1",
+  "global-recommendation-index-v1",
+  "global-transaction-v1",
+  "project-participation-v1",
+]);
+export const GLOBAL_PROTOCOL_COMPATIBILITY = Object.freeze({
+  native: "authoritative-global-v1",
+  newTuiOldServer: "limited-new-tui-old-server",
+  oldTuiNewServer: "limited-old-tui-new-server",
+});
 export const UI_CAPABILITIES = Object.freeze([
   "legacy-control-v1",
   "legacy-decision-v1",
@@ -22,7 +50,12 @@ export const UI_CAPABILITIES = Object.freeze([
 export const UI_DASHBOARD_CAPABILITIES = Object.freeze([
   "control-repo-mode-v1",
   "decision-feedback-v1",
+  "operation-global-root-policy-v1",
+  "project-analysis-control-v1",
 ]);
+const UI_OPERATION_CAPABILITIES = Object.freeze(
+  [...UI_CAPABILITIES, ...UI_DASHBOARD_CAPABILITIES].sort(compareText),
+);
 export const UI_PROTOCOL_COMPATIBILITY = Object.freeze({
   newTuiOldServer: "legacy-read-only-no-new-writes",
   oldTuiNewServer: "legacy-protocols-retained-no-new-writes",
@@ -57,6 +90,27 @@ export const UI_PROTOCOL_LIMITS = Object.freeze({
   snoozeMaxMs: 365 * 24 * 60 * 60 * 1000,
   futureSkewMs: 30 * 1000,
 });
+export const GLOBAL_PROTOCOL_LIMITS = Object.freeze({
+  canonicalBytes: UI_PROTOCOL_LIMITS.canonicalBytes,
+  capabilities: 16,
+  recommendationIndexEntries: UI_PROTOCOL_LIMITS.reviewIndexEntries,
+  availableActions: 3,
+  diffLines: UI_PROTOCOL_LIMITS.diffLines,
+  diffBytes: UI_PROTOCOL_LIMITS.diffBytes,
+  evidenceSummaryEntries: 8,
+  summaryBytes: UI_PROTOCOL_LIMITS.summaryBytes,
+  rationaleBytes: UI_PROTOCOL_LIMITS.rationaleBytes,
+  indexBytes: UI_PROTOCOL_LIMITS.indexBytes,
+  detailBytes: UI_PROTOCOL_LIMITS.detailBytes,
+  grantBytes: 4 * 1024,
+  operationBytes: UI_PROTOCOL_LIMITS.operationBytes,
+  responseBytes: UI_PROTOCOL_LIMITS.responseBytes,
+  totalProjectionBytes: UI_PROTOCOL_LIMITS.totalProjectionBytes,
+  residentDetails: UI_PROTOCOL_LIMITS.residentDetails,
+  projectionTtlMs: UI_PROTOCOL_LIMITS.projectionTtlMs,
+  operationTtlMs: UI_PROTOCOL_LIMITS.operationTtlMs,
+  futureSkewMs: UI_PROTOCOL_LIMITS.futureSkewMs,
+});
 
 export const UI_ACTIONS = Object.freeze([
   "acknowledge-audit",
@@ -65,6 +119,7 @@ export const UI_ACTIONS = Object.freeze([
   "purge-all",
   "purge-scope",
   "reject-proposal",
+  "replace-global-root-policy",
   "retry-bootstrap",
   "rollback-proposal",
   "set-kill-switch",
@@ -76,10 +131,12 @@ export const UI_OPERATION_ACTIONS = Object.freeze([
   "export-data",
   "purge-all",
   "purge-scope",
+  "replace-global-root-policy",
   "retry-bootstrap",
   "rollback-proposal",
   "set-kill-switch",
   "set-paused",
+  "set-repo-mode",
   "snooze-proposal",
 ]);
 export const UI_PROJECTION_INDEX_FIELDS = Object.freeze([
@@ -107,8 +164,44 @@ export const UI_OPERATION_RESPONSE_FIELDS = Object.freeze([
   "operationProtocolVersion", "requestId", "projectFingerprint", "stateRootIdentity", "action",
   "requestHash", "ok", "status", "processedAt", "reason", "responseHash",
 ]);
+export const GLOBAL_RECOMMENDATION_INDEX_FIELDS = Object.freeze([
+  "projectionVersion", "stateRootIdentity", "generation", "issuedAt", "expiresAt",
+  "capabilities", "recommendations", "overflow", "indexHash",
+]);
+export const GLOBAL_RECOMMENDATION_DETAIL_FIELDS = Object.freeze([
+  "projectionVersion", "stateRootIdentity", "generation", "recommendationId",
+  "recommendationVersion", "supportSetHash", "targetBindingHash", "targetHash",
+  "proposedContentHash", "priorState", "issuedAt", "expiresAt", "target", "support",
+  "safety", "generality", "rationale", "diff", "evidenceSummary", "availableActions", "detailHash",
+]);
+export const GLOBAL_ACTION_GRANT_FIELDS = Object.freeze([
+  "grantVersion", "capability", "stateRootIdentity", "generation", "indexHash", "detailHash",
+  "recommendationId", "recommendationVersion", "supportSetHash", "targetBindingHash",
+  "targetHash", "proposedContentHash", "priorState", "action", "nonce", "issuedAt",
+  "expiresAt", "grantHash",
+]);
+export const GLOBAL_ACTION_REQUEST_FIELDS = Object.freeze([
+  "protocolVersion", "capability", "requestId", "stateRootIdentity", "actingProjectFingerprint",
+  "actingHealthHash", "projectionGenerationHash", "indexHash", "detailHash", "grantHash",
+  "recommendationId", "recommendationVersion", "supportSetHash", "targetBindingHash",
+  "targetHash", "proposedContentHash", "priorState", "action", "actorRole", "issuedAt",
+  "expiresAt", "nonce", "requestHash",
+]);
+export const GLOBAL_ACTION_RESPONSE_FIELDS = Object.freeze([
+  "protocolVersion", "requestId", "stateRootIdentity", "recommendationId",
+  "recommendationVersion", "action", "requestHash", "ok", "status", "processedAt",
+  "reason", "responseHash",
+]);
+export const PROJECT_PARTICIPATION_FIELDS = Object.freeze([
+  "participationVersion", "projectFingerprint", "stateRootIdentity", "generation", "indexHash",
+  "recommendationId", "supportSetHash", "currentProjectContributed", "issuedAt", "expiresAt",
+  "participationHash",
+]);
 
 const UI_PROTOCOL_OFFER_FIELDS = Object.freeze(["projectionVersions", "operationProtocolVersions", "capabilities"]);
+const GLOBAL_PROTOCOL_OFFER_FIELDS = Object.freeze([
+  "bridgeSchemaVersions", "projectionVersions", "operationProtocolVersions", "capabilities",
+]);
 const INDEX_STATUS_FIELDS = Object.freeze([
   "state", "reason", "storedMode", "effectiveMode", "paused", "killSwitchActive",
   "repoExcluded", "circuitBreakerOpen",
@@ -158,6 +251,10 @@ const DASHBOARD_SETTINGS_FIELDS = Object.freeze([
   "globalMode", "repositoryMode", "effectiveMode", "paused", "killSwitchActive",
   "repositoryExcluded", "consent", "approvedSkillFolderCount",
 ]);
+const DASHBOARD_SETTINGS_V2_FIELDS = Object.freeze([
+  ...DASHBOARD_SETTINGS_FIELDS, "globalSettingsVersion", "globalRootPolicy",
+  "globalRootPolicyConfirmation", "globalRootPolicyAction",
+]);
 const DASHBOARD_CONSENT_FIELDS = Object.freeze([
   "passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation",
 ]);
@@ -172,9 +269,16 @@ const SNOOZE_PAYLOAD_FIELDS = Object.freeze([
 const ROLLBACK_PAYLOAD_FIELDS = Object.freeze(["proposalId", "appliedHash", "decisionVersion"]);
 const SETTINGS_PAYLOAD_FIELDS = Object.freeze(["enabled", "settingsVersion"]);
 const PAUSE_PAYLOAD_FIELDS = Object.freeze(["paused", "settingsVersion"]);
+const PROJECT_MODE_PAYLOAD_FIELDS = Object.freeze(["mode", "settingsVersion"]);
+const ROOT_POLICY_PAYLOAD_FIELDS = Object.freeze([
+  "roots", "creationRootPath", "confirmation", "settingsVersion",
+]);
+const ROOT_POLICY_ROOT_FIELDS = Object.freeze(["canonicalPath", "canUpdate", "canCreate"]);
 const PURGE_SCOPE_PAYLOAD_FIELDS = Object.freeze(["scope", "confirmation"]);
 const CONFIRMATION_PAYLOAD_FIELDS = Object.freeze(["confirmation"]);
 const EXPORT_PAYLOAD_FIELDS = Object.freeze(["scope", "confirmation"]);
+// `yolo` is a v0.2 compatibility input only: the v0.3 server never produces it,
+// and the durable domain narrows any legacy value to `auto`.
 const MODES = Object.freeze(["manual", "auto", "yolo"]);
 const PROPOSAL_STATES = Object.freeze([
   "critic-pending", "pending", "approved", "rejected", "applied", "rolled-back", "superseded", "failed-closed",
@@ -232,11 +336,12 @@ export const UI_ACTION_CAPABILITIES = Object.freeze({
   "purge-all": "operation-purge-all-v1",
   "purge-scope": "operation-purge-scope-v1",
   "reject-proposal": "legacy-decision-v1",
+  "replace-global-root-policy": "operation-global-root-policy-v1",
   "retry-bootstrap": "operation-retry-bootstrap-v1",
   "rollback-proposal": "operation-rollback-v1",
   "set-kill-switch": "operation-kill-switch-v1",
   "set-paused": "operation-pause-v1",
-  "set-repo-mode": "control-repo-mode-v1",
+  "set-repo-mode": "legacy-control-v1",
   "snooze-proposal": "operation-snooze-v1",
 });
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
@@ -255,6 +360,14 @@ const HASH_DOMAINS = Object.freeze({
   "review-detail": "self-evolve-ui-review-detail-v1",
   "operation-request": "self-evolve-ui-operation-request-v1",
   "operation-response": "self-evolve-ui-operation-response-v1",
+});
+const GLOBAL_HASH_DOMAINS = Object.freeze({
+  "recommendation-index": ["self-evolve-global-recommendation-index-v1", "indexHash"],
+  "recommendation-detail": ["self-evolve-global-recommendation-detail-v1", "detailHash"],
+  "action-grant": ["self-evolve-global-action-grant-v1", "grantHash"],
+  "action-request": ["self-evolve-global-action-request-v1", "requestHash"],
+  "action-response": ["self-evolve-global-action-response-v1", "responseHash"],
+  "project-participation": ["self-evolve-project-participation-v1", "participationHash"],
 });
 
 function fail(code, detail = "") {
@@ -424,6 +537,541 @@ export function hashUiProtocol(kind, value) {
   return createHash("sha256").update(`${domain}\n${canonicalUiJson(body)}`).digest("hex");
 }
 
+export function hashGlobalProtocol(kind, value) {
+  const entry = GLOBAL_HASH_DOMAINS[kind];
+  if (!entry) fail("unknown-global-protocol-kind", String(kind));
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail("canonical-object");
+  const [domain, omittedField] = entry;
+  const body = Object.fromEntries(Object.entries(value).filter(([key]) => key !== omittedField));
+  return createHash("sha256").update(`${domain}\n${canonicalUiJson(body)}`).digest("hex");
+}
+
+function asOpaqueUuid(value, label) {
+  if (typeof value !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value)) {
+    fail(`invalid-${label}`);
+  }
+  return value;
+}
+
+function asUtcDay(value, label) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/u.test(value)
+      || Number.isNaN(Date.parse(`${value}T00:00:00.000Z`))) fail(`invalid-${label}`);
+  return value;
+}
+
+const GLOBAL_RECOMMENDATION_STATES = Object.freeze([
+  "critic-pending", "pending", "approved", "applied", "undo-approved", "rejected",
+  "rolled-back", "superseded", "failed-closed",
+]);
+const GLOBAL_ACTIONS = Object.freeze(["apply", "reject", "undo"]);
+const GLOBAL_ACTION_PRIOR_STATES = Object.freeze({ apply: "pending", reject: "pending", undo: "applied" });
+const GLOBAL_TARGET_KINDS = Object.freeze(["existing-global-skill", "new-global-skill"]);
+const GLOBAL_TARGET_FIELDS = Object.freeze(["kind", "label"]);
+const GLOBAL_INDEX_SUPPORT_FIELDS = Object.freeze([
+  "tier", "independentDomainCount", "independentIncidentCount", "occurrenceCount",
+]);
+const GLOBAL_DETAIL_SUPPORT_FIELDS = Object.freeze([
+  ...GLOBAL_INDEX_SUPPORT_FIELDS, "firstSeenDay", "lastSeenDay",
+]);
+const GLOBAL_DATES_FIELDS = Object.freeze(["firstSeenDay", "lastSeenDay", "synthesizedAt", "updatedAt"]);
+const GLOBAL_SAFETY_FIELDS = Object.freeze([
+  "criticScoreBasisPoints", "criticPassed", "validDeterministic",
+]);
+const GLOBAL_GENERALITY_FIELDS = Object.freeze(["passed", "basis"]);
+const GLOBAL_INDEX_ENTRY_FIELDS = Object.freeze([
+  "recommendationId", "recommendationVersion", "supportSetHash", "state", "target", "support", "dates",
+  "safety", "availableActions", "detailHash",
+]);
+const GLOBAL_EVIDENCE_SUMMARY_FIELDS = Object.freeze(["kind", "count"]);
+
+function makeGlobalTarget(value) {
+  exactKeys(value, GLOBAL_TARGET_FIELDS, "global-target");
+  const label = asText(value.label, "global-target-label", 128, { singleLine: true });
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(label)) fail("invalid-global-target-label");
+  return { kind: asEnum(value.kind, GLOBAL_TARGET_KINDS, "global-target-kind"), label };
+}
+
+function makeGlobalSupport(value, { dates = false } = {}) {
+  exactKeys(value, dates ? GLOBAL_DETAIL_SUPPORT_FIELDS : GLOBAL_INDEX_SUPPORT_FIELDS, "global-support");
+  const output = {
+    tier: asEnum(value.tier, ["single-domain", "distributed"], "global-support-tier"),
+    independentDomainCount: asInt(value.independentDomainCount, "global-support-domain-count", { max: 1_000_000 }),
+    independentIncidentCount: asInt(value.independentIncidentCount, "global-support-incident-count", { max: 1_000_000 }),
+    occurrenceCount: asInt(value.occurrenceCount, "global-support-occurrence-count", { max: 1_000_000_000 }),
+  };
+  if (dates) {
+    output.firstSeenDay = asUtcDay(value.firstSeenDay, "global-support-first-seen-day");
+    output.lastSeenDay = asUtcDay(value.lastSeenDay, "global-support-last-seen-day");
+    if (output.lastSeenDay < output.firstSeenDay) fail("global-support-date-order");
+  }
+  return output;
+}
+
+function makeGlobalSafety(value) {
+  exactKeys(value, GLOBAL_SAFETY_FIELDS, "global-safety");
+  return {
+    criticScoreBasisPoints: asInt(value.criticScoreBasisPoints, "global-critic-score", { max: 10_000 }),
+    criticPassed: asBoolean(value.criticPassed, "global-critic-passed"),
+    validDeterministic: asBoolean(value.validDeterministic, "global-deterministic-valid"),
+  };
+}
+
+function makeGlobalGenerality(value) {
+  exactKeys(value, GLOBAL_GENERALITY_FIELDS, "global-generality");
+  const passed = asBoolean(value.passed, "global-generality-passed");
+  if (!passed) fail("global-generality-not-passed");
+  return {
+    passed,
+    basis: asEnum(value.basis, ["deterministic-generality-gate-v1"], "global-generality-basis"),
+  };
+}
+
+function makeGlobalActions(value, state) {
+  if (!Array.isArray(value) || value.length > GLOBAL_PROTOCOL_LIMITS.availableActions) fail("global-actions-out-of-bounds");
+  const actions = value.map((action) => asEnum(action, GLOBAL_ACTIONS, "global-action"));
+  assertOrdered(actions, compareText, "global-actions");
+  if (new Set(actions).size !== actions.length) fail("global-actions-duplicate");
+  const allowed = state === "pending" ? new Set(["apply", "reject"])
+    : state === "superseded" ? new Set(["reject"])
+      : state === "applied" ? new Set(["undo"]) : new Set();
+  if (actions.some((action) => !allowed.has(action))) fail("global-action-state-mismatch");
+  return actions;
+}
+
+function makeGlobalIndexEntry(value) {
+  exactKeys(value, GLOBAL_INDEX_ENTRY_FIELDS, "global-recommendation-index-entry");
+  const state = asEnum(value.state, GLOBAL_RECOMMENDATION_STATES, "global-recommendation-state");
+  exactKeys(value.dates, GLOBAL_DATES_FIELDS, "global-recommendation-dates");
+  const dates = {
+    firstSeenDay: asUtcDay(value.dates.firstSeenDay, "global-first-seen-day"),
+    lastSeenDay: asUtcDay(value.dates.lastSeenDay, "global-last-seen-day"),
+    synthesizedAt: asTimestamp(value.dates.synthesizedAt, "global-synthesized-at"),
+    updatedAt: asTimestamp(value.dates.updatedAt, "global-updated-at"),
+  };
+  if (dates.lastSeenDay < dates.firstSeenDay || dates.updatedAt < dates.synthesizedAt) fail("global-recommendation-date-order");
+  return {
+    recommendationId: asHash(value.recommendationId, "global-recommendation-id"),
+    recommendationVersion: asInt(value.recommendationVersion, "global-recommendation-version", { min: 1, max: 1_000_000 }),
+    supportSetHash: asHash(value.supportSetHash, "global-support-set-hash"),
+    state,
+    target: makeGlobalTarget(value.target),
+    support: makeGlobalSupport(value.support),
+    dates,
+    safety: makeGlobalSafety(value.safety),
+    availableActions: makeGlobalActions(value.availableActions, state),
+    detailHash: asHash(value.detailHash, "global-detail-hash"),
+  };
+}
+
+function makeGlobalProjectionContext(value) {
+  exactKeys(value, ["stateRootIdentity", "generation", "now", "supportedCapabilities"], "global-projection-context");
+  return {
+    stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
+    generation: asHash(value.generation, "global-generation"),
+    now: asTimestamp(value.now, "now"),
+    supportedCapabilities: exactSortedList(
+      value.supportedCapabilities,
+      "global-capabilities",
+      GLOBAL_CAPABILITIES,
+      GLOBAL_PROTOCOL_LIMITS.capabilities,
+      "unknown-global-capability",
+    ),
+  };
+}
+
+function assertGlobalProjectionTimes(issuedAt, expiresAt, now) {
+  if (issuedAt > now + GLOBAL_PROTOCOL_LIMITS.futureSkewMs) fail("future-global-projection");
+  if (expiresAt <= now) fail("expired-global-projection");
+  if (expiresAt <= issuedAt || expiresAt - issuedAt > GLOBAL_PROTOCOL_LIMITS.projectionTtlMs) {
+    fail("invalid-global-projection-lifetime");
+  }
+}
+
+export function makeGlobalRecommendationIndex(value, expectedValue) {
+  assertEnvelopeVersion(value, "projectionVersion", GLOBAL_PROJECTION_VERSION, "global-projection", "global-recommendation-index");
+  exactKeys(value, GLOBAL_RECOMMENDATION_INDEX_FIELDS, "global-recommendation-index");
+  const expected = makeGlobalProjectionContext(expectedValue);
+  const stateRootIdentity = asHash(value.stateRootIdentity, "state-root-identity");
+  const generation = asHash(value.generation, "global-generation");
+  if (stateRootIdentity !== expected.stateRootIdentity) fail("cross-root");
+  if (generation !== expected.generation) fail("stale-global-generation");
+  const issuedAt = asTimestamp(value.issuedAt, "global-projection-issued-at");
+  const expiresAt = asTimestamp(value.expiresAt, "global-projection-expires-at");
+  assertGlobalProjectionTimes(issuedAt, expiresAt, expected.now);
+  const capabilities = exactSortedList(
+    value.capabilities,
+    "global-capabilities",
+    GLOBAL_CAPABILITIES,
+    GLOBAL_PROTOCOL_LIMITS.capabilities,
+    "unknown-global-capability",
+  );
+  if (capabilities.some((capability) => !expected.supportedCapabilities.includes(capability))) fail("unsupported-global-capability");
+  if (!Array.isArray(value.recommendations)
+      || value.recommendations.length > GLOBAL_PROTOCOL_LIMITS.recommendationIndexEntries) {
+    fail("global-recommendations-out-of-bounds");
+  }
+  const recommendations = value.recommendations.map(makeGlobalIndexEntry);
+  assertOrdered(recommendations, (left, right) => right.dates.updatedAt - left.dates.updatedAt
+    || compareText(left.recommendationId, right.recommendationId), "global-recommendations");
+  if (new Set(recommendations.map((entry) => entry.recommendationId)).size !== recommendations.length) {
+    fail("duplicate-global-recommendation");
+  }
+  const clean = {
+    projectionVersion: GLOBAL_PROJECTION_VERSION,
+    stateRootIdentity,
+    generation,
+    issuedAt,
+    expiresAt,
+    capabilities,
+    recommendations,
+    overflow: makeOverflow(value.overflow, recommendations.length, "global-recommendations"),
+    indexHash: asHash(value.indexHash, "global-index-hash"),
+  };
+  if (hashGlobalProtocol("recommendation-index", clean) !== clean.indexHash) fail("global-index-hash-mismatch");
+  if (Buffer.byteLength(canonicalUiJson(clean), "utf8") > GLOBAL_PROTOCOL_LIMITS.indexBytes) fail("global-index-footprint-exceeded");
+  return deepFreeze(clean);
+}
+
+function makeGlobalDetailContext(value) {
+  exactKeys(value, [
+    "stateRootIdentity", "generation", "recommendationId",
+    "recommendationVersion", "detailHash", "now",
+  ], "global-detail-context");
+  return {
+    stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
+    generation: asHash(value.generation, "global-generation"),
+    recommendationId: asHash(value.recommendationId, "global-recommendation-id"),
+    recommendationVersion: asInt(value.recommendationVersion, "global-recommendation-version", { min: 1, max: 1_000_000 }),
+    detailHash: asHash(value.detailHash, "global-detail-hash"),
+    now: asTimestamp(value.now, "now"),
+  };
+}
+
+function makeGlobalDiff(value) {
+  exactKeys(value, DIFF_FIELDS, "global-diff");
+  if (!Array.isArray(value.lines) || value.lines.length > GLOBAL_PROTOCOL_LIMITS.diffLines) fail("global-diff-lines-out-of-bounds");
+  const lines = value.lines.map((line) => asText(line, "global-diff-line", 1024, { singleLine: true }));
+  if (lines.reduce((bytes, line) => bytes + Buffer.byteLength(line, "utf8"), 0) > GLOBAL_PROTOCOL_LIMITS.diffBytes) {
+    fail("global-diff-bytes-out-of-bounds");
+  }
+  return {
+    kind: asEnum(value.kind, ["unavailable", "unified", "new-file"], "global-diff-kind"),
+    lines,
+    overflow: makeOverflow(value.overflow, lines.length, "global-diff"),
+  };
+}
+
+export function makeGlobalRecommendationDetail(value, expectedValue) {
+  assertEnvelopeVersion(value, "projectionVersion", GLOBAL_PROJECTION_VERSION, "global-projection", "global-recommendation-detail");
+  exactKeys(value, GLOBAL_RECOMMENDATION_DETAIL_FIELDS, "global-recommendation-detail");
+  const expected = makeGlobalDetailContext(expectedValue);
+  const stateRootIdentity = asHash(value.stateRootIdentity, "state-root-identity");
+  const generation = asHash(value.generation, "global-generation");
+  const recommendationId = asHash(value.recommendationId, "global-recommendation-id");
+  const recommendationVersion = asInt(value.recommendationVersion, "global-recommendation-version", { min: 1, max: 1_000_000 });
+  if (stateRootIdentity !== expected.stateRootIdentity) fail("cross-root");
+  if (generation !== expected.generation) fail("stale-global-generation");
+  if (recommendationId !== expected.recommendationId || recommendationVersion !== expected.recommendationVersion) {
+    fail("stale-global-recommendation");
+  }
+  const issuedAt = asTimestamp(value.issuedAt, "global-detail-issued-at");
+  const expiresAt = asTimestamp(value.expiresAt, "global-detail-expires-at");
+  assertGlobalProjectionTimes(issuedAt, expiresAt, expected.now);
+  const priorState = asEnum(value.priorState, GLOBAL_RECOMMENDATION_STATES, "global-prior-state");
+  if (!Array.isArray(value.evidenceSummary)
+      || value.evidenceSummary.length > GLOBAL_PROTOCOL_LIMITS.evidenceSummaryEntries) {
+    fail("global-evidence-summary-out-of-bounds");
+  }
+  const evidenceSummary = value.evidenceSummary.map((entry) => {
+    exactKeys(entry, GLOBAL_EVIDENCE_SUMMARY_FIELDS, "global-evidence-summary-entry");
+    return {
+      kind: asEnum(entry.kind, ["independent-domains", "independent-incidents", "occurrences"], "global-evidence-summary-kind"),
+      count: asInt(entry.count, "global-evidence-summary-count", { max: 1_000_000_000 }),
+    };
+  });
+  assertOrdered(evidenceSummary, (left, right) => compareText(left.kind, right.kind), "global-evidence-summary");
+  if (new Set(evidenceSummary.map((entry) => entry.kind)).size !== evidenceSummary.length) fail("global-evidence-summary-duplicate");
+  const clean = {
+    projectionVersion: GLOBAL_PROJECTION_VERSION,
+    stateRootIdentity,
+    generation,
+    recommendationId,
+    recommendationVersion,
+    supportSetHash: asHash(value.supportSetHash, "global-support-set-hash"),
+    targetBindingHash: asHash(value.targetBindingHash, "global-target-binding-hash"),
+    targetHash: asTargetHash(value.targetHash, "global-target-hash"),
+    proposedContentHash: asHash(value.proposedContentHash, "global-proposed-content-hash"),
+    priorState,
+    issuedAt,
+    expiresAt,
+    target: makeGlobalTarget(value.target),
+    support: makeGlobalSupport(value.support, { dates: true }),
+    safety: makeGlobalSafety(value.safety),
+    generality: makeGlobalGenerality(value.generality),
+    rationale: asText(value.rationale, "global-rationale", GLOBAL_PROTOCOL_LIMITS.rationaleBytes),
+    diff: makeGlobalDiff(value.diff),
+    evidenceSummary,
+    availableActions: makeGlobalActions(value.availableActions, priorState),
+    detailHash: asHash(value.detailHash, "global-detail-hash"),
+  };
+  if (hashGlobalProtocol("recommendation-detail", clean) !== clean.detailHash
+      || clean.detailHash !== expected.detailHash) fail("global-detail-hash-mismatch");
+  if (Buffer.byteLength(canonicalUiJson(clean), "utf8") > GLOBAL_PROTOCOL_LIMITS.detailBytes) fail("global-detail-footprint-exceeded");
+  return deepFreeze(clean);
+}
+
+function makeGlobalGrantContext(value) {
+  exactKeys(value, ["stateRootIdentity", "generation", "indexHash", "detailHash", "now"], "global-grant-context");
+  return {
+    stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
+    generation: asHash(value.generation, "global-generation"),
+    indexHash: asHash(value.indexHash, "global-index-hash"),
+    detailHash: asHash(value.detailHash, "global-detail-hash"),
+    now: asTimestamp(value.now, "now"),
+  };
+}
+
+export function makeGlobalActionGrant(value, expectedValue) {
+  exactKeys(value, GLOBAL_ACTION_GRANT_FIELDS, "global-action-grant");
+  const expected = makeGlobalGrantContext(expectedValue);
+  const action = asEnum(value.action, GLOBAL_ACTIONS, "global-action");
+  const priorState = asEnum(value.priorState, GLOBAL_RECOMMENDATION_STATES, "global-prior-state");
+  if (GLOBAL_ACTION_PRIOR_STATES[action] !== priorState) fail("global-action-state-mismatch");
+  const issuedAt = asTimestamp(value.issuedAt, "global-grant-issued-at");
+  const expiresAt = asTimestamp(value.expiresAt, "global-grant-expires-at");
+  if (issuedAt > expected.now + GLOBAL_PROTOCOL_LIMITS.futureSkewMs || expiresAt <= expected.now
+      || expiresAt <= issuedAt || expiresAt - issuedAt > GLOBAL_PROTOCOL_LIMITS.operationTtlMs) {
+    fail("invalid-global-grant-lifetime");
+  }
+  const clean = {
+    grantVersion: assertVersion(value.grantVersion, 1, "global-grant"),
+    capability: asEnum(value.capability, ["global-action-grant-v1"], "global-grant-capability"),
+    stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
+    generation: asHash(value.generation, "global-generation"),
+    indexHash: asHash(value.indexHash, "global-index-hash"),
+    detailHash: asHash(value.detailHash, "global-detail-hash"),
+    recommendationId: asHash(value.recommendationId, "global-recommendation-id"),
+    recommendationVersion: asInt(value.recommendationVersion, "global-recommendation-version", { min: 1, max: 1_000_000 }),
+    supportSetHash: asHash(value.supportSetHash, "global-support-set-hash"),
+    targetBindingHash: asHash(value.targetBindingHash, "global-target-binding-hash"),
+    targetHash: asTargetHash(value.targetHash, "global-target-hash"),
+    proposedContentHash: asHash(value.proposedContentHash, "global-proposed-content-hash"),
+    priorState,
+    action,
+    nonce: asOpaqueUuid(value.nonce, "global-grant-nonce"),
+    issuedAt,
+    expiresAt,
+    grantHash: asHash(value.grantHash, "global-grant-hash"),
+  };
+  for (const field of ["stateRootIdentity", "generation", "indexHash", "detailHash"]) {
+    if (clean[field] !== expected[field]) fail(`stale-global-${field.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`)}`);
+  }
+  if (hashGlobalProtocol("action-grant", clean) !== clean.grantHash) fail("global-grant-hash-mismatch");
+  if (Buffer.byteLength(canonicalUiJson(clean), "utf8") > GLOBAL_PROTOCOL_LIMITS.grantBytes) fail("global-grant-footprint-exceeded");
+  return deepFreeze(clean);
+}
+
+export function makeGlobalActionRequestEnvelope(value, expectedValue) {
+  exactKeys(value, GLOBAL_ACTION_REQUEST_FIELDS, "global-action-request");
+  exactKeys(expectedValue, ["now", "stateRootIdentity", "grant"], "global-action-request-context");
+  const now = asTimestamp(expectedValue.now, "now");
+  const expectedRoot = asHash(expectedValue.stateRootIdentity, "state-root-identity");
+  const grant = makeGlobalActionGrant(expectedValue.grant, {
+    stateRootIdentity: expectedValue.grant?.stateRootIdentity,
+    generation: expectedValue.grant?.generation,
+    indexHash: expectedValue.grant?.indexHash,
+    detailHash: expectedValue.grant?.detailHash,
+    now,
+  });
+  const issuedAt = asTimestamp(value.issuedAt, "global-request-issued-at");
+  const expiresAt = asTimestamp(value.expiresAt, "global-request-expires-at");
+  if (issuedAt > now + GLOBAL_PROTOCOL_LIMITS.futureSkewMs || expiresAt <= now
+      || expiresAt <= issuedAt || expiresAt - issuedAt > GLOBAL_PROTOCOL_LIMITS.operationTtlMs
+      || expiresAt > grant.expiresAt) fail("invalid-global-request-lifetime");
+  const clean = {
+    protocolVersion: assertVersion(value.protocolVersion, GLOBAL_OPERATION_PROTOCOL_VERSION, "global-operation"),
+    capability: asEnum(value.capability, ["global-action-request-v1"], "global-request-capability"),
+    requestId: asOpaqueUuid(value.requestId, "global-request-id"),
+    stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
+    actingProjectFingerprint: asHash(value.actingProjectFingerprint, "acting-project-fingerprint"),
+    actingHealthHash: asHash(value.actingHealthHash, "acting-health-hash"),
+    projectionGenerationHash: asHash(value.projectionGenerationHash, "global-generation"),
+    indexHash: asHash(value.indexHash, "global-index-hash"),
+    detailHash: asHash(value.detailHash, "global-detail-hash"),
+    grantHash: asHash(value.grantHash, "global-grant-hash"),
+    recommendationId: asHash(value.recommendationId, "global-recommendation-id"),
+    recommendationVersion: asInt(value.recommendationVersion, "global-recommendation-version", { min: 1, max: 1_000_000 }),
+    supportSetHash: asHash(value.supportSetHash, "global-support-set-hash"),
+    targetBindingHash: asHash(value.targetBindingHash, "global-target-binding-hash"),
+    targetHash: asTargetHash(value.targetHash, "global-target-hash"),
+    proposedContentHash: asHash(value.proposedContentHash, "global-proposed-content-hash"),
+    priorState: asEnum(value.priorState, GLOBAL_RECOMMENDATION_STATES, "global-prior-state"),
+    action: asEnum(value.action, GLOBAL_ACTIONS, "global-action"),
+    actorRole: asEnum(value.actorRole, ["operator"], "global-actor-role"),
+    issuedAt,
+    expiresAt,
+    nonce: asOpaqueUuid(value.nonce, "global-request-nonce"),
+    requestHash: asHash(value.requestHash, "global-request-hash"),
+  };
+  if (clean.stateRootIdentity !== expectedRoot) fail("cross-root");
+  const bindings = {
+    projectionGenerationHash: "generation",
+    indexHash: "indexHash",
+    detailHash: "detailHash",
+    grantHash: "grantHash",
+    recommendationId: "recommendationId",
+    recommendationVersion: "recommendationVersion",
+    supportSetHash: "supportSetHash",
+    targetBindingHash: "targetBindingHash",
+    targetHash: "targetHash",
+    proposedContentHash: "proposedContentHash",
+    priorState: "priorState",
+    action: "action",
+    nonce: "nonce",
+  };
+  for (const [requestField, grantField] of Object.entries(bindings)) {
+    if (clean[requestField] !== grant[grantField]) fail("global-request-grant-mismatch", requestField);
+  }
+  if (hashGlobalProtocol("action-request", clean) !== clean.requestHash) fail("global-request-hash-mismatch");
+  if (Buffer.byteLength(canonicalUiJson(clean), "utf8") > GLOBAL_PROTOCOL_LIMITS.operationBytes) fail("global-request-footprint-exceeded");
+  return deepFreeze(clean);
+}
+
+export function makeGlobalActionResponse(value, expectedValue) {
+  exactKeys(value, GLOBAL_ACTION_RESPONSE_FIELDS, "global-action-response");
+  exactKeys(expectedValue, [
+    "stateRootIdentity", "requestId", "recommendationId", "recommendationVersion",
+    "action", "requestHash", "requestIssuedAt", "requestExpiresAt", "now",
+  ], "global-action-response-context");
+  const processedAt = asTimestamp(value.processedAt, "global-response-processed-at");
+  const requestIssuedAt = asTimestamp(expectedValue.requestIssuedAt, "global-request-issued-at");
+  const requestExpiresAt = asTimestamp(expectedValue.requestExpiresAt, "global-request-expires-at");
+  if (processedAt < requestIssuedAt || processedAt >= requestExpiresAt
+      || processedAt > asTimestamp(expectedValue.now, "now") + GLOBAL_PROTOCOL_LIMITS.futureSkewMs) {
+    fail("invalid-global-response-time");
+  }
+  const ok = asBoolean(value.ok, "global-response-ok");
+  const status = asEnum(value.status, ["accepted", "rejected"], "global-response-status");
+  const reason = asNullableReason(value.reason);
+  if (ok !== (status === "accepted") || (ok ? reason !== null : !reason)) fail("inconsistent-global-response");
+  const clean = {
+    protocolVersion: assertVersion(value.protocolVersion, GLOBAL_OPERATION_PROTOCOL_VERSION, "global-operation"),
+    requestId: asOpaqueUuid(value.requestId, "global-request-id"),
+    stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
+    recommendationId: asHash(value.recommendationId, "global-recommendation-id"),
+    recommendationVersion: asInt(value.recommendationVersion, "global-recommendation-version", { min: 1, max: 1_000_000 }),
+    action: asEnum(value.action, GLOBAL_ACTIONS, "global-action"),
+    requestHash: asHash(value.requestHash, "global-request-hash"),
+    ok,
+    status,
+    processedAt,
+    reason,
+    responseHash: asHash(value.responseHash, "global-response-hash"),
+  };
+  for (const field of ["stateRootIdentity", "requestId", "recommendationId", "recommendationVersion", "action", "requestHash"]) {
+    if (clean[field] !== expectedValue[field]) fail("global-response-request-mismatch", field);
+  }
+  if (hashGlobalProtocol("action-response", clean) !== clean.responseHash) fail("global-response-hash-mismatch");
+  if (Buffer.byteLength(canonicalUiJson(clean), "utf8") > GLOBAL_PROTOCOL_LIMITS.responseBytes) fail("global-response-footprint-exceeded");
+  return deepFreeze(clean);
+}
+
+export function makeProjectParticipationSidecar(value, expectedValue) {
+  exactKeys(value, PROJECT_PARTICIPATION_FIELDS, "project-participation");
+  exactKeys(expectedValue, [
+    "projectFingerprint", "stateRootIdentity", "generation", "indexHash", "recommendationId",
+    "supportSetHash", "now",
+  ], "project-participation-context");
+  const issuedAt = asTimestamp(value.issuedAt, "participation-issued-at");
+  const expiresAt = asTimestamp(value.expiresAt, "participation-expires-at");
+  assertGlobalProjectionTimes(issuedAt, expiresAt, asTimestamp(expectedValue.now, "now"));
+  const clean = {
+    participationVersion: assertVersion(value.participationVersion, PROJECT_PARTICIPATION_VERSION, "project-participation"),
+    projectFingerprint: asHash(value.projectFingerprint, "project-fingerprint"),
+    stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
+    generation: asHash(value.generation, "global-generation"),
+    indexHash: asHash(value.indexHash, "global-index-hash"),
+    recommendationId: asHash(value.recommendationId, "global-recommendation-id"),
+    supportSetHash: asHash(value.supportSetHash, "global-support-set-hash"),
+    currentProjectContributed: asBoolean(value.currentProjectContributed, "current-project-contributed"),
+    issuedAt,
+    expiresAt,
+    participationHash: asHash(value.participationHash, "participation-hash"),
+  };
+  for (const field of ["projectFingerprint", "stateRootIdentity", "generation", "indexHash", "recommendationId", "supportSetHash"]) {
+    if (clean[field] !== expectedValue[field]) fail("project-participation-binding-mismatch", field);
+  }
+  if (hashGlobalProtocol("project-participation", clean) !== clean.participationHash) fail("participation-hash-mismatch");
+  return deepFreeze(clean);
+}
+
+export function makeGlobalProtocolOffer(value) {
+  exactKeys(value, GLOBAL_PROTOCOL_OFFER_FIELDS, "global-protocol-offer");
+  return deepFreeze({
+    bridgeSchemaVersions: exactSortedList(value.bridgeSchemaVersions, "global-bridge-versions", [GLOBAL_BRIDGE_SCHEMA_VERSION], 4, "unsupported-global-bridge-version"),
+    projectionVersions: exactSortedList(value.projectionVersions, "global-projection-versions", [GLOBAL_PROJECTION_VERSION], 4, "unsupported-global-projection-version"),
+    operationProtocolVersions: exactSortedList(value.operationProtocolVersions, "global-operation-versions", [GLOBAL_OPERATION_PROTOCOL_VERSION], 4, "unsupported-global-operation-version"),
+    capabilities: exactSortedList(value.capabilities, "global-capabilities", GLOBAL_CAPABILITIES, GLOBAL_PROTOCOL_LIMITS.capabilities, "unknown-global-capability"),
+  });
+}
+
+function makeGlobalPeerOffer(value) {
+  exactKeys(value, GLOBAL_PROTOCOL_OFFER_FIELDS, "global-protocol-peer-offer");
+  const capabilities = value.capabilities;
+  if (!Array.isArray(capabilities) || capabilities.length > GLOBAL_PROTOCOL_LIMITS.capabilities) fail("global-capabilities-out-of-bounds");
+  for (const capability of capabilities) {
+    if (typeof capability !== "string" || !/^[a-z0-9][a-z0-9.-]{0,63}$/u.test(capability)) fail("invalid-global-peer-capability");
+  }
+  assertOrdered(capabilities, compareText, "global-capabilities");
+  if (new Set(capabilities).size !== capabilities.length) fail("global-capabilities-duplicate");
+  return {
+    bridgeSchemaVersions: makePeerVersionList(value.bridgeSchemaVersions, "global-bridge-versions"),
+    projectionVersions: makePeerVersionList(value.projectionVersions, "global-projection-versions"),
+    operationProtocolVersions: makePeerVersionList(value.operationProtocolVersions, "global-operation-versions"),
+    capabilities,
+  };
+}
+
+function limitedGlobalProtocol(label, reason) {
+  return deepFreeze({
+    mode: "limited",
+    label,
+    bridgeSchemaVersion: null,
+    projectionVersion: null,
+    operationProtocolVersion: null,
+    capabilities: [],
+    reason,
+  });
+}
+
+export function negotiateGlobalProtocol(serverValue, clientValue) {
+  if (serverValue === null || serverValue === undefined) {
+    return limitedGlobalProtocol(GLOBAL_PROTOCOL_COMPATIBILITY.newTuiOldServer, "global-server-offer-unavailable");
+  }
+  if (clientValue === null || clientValue === undefined) {
+    return limitedGlobalProtocol(GLOBAL_PROTOCOL_COMPATIBILITY.oldTuiNewServer, "global-client-offer-unavailable");
+  }
+  const server = makeGlobalPeerOffer(serverValue);
+  const client = makeGlobalPeerOffer(clientValue);
+  const bridgeSchemaVersion = [...server.bridgeSchemaVersions].reverse().find((version) => client.bridgeSchemaVersions.includes(version)) ?? null;
+  const projectionVersion = [...server.projectionVersions].reverse().find((version) => client.projectionVersions.includes(version)) ?? null;
+  const operationProtocolVersion = [...server.operationProtocolVersions].reverse().find((version) => client.operationProtocolVersions.includes(version)) ?? null;
+  const capabilities = GLOBAL_CAPABILITIES.filter((capability) => server.capabilities.includes(capability) && client.capabilities.includes(capability));
+  if (bridgeSchemaVersion === null || projectionVersion === null || operationProtocolVersion === null
+      || !GLOBAL_AUTHORITATIVE_CAPABILITIES.every((capability) => capabilities.includes(capability))) {
+    return limitedGlobalProtocol("limited-incompatible-global-protocol", "global-authority-capability-unavailable");
+  }
+  return deepFreeze({
+    mode: "native",
+    label: GLOBAL_PROTOCOL_COMPATIBILITY.native,
+    bridgeSchemaVersion,
+    projectionVersion,
+    operationProtocolVersion,
+    capabilities,
+    reason: null,
+  });
+}
+
 export function makeUiProtocolOffer(value) {
   exactKeys(value, UI_PROTOCOL_OFFER_FIELDS, "ui-protocol-offer");
   const projectionVersions = exactSortedList(value.projectionVersions, "projection-versions", [UI_PROJECTION_VERSION], 4, "unsupported-projection-version");
@@ -569,6 +1217,36 @@ function makeDashboardReason(value, label = "dashboard-reason") {
   return value === null ? null : asEnum(value, UI_DASHBOARD_REASON_CODES, label);
 }
 
+function makeDashboardGlobalRootPolicy(value) {
+  if (value === null) return null;
+  exactKeys(value, ["roots", "creationRootPath", "rootSetHash", "updatedAt"], "dashboard-global-root-policy");
+  if (!Array.isArray(value.roots) || value.roots.length < 1 || value.roots.length > 32) {
+    fail("dashboard-global-root-policy-roots-out-of-bounds");
+  }
+  const roots = value.roots.map((root) => {
+    exactKeys(root, ROOT_POLICY_ROOT_FIELDS, "dashboard-global-root-policy-root");
+    const clean = makeApprovedGlobalRoot(root);
+    return {
+      canonicalPath: clean.canonicalPath,
+      canUpdate: clean.canUpdate,
+      canCreate: clean.canCreate,
+    };
+  });
+  const creationRootPath = value.creationRootPath === null
+    ? null
+    : makeApprovedGlobalRoot({
+        canonicalPath: value.creationRootPath,
+        canUpdate: true,
+        canCreate: false,
+      }).canonicalPath;
+  return {
+    roots,
+    creationRootPath,
+    rootSetHash: asHash(value.rootSetHash, "root-set-hash"),
+    updatedAt: asTimestamp(value.updatedAt, "root-policy-updated-at"),
+  };
+}
+
 function makeDashboardBudgetUsage(value, label) {
   exactKeys(value, DASHBOARD_BUDGET_USAGE_FIELDS, `${label}-usage`);
   const used = asInt(value.used, `${label}-used`, { max: 1_000_000_000 });
@@ -708,7 +1386,11 @@ export function makeUiDashboard(value, expectedValue) {
       && rollout.successRateBasisPoints >= rollout.minSuccessRateBasisPoints)) {
     fail("dashboard-rollout-readiness-mismatch");
   }
-  exactKeys(value.settings, DASHBOARD_SETTINGS_FIELDS, "dashboard-settings");
+  exactKeys(
+    value.settings,
+    dashboardVersion === 1 ? DASHBOARD_SETTINGS_FIELDS : DASHBOARD_SETTINGS_V2_FIELDS,
+    "dashboard-settings",
+  );
   exactKeys(value.settings.consent, DASHBOARD_CONSENT_FIELDS, "dashboard-consent");
   const settings = {
     globalMode: asEnum(value.settings.globalMode, MODES, "dashboard-global-mode"),
@@ -722,6 +1404,27 @@ export function makeUiDashboard(value, expectedValue) {
     ])),
     approvedSkillFolderCount: asInt(value.settings.approvedSkillFolderCount, "dashboard-approved-skill-folder-count", { max: 1_000_000 }),
   };
+  if (dashboardVersion === 2) {
+    settings.globalSettingsVersion = asHash(value.settings.globalSettingsVersion, "global-settings-version");
+    settings.globalRootPolicy = makeDashboardGlobalRootPolicy(value.settings.globalRootPolicy);
+    settings.globalRootPolicyConfirmation = asText(
+      value.settings.globalRootPolicyConfirmation,
+      "global-root-policy-confirmation",
+      64,
+      { singleLine: true },
+    );
+    settings.globalRootPolicyAction = value.settings.globalRootPolicyAction === null
+      ? null
+      : makeAllowedAction(value.settings.globalRootPolicyAction, {
+          capabilities,
+          expiresAt: generatedAt + UI_PROTOCOL_LIMITS.projectionTtlMs,
+          now: expected.now,
+        });
+    if (settings.globalRootPolicyAction !== null
+        && settings.globalRootPolicyAction.action !== "replace-global-root-policy") {
+      fail("invalid-global-root-policy-action");
+    }
+  }
   exactKeys(value.retention, DASHBOARD_RETENTION_FIELDS, "dashboard-retention");
   const retention = dashboardVersion === 1
     ? {
@@ -808,7 +1511,7 @@ function makeOperationEntry(value) {
 function makeAllowedAction(value, { capabilities, expiresAt, now }) {
   exactKeys(value, ALLOWED_ACTION_FIELDS, "ui-allowed-action");
   const action = asEnum(value.action, UI_ACTIONS, "ui-action");
-  const capability = asEnum(value.capability, UI_CAPABILITIES, "capability");
+  const capability = asEnum(value.capability, UI_OPERATION_CAPABILITIES, "capability");
   if (UI_ACTION_CAPABILITIES[action] !== capability) fail("action-capability-mismatch");
   if (!capabilities.includes(capability)) fail("unsupported-capability", capability);
   if (action === "acknowledge-audit") {
@@ -1089,12 +1792,12 @@ function makeOperationContext(value) {
     "projectFingerprint", "stateRootIdentity", "generation", "projectionHash", "now", "supportedCapabilities", "grant",
   ], "ui-operation-context");
   const now = asTimestamp(value.now, "now");
-  const supportedCapabilities = exactSortedList(value.supportedCapabilities, "capabilities", UI_CAPABILITIES, UI_PROTOCOL_LIMITS.capabilities, "unknown-capability");
+  const supportedCapabilities = exactSortedList(value.supportedCapabilities, "capabilities", UI_OPERATION_CAPABILITIES, UI_PROTOCOL_LIMITS.capabilities, "unknown-capability");
   exactKeys(value.grant, ALLOWED_ACTION_FIELDS, "ui-operation-grant");
   if (!UI_OPERATION_ACTIONS.includes(value.grant.action)) fail("invalid-operation-grant-action");
   const grant = {
     action: value.grant.action,
-    capability: asEnum(value.grant.capability, UI_CAPABILITIES, "operation-grant-capability"),
+    capability: asEnum(value.grant.capability, UI_OPERATION_CAPABILITIES, "operation-grant-capability"),
     nonce: asId(value.grant.nonce, "operation-grant-nonce"),
     expiresAt: asTimestamp(value.grant.expiresAt, "operation-grant-expires-at"),
   };
@@ -1114,6 +1817,10 @@ function makeOperationContext(value) {
 
 function asTargetHash(value, label) {
   return value === "must-not-exist" ? value : asHash(value, label);
+}
+
+export function globalRootPolicyConfirmation(settingsVersion) {
+  return `REPLACE GLOBAL ROOT POLICY ${asHash(settingsVersion, "settings-version").slice(0, 12)}`;
 }
 
 function makeOperationPayload(action, value, now) {
@@ -1151,9 +1858,58 @@ function makeOperationPayload(action, value, now) {
       settingsVersion: asHash(value.settingsVersion, "settings-version"),
     };
   }
+  if (action === "set-repo-mode") {
+    exactKeys(value, PROJECT_MODE_PAYLOAD_FIELDS, "project-mode-payload");
+    return {
+      mode: asEnum(value.mode, ["inherit", "manual", "auto"], "project-analysis-mode"),
+      settingsVersion: asHash(value.settingsVersion, "settings-version"),
+    };
+  }
+  if (action === "replace-global-root-policy") {
+    exactKeys(value, ROOT_POLICY_PAYLOAD_FIELDS, "global-root-policy-payload");
+    const settingsVersion = asHash(value.settingsVersion, "settings-version");
+    if (!Array.isArray(value.roots) || value.roots.length < 1 || value.roots.length > 32) {
+      fail("global-root-policy-roots-out-of-bounds");
+    }
+    const roots = value.roots.map((root) => {
+      exactKeys(root, ROOT_POLICY_ROOT_FIELDS, "global-root-policy-root");
+      const clean = makeApprovedGlobalRoot(root);
+      return {
+        canonicalPath: clean.canonicalPath,
+        canUpdate: clean.canUpdate,
+        canCreate: clean.canCreate,
+      };
+    });
+    if (new Set(roots.map((root) => root.canonicalPath)).size !== roots.length) {
+      fail("duplicate-global-root-path");
+    }
+    for (let index = 1; index < roots.length; index += 1) {
+      if (compareText(roots[index - 1].canonicalPath, roots[index].canonicalPath) >= 0) {
+        fail("global-root-policy-roots-not-sorted");
+      }
+    }
+    const creationRootPath = value.creationRootPath === null
+      ? null
+      : makeApprovedGlobalRoot({
+          canonicalPath: value.creationRootPath,
+          canUpdate: true,
+          canCreate: false,
+        }).canonicalPath;
+    const createRoots = roots.filter((root) => root.canCreate);
+    if ((creationRootPath === null && createRoots.length !== 0)
+        || (creationRootPath !== null
+          && (createRoots.length !== 1 || createRoots[0].canonicalPath !== creationRootPath))) {
+      fail("global-root-policy-creation-root-mismatch");
+    }
+    const confirmation = asText(value.confirmation, "global-root-policy-confirmation", 64, { singleLine: true });
+    if (confirmation !== globalRootPolicyConfirmation(settingsVersion)) {
+      fail("invalid-global-root-policy-confirmation");
+    }
+    return { roots, creationRootPath, confirmation, settingsVersion };
+  }
   if (action === "purge-scope") {
     exactKeys(value, PURGE_SCOPE_PAYLOAD_FIELDS, "purge-scope-payload");
-    const scope = asEnum(value.scope, ["observations", "proposals", "project"], "purge-scope");
+    const scope = asEnum(value.scope, ["observations", "global-recommendations", "project"], "purge-scope");
     const confirmation = asText(value.confirmation, "purge-confirmation", 64, { singleLine: true });
     if (confirmation !== `PURGE ${scope.toUpperCase()}`) fail("invalid-purge-confirmation");
     return { scope, confirmation };
@@ -1161,12 +1917,12 @@ function makeOperationPayload(action, value, now) {
   if (action === "purge-all") {
     exactKeys(value, CONFIRMATION_PAYLOAD_FIELDS, "purge-all-payload");
     const confirmation = asText(value.confirmation, "purge-all-confirmation", 64, { singleLine: true });
-    if (confirmation !== "PURGE ALL SELF-EVOLVE DATA") fail("invalid-purge-confirmation");
+    if (confirmation !== "PURGE ALL SELF-EVOLVE 0.3.0") fail("invalid-purge-confirmation");
     return { confirmation };
   }
   if (action === "export-data") {
     exactKeys(value, EXPORT_PAYLOAD_FIELDS, "export-payload");
-    const scope = asEnum(value.scope, ["observations", "proposals", "project", "all"], "export-scope");
+    const scope = asEnum(value.scope, ["observations", "global-recommendations", "project", "all"], "export-scope");
     const confirmation = asText(value.confirmation, "export-confirmation", 64, { singleLine: true });
     if (confirmation !== "EXPORT SENSITIVE SELF-EVOLVE DATA") fail("invalid-export-confirmation");
     return { scope, confirmation };
@@ -1193,7 +1949,7 @@ export function makeUiOperationRequest(value, expectedValue) {
   if (projectionHash !== expected.projectionHash) fail("stale-projection");
   if (!UI_OPERATION_ACTIONS.includes(value.action)) fail("unknown-operation-action", String(value.action));
   const action = value.action;
-  const capability = asEnum(value.capability, UI_CAPABILITIES, "capability");
+  const capability = asEnum(value.capability, UI_OPERATION_CAPABILITIES, "capability");
   if (UI_ACTION_CAPABILITIES[action] !== capability) fail("action-capability-mismatch");
   if (!expected.supportedCapabilities.includes(capability)) fail("unsupported-capability", capability);
   if (action !== expected.grant.action) fail("operation-grant-action-mismatch");
