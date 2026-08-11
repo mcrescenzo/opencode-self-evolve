@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  deriveEvidenceCapsuleSummary,
+  deriveSourceLineage,
   EXTRACT_RULES,
   correlateObservations,
   evaluateEligibility,
@@ -87,6 +89,34 @@ test("session lineage and message cursors are stable domain-separated hashes", (
   assert.doesNotMatch(hashMessageCursor(legacy), /private|mocked|message/u);
 });
 
+test("source-lineage fixtures collapse no-remote and ambiguity while clones, linked worktrees, and relocation converge", () => {
+  const remoteUrl = "git@GitHub.com:Example/Repo.git";
+  const known = [
+    { name: "clone", remoteUrl, worktreePath: "/tmp/clone" },
+    { name: "linked-worktree", remoteUrl, worktreePath: "/tmp/main-linked" },
+    { name: "relocation", remoteUrl, worktreePath: "/opt/relocated" },
+    { name: "transport-alias", remoteUrl: "https://github.com/Example/Repo.git", worktreePath: "/tmp/https-clone" },
+  ].map((fixture) => ({ ...fixture, lineage: deriveSourceLineage(fixture) }));
+  assert.equal(new Set(known.map((fixture) => fixture.lineage.sourceLineageHash)).size, 1);
+  assert.equal(known.every((fixture) => fixture.lineage.lineageStatus === "known"), true);
+
+  assert.deepEqual(deriveSourceLineage({ remoteUrl: "", worktreePath: "/tmp/no-remote" }), {
+    lineageStatus: "unknown",
+    sourceLineageHash: null,
+  });
+  assert.deepEqual(deriveSourceLineage({ worktreePath: "/tmp/unknown-lineage" }), {
+    lineageStatus: "unknown",
+    sourceLineageHash: null,
+  });
+  assert.deepEqual(deriveSourceLineage({ remoteUrls: [
+    "https://github.com/example/repo.git",
+    "https://gitlab.com/example/repo.git",
+  ] }), {
+    lineageStatus: "ambiguous",
+    sourceLineageHash: null,
+  });
+});
+
 test("receipt and cluster ordering never depends on localeCompare", () => {
   const original = String.prototype.localeCompare;
   String.prototype.localeCompare = () => { throw new Error("locale-dependent-ordering"); };
@@ -128,6 +158,116 @@ test("extractor recognizes repeated commands, tool errors, procedures, and clari
   ]));
   assert.equal(receipts.every((item) => /^[a-f0-9]{64}$/.test(item.signatureHash)), true);
   assert.equal(receipts.every(Object.isFrozen), true);
+});
+
+test("one admitted tool-error receipt derives one useful bounded capsule summary", () => {
+  const admitted = episode([
+    { role: "tool", toolName: "lint", toolError: "E_CONFIG" },
+    { role: "tool", toolName: "lint", toolError: "E_CONFIG" },
+  ]);
+  const [receipt] = extractReceipts(admitted, {
+    projectFingerprint: PROJECT_A,
+    scopeFingerprint: SCOPE,
+    now: NOW,
+  });
+
+  assert.deepEqual(deriveEvidenceCapsuleSummary(admitted, receipt), {
+    ok: true,
+    summary: "Tool lint repeatedly failed with E_CONFIG (2 occurrences).",
+  });
+});
+
+test("tool-error capsule derivation keeps a safe error code or strips the raw error detail", () => {
+  const token = `sk-${"s".repeat(24)}`;
+  const admitted = episode([
+    { role: "tool", toolName: "lint", toolError: `failed at /private/project with ${token}` },
+    { role: "tool", toolName: "lint", toolError: `failed at /private/project with ${token}` },
+  ]);
+  const [receipt] = extractReceipts(admitted, {
+    projectFingerprint: PROJECT_A,
+    scopeFingerprint: SCOPE,
+    now: NOW,
+  });
+
+  const result = deriveEvidenceCapsuleSummary(admitted, receipt);
+  assert.deepEqual(result, {
+    ok: true,
+    summary: "Tool lint repeatedly failed (2 occurrences).",
+  });
+  assert.equal(result.summary.includes(token), false);
+  assert.doesNotMatch(result.summary, /private|project/u);
+});
+
+test("one admitted repeated-command receipt derives metadata rather than message content", () => {
+  const admitted = episode([
+    { role: "user", content: "/verify customer payload", commandName: "/verify" },
+    { role: "user", content: "/verify another payload", commandName: "/verify" },
+  ]);
+  const [receipt] = extractReceipts(admitted, {
+    projectFingerprint: PROJECT_A,
+    scopeFingerprint: SCOPE,
+    now: NOW,
+  });
+
+  const result = deriveEvidenceCapsuleSummary(admitted, receipt);
+  assert.deepEqual(result, {
+    ok: true,
+    summary: "Command verify recurred 2 times and required repeated handling.",
+  });
+  assert.doesNotMatch(result.summary, /customer payload|another payload/u);
+});
+
+test("procedure and clarification capsules remain useful without copying message bodies", () => {
+  const procedure = episode([
+    { role: "assistant", toolName: "read" },
+    { role: "assistant", toolName: "build" },
+    { role: "assistant", toolName: "test" },
+    { role: "assistant", toolName: "read" },
+    { role: "assistant", toolName: "build" },
+    { role: "assistant", toolName: "test" },
+  ]);
+  const procedureReceipt = extractReceipts(procedure, {
+    projectFingerprint: PROJECT_A,
+    scopeFingerprint: SCOPE,
+    now: NOW,
+  }).find((item) => item.receiptType === "repeated-manual-procedure");
+  assert.deepEqual(deriveEvidenceCapsuleSummary(procedure, procedureReceipt), {
+    ok: true,
+    summary: "Procedure steps read -> build -> test recurred 2 times.",
+  });
+
+  const clarification = episode([
+    { role: "user", content: "To clarify, never expose customer-zephyr." },
+    { role: "assistant", content: "Acknowledged." },
+    { role: "user", content: "I mean omit every private identifier." },
+  ]);
+  const [clarificationReceipt] = extractReceipts(clarification, {
+    projectFingerprint: PROJECT_A,
+    scopeFingerprint: SCOPE,
+    now: NOW,
+  });
+  const result = deriveEvidenceCapsuleSummary(clarification, clarificationReceipt);
+  assert.deepEqual(result, {
+    ok: true,
+    summary: "User clarification recurred within 8 messages and corrected prior instructions.",
+  });
+  assert.doesNotMatch(result.summary, /customer-zephyr|private identifier/u);
+});
+
+test("capsule derivation fails closed instead of returning an oversized UTF-8 summary", () => {
+  const admitted = episode([
+    { role: "user", commandName: `/${"a".repeat(220)}` },
+    { role: "user", commandName: `/${"a".repeat(220)}` },
+  ]);
+  const [receipt] = extractReceipts(admitted, {
+    projectFingerprint: PROJECT_A,
+    scopeFingerprint: SCOPE,
+    now: NOW,
+  });
+  assert.deepEqual(deriveEvidenceCapsuleSummary(admitted, receipt), {
+    ok: false,
+    reason: "capsule-summary-too-large",
+  });
 });
 
 test("secret-canary normalization removes provider tokens and raw text from receipts", () => {
@@ -314,6 +454,38 @@ test("three independent episodes across distinct sessions accumulate to eligibil
   assert.deepEqual(result.thresholdsMissed, {});
   assert.equal(Object.keys(result.thresholdsMet).length >= 4, true);
   assert.deepEqual(result.reasons, ["all-thresholds-met"]);
+});
+
+test("default thresholds admit two independent incidents in two distinct root sessions", () => {
+  const clusters = correlateObservations([
+    observation({
+      incidentId: "episode-1",
+      sessionLineageHash: LINEAGE_1,
+      rootLineageHash: ROOT_1,
+      structuredFields: { occurrences: 2 },
+      createdAt: NOW - 1,
+    }),
+    observation({
+      incidentId: "episode-2",
+      sessionLineageHash: LINEAGE_2,
+      rootLineageHash: ROOT_2,
+      structuredFields: { occurrences: 2 },
+      createdAt: NOW,
+    }),
+  ]);
+  const [result] = evaluateEligibility(clusters, { now: NOW });
+  assert.equal(result.eligible, true);
+  assert.equal(result.thresholdsMet.minIndependentIncidents, "2 (actual 2)");
+  assert.equal(result.thresholdsMet.minOccurrencesSum, "3 (actual 4)");
+  assert.equal(result.thresholdsMet.minDistinctSessions, "2 (actual 2)");
+  assert.deepEqual(result.reasons, ["all-thresholds-met"]);
+
+  const [single] = evaluateEligibility(correlateObservations([
+    observation({ structuredFields: { occurrences: 4 } }),
+  ]), { now: NOW });
+  assert.equal(single.eligible, false);
+  assert.equal(single.thresholdsMissed.minIndependentIncidents, "2 (actual 1)");
+  assert.ok(single.reasons.includes("independent-incidents-not-met"));
 });
 
 test("missing legacy root lineage contributes no independent roots", () => {

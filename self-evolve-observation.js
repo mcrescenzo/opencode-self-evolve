@@ -8,8 +8,10 @@ import {
   makeEvidenceCluster,
   makeObservation,
   makeReceipt,
+  MAX_EVIDENCE_CAPSULE_BYTES,
   ORIGIN_KINDS,
   recordIncident,
+  UNKNOWN_EVIDENCE_DOMAIN_ID,
   UNKNOWN_ROOT_LINEAGE_HASH,
   UNKNOWN_SESSION_LINEAGE_HASH,
 } from "./self-evolve-schemas.js";
@@ -80,6 +82,158 @@ export function hashSessionLineage(sessionID) {
 export function hashRootLineage(rootSessionID) {
   if (typeof rootSessionID !== "string" || !rootSessionID) throw new TypeError("root-session-id-required");
   return hashSignature(`self-evolve-root-lineage-v1\n${rootSessionID}`);
+}
+
+function canonicalRemoteSource(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  let remote = value.trim().replace(/\\/gu, "/");
+  const scp = /^(?:[^/@\s]+@)?([^/:\s]+):(.+)$/u.exec(remote);
+  if (scp && !remote.includes("://")) remote = `ssh://${scp[1]}/${scp[2]}`;
+  let url;
+  try { url = new URL(remote); } catch { return null; }
+  if (!["git:", "http:", "https:", "ssh:"].includes(url.protocol)) return null;
+  if (!url.hostname || url.search || url.hash) return null;
+  const defaultPort = (url.protocol === "https:" && url.port === "443")
+    || (url.protocol === "http:" && url.port === "80")
+    || (url.protocol === "ssh:" && url.port === "22")
+    || (url.protocol === "git:" && url.port === "9418");
+  const host = url.hostname.toLowerCase() + (!url.port || defaultPort ? "" : `:${url.port}`);
+  const sourcePath = url.pathname.replace(/\/{2,}/gu, "/").replace(/\/+$/u, "").replace(/\.git$/iu, "");
+  if (!sourcePath || sourcePath === "/") return null;
+  return `${host}${sourcePath}`;
+}
+
+export function deriveSourceLineage({ remoteUrl, remoteUrls } = {}) {
+  const supplied = remoteUrls === undefined ? (remoteUrl ? [remoteUrl] : []) : remoteUrls;
+  if (!Array.isArray(supplied) || supplied.some((value) => typeof value !== "string")) {
+    return deepFreeze({ lineageStatus: "ambiguous", sourceLineageHash: null });
+  }
+  if (supplied.length === 0 || supplied.every((value) => value.trim() === "")) {
+    return deepFreeze({ lineageStatus: "unknown", sourceLineageHash: null });
+  }
+  const canonical = supplied.map(canonicalRemoteSource);
+  if (canonical.some((value) => value === null)) {
+    return deepFreeze({ lineageStatus: "ambiguous", sourceLineageHash: null });
+  }
+  const distinct = [...new Set(canonical)];
+  if (distinct.length !== 1) return deepFreeze({ lineageStatus: "ambiguous", sourceLineageHash: null });
+  return deepFreeze({
+    lineageStatus: "known",
+    sourceLineageHash: hashSignature(`self-evolve-source-lineage-v1\n${distinct[0]}`),
+  });
+}
+
+export function summarizeGlobalCandidateSupport(facts, { nowMs, retentionMs = DEFAULT_RETENTION_MS } = {}) {
+  if (!Array.isArray(facts) || facts.length === 0) throw new TypeError("candidate-support-facts-required");
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new TypeError("invalid-candidate-support-time");
+  if (!Number.isSafeInteger(retentionMs) || retentionMs < 1) throw new TypeError("invalid-candidate-support-retention");
+  const incidents = new Map();
+  for (const fact of facts) {
+    if (!fact || typeof fact !== "object" || Array.isArray(fact)) throw new TypeError("invalid-candidate-support-fact");
+    const key = `${fact.evidenceDomainId}\n${fact.incidentId}`;
+    const current = incidents.get(key);
+    const next = {
+      contributionId: String(fact.contributionId).toLowerCase(),
+      evidenceDomainId: String(fact.evidenceDomainId),
+      incidentId: String(fact.incidentId),
+      occurrenceCount: Number(fact.occurrenceCount),
+      observedAt: Number(fact.observedAt),
+      firstSeenDay: String(fact.firstSeenDay),
+      lastSeenDay: String(fact.lastSeenDay),
+      expiresAt: Number(fact.expiresAt),
+      rootLineageHash: String(fact.rootLineageHash),
+      originKind: String(fact.originKind),
+      contradictionFree: fact.contradictionFree === true,
+      injectionFree: fact.injectionFree === true,
+      chronologyValid: fact.chronologyValid === true,
+      correlationValid: fact.correlationValid === true,
+    };
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(next.contributionId)
+        || !/^[a-f0-9]{64}$/u.test(next.evidenceDomainId)
+        || !next.incidentId || next.incidentId.length > 128
+        || !Number.isSafeInteger(next.occurrenceCount) || next.occurrenceCount < 1
+        || !Number.isSafeInteger(next.observedAt) || next.observedAt < 0
+        || !/^\d{4}-\d{2}-\d{2}$/u.test(next.firstSeenDay)
+        || !/^\d{4}-\d{2}-\d{2}$/u.test(next.lastSeenDay)
+        || next.lastSeenDay < next.firstSeenDay
+        || !Number.isSafeInteger(next.expiresAt) || next.expiresAt <= next.observedAt
+        || !/^[a-f0-9]{64}$/u.test(next.rootLineageHash)) {
+      throw new TypeError("invalid-candidate-support-fact");
+    }
+    if (!current) {
+      incidents.set(key, next);
+      continue;
+    }
+    current.occurrenceCount = Math.max(current.occurrenceCount, next.occurrenceCount);
+    current.observedAt = Math.min(current.observedAt, next.observedAt);
+    current.firstSeenDay = current.firstSeenDay < next.firstSeenDay ? current.firstSeenDay : next.firstSeenDay;
+    current.lastSeenDay = current.lastSeenDay > next.lastSeenDay ? current.lastSeenDay : next.lastSeenDay;
+    current.expiresAt = Math.min(current.expiresAt, next.expiresAt);
+    if (current.rootLineageHash !== next.rootLineageHash || current.originKind !== next.originKind) {
+      current.rootLineageHash = UNKNOWN_ROOT_LINEAGE_HASH;
+      current.originKind = "unknown";
+    }
+    current.contradictionFree &&= next.contradictionFree;
+    current.injectionFree &&= next.injectionFree;
+    current.chronologyValid &&= next.chronologyValid;
+    current.correlationValid &&= next.correlationValid;
+  }
+
+  const domains = new Map();
+  for (const incident of incidents.values()) {
+    const domain = domains.get(incident.evidenceDomainId) ?? [];
+    domain.push(incident);
+    domains.set(incident.evidenceDomainId, domain);
+  }
+  const ranked = [...domains].map(([domainId, values]) => {
+    const occurrenceCount = values.reduce((sum, item) => sum + item.occurrenceCount, 0);
+    const nonUnknownUserRootLineageCount = new Set(values
+      .filter((item) => item.originKind === "user" && item.rootLineageHash !== UNKNOWN_ROOT_LINEAGE_HASH)
+      .map((item) => item.rootLineageHash)).size;
+    const fresh = values.filter((item) => item.observedAt <= nowMs && nowMs - item.observedAt <= retentionMs).length;
+    return {
+      domainId,
+      lineageClass: domainId === UNKNOWN_EVIDENCE_DOMAIN_ID ? "local-unknown" : "known",
+      independentIncidentCount: values.length,
+      occurrenceCount,
+      nonUnknownUserRootLineageCount,
+      freshnessRatio: values.length ? fresh / values.length : 0,
+    };
+  }).sort((left, right) => right.independentIncidentCount - left.independentIncidentCount
+    || right.occurrenceCount - left.occurrenceCount
+    || right.nonUnknownUserRootLineageCount - left.nonUnknownUserRootLineageCount
+    || right.freshnessRatio - left.freshnessRatio
+    || compareCodepoints(left.domainId, right.domainId));
+  const strongest = ranked[0];
+  const knownDomainIds = new Set(ranked.filter((item) => item.lineageClass === "known").map((item) => item.domainId));
+  const values = [...incidents.values()];
+  return deepFreeze({
+    contributionIds: values.map((item) => item.contributionId).sort(compareCodepoints),
+    strongestSingleDomain: {
+      lineageClass: strongest.lineageClass,
+      independentIncidentCount: strongest.independentIncidentCount,
+      occurrenceCount: strongest.occurrenceCount,
+      nonUnknownUserRootLineageCount: strongest.nonUnknownUserRootLineageCount,
+      freshnessRatio: strongest.freshnessRatio,
+    },
+    distributed: {
+      independentKnownDomainCount: knownDomainIds.size,
+      independentIncidentCount: values.filter((item) => knownDomainIds.has(item.evidenceDomainId)).length,
+      unknownLineageCollapsed: domains.has(UNKNOWN_EVIDENCE_DOMAIN_ID),
+    },
+    integrity: {
+      contradictionFree: values.every((item) => item.contradictionFree),
+      injectionFree: values.every((item) => item.injectionFree),
+      chronologyValid: values.every((item) => item.chronologyValid),
+      correlationValid: values.every((item) => item.correlationValid),
+    },
+    independentDomainCount: domains.size,
+    independentIncidentCount: values.length,
+    occurrenceCount: values.reduce((sum, item) => sum + item.occurrenceCount, 0),
+    firstSeenDay: values.map((item) => item.firstSeenDay).reduce((earliest, value) => earliest < value ? earliest : value),
+    lastSeenDay: values.map((item) => item.lastSeenDay).reduce((latest, value) => latest > value ? latest : value),
+    expiresAt: values.reduce((earliest, item) => Math.min(earliest, item.expiresAt), Number.MAX_SAFE_INTEGER),
+  });
 }
 
 export function isAutomationControlPart(part) {
@@ -262,11 +416,18 @@ function repeatedProcedures(actions) {
       const occurrences = 1 + current.positions.filter((position) => position >= first + length).length;
       if (occurrences < 2) continue;
       const key = signature("procedure", candidate);
-      if (!procedures.has(key)) procedures.set(key, { count: occurrences, length });
+      if (!procedures.has(key)) procedures.set(key, { count: occurrences, length, start: first });
     }
     if (procedures.size) break;
   }
   return procedures;
+}
+
+function capsuleSummary(summary) {
+  const clean = String(summary).replace(/\s+/gu, " ").trim();
+  return Buffer.byteLength(clean, "utf8") <= MAX_EVIDENCE_CAPSULE_BYTES
+    ? { ok: true, summary: clean }
+    : { ok: false, reason: "capsule-summary-too-large" };
 }
 
 function receipt(type, signatureHash, occurrences, episode, options) {
@@ -328,6 +489,68 @@ export function extractReceipts(episode, { projectFingerprint, scopeFingerprint,
   }
 
   return output.sort((left, right) => compareCodepoints(left.receiptType, right.receiptType) || compareCodepoints(left.signatureHash, right.signatureHash));
+}
+
+export function deriveEvidenceCapsuleSummary(episode, receipt) {
+  if (!episode || typeof episode !== "object" || !Array.isArray(episode.messages)) return { ok: false, reason: "malformed-episode" };
+  if (!receipt || typeof receipt !== "object") return { ok: false, reason: "unsupported-receipt" };
+  const messages = episode.messages.slice(0, EXTRACT_RULES.maxMessages).filter((message) => message
+    && typeof message === "object"
+    && !message.isSelfEvolveOutput
+    && !messageIsExcludedFromEvidence(message));
+  if (receipt.receiptType === "repeated-manual-procedure") {
+    const actions = messages.flatMap((message) => {
+      if (typeof message?.commandName === "string" && message.commandName.trim()) {
+        return [{ signature: signature("command-step", message.commandName), label: message.commandName.replace(/^\/+/, "") }];
+      }
+      if (typeof message?.toolName === "string" && message.toolName.trim()) {
+        return [{ signature: signature("tool-step", message.toolName), label: message.toolName }];
+      }
+      return [];
+    });
+    const procedure = repeatedProcedures(actions.map((action) => action.signature)).get(receipt.signatureHash);
+    return procedure
+      ? capsuleSummary(`Procedure steps ${actions.slice(procedure.start, procedure.start + procedure.length).map((action) => action.label).join(" -> ")} recurred ${receipt.occurrences} times.`)
+      : { ok: false, reason: "receipt-evidence-unavailable" };
+  }
+  if (receipt.receiptType === "repeated-clarification") {
+    const clarifications = messages
+      .map((message, index) => ({ message, index }))
+      .filter(({ message }) => message?.role === "user" && typeof message.content === "string" && CLARIFICATION_RE.test(message.content));
+    for (let index = 0; index < clarifications.length - 1; index += 1) {
+      const first = clarifications[index];
+      const second = clarifications[index + 1];
+      if (second.index - first.index > EXTRACT_RULES["repeated-clarification"].windowMessages) continue;
+      const normalized = [first.message.content, second.message.content].map(normalizeForSignature).sort().join("\n");
+      if (hashSignature(normalized) === receipt.signatureHash) {
+        return capsuleSummary(`User clarification recurred within ${EXTRACT_RULES["repeated-clarification"].windowMessages} messages and corrected prior instructions.`);
+      }
+    }
+    return { ok: false, reason: "receipt-evidence-unavailable" };
+  }
+  const match = messages.find((message) => {
+    if (!message || typeof message !== "object") return false;
+    if (receipt.receiptType === "repeated-command") {
+      return message.role === "user"
+        && typeof message.commandName === "string"
+        && signature("command", message.commandName) === receipt.signatureHash;
+    }
+    if (receipt.receiptType === "repeated-tool-error") {
+      return message.role === "tool"
+        && typeof message.toolName === "string"
+        && typeof message.toolError === "string"
+        && signature("tool-error", `${message.toolName}\n${message.toolError}`) === receipt.signatureHash;
+    }
+    return false;
+  });
+  if (!match) return { ok: false, reason: "receipt-evidence-unavailable" };
+  if (receipt.receiptType === "repeated-command") {
+    const commandName = match.commandName.replace(/^\/+/, "");
+    return capsuleSummary(`Command ${commandName} recurred ${receipt.occurrences} times and required repeated handling.`);
+  }
+  if (receipt.receiptType !== "repeated-tool-error") return { ok: false, reason: "unsupported-receipt" };
+  const errorCode = /\b(?:E[A-Z0-9_]{2,31}|[A-Z][A-Z0-9]*_[A-Z0-9_]{1,31})\b/u.exec(match.toolError)?.[0];
+  return capsuleSummary(`Tool ${match.toolName} repeatedly failed${errorCode ? ` with ${errorCode}` : ""} (${receipt.occurrences} occurrences).`);
 }
 
 export function isSelfReference(observation) {
@@ -449,7 +672,7 @@ function thresholdTarget(target, actual) {
 
 export function evaluateEligibility(clusters, thresholds = {}) {
   if (!Array.isArray(clusters)) throw new TypeError("clusters must be an array");
-  const minIndependentIncidents = thresholds.minIndependentIncidents ?? 3;
+  const minIndependentIncidents = thresholds.minIndependentIncidents ?? 2;
   const minOccurrencesSum = thresholds.minOccurrencesSum ?? 3;
   const minDistinctSessions = thresholds.minDistinctSessions ?? 2;
   const minFreshnessRatio = thresholds.minFreshnessRatio ?? 0.5;

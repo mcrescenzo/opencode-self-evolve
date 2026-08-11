@@ -20,20 +20,21 @@ export const MIGRATION_NOTE = Object.freeze(
 
 const MODES = new Set(Mode.values);
 const REPO_MODES = new Set([...MODES, "inherit"]);
-const EXPORT_SCOPES = new Set(["observations", "proposals", "project", "all"]);
-const PURGE_SCOPES = new Set(["observations", "proposals", "project", "all"]);
+const EXPORT_SCOPES = new Set(["observations", "proposals", "global-recommendations", "project", "all"]);
+const PURGE_SCOPES = new Set(["observations", "project-evidence", "proposals", "global-recommendations", "project", "all"]);
 const CONSENT_KEYS = Object.freeze({
   passive: "passiveCalls",
   observations: "durableObservations",
   excerpts: "sanitizedExcerpts",
   "cross-repo": "crossRepoAggregation",
 });
-const RESTART_NOTICE = "OpenCode must be restarted for the new mode to take full effect.";
 export const MAX_OBSERVATION_INSPECTION = 100;
 const DEFAULT_OBSERVATION_INSPECTION = 20;
-export const HEADLESS_APPROVAL_USAGE = "/self-evolve approve <proposal-id> --target-hash <sha256> --proposed-content-hash <sha256> --decision-version <integer> --nonce <one-use-nonce>";
+export const HEADLESS_APPROVAL_USAGE = "/self-evolve approve <proposal-id> --target-hash <sha256|must-not-exist> --proposed-content-hash <sha256> --decision-version <integer> --nonce <one-use-nonce>";
 const SHA256_RE = /^[a-f0-9]{64}$/u;
+const PURGE_ALL_CONFIRMATION = "PURGE ALL SELF-EVOLVE 0.3.0";
 const NONCE_RE = /^[a-f0-9]{48}$/u;
+const MUST_NOT_EXIST = "must-not-exist";
 const DISCLOSURES = Object.freeze({
   passiveCalls: "Disclosure: passive provider calls may occur at stable idle boundaries within configured budgets.",
   durableObservations: "Disclosure: bounded structured observations will be stored durably; complete transcripts and raw message bodies are never stored.",
@@ -106,18 +107,10 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
     return args.length > 1 ? error("Usage: /self-evolve dismiss [proposal-id]") : parsed("dismiss", { proposalId: args[0] });
   }
   if (MODES.has(verb)) {
-    if (verb !== "yolo") return args.length ? error(`Usage: /self-evolve ${verb}`) : parsed("mode", { mode: verb });
-    if (args.length === 0) {
-      return parsed("mode", {
-        mode: "yolo",
-        requiresConfirmation: true,
-        confirmationPrompt: "Yolo can apply validated skill changes without per-change approval. Confirm with /self-evolve yolo confirm --allowlist <absolute-root>.",
-      });
-    }
-    if (args.length === 3 && args[0].toLowerCase() === "confirm" && args[1] === "--allowlist" && args[2]) {
-      return parsed("mode", { mode: "yolo", confirmed: true, allowlist: [args[2]] });
-    }
-    return error("Yolo requires explicit confirmation and an allowlist: /self-evolve yolo confirm --allowlist <absolute-root>.");
+    return args.length ? error(`Usage: /self-evolve ${verb}`) : parsed("mode", { mode: verb });
+  }
+  if (verb === "yolo") {
+    return error("Yolo was retired in v0.3. Project analysis is /self-evolve manual or /self-evolve auto, and every global skill write needs an explicit decision.");
   }
   if (["review", "reject", "undo"].includes(verb)) {
     if (verb === "review" && args.length <= 1) return parsed(verb, { proposalId: args[0] });
@@ -135,7 +128,10 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
       values[flag] = value;
     }
     if (Object.keys(values).length !== flags.size) return error(`Usage: ${HEADLESS_APPROVAL_USAGE}`);
-    if (!SHA256_RE.test(values["--target-hash"]) || !SHA256_RE.test(values["--proposed-content-hash"])) return error("Approval hashes must be lowercase 64-character SHA-256 values.");
+    if ((values["--target-hash"] !== MUST_NOT_EXIST && !SHA256_RE.test(values["--target-hash"]))
+        || !SHA256_RE.test(values["--proposed-content-hash"])) {
+      return error("Approval target hash must be a lowercase 64-character SHA-256 value or must-not-exist; proposed content hash must be a lowercase 64-character SHA-256 value.");
+    }
     if (!/^[1-9]\d*$/u.test(values["--decision-version"]) || !Number.isSafeInteger(Number(values["--decision-version"]))) return error("Approval decision version must be a positive safe integer.");
     if (!NONCE_RE.test(values["--nonce"])) return error("Approval nonce must be the server-issued 48-character lowercase hexadecimal value.");
     return parsed("approve", {
@@ -154,7 +150,7 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
     return args.length ? error(`/self-evolve ${verb} does not accept arguments.`) : parsed("repo-override", { excluded: verb === "exclude" });
   }
   if (verb === "repo") {
-    if (args.length !== 1 || !REPO_MODES.has(args[0].toLowerCase())) return error("Usage: /self-evolve repo <manual|auto|yolo|inherit>");
+    if (args.length !== 1 || !REPO_MODES.has(args[0].toLowerCase())) return error("Usage: /self-evolve repo <manual|auto|inherit>");
     return parsed("repo-mode", { mode: args[0].toLowerCase() });
   }
   if (verb === "consent") {
@@ -194,11 +190,21 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
   }
   if (verb === "export") {
     const scope = (args[0] ?? "project").toLowerCase();
-    return args.length <= 1 && EXPORT_SCOPES.has(scope) ? parsed("export", { scope }) : error("Usage: /self-evolve export [observations|proposals|project|all]");
+    return args.length <= 1 && EXPORT_SCOPES.has(scope) ? parsed("export", { scope }) : error("Usage: /self-evolve export [observations|proposals|global-recommendations|project|all]");
   }
   if (verb === "purge") {
     const scope = args[0] === "--all" ? "all" : args[0]?.toLowerCase();
-    return args.length === 1 && PURGE_SCOPES.has(scope) ? parsed("purge", { scope }) : error("Usage: /self-evolve purge <observations|proposals|project|all>");
+    if (scope === "all") {
+      return args[1] === "--confirm" && args.slice(2).join(" ") === PURGE_ALL_CONFIRMATION
+        ? parsed("purge", { scope, confirmation: PURGE_ALL_CONFIRMATION })
+        : error(`Usage: /self-evolve purge --all --confirm ${PURGE_ALL_CONFIRMATION}`);
+    }
+    if (scope === "global-recommendation" && args.length === 2 && SHA256_RE.test(args[1])) {
+      return parsed("purge", { scope, recommendationId: args[1] });
+    }
+    return args.length === 1 && PURGE_SCOPES.has(scope)
+      ? parsed("purge", { scope })
+      : error(`Usage: /self-evolve purge <observations|project-evidence|proposals|global-recommendations|project> | purge global-recommendation <recommendation-id> | purge --all --confirm ${PURGE_ALL_CONFIRMATION}`);
   }
   if (verb === "kill-switch") {
     const enabled = args[0]?.toLowerCase();
@@ -214,16 +220,16 @@ function helpText() {
     "Self-evolve commands:",
     "/self-evolve - open status and the durable inbox (legacy: scan)",
     "/self-evolve help | scan | status | pause | resume | inbox | budget | health",
-    "/self-evolve manual | auto | yolo",
+    "/self-evolve manual | auto",
     "/self-evolve review [id] | reject <id> | snooze <id> [duration] | undo <id>",
     HEADLESS_APPROVAL_USAGE,
     "The current approval tuple is shown by inbox and review; it contains hashes, version, and a one-use nonce, never proposal content.",
-    "/self-evolve exclude | include | repo <manual|auto|yolo|inherit>",
+    "/self-evolve exclude | include | repo <manual|auto|inherit>",
     "/self-evolve consent <passive|observations|excerpts|cross-repo> <on|off>",
     "/self-evolve allowlist list | allowlist <add|remove> <canonical-absolute-path> --confirm UPDATE ALLOWLIST",
     "/self-evolve inspect observations [N] | inspect eligibility [clusterId]",
-    "/self-evolve export [observations|proposals|project|all]",
-    "/self-evolve purge <observations|proposals|project|all>",
+    "/self-evolve export [observations|proposals|global-recommendations|project|all]",
+    `/self-evolve purge <observations|project-evidence|proposals|global-recommendations|project> | purge global-recommendation <recommendation-id> | purge --all --confirm ${PURGE_ALL_CONFIRMATION}`,
     "/self-evolve kill-switch <on|off>",
     "Legacy aliases: disable -> pause (deprecated); dismiss [id] -> reject when an id is supplied.",
     MIGRATION_NOTE,
@@ -237,7 +243,7 @@ export function buildResponse(commandValue, outcome = {}) {
   if (commandName === "help") return helpText();
   if (commandName === "mode" || commandName === "repo-mode") {
     if (commandValue.requiresConfirmation && !commandValue.confirmed) return `${commandValue.confirmationPrompt}\nNo mode change or file application occurred.`;
-    return `Self-evolve mode preference changed to ${outcome.mode ?? commandValue.mode}. No proposal was accepted and no files were applied. ${RESTART_NOTICE}`;
+    return `Self-evolve mode preference changed to ${outcome.mode ?? commandValue.mode}. The next eligible lifecycle event observes the new analysis mode. No proposal was accepted and no files were applied.`;
   }
   if (commandName === "approve") return `Proposal ${commandValue.proposalId} approval was processed by the durable server integration from the exact one-use tuple.`;
   if (commandName === "reject" || commandName === "dismiss") return `Proposal ${commandValue.proposalId} rejected. No files were applied.`;
@@ -315,15 +321,13 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     });
   }
 
-  function setMode(mode, opts = {}) {
-    if (mode === "yolo") {
-      if (!opts.confirmed) return { ok: false, error: "yolo-confirmation-required" };
-      if (!Array.isArray(opts.allowlist) || opts.allowlist.length === 0) return { ok: false, error: "yolo-allowlist-required" };
-    }
+  function setMode(mode) {
+    // The command surface only configures the v0.3 project analysis modes; a
+    // legacy value is refused rather than silently narrowed.
+    if (!MODES.has(mode)) return { ok: false, error: "unsupported-analysis-mode" };
     let transitioned;
     const saved = store.updateSettings((current) => {
-      let global = current.global;
-      if (mode === "yolo") global = makeGlobalSettings({ ...global, allowedSkillRoots: opts.allowlist, updatedAt: now() });
+      const global = current.global;
       transitioned = transitionMode(global, current.repo, { scope: "global", mode }, now(), "self-evolve-command");
       if (!transitioned.ok) throw new Error(transitioned.error);
       return { global: transitioned.state.global };
@@ -356,9 +360,12 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     let consent;
     const saved = store.updateGlobalSettings((global) => {
       if (key === "crossRepoAggregation" && value && !global.consent.sanitizedExcerpts) throw new Error("sanitized-excerpts-consent-required");
-      if (key === "sanitizedExcerpts" && !value && global.consent.crossRepoAggregation) throw new Error("cross-repository-aggregation-requires-excerpts");
       wasEnabled = global.consent[key];
-      consent = makeConsentState({ ...global.consent, [key]: value });
+      consent = makeConsentState({
+        ...global.consent,
+        [key]: value,
+        ...(key === "sanitizedExcerpts" && !value ? { crossRepoAggregation: false } : {}),
+      });
       return makeGlobalSettings({ ...global, consent, updatedAt: now() });
     });
     if (!saved.ok) return { ok: false, error: saved.reason };
@@ -483,12 +490,10 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     if (verb === "health") return { responseText: `Self-evolve health: host ${health.hostVersion}; source ${health.hostVersionSource ?? "global-health"}; schema ${health.schemaVersion}; mode ${health.mode}; repo mode ${health.repoMode}; circuit breaker ${health.circuitBreakerOpen ? "open" : "closed"}; kill switch ${health.killSwitchActive ? "on" : "off"}.${health.lastError ? ` Last error: ${health.lastError}` : ""}` };
     if (verb === "mode") {
       if (commandValue.requiresConfirmation && !commandValue.confirmed) return { responseText: buildResponse(commandValue) };
-      const result = setMode(commandValue.mode, { confirmed: commandValue.confirmed, allowlist: commandValue.allowlist });
+      const result = setMode(commandValue.mode);
       return { responseText: buildResponse(commandValue, result), ...(result.auditEvent ? { auditEvent: result.auditEvent } : {}) };
     }
     if (verb === "repo-mode") {
-      const current = settingsResult().settings;
-      if (commandValue.mode === "yolo" && current.global.allowedSkillRoots.length === 0) return { responseText: buildResponse(commandValue, { ok: false, error: "yolo-allowlist-required" }) };
       const result = setRepoMode(commandValue.mode);
       return { responseText: buildResponse(commandValue, result), ...(result.auditEvent ? { auditEvent: result.auditEvent } : {}) };
     }
@@ -560,7 +565,11 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
       return { responseText: `Eligibility records (${records.length}):\n${JSON.stringify(records, null, 2)}` };
     }
     if (verb === "export") {
-      const archive = commandValue.scope === "all" ? privacy.exportAll() : privacy.exportScope(projectFingerprint);
+      const archive = commandValue.scope === "all"
+        ? privacy.exportAll()
+        : commandValue.scope === "global-recommendations"
+          ? privacy.exportGlobalRecommendations()
+          : privacy.exportScope(projectFingerprint);
       const records = commandValue.scope === "observations"
         ? archive.records.filter((record) => record.kind === "observation")
         : commandValue.scope === "proposals"
@@ -569,10 +578,20 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
       return { responseText: JSON.stringify({ ...archive, exportScope: commandValue.scope, records }, null, 2) };
     }
     if (verb === "purge") {
-      const result = privacy.purgeScope({ scope: commandValue.scope, projectFingerprint });
+      if (commandValue.scope === "all") {
+        return {
+          ok: false,
+          reason: "purge-all-requires-terminal-integration",
+          responseText: "Purge all requires terminal integration handling before deletion.",
+        };
+      }
+      const result = privacy.purgeScope({
+        scope: commandValue.scope,
+        projectFingerprint,
+        ...(commandValue.recommendationId ? { recommendationId: commandValue.recommendationId } : {}),
+      });
       return {
-        ...(commandValue.scope === "all" && result.ok !== false ? { terminalPurge: true } : {}),
-        responseText: result.ok === false ? `Purge failed: ${result.reason}.` : `Purge ${commandValue.scope} completed: ${JSON.stringify(result.counts)}. ${commandValue.scope === "all" ? "Restart OpenCode before using self-evolve again." : "No skill files were changed."}`,
+        responseText: result.ok === false ? `Purge failed: ${result.reason}.` : `Purge ${commandValue.scope} completed: ${JSON.stringify(result.counts)}. No skill files were changed.`,
       };
     }
     if (verb === "undo") {

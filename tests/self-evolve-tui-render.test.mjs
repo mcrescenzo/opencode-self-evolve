@@ -188,11 +188,25 @@ ${insertionPoint}`));
         activationParity: ["pointer", "enter", "space"],
         tabDirections: ["forward", "reverse"],
       },
+      sidebarModeCoverage: {
+        activationParity: ["pointer", "enter", "space"],
+        cardAndControlFocus: "siblings",
+        manualToAuto: "inline-confirmation",
+        autoToManual: "immediate",
+        unavailableAuthority: ["stale", "pending", "unsupported", "limited"],
+      },
+      escapeRestoration: "exact-prior-route-from-focused-descendant",
+      globalRecommendationCoverage: {
+        actions: ["apply", "reject", "undo"],
+        outcomes: ["pending", "accepted", "rejected", "failed-closed"],
+        projectSwitch: ["queue-bytes-preserved", "selection-preserved", "participation-replaced", "prepared-authority-cleared"],
+        privacy: "identity-free-counts-only",
+      },
       deepLinkFocusCoverage: ["activity-errors", "settings-provider", "first-run-home"],
       reactiveLastCycle: true,
       identityResetCoverage: {
-        stateClasses: ["confirmation", "consent", "folder-draft", "yolo", "maintenance", "recommendation", "pending-route", "prior-route"],
-        transitions: ["key", "projectFingerprint", "stateRootIdentity", "identified-to-identity-less", "identity-less-to-identified"],
+        stateClasses: ["confirmation", "consent", "maintenance", "recommendation", "pending-route", "prior-route"],
+        transitions: ["project-selection-preserved", "project-authority-cleared", "state-root-reset"],
         freshReview: true,
       },
       authorityRecoveryCoverage: {

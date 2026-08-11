@@ -16,7 +16,7 @@ import {
   writeSync,
 } from "node:fs";
 import path from "node:path";
-import { errorReasonCode } from "./self-evolve-schemas.js";
+import { assertGlobalIdentitySafe, errorReasonCode } from "./self-evolve-schemas.js";
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -87,6 +87,57 @@ function removeFile(filePath) {
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("export-artifact-rejected");
   unlinkSync(filePath);
   return 1;
+}
+
+function validateSensitiveExportArchive(scope, archive, projectFingerprint) {
+  if (!archive || typeof archive !== "object" || Array.isArray(archive)) throw new Error("export-archive-rejected");
+  if (archive.projectFingerprint !== undefined && archive.projectFingerprint !== projectFingerprint) {
+    throw new Error("cross-project-export-forbidden");
+  }
+  if (archive.projects !== undefined) {
+    if (!Array.isArray(archive.projects) || archive.projects.length > 1
+        || archive.projects.some((project) => project?.projectFingerprint !== projectFingerprint)) {
+      throw new Error("cross-project-export-forbidden");
+    }
+  }
+  if (archive.projects !== undefined && archive.bridge !== undefined) {
+    if (!Array.isArray(archive.bridge) || archive.bridge.length > 1
+        || archive.bridge.some((project) => project?.projectFingerprint !== projectFingerprint)) {
+      throw new Error("cross-project-export-forbidden");
+    }
+  }
+  const projects = archive.projects ?? [archive];
+  for (const project of projects) {
+    if (project.capsules !== undefined && (!Array.isArray(project.capsules)
+        || project.capsules.some((entry) => entry?.classification !== "sensitive-evidence-capsule"
+          || !entry.capsule || typeof entry.capsule !== "object"))) {
+      throw new Error("export-capsule-classification-required");
+    }
+    if (project.snapshots !== undefined && (!Array.isArray(project.snapshots)
+        || project.snapshots.some((entry) => entry?.classification !== "sensitive-skill-snapshot"))) {
+      throw new Error("export-snapshot-classification-required");
+    }
+  }
+  if (archive.global !== undefined) {
+    assertGlobalIdentitySafe(archive.global, { forbiddenIdentityValues: [projectFingerprint] });
+    if (Object.hasOwn(archive.global, "capsules") || Object.hasOwn(archive.global, "capsuleIds")) {
+      throw new Error("forbidden-global-identity");
+    }
+    if (archive.global.recommendationContent !== undefined
+        && (!Array.isArray(archive.global.recommendationContent)
+          || archive.global.recommendationContent.some((entry) => entry?.classification !== "sensitive-skill-content"))) {
+      throw new Error("export-content-classification-required");
+    }
+    if (archive.global.skillSnapshots !== undefined
+        && (!Array.isArray(archive.global.skillSnapshots)
+          || archive.global.skillSnapshots.some((entry) => entry?.classification !== "sensitive-skill-snapshot"))) {
+      throw new Error("export-snapshot-classification-required");
+    }
+  }
+  if (scope === "all" && archive.global === undefined && archive.exportScope === "all") {
+    throw new Error("export-global-member-required");
+  }
+  return archive;
 }
 
 export function createSensitiveExportManager({
@@ -218,6 +269,8 @@ export function createSensitiveExportManager({
   }
 
   function run({ scope, archive }) {
+    try { validateSensitiveExportArchive(scope, archive, projectFingerprint); }
+    catch (error) { return { ok: false, reason: errorReasonCode(error, "export-archive-rejected") }; }
     const timestamp = now();
     acquire(timestamp);
     const id = randomBytes(16).toString("hex");
@@ -361,7 +414,7 @@ export function readLatestSensitiveExport({
     let value;
     try { value = JSON.parse(readFileSync(metadataPath, "utf8")); } catch { continue; }
     if (value?.ok !== true
-        || !["observations", "proposals", "project", "all"].includes(value.scope)
+        || !["observations", "proposals", "global-recommendations", "project", "all"].includes(value.scope)
         || typeof value.path !== "string"
         || path.dirname(value.path) !== projectRoot
         || !Number.isSafeInteger(value.bytes)

@@ -37,17 +37,15 @@ const ctx = { directory: root, client: { session: {
     action: "no-op",
     targetLogicalName: target.logicalName,
     proposedContent: current,
-    proposedContentHash: currentHash,
     evidenceMapping: [{ claim: "No skill change is required.", observationIds: [observationId] }],
     expectedBehavior: "Cleanup ownership remains durable.",
     counterExamples: ["Successful cleanup releases ownership."],
     overlap: [],
     riskNotes: "No content change.",
-    evaluationScenarios: ["Hidden cleanup abort fails."],
-    sizeDeltaBytes: 0,
-    approxTokenDelta: 0,
+    evaluationScenarios: ["Hidden session deletion fails."],
   } } } }),
-  abort: async () => { throw new Error("simulated-abort-failure"); },
+  abort: async () => ({ data: {} }),
+  delete: async () => { throw new Error("simulated-delete-failure"); },
 } } };
 
 const result = await runSynthesis({
@@ -67,5 +65,5 @@ const result = await runSynthesis({
   now,
 });
 const owner = store.hostOwnerStatus(sessionId, { projectFingerprint, rootIdentity: store.rootIdentity, now: Date.now() });
-writeFileSync(process.stdout.fd, `${JSON.stringify({ ok: result.ok, sessionId, classification: owner.classification, nonce: owner.owner?.nonce })}\n`);
+writeFileSync(process.stdout.fd, `${JSON.stringify({ ok: result.ok, reason: result.reason, sessionId, classification: owner.classification, nonce: owner.owner?.nonce })}\n`);
 store.close();

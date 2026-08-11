@@ -1,4 +1,3 @@
-import { createPrivacyGuard } from "../../self-evolve-privacy.js";
 import { writeFileSync, utimesSync } from "node:fs";
 import path from "node:path";
 import {
@@ -72,30 +71,6 @@ if (operation === "append") {
   result = store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, mode: value }));
 } else if (operation === "update-repo-excluded") {
   result = store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, excluded: value === "true" }));
-} else if (operation === "aggregate") {
-  const consentUpdate = store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: true, crossRepoAggregation: true },
-    updatedAt: now,
-  }));
-  if (!consentUpdate.ok) result = consentUpdate;
-  else {
-    const guard = createPrivacyGuard({
-      consent: { sanitizedExcerpts: true, crossRepoAggregation: true },
-      projectFingerprint,
-      now: () => now,
-      store,
-    });
-    result = guard.contributeAggregate({
-      claimType: "global-skill-candidate",
-      receiptType: "repeated-command",
-      signatureHash: hashContent("shared-signature"),
-      incidentId: value,
-      occurrenceCount: 1,
-      firstSeenAt: now,
-      lastSeenAt: now,
-    });
-  }
 } else if (operation === "retain") {
   result = store.retain(Number(value));
 } else if (operation === "append-at") {

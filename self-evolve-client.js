@@ -149,7 +149,11 @@ export function sessionOutput(result) {
   ];
   for (const parts of candidates) {
     if (!Array.isArray(parts)) continue;
-    const text = parts.map((part) => part?.text ?? part?.content ?? "").filter(Boolean).join("\n");
+    const text = parts
+      .filter((part) => part?.type === undefined || part?.type === "text")
+      .map((part) => part?.text ?? part?.content ?? "")
+      .filter(Boolean)
+      .join("\n");
     if (text.trim()) return text;
   }
   return String(result?.data?.text ?? result?.text ?? result?.message?.text ?? "");
@@ -218,6 +222,20 @@ export async function cleanupSession(ctx, sessionID, options = {}) {
       timeoutMs: options.timeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS,
       signal: options.signal,
       label: options.label ?? `OpenCode session.${methodName} cleanup`,
+    },
+  );
+}
+
+export async function deleteSession(ctx, sessionID, options = {}) {
+  const session = ctx?.client?.session;
+  const method = session?.delete;
+  if (typeof method !== "function") throw new Error("OpenCode session.delete is unavailable.");
+  return invokeOnce(
+    () => method.call(session, { path: { id: sessionID }, query: { directory: ctx.directory } }),
+    {
+      timeoutMs: options.timeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS,
+      signal: options.signal,
+      label: options.label ?? "OpenCode session.delete",
     },
   );
 }

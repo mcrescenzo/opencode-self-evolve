@@ -1,6 +1,6 @@
 {
   "name": "@mcrescenzo/opencode-self-evolve",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Evidence-backed OpenCode self-improvement plugin with manual, auto, and yolo modes; durable observations; native review; transactional skill application.",
   "type": "module",
   "main": "./self-evolve.js",

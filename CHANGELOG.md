@@ -5,6 +5,43 @@ recorded here.
 
 This project follows semantic versioning after the first public release.
 
+## 0.3.0 — global-first cross-project recommendations
+
+- **Breaking:** autonomous targets are global only. Project analysis produces
+  privacy-safe global contributions, candidates, and recommendations against
+  operator-approved global skill collections; repository-local `.opencode/skills`
+  are never autonomous targets, and the durable cycle no longer creates project
+  proposals. Existing project proposals stay readable, exportable, rejectable,
+  and purgeable.
+- **Breaking:** the `yolo` mode is retired. Project analysis is exactly `manual`
+  or `auto`, neither carries write authority, `/self-evolve yolo ...` and
+  `repo yolo` are refused, a bridge peer that requests `yolo` is rejected with
+  `yolo-retired`, and a stored v0.2 `yolo` preference narrows to `auto`.
+- **Breaking:** the durable state generation is `0.3.0`. Partitions written by
+  `0.2.0`, `0.2.1`, and `0.2.2` are migration input only: they are read,
+  re-stamped once, and never written again. Migration carries forward consent,
+  budgets, retention, pause, kill switch, and allowlist suggestions, and never
+  promotes legacy claims or proposals into global authority.
+- Bridge, projection, dashboard, operation, feedback, and transaction protocols
+  are versioned independently of the state generation. The control state now
+  publishes the bridge wire version rather than the state generation.
+- Added the state-root-wide Global Recommendation Index, its mailbox, and
+  cross-project Apply/Reject/Undo with fresh nonce-, version-, and hash-bound
+  operator decisions plus state-root-wide target leases.
+- Added project-local evidence capsules, identity-free global contributions,
+  support-set eligibility (single-domain and distributed routes with
+  unknown-lineage anti-inflation), and bounded ephemeral synthesis packets.
+- Added the complete consent, retention, purge, quota, and export lifecycle for
+  global state, including scoped global-recommendation purge, quota reclamation,
+  and idempotent crash recovery at every durable boundary.
+- Hardened multi-process behavior: canonical contribution counts, one synthesis
+  per support set, one mailbox outcome, serialized target writes, budget and
+  storage-quota races, dead-owner lease recovery, and fault injection across
+  contribution, candidate, attempt, content, decision, temp-write, rename/link,
+  readback, response, purge, and projection boundaries.
+- Native control center is global-first: one state-root-wide recommendation
+  runtime with project-scoped status, participation, and Manual/Auto controls.
+
 ## Unreleased
 
 - Fixed native control-center crashes when optional dashboard fields such as the last-cycle outcome are absent. The deterministic prebuilt target now uses OpenTUI's supported Solid transform, guards nullable branches, and is exercised as a real reactive render in both local regression coverage and every supported packed-consumer lane.

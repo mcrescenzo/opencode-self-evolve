@@ -133,8 +133,9 @@ function projectionIndex(overrides = {}) {
 }
 
 function dashboard(overrides = {}) {
+  const dashboardVersion = overrides.dashboardVersion ?? UI_DASHBOARD_VERSION;
   const body = {
-    dashboardVersion: UI_DASHBOARD_VERSION,
+    dashboardVersion,
     projectFingerprint: PROJECT,
     stateRootIdentity: ROOT,
     generation: GENERATION,
@@ -181,6 +182,12 @@ function dashboard(overrides = {}) {
         crossRepoAggregation: false,
       },
       approvedSkillFolderCount: 1,
+      ...(dashboardVersion === 2 ? {
+        globalSettingsVersion: H("4"),
+        globalRootPolicy: null,
+        globalRootPolicyConfirmation: "REPLACE GLOBAL ROOT POLICY 444444444444",
+        globalRootPolicyAction: null,
+      } : {}),
     },
     retention: { observationsDays: 30, operationalDays: 90 },
     supportedControls: ["set-paused"],
@@ -324,7 +331,7 @@ function operationContext(value, overrides = {}) {
     generation: GENERATION,
     projectionHash: H("d"),
     now: NOW,
-    supportedCapabilities: UI_CAPABILITIES,
+    supportedCapabilities: [...UI_CAPABILITIES, ...UI_DASHBOARD_CAPABILITIES].sort(),
     grant: {
       action: value.action,
       capability: value.capability,
@@ -417,6 +424,8 @@ test("capability negotiation is strict and mixed-version peers remain legacy-onl
   assert.deepEqual(UI_DASHBOARD_CAPABILITIES, [
     "control-repo-mode-v1",
     "decision-feedback-v1",
+    "operation-global-root-policy-v1",
+    "project-analysis-control-v1",
   ]);
   const server = makeUiProtocolOffer({
     projectionVersions: [UI_PROJECTION_VERSION],
@@ -812,6 +821,7 @@ test("dashboard-v1 preserves its independent retention fields while v2 requires 
 test("dashboard-v1 canonical and published wire compatibility bytes remain literal", () => {
   const value = dashboard({
     dashboardVersion: 1,
+    capabilities: ["control-repo-mode-v1", "decision-feedback-v1"],
     retention: { observationsDays: 10, operationalDays: 90 },
   });
   const clean = makeUiDashboard(value, dashboardContext(value));
@@ -1023,7 +1033,7 @@ test("operation responses bind exact requests and reserve accepted-terminal for 
     /invalid-request-lifetime/u,
   );
 
-  const purge = operationRequest("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE DATA" });
+  const purge = operationRequest("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" });
   const terminal = operationResponse(purge);
   assert.equal(makeUiOperationResponse(terminal, { ...context, requestId: purge.requestId, action: purge.action, requestHash: purge.operationHash }).status, "accepted-terminal");
 });
@@ -1037,8 +1047,15 @@ test("every operation action has a closed bounded payload and no native scan act
     ["rollback-proposal", { proposalId: "proposal-1", appliedHash: H("e"), decisionVersion: 5 }],
     ["set-kill-switch", { enabled: true, settingsVersion: H("4") }],
     ["set-paused", { paused: true, settingsVersion: H("4") }],
+    ["set-repo-mode", { mode: "auto", settingsVersion: H("4") }],
+    ["replace-global-root-policy", {
+      roots: [{ canonicalPath: "/global/skills", canUpdate: true, canCreate: true }],
+      creationRootPath: "/global/skills",
+      confirmation: "REPLACE GLOBAL ROOT POLICY 444444444444",
+      settingsVersion: H("4"),
+    }],
     ["purge-scope", { scope: "observations", confirmation: "PURGE OBSERVATIONS" }],
-    ["purge-all", { confirmation: "PURGE ALL SELF-EVOLVE DATA" }],
+    ["purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" }],
     ["export-data", { scope: "project", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" }],
     ["retry-bootstrap", {}],
   ];
@@ -1048,6 +1065,16 @@ test("every operation action has a closed bounded payload and no native scan act
     const request = operationRequest(action, payload);
     assert.deepEqual(makeUiOperationRequest(request, operationContext(request)).payload, payload, action);
   }
+  const globalPurge = operationRequest("purge-scope", {
+    scope: "global-recommendations",
+    confirmation: "PURGE GLOBAL-RECOMMENDATIONS",
+  });
+  assert.equal(makeUiOperationRequest(globalPurge, operationContext(globalPurge)).payload.scope, "global-recommendations");
+  const globalExport = operationRequest("export-data", {
+    scope: "global-recommendations",
+    confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA",
+  });
+  assert.equal(makeUiOperationRequest(globalExport, operationContext(globalExport)).payload.scope, "global-recommendations");
 
   const base = operationRequest();
   assert.throws(
@@ -1066,6 +1093,23 @@ test("every operation action has a closed bounded payload and no native scan act
   assert.throws(() => makeUiOperationRequest(invalidExportConfirmation, operationContext(invalidExportConfirmation)), /invalid-export-confirmation/u);
   const invalidRetry = operationRequest("retry-bootstrap", { force: true });
   assert.throws(() => makeUiOperationRequest(invalidRetry, operationContext(invalidRetry)), /unknown-field/u);
+  const legacyYolo = operationRequest("set-repo-mode", { mode: "yolo", settingsVersion: H("4") });
+  assert.throws(() => makeUiOperationRequest(legacyYolo, operationContext(legacyYolo)), /project-analysis-mode/u);
+  const rootPolicyPayload = cases.find(([action]) => action === "replace-global-root-policy")[1];
+  for (const invalid of [
+    { ...rootPolicyPayload, roots: [] },
+    { ...rootPolicyPayload, roots: [{ canonicalPath: "/global/skills", canUpdate: false, canCreate: false }] },
+    { ...rootPolicyPayload, roots: [rootPolicyPayload.roots[0], rootPolicyPayload.roots[0]] },
+    { ...rootPolicyPayload, roots: [
+      { canonicalPath: "/z-global/skills", canUpdate: true, canCreate: false },
+      { canonicalPath: "/a-global/skills", canUpdate: true, canCreate: true },
+    ], creationRootPath: "/a-global/skills" },
+    { ...rootPolicyPayload, creationRootPath: null },
+    { ...rootPolicyPayload, confirmation: "REPLACE GLOBAL ROOT POLICY stale" },
+  ]) {
+    const request = operationRequest("replace-global-root-policy", invalid);
+    assert.throws(() => makeUiOperationRequest(request, operationContext(request)));
+  }
   assert.throws(
     () => makeUiOperationRequest(operationRequest("snooze-proposal", base.payload, { actor: "other" }), operationContext(base)),
     /invalid-operation-actor/u,
@@ -1174,7 +1218,9 @@ test("the aggregate projection footprint rejects individually valid artifacts ab
 });
 
 test("new UI protocols do not change legacy Decision, decision-request, or control wire bytes", () => {
-  assert.equal(SCHEMA_VERSION, "0.2.2");
+  // The durable state generation and the frozen bridge wire version move
+  // independently; the wire bytes below stay pinned to the Release A contract.
+  assert.equal(SCHEMA_VERSION, "0.3.0");
   assert.equal(BRIDGE_SCHEMA_VERSION, "0.2.1");
   const decision = makeDecision({
     proposalId: "proposal-1",
@@ -1192,7 +1238,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   assert.equal(JSON.stringify(decision), decisionBytes);
 
   const request = makeBridgeRequest({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     requestId: "request-1",
     projectFingerprint: PROJECT,
     ...decision,
@@ -1202,7 +1248,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   assert.equal(`${JSON.stringify(request)}\n`, requestBytes);
 
   const controlRequest = makeControlRequest({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     requestId: "control-1",
     projectFingerprint: PROJECT,
     actor: "self-evolve-tui",
@@ -1220,7 +1266,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   );
 
   const controlState = makeControlState({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     projectFingerprint: PROJECT,
     actor: "self-evolve-integration",
     issuedAt: NOW,
@@ -1242,7 +1288,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   );
 
   const bridgeResponse = makeBridgeResponse({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     requestId: "request-1",
     projectFingerprint: PROJECT,
     proposalId: "proposal-1",
@@ -1259,7 +1305,7 @@ test("new UI protocols do not change legacy Decision, decision-request, or contr
   );
 
   const controlResponse = makeControlResponse({
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
     requestId: "control-1",
     projectFingerprint: PROJECT,
     ok: true,

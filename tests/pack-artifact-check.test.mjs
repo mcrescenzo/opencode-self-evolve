@@ -138,8 +138,9 @@ test("pack command diagnostics distinguish spawn, signal, and exit failures", ()
   );
 });
 
-test("integration boot aborts only active orphaned self-evolve analyzer sessions", async () => {
+test("integration boot interrupts active and deletes active or terminal owned hidden sessions", async () => {
   const aborted = [];
+  const deleted = [];
   const records = [];
   const settings = {
     global: schemas.makeGlobalSettings(),
@@ -152,13 +153,19 @@ test("integration boot aborts only active orphaned self-evolve analyzer sessions
     retain: () => ({ observations: 0 }),
     cleanupExpiredLeases: () => undefined,
     // Recovery (self-evolve-3r4) requires a durable dead-owner proof. Only
-    // "orphan-synth" has one; the foreign same-name analyzer does not and must
-    // NOT be aborted even though it matches the hidden-agent name filter.
+    // The active synthesizer and terminal critic have dead-owner proofs. The
+    // foreign same-name analyzer does not and must remain untouched.
     hostOwnerStatus(id) {
       if (id === "orphan-synth") return { classification: "abortable", nonce: "dead-owner-nonce", reason: "host-owner-process-dead" };
+      if (id === "finished-critic") return { classification: "abortable", nonce: "dead-critic-nonce", reason: "host-owner-process-dead" };
       return { classification: "unknown", reason: "host-owner-not-found" };
     },
-    releaseHostOwner(id, nonce) { return nonce === "dead-owner-nonce" ? { ok: true } : { ok: false, absent: true }; },
+    releaseHostOwner(id, nonce) {
+      return (id === "orphan-synth" && nonce === "dead-owner-nonce")
+        || (id === "finished-critic" && nonce === "dead-critic-nonce")
+        ? { ok: true }
+        : { ok: false, absent: true };
+    },
     close() {},
   };
   const integration = createIntegration({
@@ -181,13 +188,16 @@ test("integration boot aborts only active orphaned self-evolve analyzer sessions
       { id: "working-session", agent: "build", state: "running" },
     ] }),
     abort: async (input) => { aborted.push(input.path?.id ?? input.sessionID ?? input.id ?? input); return { data: {} }; },
+    delete: async (input) => { deleted.push(input.path?.id); return { data: {} }; },
   } } };
 
   const result = await integration.boot({ ctx, hostVersion: "1.18.3" });
   assert.equal(result.ok, true);
   assert.deepEqual(aborted, ["orphan-synth"]);
-  assert.equal(result.hiddenSessionRecovery.find((item) => item.id === "orphan-synth").action, "aborted");
+  assert.deepEqual(deleted, ["orphan-synth", "finished-critic"]);
+  assert.equal(result.hiddenSessionRecovery.find((item) => item.id === "orphan-synth").action, "deleted");
+  assert.equal(result.hiddenSessionRecovery.find((item) => item.id === "finished-critic").action, "deleted");
   assert.equal(result.hiddenSessionRecovery.find((item) => item.id === "foreign-analyzer").action, "unknown");
-  assert.equal(records.some((record) => record.payload.details.abortedHiddenSessions === 1), true);
+  assert.equal(records.some((record) => record.payload.details.abortedHiddenSessions === 2), true);
   await integration.shutdown();
 });

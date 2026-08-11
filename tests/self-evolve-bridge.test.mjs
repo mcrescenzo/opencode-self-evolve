@@ -13,6 +13,7 @@ import {
 } from "../self-evolve-ui-protocol.js";
 import {
   BRIDGE_FEEDBACK_REQUEST_FIELDS,
+  BRIDGE_SCHEMA_VERSION,
   BRIDGE_MAILBOX_DESCRIPTORS,
   BRIDGE_REQUEST_FIELDS,
   DECISION_FEEDBACK_VERSION,
@@ -41,6 +42,10 @@ import {
   validateBridgeExportMetadata,
 } from "../self-evolve-bridge.js";
 
+// Bridge wire records carry the bridge protocol version, which is versioned
+// separately from the durable state generation.
+const WIRE_VERSION = BRIDGE_SCHEMA_VERSION;
+
 const PROJECT = "a".repeat(64);
 const TARGET = "b".repeat(64);
 const PROPOSED = "c".repeat(64);
@@ -67,7 +72,7 @@ function fixture(t) {
 function controlState(overrides = {}) {
   const now = Date.now();
   return {
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: WIRE_VERSION,
     projectFingerprint: PROJECT,
     actor: "self-evolve-integration",
     issuedAt: now,
@@ -551,7 +556,7 @@ test("owned response residues are completion markers and never repeat mailbox ef
   const bridgeRoot = path.join(root, "self-evolve", "bridge", PROJECT);
   const responseValues = [
     ["responses", decision.requestId, {
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: WIRE_VERSION,
       requestId: decision.requestId,
       projectFingerprint: PROJECT,
       proposalId: decision.proposalId,
@@ -562,7 +567,7 @@ test("owned response residues are completion markers and never repeat mailbox ef
       recovered: false,
     }],
     ["control-responses", control.requestId, {
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: WIRE_VERSION,
       requestId: control.requestId,
       projectFingerprint: PROJECT,
       ok: true,

@@ -387,12 +387,12 @@ Arguments: $ARGUMENTS
 
 Common forms:
 - status | health | budget | scan
-- manual | auto | yolo confirm --allowlist <absolute-root>
+- manual | auto
 - inbox | review [id] | approve <id> ... | reject <id> | snooze <id> [duration] | undo <id>
-- pause | resume | exclude | include | repo <manual|auto|yolo|inherit>
+- pause | resume | exclude | include | repo <manual|auto|inherit>
 - consent <passive|observations|excerpts|cross-repo> <on|off>
 - inspect observations [N] | inspect eligibility [clusterId]
-- export [observations|proposals|project|all] | purge <observations|proposals|project|all>
+- export [observations|proposals|global-recommendations|project|all] | purge <observations|project-evidence|proposals|global-recommendations|project|all>
 - kill-switch <on|off>
 
 Use /self-evolve help for exact syntax and safety disclosures.`;
@@ -1132,6 +1132,10 @@ async function validateOfficialRootAfterStartup(ctx, provisionalRoot, options = 
   throw lastError ?? new Error("state-root-validation-failed");
 }
 
+function durableInventory(inventoryModule, settings, projectRoot) {
+  return inventoryModule.buildGlobalSkillCatalog(settings?.global?.globalRootPolicy ?? null, { projectRoot });
+}
+
 async function createDurablePipeline(ctx, options, selectedStateRoot, compatibility) {
   const storeModule = await import("./self-evolve-store.js");
   const identity = storeModule.resolveProjectIdentity({
@@ -1162,16 +1166,27 @@ async function createDurablePipeline(ctx, options, selectedStateRoot, compatibil
     durableStore = storeModule.openStore(stateRoot, { projectFingerprint, projectName: options.projectName, now: options.now });
     const settings = durableStore.getSettings();
     const privacy = privacyModule.createPrivacyGuard({ consent: settings.global.consent, projectFingerprint, retentionDays: settings.global.retentionDays, storageQuotaMiB: settings.global.budgets.storageQuotaMiB, store: durableStore, now: options.now });
-    const roots = inventoryModule.loadAllowlist({ globalSkillRoots: settings.global.allowedSkillRoots }).canonicalRoots;
-    const records = inventoryModule.discoverSkills(roots);
+    const projectRoot = options.projectRoot ?? options.worktree ?? ctx?.worktree ?? ctx?.directory;
+    const runtimeInventory = durableInventory(inventoryModule, settings, projectRoot);
+    const currentCatalog = () => durableInventory(inventoryModule, durableStore.getSettings(), projectRoot);
     const applier = applierModule.createApplier({
       store: durableStore,
-      inventory: { records, canonicalRoots: roots, discoverSkills: inventoryModule.discoverSkills },
+      inventory: {
+        records: runtimeInventory.records,
+        get canonicalRoots() {
+          const catalog = currentCatalog();
+          return catalog.ok ? catalog.canonicalRoots : [];
+        },
+        discoverSkills: () => {
+          const refreshed = currentCatalog();
+          return refreshed.ok ? refreshed.records : [];
+        },
+      },
       privacy,
       now: options.now,
     });
     const guardedSynthesisModule = bindHiddenAgentRegistration(synthesisModule, options.hiddenAgentRegistration);
-    const integration = integrationModule.createIntegration({ store: durableStore, inventory: inventoryModule, privacy, synthesisModule: guardedSynthesisModule, applier, commands: commandsModule, pipeline: pipelineModule, scheduler: schedulerModule, schemas: schemasModule, observation: observationModule, options: { ...options, hostVersion: compatibility?.hostVersion ?? "unknown", hostVersionSource: compatibility?.diagnostic === "tui-app-version" ? "tui-app-version" : "global-health", hostSupported: compatibility?.supported === true, stateRoot, projectFingerprint, ctx }, now: options.now });
+    const integration = integrationModule.createIntegration({ store: durableStore, inventory: inventoryModule, privacy, synthesisModule: guardedSynthesisModule, applier, commands: commandsModule, pipeline: pipelineModule, scheduler: schedulerModule, schemas: schemasModule, observation: observationModule, options: { ...options, bootValidated: false, hostVersion: compatibility?.hostVersion ?? "unknown", hostVersionSource: compatibility?.diagnostic === "tui-app-version" ? "tui-app-version" : "global-health", hostSupported: compatibility?.supported === true, stateRoot, projectFingerprint, ctx }, now: options.now });
     return { integration, identity };
   } catch (error) {
     try { durableStore?.close(); } catch {}
@@ -1230,7 +1245,6 @@ async function SelfEvolvePlugin(ctx, options = {}) {
   let runningHostCompatibility = hostCompatibility("unknown", false, "host-health-unavailable");
   let initialSelection;
   let initialIdentity;
-  let startupMode = "manual";
   if (durableEnabled) {
     initialSelection = initialStateRootSelection({
       explicitStateRoot: instancePluginOptions.stateRoot,
@@ -1246,8 +1260,6 @@ async function SelfEvolvePlugin(ctx, options = {}) {
         worktreePath: instancePluginOptions.worktree ?? ctx?.worktree,
         directory: ctx?.directory,
       });
-      const provisionalCompatibility = hostCompatibility("unknown", instancePluginOptions.hostSupported !== false, "startup-validation-pending");
-      startupMode = await provisionalStartupMode(initialSelection.stateRoot, initialIdentity, instancePluginOptions, provisionalCompatibility);
     }
     startupValidationPending = true;
     durableRuntimePromise = new Promise((resolve) => { resolveDeferredRuntime = resolve; });
@@ -1309,7 +1321,7 @@ async function SelfEvolvePlugin(ctx, options = {}) {
       if (sharedRecoveryCancelled()) return null;
       runtime = await createDurablePipeline(ctx, {
         ...instancePluginOptions,
-        passiveEventHookInstalled: startupMode !== "manual",
+        passiveEventHookInstalled: true,
       }, selectedRoot, runningHostCompatibility);
       if (!runtime?.integration) throw new Error("durable-initialization-failed");
       if (typeof runtime.integration.boot === "function") {
@@ -1566,10 +1578,15 @@ async function SelfEvolvePlugin(ctx, options = {}) {
     },
   };
 
-  if (durableEnabled && startupMode !== "manual") {
+  if (durableEnabled) {
     hooks.event = (input) => {
       try {
         if (!isDurableLifecycleEvent(input)) return;
+        if (disposed) return;
+        const integration = settledRuntime?.integration;
+        if (!integration) return;
+        const operationalState = integration.getProjectOperationalState?.();
+        if (operationalState && operationalState.passiveAnalysisAllowed !== true) return;
         const timestamp = now(instancePluginOptions);
         if (pendingEventDeliveries >= EVENT_DELIVERY_MAX_PENDING) {
           if (eventDeliveryDiagnostics.accept("saturated", timestamp)) {
@@ -1584,8 +1601,6 @@ async function SelfEvolvePlugin(ctx, options = {}) {
             void Promise.resolve()
               .then(async () => {
                 if (disposed) return;
-                const integration = settledRuntime?.integration;
-                if (!integration) return;
                 if (lateRecoveryCoordination && !lateRecoveryCoordination.eventDispatches.acceptEvent(input, timestamp)) return;
                 await integration.handleEvent?.(input);
               })
@@ -1645,6 +1660,7 @@ SelfEvolvePlugin.__test = {
   ownsHiddenAgent,
   createHiddenAgentRegistration,
   bindHiddenAgentRegistration,
+  durableInventory,
   commandDefinitionFingerprint,
   selfEvolveCommandDefinition,
   equivalentSelfEvolveCommandDefinition,

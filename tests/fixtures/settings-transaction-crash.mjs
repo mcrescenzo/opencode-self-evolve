@@ -11,7 +11,13 @@ const store = openStore(root, {
   },
 });
 
-if (scope === "global") {
+if (scope === "revoke-excerpts") {
+  store.updateGlobalSettings((global) => makeGlobalSettings({
+    ...global,
+    consent: { ...global.consent, sanitizedExcerpts: false },
+    updatedAt: Math.max(2_000, global.updatedAt + 1),
+  }));
+} else if (scope === "global") {
   store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, mode: "auto", updatedAt: 2_000 }));
 } else if (scope === "repo") {
   store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, mode: "auto", excluded: true }));

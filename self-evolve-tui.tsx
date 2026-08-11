@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 
-import { createEffect, createMemo, createSignal, onCleanup, onMount, Show } from "solid-js"
+import { batch, createEffect, createMemo, createSignal, onCleanup, onMount, Show } from "solid-js"
 import type { KeyEvent, Renderable } from "@opentui/core"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
@@ -16,6 +16,7 @@ import {
   buildControlCenterModel,
   controlCenterRouteParams,
   deriveSidebarCard,
+  deriveSidebarModeControl,
   parseControlCenterDestination,
   validateApprovedSkillFolderInput,
 } from "./self-evolve-tui-store.js"
@@ -30,8 +31,8 @@ const activeApis = new WeakSet<object>()
 
 type ProjectStore = ReturnType<typeof acquireProjectTuiStore>
 type RequestResponse = ReturnType<ProjectStore["getSnapshot"]>["responses"][number]
-type MaintenanceScope = "observations" | "proposals" | "project" | "all"
-type YoloTarget = "global" | "project"
+type MaintenanceScope = "observations" | "global-recommendations" | "project" | "all"
+type RecommendationFilter = "needs-review" | "applied" | "dismissed" | "all"
 type FocusableRenderable = Renderable & {
   id: string
   focusable: boolean
@@ -57,6 +58,30 @@ function snapshotIdentity(snapshot: ReturnType<ProjectStore["getSnapshot"]>) {
     snapshot.stateRootIdentity ?? null,
     snapshot.projectFingerprint ?? null,
   ])
+}
+
+function globalSnapshotIdentity(snapshot: ReturnType<ProjectStore["getSnapshot"]>) {
+  return snapshot?.stateRootIdentity ?? snapshot?.global?.stateRootIdentity ?? null
+}
+
+function recommendationRecords(snapshot: ReturnType<ProjectStore["getSnapshot"]>) {
+  const global = snapshot?.global?.projection?.index?.recommendations
+  if (Array.isArray(global)) return global.map((entry) => ({ id: entry.recommendationId, state: entry.state }))
+  return (snapshot?.projection?.index?.reviews ?? [])
+    .filter((entry) => entry.state !== "critic-pending")
+    .map((entry) => ({ id: entry.proposalId, state: entry.state }))
+}
+
+function recommendationFilterForState(state: string | null | undefined): RecommendationFilter {
+  if (state === null || state === undefined) return "needs-review"
+  if (["pending", "approved"].includes(state ?? "")) return "needs-review"
+  if (["applied", "rolled-back"].includes(state ?? "")) return "applied"
+  if (["rejected", "superseded"].includes(state ?? "")) return "dismissed"
+  return "all"
+}
+
+function recommendationFilterIncludesState(filter: RecommendationFilter, state: string | null | undefined) {
+  return filter === "all" || recommendationFilterForState(state) === filter
 }
 
 function isActivationKey(event: KeyEvent) {
@@ -137,23 +162,122 @@ function SidebarCard(props: {
   )
 }
 
+function SidebarModeControl(props: {
+  api: Parameters<TuiPlugin>[0]
+  store: ProjectStore
+  snapshot: () => ReturnType<ProjectStore["getSnapshot"]>
+}) {
+  const [confirmation, setConfirmation] = createSignal(false)
+  const [feedback, setFeedback] = createSignal<string | null>(null)
+  const [focused, setFocused] = createSignal<string | null>(null)
+  const nodes = new Map<string, Renderable>()
+  const model = () => deriveSidebarModeControl(props.snapshot())
+  let projectIdentity = props.snapshot()?.projectFingerprint ?? null
+  createEffect(() => {
+    const snapshot = props.snapshot()
+    const nextProject = snapshot?.projectFingerprint ?? null
+    if (nextProject !== projectIdentity || !deriveSidebarModeControl(snapshot).available) {
+      projectIdentity = nextProject
+      setConfirmation(false)
+      setFeedback(null)
+    }
+  })
+  useKeyboard((event) => {
+    if (event.name !== "tab") return
+    const node = nodes.get("manual") ?? nodes.get("auto")
+    let root = node as FocusableRenderable | undefined
+    while (root?.parent) root = root.parent as FocusableRenderable
+    const card = root?.findDescendantById(CARD_ID)
+    const candidates = [card, nodes.get("manual"), nodes.get("auto")]
+      .filter((value): value is FocusableRenderable => Boolean(value?.focusable && value.visible))
+    const current = candidates.findIndex((value) => value.focused)
+    if (current < 0) return
+    const navigationEvent = event as NavigationKeyEvent
+    navigationEvent.preventDefault()
+    navigationEvent.stopPropagation()
+    const offset = navigationEvent.shift ? -1 : 1
+    candidates[(current + offset + candidates.length) % candidates.length].focus()
+  })
+  const activate = async (value: "manual" | "auto") => {
+    const current = model()
+    if (!current.available || current.pending || current.current === value) return
+    if (value === "auto" && !confirmation()) {
+      setConfirmation(true)
+      setFeedback("Auto analyzes at safe idle points but never applies without approval. Activate Confirm Auto to continue.")
+      return
+    }
+    try {
+      await props.store.submitControl("set-repo-mode", { mode: value })
+      setConfirmation(false)
+      setFeedback(value === "manual" ? "On demand requested for this project." : "Auto requested for this project.")
+    } catch (error) {
+      setConfirmation(false)
+      setFeedback(`Mode was not changed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return (
+    <box flexDirection="column" width="100%">
+      <box flexDirection="row" width="100%">
+        {model().options.map((option) => {
+          const key = `sidebar-mode:${option.value}`
+          const selected = () => model().current === option.value
+          const enabled = () => model().available
+          const label = () => option.value === "auto" && confirmation() ? "Confirm Auto" : option.label
+          return (
+            <box
+              id={`self-evolve-sidebar-mode-${option.value}`}
+              ref={(value: Renderable) => nodes.set(option.value, value)}
+              focusable={enabled()}
+              border
+              flexGrow={1}
+              paddingLeft={1}
+              paddingRight={1}
+              borderColor={focused() === key
+                ? props.api.theme.current.borderActive
+                : selected() ? props.api.theme.current.info : props.api.theme.current.borderSubtle}
+              on:focused={() => setFocused(key)}
+              on:blurred={() => setFocused((value) => value === key ? null : value)}
+              onMouseDown={() => nodes.get(option.value)?.focus()}
+              onMouseUp={() => { if (enabled()) void activate(option.value as "manual" | "auto") }}
+              onKeyDown={(event: KeyEvent) => {
+                if (!isActivationKey(event) || !enabled()) return
+                event.preventDefault()
+                void activate(option.value as "manual" | "auto")
+              }}
+            >
+              <text fg={enabled() ? props.api.theme.current.text : props.api.theme.current.textMuted}>
+                {focused() === key ? "› " : selected() ? "• " : "  "}{label()}{model().pending ? " · Pending" : ""}
+              </text>
+            </box>
+          )
+        })}
+      </box>
+      <Show when={!model().available || feedback()}>
+        <text fg={!model().available ? props.api.theme.current.textMuted : props.api.theme.current.info} wrapMode="word">
+          {feedback() ?? `Project mode is read-only: ${model().status}.`}
+        </text>
+      </Show>
+    </box>
+  )
+}
+
 function ControlCenter(props: {
   api: Parameters<TuiPlugin>[0]
   store: ProjectStore
   snapshot: () => ReturnType<ProjectStore["getSnapshot"]>
   prior: () => { name: string; params?: Record<string, unknown> }
+  routeRevision: () => number
   initial: ReturnType<typeof parseControlCenterDestination>
 }) {
   const names = CONTROL_CENTER_SECTIONS
   const [section, setSection] = createSignal<(typeof names)[number]>(props.initial.section)
-  const [selectedIndex, setSelectedIndex] = createSignal(props.initial.selectedIndex ?? 0)
-  const initialRecommendationState = props.snapshot().projection?.index?.reviews?.[props.initial.selectedIndex ?? 0]?.state
-  const [recommendationFilter, setRecommendationFilter] = createSignal<"needs-review" | "applied" | "dismissed" | "all">(
-    ["applied", "rolled-back"].includes(initialRecommendationState ?? "")
-      ? "applied"
-      : ["rejected", "superseded"].includes(initialRecommendationState ?? "")
-        ? "dismissed"
-        : "needs-review",
+  const initialSelectedIndex = props.initial.section === "recommendations" ? props.initial.selectedIndex ?? 0 : 0
+  const [selectedIndex, setSelectedIndex] = createSignal(initialSelectedIndex)
+  const initialRecommendationState = props.initial.section === "recommendations"
+    ? recommendationRecords(props.snapshot())[initialSelectedIndex]?.state
+    : null
+  const [recommendationFilter, setRecommendationFilter] = createSignal<RecommendationFilter>(
+    recommendationFilterForState(initialRecommendationState),
   )
   const [activityFilter, setActivityFilter] = createSignal(props.initial.filter ?? "all")
   const [settingsAnchor, setSettingsAnchor] = createSignal<string | undefined>(props.initial.anchor)
@@ -162,15 +286,19 @@ function ControlCenter(props: {
   const [technicalExpanded, setTechnicalExpanded] = createSignal(false)
   const [activityExpanded, setActivityExpanded] = createSignal<number | null>(null)
   const [diagnosticsExpanded, setDiagnosticsExpanded] = createSignal(false)
+  const [outcomesExpanded, setOutcomesExpanded] = createSignal(false)
   const [feedback, setFeedback] = createSignal<string | null>(null)
   const [confirmation, setConfirmation] = createSignal<string | null>(null)
   const [consentIntent, setConsentIntent] = createSignal<string | null>(null)
   const [folderInput, setFolderInput] = createSignal("")
   const [folderError, setFolderError] = createSignal<string | null>(null)
-  const [folderDraft, setFolderDraft] = createSignal<string[] | null>(null)
+  const [folderDraft, setFolderDraft] = createSignal<Array<{
+    canonicalPath: string
+    canUpdate: boolean
+    canCreate: boolean
+    primaryCreationRoot: boolean
+  }> | null>(null)
   const [folderConfirmation, setFolderConfirmation] = createSignal("")
-  const [yoloTarget, setYoloTarget] = createSignal<YoloTarget | null>(null)
-  const [yoloConfirmation, setYoloConfirmation] = createSignal("")
   const [maintenanceScope, setMaintenanceScope] = createSignal<MaintenanceScope>("observations")
   const [maintenanceIntent, setMaintenanceIntent] = createSignal<"export" | "delete" | null>(null)
   const [maintenanceConfirmation, setMaintenanceConfirmation] = createSignal("")
@@ -223,6 +351,10 @@ function ControlCenter(props: {
   let popMode = () => {}
   let unsubscribeIdentity = () => {}
   let mountedIdentity = snapshotIdentity(props.snapshot())
+  let mountedGlobalIdentity = globalSnapshotIdentity(props.snapshot())
+  let selectedRecommendationId = props.initial.section === "recommendations"
+    ? recommendationRecords(props.snapshot())[props.initial.selectedIndex ?? 0]?.id ?? null
+    : null
   let mountedPhase = props.snapshot().phase
   const clearPreparedAuthority = () => {
     setRejectionReason(null)
@@ -234,12 +366,11 @@ function ControlCenter(props: {
     setFolderError(null)
     setFolderDraft(null)
     setFolderConfirmation("")
-    setYoloTarget(null)
-    setYoloConfirmation("")
     setMaintenanceIntent(null)
     setMaintenanceConfirmation("")
+    setOutcomesExpanded(false)
   }
-  const resetForProjectIdentity = () => {
+  const resetForGlobalIdentity = () => {
     setSection("home")
     setSelectedIndex(0)
     setRecommendationFilter("needs-review")
@@ -252,17 +383,73 @@ function ControlCenter(props: {
     clearPreparedAuthority()
     void props.store.selectDetails([])
   }
+  const clearInvalidRecommendation = () => {
+    focusableDescendants().find((node) => node.focused)?.blur()
+    batch(() => {
+      selectedRecommendationId = null
+      setSection("home")
+      setSelectedIndex(0)
+      setRecommendationFilter("needs-review")
+      setSettingsAnchor(undefined)
+      setTechnicalExpanded(false)
+      setFocusedControl(null)
+      clearPreparedAuthority()
+      void props.store.selectDetails([])
+      if (props.api.route.current.name === CONTROL_CENTER_ROUTE) {
+        props.api.route.navigate(CONTROL_CENTER_ROUTE, { section: "home" })
+      }
+    })
+  }
+  const currentRecommendationToken = () => {
+    const route = props.api.route.current
+    const params = route.name === CONTROL_CENTER_ROUTE && "params" in route
+      ? route.params as Record<string, unknown>
+      : undefined
+    return selectedRecommendationId
+      ?? (params?.section === "recommendations" && typeof params.recommendation === "string"
+        ? params.recommendation
+        : null)
+  }
+  let observedRouteRevision = props.routeRevision()
+  createEffect(() => {
+    const revision = props.routeRevision()
+    if (revision === observedRouteRevision) return
+    observedRouteRevision = revision
+    clearInvalidRecommendation()
+  })
   onMount(() => {
     popMode = props.api.mode.push(CONTROL_CENTER_MODE)
-    selectRecommendation(selectedIndex())
+    if (props.initial.section === "recommendations") selectRecommendation(selectedIndex())
     unsubscribeIdentity = props.store.subscribe((next) => {
       const nextIdentity = snapshotIdentity(next)
-      if (mountedIdentity !== nextIdentity) {
-        resetForProjectIdentity()
+      const nextGlobalIdentity = globalSnapshotIdentity(next)
+      if (mountedGlobalIdentity !== nextGlobalIdentity) {
+        resetForGlobalIdentity()
+        selectedRecommendationId = null
+      } else if (mountedIdentity !== nextIdentity) {
+        clearPreparedAuthority()
+        setSettingsAnchor(undefined)
+        setActivityExpanded(null)
+        setDiagnosticsExpanded(false)
+        setMaintenanceScope("observations")
       } else if (mountedPhase !== "error" && next.phase === "error") {
         clearPreparedAuthority()
       }
+      const recommendationToken = currentRecommendationToken()
+      if (recommendationToken !== null) {
+        const retained = recommendationRecords(next).findIndex((entry) => entry.id === recommendationToken)
+        if (retained < 0) clearInvalidRecommendation()
+        else {
+          const retainedState = recommendationRecords(next)[retained]?.state
+          if (!recommendationFilterIncludesState(recommendationFilter(), retainedState)) {
+            setRecommendationFilter(recommendationFilterForState(retainedState))
+          }
+          selectedRecommendationId = recommendationToken
+          setSelectedIndex(retained)
+        }
+      }
       mountedIdentity = nextIdentity
+      mountedGlobalIdentity = nextGlobalIdentity
       mountedPhase = next.phase
     })
   })
@@ -288,11 +475,12 @@ function ControlCenter(props: {
     navigate({ section: names[(index + offset + names.length) % names.length] })
   }
   const selectRecommendation = (sourceIndex: number) => {
-    const reviews = props.snapshot().projection?.index?.reviews ?? []
+    const reviews = recommendationRecords(props.snapshot())
     if (!reviews[sourceIndex]) return
     setSelectedIndex(sourceIndex)
-    const adjacent = reviews[sourceIndex + 1]?.proposalId ?? reviews[sourceIndex - 1]?.proposalId
-    const ids = [reviews[sourceIndex].proposalId, adjacent].filter(Boolean).slice(0, 2)
+    selectedRecommendationId = reviews[sourceIndex].id
+    const adjacent = reviews[sourceIndex + 1]?.id ?? reviews[sourceIndex - 1]?.id
+    const ids = [reviews[sourceIndex].id, adjacent].filter(Boolean).slice(0, 2)
     void props.store.selectDetails(ids)
     setConfirmation(null)
     setRejectionReason(null)
@@ -582,22 +770,12 @@ function ControlCenter(props: {
       ? "Retry did not restore a fresh projection. Read-only stale context remains available."
       : "Projection refreshed. Only newly negotiated actions are available.")
   }
-  const modeRank = (value: string | null) => ({ manual: 0, auto: 1, yolo: 2 }[value ?? ""] ?? 0)
+  const modeRank = (value: string | null) => ({ manual: 0, auto: 1 }[value ?? ""] ?? 0)
   const projectedModeFor = (target: string, scope: "global" | "project") => {
     if (scope === "global") return target
     return target === "inherit" ? settings().mode.global.value : target
   }
-  const submitMode = (scope: "global" | "project", mode: "inherit" | "manual" | "auto" | "yolo") => {
-    if (mode === "yolo") {
-      if (!settings().modes.find((entry) => entry.value === "yolo")?.available) {
-        setFeedback("Apply automatically is unavailable until every listed prerequisite passes.")
-        return
-      }
-      setYoloTarget(scope)
-      setYoloConfirmation("")
-      setFeedback(`Type ENABLE YOLO to grant Apply automatically for the ${scope === "global" ? "global default" : "current project"}.`)
-      return
-    }
+  const submitMode = (scope: "global" | "project", mode: "inherit" | "manual" | "auto") => {
     const current = scope === "global" ? settings().mode.global.value : settings().mode.effective.value
     const riskIncreasing = modeRank(projectedModeFor(mode, scope)) > modeRank(current)
     const action = scope === "global" ? "set-mode" : "set-repo-mode"
@@ -638,39 +816,20 @@ function ControlCenter(props: {
       )}
     </Show>
   )
-  const confirmYolo = async () => {
-    const target = yoloTarget()
-    if (!target || yoloConfirmation() !== "ENABLE YOLO") {
-      setFeedback("The exact phrase ENABLE YOLO is required.")
+  const stageFolderList = (next: Array<{
+    canonicalPath: string
+    canUpdate: boolean
+    canCreate: boolean
+    primaryCreationRoot: boolean
+  }>) => {
+    if (!next.length) {
+      setFolderError("At least one authoritative global root is required.")
       return
     }
-    try {
-      await props.store.submitControl(
-        target === "global" ? "set-mode" : "set-repo-mode",
-        target === "global"
-          ? {
-            mode: "yolo",
-            allowlist: [...settings().approvedSkillFolders],
-            confirmation: "ENABLE YOLO",
-          }
-          : { mode: "yolo" },
-      )
-      setYoloTarget(null)
-      setYoloConfirmation("")
-      setFeedback("Apply automatically request submitted for fresh server-side prerequisite validation.")
-    } catch (error) {
-      setFeedback(`Apply automatically was not submitted: ${error instanceof Error ? error.message : String(error)}`)
-    }
-  }
-  const stageFolderList = (next: string[]) => {
-    if (next.length === 0 && settings().approvedSkillFolderRequiresNonEmpty) {
-      setFolderError("At least one approved skill folder is required while Apply automatically is stored globally or for this project.")
-      return
-    }
-    setFolderDraft(next)
+    setFolderDraft(next.map((root) => ({ ...root })))
     setFolderConfirmation("")
     setFolderError(null)
-    setFeedback("Review the exact folder list below, then type UPDATE ALLOWLIST.")
+    setFeedback("Review the complete authoritative root policy, then type the version-bound confirmation phrase.")
   }
   const stageFolderAdd = () => {
     const checked = validateApprovedSkillFolderInput(folderInput(), settings().approvedSkillFolders)
@@ -679,32 +838,67 @@ function ControlCenter(props: {
       return
     }
     setFolderInput("")
-    stageFolderList([...settings().approvedSkillFolders, checked.value!])
+    stageFolderList([
+      ...settings().globalRoots,
+      { canonicalPath: checked.value!, canUpdate: true, canCreate: false, primaryCreationRoot: false },
+    ])
     setFolderError(checked.warning)
+  }
+  const updateFolderDraft = (index: number, change: Partial<{
+    canUpdate: boolean
+    canCreate: boolean
+    primaryCreationRoot: boolean
+  }>) => {
+    setFolderDraft((current) => current?.map((root, currentIndex) => currentIndex === index
+      ? { ...root, ...change }
+      : root) ?? null)
+    setFolderConfirmation("")
+    setFolderError(null)
   }
   const submitFolderList = async () => {
     const draft = folderDraft()
-    if (!draft || folderConfirmation() !== "UPDATE ALLOWLIST") {
-      setFolderError("The exact phrase UPDATE ALLOWLIST is required.")
+    const phrase = settings().globalRootPolicyConfirmation
+    if (!draft?.length) {
+      setFolderError("At least one authoritative global root is required.")
+      return
+    }
+    if (!phrase || folderConfirmation() !== phrase) {
+      setFolderError(`The exact phrase ${phrase ?? "shown by the fresh server projection"} is required.`)
+      return
+    }
+    if (draft.some((root) => !root.canUpdate && !root.canCreate)) {
+      setFolderError("Every root must allow update, create, or both.")
+      return
+    }
+    const createRoots = draft.filter((root) => root.canCreate)
+    const primaryRoots = draft.filter((root) => root.primaryCreationRoot)
+    if ((createRoots.length === 0 && primaryRoots.length !== 0)
+        || (createRoots.length !== 0
+          && (createRoots.length !== 1 || primaryRoots.length !== 1 || createRoots[0] !== primaryRoots[0]))) {
+      setFolderError("Creation authority requires one sole create-capable root selected as the primary creation root.")
       return
     }
     try {
-      await props.store.submitControl("update-allowlist", {
-        allowlist: draft,
-        confirmation: "UPDATE ALLOWLIST",
+      const roots = [...draft]
+        .sort((left, right) => left.canonicalPath < right.canonicalPath ? -1 : left.canonicalPath > right.canonicalPath ? 1 : 0)
+        .map(({ canonicalPath, canUpdate, canCreate }) => ({ canonicalPath, canUpdate, canCreate }))
+      await props.store.submitOperation("replace-global-root-policy", {
+        roots,
+        creationRootPath: primaryRoots[0]?.canonicalPath ?? null,
+        confirmation: phrase,
       })
       setFolderDraft(null)
       setFolderConfirmation("")
       setFolderError(null)
-      setFeedback("Approved skill folder replacement submitted for canonical server revalidation.")
+      setFeedback("Authoritative global root replacement submitted for transactional server revalidation.")
     } catch (error) {
-      setFolderError(`Folder replacement was not submitted: ${error instanceof Error ? error.message : String(error)}`)
+      setFolderError(`Root-policy replacement was not submitted: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   const maintenancePhrase = () => maintenanceIntent() === "export"
     ? "EXPORT SENSITIVE SELF-EVOLVE DATA"
     : maintenanceScope() === "all"
-      ? "PURGE ALL SELF-EVOLVE DATA"
+      ? "PURGE ALL SELF-EVOLVE 0.3.0"
       : `PURGE ${maintenanceScope().toUpperCase()}`
   const submitMaintenance = async () => {
     const intent = maintenanceIntent()
@@ -734,21 +928,15 @@ function ControlCenter(props: {
   const openActivityDestination = (entry: ReturnType<typeof activity>["activity"][number]) => {
     if (entry.destination?.section !== "recommendations") return
     const sourceIndex = entry.destination.selectedIndex ?? 0
-    const state = props.snapshot().projection?.index?.reviews?.[sourceIndex]?.state
-    setRecommendationFilter(
-      ["applied", "rolled-back"].includes(state ?? "")
-        ? "applied"
-        : ["rejected", "superseded"].includes(state ?? "")
-          ? "dismissed"
-          : "needs-review",
-    )
+    const state = recommendationRecords(props.snapshot())[sourceIndex]?.state
+    setRecommendationFilter(recommendationFilterForState(state))
     selectRecommendation(sourceIndex)
     navigate({ section: "recommendations", selectedIndex: sourceIndex })
   }
   const selectedProposalId = () => {
     const sourceIndex = recommendations().selected?.sourceIndex
     return Number.isSafeInteger(sourceIndex)
-      ? props.snapshot().projection?.index?.reviews?.[sourceIndex!]?.proposalId ?? null
+      ? recommendationRecords(props.snapshot())[sourceIndex!]?.id ?? null
       : null
   }
   const pendingRecommendation = () => props.snapshot().pending.some((entry) => entry.subject === selectedProposalId())
@@ -760,21 +948,20 @@ function ControlCenter(props: {
       return
     }
     if (action === "acknowledge-audit") {
-      const auditIds = (props.snapshot().dashboard?.activity ?? [])
-        .filter((entry) => entry.outcome === "applied" && entry.proposalId === proposalId)
-        .map((entry) => entry.id)
-      props.store.acknowledgeAudits([...auditIds, proposalId])
+      props.store.acknowledgeOutcome(proposalId)
       setFeedback("Applied result acknowledged locally. Activity history was retained.")
       return
     }
     const key = `${action}:${snoozeMs ?? ""}`
-    if (confirmation() !== key) {
+    if (["apply", "apply-proposal"].includes(action) && confirmation() !== key) {
       setConfirmation(key)
       setFeedback(`Activate “Confirm ${action.replaceAll("-", " ")}” to continue.`)
       return
     }
     try {
-      if (action === "apply-proposal") {
+      if (["apply", "reject", "undo"].includes(action)) {
+        await props.store.submitRecommendationAction(proposalId, action)
+      } else if (action === "apply-proposal") {
         await props.store.submitDecision({ proposalId, newState: "approved" })
       } else if (action === "reject-proposal") {
         const reason = rejectionReason()
@@ -883,6 +1070,7 @@ function ControlCenter(props: {
         ))}
       </box>
       <scrollbox
+        id="self-evolve-content-scrollbox"
         ref={(value: Renderable) => (contentScrollbox = value as ScrollableRenderable)}
         flexGrow={1}
         minHeight={1}
@@ -915,6 +1103,18 @@ function ControlCenter(props: {
               <text wrapMode="word">Global default: {home().mode.global.label}</text>
               <text wrapMode="word">This project: {home().mode.repository.label}</text>
             </box>
+            <Show when={home().globalReadiness}>
+              {(globalReadiness) => (
+                <box border borderColor={globalReadiness().state === "ready" ? props.api.theme.current.borderSubtle : props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
+                  <text><b>Global recommendations</b>: {globalReadiness().state === "ready" ? "Ready" : "Limited / read-only"}</text>
+                  <text wrapMode="word">Protocol: {globalReadiness().label}</text>
+                  <Show when={globalReadiness().recommendationCount !== null}>
+                    <text>{globalReadiness().recommendationCount} global recommendation{globalReadiness().recommendationCount === 1 ? "" : "s"}</text>
+                  </Show>
+                  <Show when={globalReadiness().reason}><text fg={props.api.theme.current.textMuted} wrapMode="word">{globalReadiness().reason}</text></Show>
+                </box>
+              )}
+            </Show>
             <Show when={home().firstRun}>
               <box border borderColor={props.api.theme.current.info} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
                 <text><b>Get automatic recommendations</b></text>
@@ -1007,8 +1207,10 @@ function ControlCenter(props: {
               {(usage) => (
                 <box flexDirection="column">
                   <text><b>Actual usage</b></text>
-                  <text>Background analysis: {usage().passive.used} / {usage().passive.limit}</text>
-                  <text>Recommendation synthesis: {usage().synthesis.used} / {usage().synthesis.limit}</text>
+                   <text>Background analysis: {usage().passive.used} / {usage().passive.limit}</text>
+                   <text>Background analysis resets: {usage().passive.resetAt ? new Date(usage().passive.resetAt).toISOString() : "Unavailable"}</text>
+                   <text>Recommendation synthesis: {usage().synthesis.used} / {usage().synthesis.limit}</text>
+                   <text>Recommendation synthesis resets: {usage().synthesis.resetAt ? new Date(usage().synthesis.resetAt).toISOString() : "Unavailable"}</text>
                   <text>Storage: {usage().storage.usedBytes} / {usage().storage.limitBytes} bytes</text>
                 </box>
               )}
@@ -1033,6 +1235,14 @@ function ControlCenter(props: {
         <Show when={section() === "recommendations"}>
           <box flexDirection="column" gap={1}>
             <text><b>Recommendations</b></text>
+            <Show when={recommendations().limited}>
+              <text fg={props.api.theme.current.warning} wrapMode="word">
+                Limited / read-only global recommendations. Fresh aligned grants are required before Apply, Reject, or Undo appears.
+              </text>
+            </Show>
+            <Show when={recommendations().enhancedError}>
+              <text fg={props.api.theme.current.error} wrapMode="word">{recommendations().enhancedError}</text>
+            </Show>
             <box flexDirection="row" gap={1} flexWrap="wrap">
               {([
                 ["needs-review", "Needs review"],
@@ -1123,6 +1333,16 @@ function ControlCenter(props: {
                       <box flexDirection="column">
                         <text><b>Why this was suggested</b></text>
                         <text wrapMode="word">{summary().rationale}</text>
+                        <Show when={summary().support}>
+                          {(support) => (
+                            <>
+                              <text wrapMode="word">Target: {summary().targetKind === "new-global-skill" ? "New global skill" : "Existing global skill"} · {summary().target}</text>
+                              <text wrapMode="word">Support: {support().tier.replaceAll("-", " ")} · {support().independentDomainCount} independent domains · {support().independentIncidentCount} incidents · {support().occurrenceCount} occurrences</text>
+                              <text wrapMode="word">Observed: {support().firstSeenDay} through {support().lastSeenDay}</text>
+                              <text wrapMode="word">Current project contributed: {summary().currentProjectContributed === null ? "Unavailable" : summary().currentProjectContributed ? "Yes" : "No"}</text>
+                            </>
+                          )}
+                        </Show>
                       </box>
                       <box flexDirection="column">
                         <text><b>Proposed change</b></text>
@@ -1140,14 +1360,29 @@ function ControlCenter(props: {
                       <box flexDirection="column">
                         <text><b>Safety checks</b></text>
                         <text>Critic: {summary().criticPassed ? "Passed" : "Not passed"}</text>
+                        <Show when={summary().criticScoreBasisPoints !== undefined}>
+                          <text>Critic score: {(summary().criticScoreBasisPoints / 100).toFixed(2)}%</text>
+                        </Show>
                         <text>Deterministic checks: {summary().validDeterministic ? "Passed" : "Not passed"}</text>
-                        <text>Injection scan: {summary().injectionFlagged ? "Flagged" : "Clear"}</text>
-                        {reactiveChild(() => summary().eligibility.checks.map((check) =>
-                          <text wrapMode="word">[{check.met ? "Passed" : "Blocked"}] {check.name}: {check.actual} / {check.required}</text>))}
+                        <Show when={summary().injectionFlagged !== undefined}>
+                          <text>Injection scan: {summary().injectionFlagged ? "Flagged" : "Clear"}</text>
+                        </Show>
+                        <Show when={summary().eligibility}>
+                          {(eligibility) => reactiveChild(() => eligibility().checks.map((check) =>
+                            <text wrapMode="word">[{check.met ? "Passed" : "Blocked"}] {check.name}: {check.actual} / {check.required}</text>))}
+                        </Show>
+                      </box>
+                      <box flexDirection="column">
+                        <text><b>Generality</b></text>
+                        <text wrapMode="word">{summary().generality.status}: {summary().generality.explanation}</text>
                       </box>
                       <box flexDirection="column">
                         <text><b>Token impact</b></text>
-                        <text>{summary().tokenImpact.estimatedTokens} estimated / {summary().tokenImpact.budgetTokens} budgeted tokens</text>
+                        <Show when={summary().tokenImpact.available} fallback={
+                          <text wrapMode="word">Unavailable: {summary().tokenImpact.explanation}</text>
+                        }>
+                          <text>{summary().tokenImpact.estimatedTokens} estimated / {summary().tokenImpact.budgetTokens} budgeted tokens</text>
+                        </Show>
                       </box>
                       <box flexDirection="column">
                         <text><b>Rollback</b></text>
@@ -1172,8 +1407,8 @@ function ControlCenter(props: {
                       </box>
                       <Show when={technicalExpanded()}>
                         <text>State: {summary().state}</text>
-                        <text>Effective mode: {summary().effectiveMode}</text>
-                        <text>Operation: {summary().operation.status}</text>
+                        <Show when={summary().effectiveMode}><text>Effective mode: {summary().effectiveMode}</text></Show>
+                        <Show when={summary().operation}><text>Operation: {summary().operation.status}</text></Show>
                         {reactiveChild(() => selected().audit.map((entry) =>
                           <text wrapMode="word">{entry.kind}: {entry.summary}</text>))}
                       </Show>
@@ -1181,7 +1416,7 @@ function ControlCenter(props: {
                   )}
                 </Show>
                 <Show when={selected().actions.some((action) =>
-                  action.action === "reject-proposal" && action.feedbackSupported)}>
+                  ["reject-proposal", "reject"].includes(action.action) && action.feedbackSupported)}>
                   <box flexDirection="column">
                     <text fg={props.api.theme.current.textMuted}>Optional rejection feedback (audit-only)</text>
                     <box flexDirection="row" gap={1} flexWrap="wrap">
@@ -1223,8 +1458,12 @@ function ControlCenter(props: {
                         { label: "Snooze 7 days", delay: 604_800_000 },
                       ]
                       : [{
-                        label: action.action === "rollback-proposal"
+                        label: action.action === "rollback-proposal" || action.action === "undo"
                           ? "Undo"
+                          : action.action === "apply"
+                            ? "Apply"
+                            : action.action === "reject"
+                              ? "Reject"
                           : action.action === "acknowledge-audit"
                             ? "Acknowledge"
                             : action.label,
@@ -1355,7 +1594,7 @@ function ControlCenter(props: {
                 }}
               >
                 <text wrapMode="word">
-                  {focusMark(`activity-row:${index}`)}[{entry.marker}] {entry.summary} · {relativeTime(entry.occurredAt)}
+                  {focusMark(`activity-row:${index}`)}[{entry.marker}] [{entry.scope}] {entry.summary} · {relativeTime(entry.occurredAt)}
                 </text>
                 <Show when={entry.target}><text fg={props.api.theme.current.textMuted}>Skill: {entry.target}</text></Show>
                 <Show when={activityExpanded() === index}>
@@ -1363,6 +1602,16 @@ function ControlCenter(props: {
                   <text fg={props.api.theme.current.textMuted}>Outcome: {entry.technical.outcome.replaceAll("-", " ")}</text>
                   <Show when={entry.technical.reason}>
                     {(reason) => <text fg={props.api.theme.current.textMuted}>Reason: {reason().replaceAll("-", " ")}</text>}
+                  </Show>
+                  <Show when={entry.acknowledgementRequestId}>
+                    {(requestId) => localActionButton(
+                      "Acknowledge global failure",
+                      () => props.store.acknowledgeGlobalFailure(requestId()),
+                      false,
+                      undefined,
+                      undefined,
+                      `acknowledge-global-failure:${index}`,
+                    )}
                   </Show>
                   <Show when={entry.destination?.section === "recommendations"}>
                     <box
@@ -1390,6 +1639,7 @@ function ControlCenter(props: {
               <text fg={props.api.theme.current.warning} wrapMode="word">{activity().overflowMessage}</text>
             </Show>
             <box
+              id={focusId("activity:diagnostics")}
               focusable
               border
               borderColor={diagnosticsExpanded() ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle}
@@ -1411,6 +1661,7 @@ function ControlCenter(props: {
                 <text wrapMode="word">Projection refreshed: {activity().diagnostics.refreshedAt ? relativeTime(activity().diagnostics.refreshedAt) : "Unavailable"}</text>
                 <text wrapMode="word">Core projection: {activity().diagnostics.coreProjection}</text>
                 <text wrapMode="word">Enhanced projection: {activity().diagnostics.enhancedProjection}</text>
+                <text wrapMode="word">Global projection: {activity().diagnostics.globalProjection} ({activity().diagnostics.globalProtocolLabel ?? "Unavailable"})</text>
                 <text wrapMode="word">OpenCode: {activity().diagnostics.runtime.hostVersion} ({activity().diagnostics.runtime.hostVersionSource})</text>
                 <text wrapMode="word">Self-evolve: {activity().diagnostics.runtime.pluginVersion}</text>
                 <text wrapMode="word">Projection protocol: {activity().diagnostics.runtime.projectionVersion ?? "Unavailable"}</text>
@@ -1479,13 +1730,21 @@ function ControlCenter(props: {
             <Show when={settings().enhancedError}>
               <text fg={props.api.theme.current.error} wrapMode="word">{settings().enhancedError}</text>
             </Show>
+            <Show when={settings().globalProtocol}>
+              {(globalProtocol) => (
+                <text fg={globalProtocol().authoritative ? props.api.theme.current.textMuted : props.api.theme.current.warning} wrapMode="word">
+                  Global protocol: {globalProtocol().label} · {globalProtocol().authoritative ? "authoritative" : "limited / read-only"}
+                </text>
+              )}
+            </Show>
 
-            <text><b>Modes</b></text>
-            <text wrapMode="word">Effective result: {settings().mode.effective.label}</text>
-            <text wrapMode="word">Global default: {settings().mode.global.label}</text>
-            <text wrapMode="word">This project: {settings().mode.repository.label}</text>
+            <text><b>Project analysis</b></text>
+            <text wrapMode="word">Configured analysis: {settings().mode.effective.label}</text>
+            <text wrapMode="word">Operational state: {model().operational.label}</text>
+            <text wrapMode="word">Installation default: {settings().mode.global.label}</text>
+            <text wrapMode="word">This project override: {settings().mode.repository.label}</text>
             <text fg={props.api.theme.current.textMuted} wrapMode="word">
-              The global default applies to every current and future project. “Use for this project” creates an override here only.
+              Pause, exclusion, and other temporary suppressors do not rewrite configured analysis. “Use for this project” creates an override here only.
             </text>
             <Show when={settings().controls.globalMode && modeRank(settings().mode.global.value) < modeRank("auto")}>
               <box border borderColor={props.api.theme.current.info} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
@@ -1518,8 +1777,8 @@ function ControlCenter(props: {
                     <Show when={settings().controls.globalMode}>
                       {localActionButton(
                         settings().mode.global.value === mode.value ? "Global default ✓" : "Set global default",
-                        () => submitMode("global", mode.value as "manual" | "auto" | "yolo"),
-                        mode.value === "yolo",
+                        () => submitMode("global", mode.value as "manual" | "auto"),
+                        mode.value === "auto",
                         `global-mode-${mode.value}`,
                         { action: "set-mode", subject: "global-mode" },
                       )}
@@ -1527,8 +1786,8 @@ function ControlCenter(props: {
                     <Show when={settings().controls.repositoryMode}>
                       {localActionButton(
                         settings().mode.repository.value === mode.value ? "This project ✓" : "Use for this project",
-                        () => submitMode("project", mode.value as "manual" | "auto" | "yolo"),
-                        mode.value === "yolo",
+                        () => submitMode("project", mode.value as "manual" | "auto"),
+                        mode.value === "auto",
                         `project-mode-${mode.value}`,
                         { action: "set-repo-mode", subject: "repository-mode" },
                       )}
@@ -1546,34 +1805,6 @@ function ControlCenter(props: {
                 { action: "set-repo-mode", subject: "repository-mode" },
               )}
             </Show>
-            <Show when={yoloTarget()}>
-              <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
-                <text wrapMode="word">
-                  Apply automatically expands write authority for the {yoloTarget() === "global" ? "global default" : "current project"}.
-                  Approved folders and every current prerequisite will be revalidated by the server.
-                </text>
-                <text>Type exactly: ENABLE YOLO</text>
-                <input
-                  value={yoloConfirmation()}
-                  placeholder="ENABLE YOLO"
-                  onInput={(value: string) => setYoloConfirmation(value.slice(0, 64))}
-                />
-                <box flexDirection="row" flexWrap="wrap" gap={1}>
-                  {localActionButton(
-                    "Submit Apply automatically",
-                    () => void confirmYolo(),
-                    true,
-                    undefined,
-                    { action: yoloTarget() === "global" ? "set-mode" : "set-repo-mode", subject: yoloTarget() === "global" ? "global-mode" : "repository-mode" },
-                  )}
-                  {localActionButton("Cancel", () => {
-                    setYoloTarget(null)
-                    setYoloConfirmation("")
-                  }, false, undefined, undefined, "cancel-yolo")}
-                </box>
-              </box>
-            </Show>
-
             <text><b>Privacy and project scope</b></text>
             <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
               <text><b>Include this project</b>: {settings().projectExcluded ? "No" : "Yes"}</text>
@@ -1622,25 +1853,50 @@ function ControlCenter(props: {
             <text wrapMode="word">Pause automatic work: {settings().paused ? "Paused" : "Running when eligible"}. Pause preserves modes and consent.</text>
             <text wrapMode="word">Emergency stop: {settings().emergencyStop ? "On" : "Off"}. It overrides every automatic provider and write path.</text>
 
-            <text><b>Approved skill folders</b></text>
+            <text><b>Approved global skill folders</b></text>
             <text wrapMode="word">{settings().approvedSkillFolderWarning}</text>
-            <Show when={!settings().approvedSkillFolders.length}>
-              <text fg={props.api.theme.current.warning} wrapMode="word">No folder is approved; Apply automatically cannot be enabled.</text>
+            <Show when={!settings().globalRoots.length}>
+              <text fg={props.api.theme.current.warning} wrapMode="word">No exact approved global root is available in this projection.</text>
             </Show>
-            {reactiveChild(() => settings().approvedSkillFolders.map((folder) => (
-              <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="row" flexWrap="wrap" gap={1}>
-                <text wrapMode="word">{folder}</text>
+            {reactiveChild(() => settings().globalRoots.map((root, index) => (
+              <box id={focusId(`root-row:${index}`)} border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
+                <text wrapMode="word">{root.canonicalPath}</text>
+                <text id={focusId(`root-capabilities:${index}`)} fg={props.api.theme.current.textMuted} wrapMode="word">
+                  {root.canUpdate ? "Update" : "No update"} · {root.canCreate ? "Create" : "No create"}{root.primaryCreationRoot ? " · Primary creation root" : ""}
+                </text>
                 <Show when={settings().controls.approvedSkillFolders}>
-                  {localActionButton("Remove", () => stageFolderList(
-                    settings().approvedSkillFolders.filter((candidate) => candidate !== folder),
-                  ), false, undefined, undefined, `remove-folder:${folder}`)}
+                  <box flexDirection="row" flexWrap="wrap" gap={1}>
+                    {localActionButton(
+                      `Edit ${root.canonicalPath}`,
+                      () => stageFolderList(settings().globalRoots),
+                      false,
+                      undefined,
+                      undefined,
+                      `edit-root:${index}`,
+                    )}
+                    {localActionButton(
+                      `Remove ${root.canonicalPath}`,
+                      () => stageFolderList(settings().globalRoots.filter((_, currentIndex) => currentIndex !== index)),
+                      true,
+                      undefined,
+                      undefined,
+                      `remove-root:${index}`,
+                    )}
+                  </box>
                 </Show>
               </box>
             )))}
+            <Show when={settings().collectionSuggestions.length}>
+              <box flexDirection="column">
+                <text><b>Legacy collection suggestions (no authority)</b></text>
+                {reactiveChild(() => settings().collectionSuggestions.map((folder) => <text wrapMode="word">{folder}</text>))}
+              </box>
+            </Show>
             <Show when={settings().controls.approvedSkillFolders}>
               <box flexDirection="column">
                 <text>Add one canonical absolute folder</text>
                 <input
+                  id={focusId("root-path-input")}
                   value={folderInput()}
                   placeholder="/canonical/path/to/skills"
                   onInput={(value: string) => {
@@ -1657,24 +1913,71 @@ function ControlCenter(props: {
             <Show when={folderDraft()}>
               {(draft) => (
                 <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
-                  <text><b>Exact replacement</b></text>
-                  <Show when={draft().length}>
-                    {reactiveChild(() => draft().map((folder) => <text wrapMode="word">• {folder}</text>))}
-                  </Show>
-                  <Show when={draft().length === 0}><text>(empty)</text></Show>
-                  <text>Type exactly: UPDATE ALLOWLIST</text>
+                  <text><b>Complete authoritative replacement</b></text>
+                  {reactiveChild(() => draft().map((root, index) => (
+                    <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
+                      <text wrapMode="word">{root.canonicalPath}</text>
+                      <box flexDirection="row" flexWrap="wrap" gap={1}>
+                        {localActionButton(
+                          root.canUpdate ? "Update allowed" : "Allow updates",
+                          () => updateFolderDraft(index, { canUpdate: !root.canUpdate }),
+                          false,
+                          undefined,
+                          undefined,
+                          `draft-update:${index}`,
+                        )}
+                        {localActionButton(
+                          root.canCreate ? "Create allowed" : "Allow creation",
+                          () => updateFolderDraft(index, {
+                            canCreate: !root.canCreate,
+                            ...(!root.canCreate ? {} : { primaryCreationRoot: false }),
+                          }),
+                          false,
+                          undefined,
+                          undefined,
+                          `draft-create:${index}`,
+                        )}
+                        {localActionButton(
+                          root.primaryCreationRoot ? "Primary creation root" : "Make primary creation root",
+                          () => {
+                            setFolderDraft((current) => current?.map((entry, currentIndex) => ({
+                              ...entry,
+                              primaryCreationRoot: currentIndex === index,
+                              canCreate: currentIndex === index,
+                            })) ?? null)
+                            setFolderConfirmation("")
+                            setFolderError(null)
+                          },
+                          root.primaryCreationRoot,
+                          undefined,
+                          undefined,
+                          `draft-primary:${index}`,
+                        )}
+                        {localActionButton(
+                          "Remove row",
+                          () => stageFolderList(draft().filter((_, currentIndex) => currentIndex !== index)),
+                          true,
+                          undefined,
+                          undefined,
+                          `draft-remove:${index}`,
+                        )}
+                      </box>
+                    </box>
+                  )))}
+                  <text wrapMode="word">Type exactly: {settings().globalRootPolicyConfirmation ?? "Fresh server confirmation unavailable"}</text>
                   <input
+                    id={focusId("root-policy-confirmation")}
                     value={folderConfirmation()}
-                    placeholder="UPDATE ALLOWLIST"
+                    placeholder={settings().globalRootPolicyConfirmation ?? "Fresh server confirmation unavailable"}
                     onInput={(value: string) => setFolderConfirmation(value.slice(0, 64))}
                   />
                   <box flexDirection="row" flexWrap="wrap" gap={1}>
                     {localActionButton(
-                      "Replace approved folders",
+                      "Replace authoritative roots",
                       () => void submitFolderList(),
                       true,
                       undefined,
-                      { action: "update-allowlist", subject: "approved-skill-folders" },
+                      { action: "replace-global-root-policy", subject: "project" },
                     )}
                     {localActionButton("Cancel", () => {
                       setFolderDraft(null)
@@ -1701,7 +2004,7 @@ function ControlCenter(props: {
             <Show when={settings().rolloutProgress}>
               {(rolloutProgress) => (
                 <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
-                  <text><b>Automatic-apply rollout evidence</b>: {rolloutProgress().ready ? "Ready" : "Not ready"}</text>
+                  <text><b>Compatibility rollout diagnostics (no authority)</b>: {rolloutProgress().ready ? "Threshold met" : "Threshold not met"}</text>
                   <text wrapMode="word">Actual: {rolloutProgress().actual}</text>
                   <text wrapMode="word">Configured requirement: {rolloutProgress().configured}</text>
                 </box>
@@ -1806,6 +2109,52 @@ function ControlCenter(props: {
             <text fg={props.api.theme.current.textMuted} wrapMode="word">{settings().footer.help}</text>
           </box>
         </Show>
+        <Show when={props.snapshot().responses.length || feedback()}>
+          <box id="self-evolve-outcomes" border borderColor={outcomesExpanded() ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
+            <box
+              id={focusId("outcomes-summary")}
+              focusable
+              on:focused={() => setFocusedControl("outcomes-summary")}
+              on:blurred={() => setFocusedControl((current) => current === "outcomes-summary" ? null : current)}
+              onMouseUp={() => setOutcomesExpanded((value) => !value)}
+              onKeyDown={(event: KeyEvent) => {
+                if (!isActivationKey(event)) return
+                event.preventDefault()
+                setOutcomesExpanded((value) => !value)
+              }}
+            >
+              <text>
+                {focusMark("outcomes-summary")}Outcomes and next steps · {props.snapshot().responses.length} retained{feedback() ? " · current feedback" : ""} {outcomesExpanded() ? "▲" : "▼"}
+              </text>
+            </box>
+            <Show when={outcomesExpanded()}>
+              {reactiveChild(() => props.snapshot().responses.map((completedResponse, index) => (
+                <box
+                  id={focusId(`outcome:${index}`)}
+                  focusable
+                  on:focused={() => setFocusedControl(`outcome:${index}`)}
+                  on:blurred={() => setFocusedControl((current) => current === `outcome:${index}` ? null : current)}
+                >
+                  <text fg={completedResponse.response?.ok === false ? props.api.theme.current.error : props.api.theme.current.info} wrapMode="word">
+                    {focusMark(`outcome:${index}`)}{requestResponseMessage(completedResponse)}
+                  </text>
+                </box>
+              )))}
+              <Show when={feedback()}>
+                {(message) => (
+                  <box
+                    id={focusId("outcome-feedback")}
+                    focusable
+                    on:focused={() => setFocusedControl("outcome-feedback")}
+                    on:blurred={() => setFocusedControl((current) => current === "outcome-feedback" ? null : current)}
+                  >
+                    <text fg={props.api.theme.current.info} wrapMode="word">{focusMark("outcome-feedback")}{message()}</text>
+                  </box>
+                )}
+              </Show>
+            </Show>
+          </box>
+        </Show>
       </scrollbox>
       <box
         flexDirection="column"
@@ -1816,14 +2165,6 @@ function ControlCenter(props: {
         <text fg={props.api.theme.current.textMuted}>
           Esc returns to {props.prior().name}
         </text>
-        {reactiveChild(() => props.snapshot().responses.map((completedResponse) => (
-          <text fg={completedResponse.response?.ok === false ? props.api.theme.current.error : props.api.theme.current.info} wrapMode="word">
-            {requestResponseMessage(completedResponse)}
-          </text>
-        )))}
-        <Show when={feedback()}>
-          <text fg={props.api.theme.current.info} wrapMode="word">{feedback()}</text>
-        </Show>
       </box>
     </box>
   )
@@ -1859,19 +2200,34 @@ const tui: TuiPlugin = async (api, options, meta) => {
   if (!projectStore) return
   releaseWithNativeCleanup = true
   const [priorRoute, setPriorRoute] = createSignal<{ name: string; params?: Record<string, unknown> }>({ name: "home" })
+  const [routeRevision, setRouteRevision] = createSignal(0)
   const initialSnapshot = projectStore.getSnapshot()
   const [snapshot, setSnapshot] = createSignal(initialSnapshot)
-  let activeSnapshotIdentity = snapshotIdentity(initialSnapshot)
+  let activeGlobalIdentity = globalSnapshotIdentity(initialSnapshot)
   const unsubscribe = projectStore.subscribe((next) => {
-    const nextIdentity = snapshotIdentity(next)
-    if (activeSnapshotIdentity !== nextIdentity) {
+    const nextGlobalIdentity = globalSnapshotIdentity(next)
+    const currentParams = api.route.current.name === CONTROL_CENTER_ROUTE && "params" in api.route.current
+      ? api.route.current.params as Record<string, unknown>
+      : undefined
+    const invalidRecommendationRoute = currentParams?.section === "recommendations"
+      && typeof currentParams.recommendation === "string"
+      && parseControlCenterDestination(currentParams, next).section === "home"
+    let clearDetails = false
+    if (activeGlobalIdentity !== nextGlobalIdentity) {
       setPriorRoute({ name: "home" })
       if (api.route.current.name === CONTROL_CENTER_ROUTE) {
+        clearDetails = true
+        setRouteRevision((revision) => revision + 1)
         api.route.navigate(CONTROL_CENTER_ROUTE, { section: "home" })
       }
+    } else if (invalidRecommendationRoute) {
+      clearDetails = true
+      setRouteRevision((revision) => revision + 1)
+      api.route.navigate(CONTROL_CENTER_ROUTE, { section: "home" })
     }
-    activeSnapshotIdentity = nextIdentity
+    activeGlobalIdentity = nextGlobalIdentity
     setSnapshot(next)
+    if (clearDetails) void projectStore.selectDetails([])
   })
   api.lifecycle.onDispose(unsubscribe)
   const closeControlCenter = () => {
@@ -1895,6 +2251,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
       store={projectStore!}
       snapshot={snapshot}
       prior={priorRoute}
+      routeRevision={routeRevision}
       initial={parseControlCenterDestination(
         "params" in api.route.current ? api.route.current.params : undefined,
         snapshot(),
@@ -1936,14 +2293,17 @@ const tui: TuiPlugin = async (api, options, meta) => {
     order: 275,
     slots: {
       sidebar_content() {
-        return <SidebarCard
-          api={api}
-          card={() => deriveSidebarCard(snapshot())}
-          open={() => {
-            const card = deriveSidebarCard(snapshot())
-            openControlCenter(card.destination)
-          }}
-        />
+        return <box flexDirection="column" width="100%" gap={1}>
+          <SidebarCard
+            api={api}
+            card={() => deriveSidebarCard(snapshot())}
+            open={() => {
+              const card = deriveSidebarCard(snapshot())
+              openControlCenter(card.destination)
+            }}
+          />
+          <SidebarModeControl api={api} store={projectStore!} snapshot={snapshot} />
+        </box>
       },
     },
   })

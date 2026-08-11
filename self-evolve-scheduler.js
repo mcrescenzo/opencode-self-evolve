@@ -170,12 +170,10 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   const backoffUntil = new Map();
   let disposed = false;
   let accepting = true;
-  let modeOverride = null;
   let breaker = latestBreaker();
   let cachedMode = effectiveMode(initialSettings);
 
   function effectiveMode(settings = safeSettings(store)) {
-    if (modeOverride) return modeOverride;
     if (!settings) return "manual";
     return resolveMode(settings.global.mode, settings.repo.mode, {
       killSwitchActive: settings.global.killSwitchActive,
@@ -487,6 +485,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     const event = eventBody(input);
     const status = statusType(event);
     if (!status && event?.type !== "session.compacted") return;
+    cachedMode = effectiveMode(safeSettings(store));
     if (cachedMode === "manual") return;
     const sessionID = eventSessionID(event);
     if (!sessionID) return;
@@ -575,7 +574,6 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   function setMode(mode, reason = "mode-change") {
     if (!Mode.values.includes(mode)) throw new TypeError("invalid-mode");
     const prior = cachedMode;
-    modeOverride = mode;
     cachedMode = breaker.open ? "manual" : mode;
     if (cachedMode === "manual") for (const state of sessions.values()) clearTimer(state);
     if (prior !== cachedMode) audit("mode-downgrade", { priorMode: prior, mode: cachedMode, reason: String(reason) }, now());

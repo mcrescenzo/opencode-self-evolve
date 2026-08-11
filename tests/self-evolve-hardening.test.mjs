@@ -68,6 +68,11 @@ function skillFixture(t, label = "skill") {
   const roots = inventory.loadAllowlist({ globalSkillRoots: [skillRoot] }).canonicalRoots;
   const records = inventory.discoverSkills(roots);
   store = openStore(path.join(root, "state"), { projectName: "hardening", projectFingerprint: PROJECT_A, now: () => NOW });
+  assert.equal(store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+    ...global,
+    consent: { ...global.consent, durableObservations: true },
+    updatedAt: global.updatedAt + 1,
+  })).ok, true);
   const privacy = createPrivacyGuard({ consent: {}, projectFingerprint: PROJECT_A, store, now: () => NOW });
   applier = createApplier({ store, inventory: { records, canonicalRoots: roots }, privacy, now: () => NOW });
   return { root, skillRoot, target, roots, records, store, privacy, applier };
@@ -419,19 +424,21 @@ test("11 bounded cost and concurrency: ten idle events stay under six calls and 
   assert.equal(scheduler.getCircuitBreaker().open, true);
 });
 
-test("12 hidden analyzer sessions are aborted after success, failure, and timeout", async (t) => {
+test("12 hidden analyzer sessions are interrupted and deleted after success, failure, and timeout", async (t) => {
   const f = skillFixture(t, "hidden-cleanup");
   async function one(output, never = false) {
     const cluster = synthesisCluster({ id: H(`hidden-${output}-${never}`) });
-    const calls = { abort: 0 };
+    const calls = { abort: 0, delete: 0 };
     const ctx = { directory: f.root, client: { session: {
       create: async () => ({ data: { id: cluster.id } }),
       prompt: async () => never ? await new Promise(() => {}) : { data: { info: { structured_output: output } } },
       abort: async () => { calls.abort += 1; return { data: {} }; },
+      delete: async () => { calls.delete += 1; return { data: {} }; },
     } } };
     const result = await synthesis.runSynthesis({ ctx, cluster, targetSkill: synthesisTarget(f), inventory: f.records, privacy: { checkPartition: () => ({ ok: true }), isObservationEligible: () => true }, options: { store: f.store, currentContent: CURRENT, eligibility: { clusterId: cluster.id, eligible: true }, validateTarget: () => ({ ok: true }), timeoutMs: 5 }, now: NOW });
     synthesis.resetSynthesisProcessStateForTests();
     assert.equal(calls.abort, 1);
+    assert.equal(calls.delete, 1);
     return result;
   }
   assert.equal((await one(synthesisOutput())).ok, true);
@@ -450,7 +457,7 @@ test("13 rollback hash drift is refused, audited, and trips the circuit breaker"
   assert.equal(f.store.readRecords("audit-event").some((record) => record.payload.kind === "rollback" && record.payload.details.reason === "hash-drift"), true);
 });
 
-test("14 yolo kill switch between lease and rename prevents write and preserves stored mode", async (t) => {
+test("14 kill switch defeats an explicitly decided legacy yolo input between lease and rename", async (t) => {
   const f = skillFixture(t, "kill-race");
   const current = f.store.getSettings();
   f.store.setGlobalSettings(schemas.makeGlobalSettings({ ...current.global, mode: "yolo", allowedSkillRoots: [f.skillRoot], updatedAt: NOW }));
@@ -471,11 +478,11 @@ test("14 yolo kill switch between lease and rename prevents write and preserves 
   const applier = createApplier({ store: wrappedStore, inventory: { records: f.records, canonicalRoots: f.roots }, privacy: f.privacy, now: () => NOW });
   t.after(() => applier.close());
   const item = proposal(f);
-  const result = await applier.applyProposal({ proposal: item, mode: "yolo", headless: true });
+  const result = await applier.applyProposal({ proposal: item, decision: decision(item), mode: "yolo", headless: true });
   assert.equal(result.reason, "kill-switch");
   assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
   assert.deepEqual(fs.readdirSync(path.dirname(f.target)).filter((name) => name.includes("self-evolve-tmp")), []);
-  assert.equal(f.store.getSettings().global.mode, "yolo");
+  assert.equal(f.store.getSettings().global.mode, "auto", "a stored legacy yolo preference narrows to auto");
   assert.equal(f.store.readRecords("audit-event").some((record) => record.payload.kind === "kill-switch" && record.payload.details.state === "downgraded"), true);
 });
 
@@ -483,12 +490,14 @@ test("15 provider and TUI hangs are bounded and fail closed without disabling ma
   const f = skillFixture(t, "hangs");
   const cluster = synthesisCluster();
   let aborts = 0;
+  let deletions = 0;
   const started = Date.now();
-  const result = await synthesis.runSynthesis({ ctx: { directory: f.root, client: { session: { create: async () => ({ data: { id: "hung" } }), prompt: async () => await new Promise(() => {}), abort: async () => { aborts += 1; } } } }, cluster, targetSkill: synthesisTarget(f), inventory: f.records, privacy: { checkPartition: () => ({ ok: true }), isObservationEligible: () => true }, options: { store: f.store, currentContent: CURRENT, eligibility: cluster.eligibility, validateTarget: () => ({ ok: true }), timeoutMs: 5, cleanupTimeoutMs: 5 }, now: NOW });
+  const result = await synthesis.runSynthesis({ ctx: { directory: f.root, client: { session: { create: async () => ({ data: { id: "hung" } }), prompt: async () => await new Promise(() => {}), abort: async () => { aborts += 1; }, delete: async () => { deletions += 1; } } } }, cluster, targetSkill: synthesisTarget(f), inventory: f.records, privacy: { checkPartition: () => ({ ok: true }), isObservationEligible: () => true }, options: { store: f.store, currentContent: CURRENT, eligibility: cluster.eligibility, validateTarget: () => ({ ok: true }), timeoutMs: 5, cleanupTimeoutMs: 5 }, now: NOW });
   synthesis.resetSynthesisProcessStateForTests();
   assert.equal(result.ok, false);
   assert.ok(Date.now() - started < 2_000);
   assert.equal(aborts, 1);
+  assert.equal(deletions, 1);
 
   const controller = new AbortController();
   const alerts = [];
@@ -513,11 +522,16 @@ test("15 provider and TUI hangs are bounded and fail closed without disabling ma
     __testMailboxClient: { getInbox: async () => await new Promise(() => {}) },
   };
   await SelfEvolveTuiPlugin(api, { selfEvolve: { projectFingerprint: PROJECT_A, serverTimeoutMs: 5, idleDebounceMs: 0 } });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  t.after(() => {
+    controller.abort();
+    for (const dispose of disposers) dispose();
+  });
+  const alertDeadline = Date.now() + 500;
+  while (alerts.length === 0 && Date.now() < alertDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   assert.equal(alerts.length, 1);
   assert.equal(createCommandPolicy({ store: f.store, privacy: f.privacy, now: () => NOW }).getMode(), "manual");
-  controller.abort();
-  for (const dispose of disposers) dispose();
 });
 
 test("16 newer schema state falls back to manual, reports health, and blocks autonomous commands", (t) => {
@@ -639,13 +653,13 @@ function seedRolloutHistory(store, observed, successes) {
   }
 }
 
-test("19 yolo calibration gate rejects 15/20 and enables 18/20", async (t) => {
+test("19 legacy yolo calibration never bypasses an explicit decision", async (t) => {
   const low = integrationThresholdHarness(t, 15 / 20);
   assert.equal((await low.runtime.runEvolutionCycle({ projectFingerprint: PROJECT_A })).result, "proposal-ready");
   assert.equal(low.applies, 0);
   const high = integrationThresholdHarness(t, 18 / 20);
-  assert.equal((await high.runtime.runEvolutionCycle({ projectFingerprint: PROJECT_A })).result, "applied");
-  assert.equal(high.applies, 1);
+  assert.equal((await high.runtime.runEvolutionCycle({ projectFingerprint: PROJECT_A })).result, "proposal-ready");
+  assert.equal(high.applies, 0);
 });
 
 test("20 a manual mode change during synthesis allows completion but prevents apply", async (t) => {

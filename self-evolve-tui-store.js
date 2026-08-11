@@ -2,16 +2,22 @@ import { watch as watchDirectory } from "node:fs";
 import path from "node:path";
 import {
   BRIDGE_TTL_MS,
+  createGlobalActionRequest,
   createControlRequest,
   createDecisionRequest,
   createUiOperationRequest,
+  pollGlobalActionResponse,
   pollControlResponse,
   pollDecisionResponse,
   pollUiOperationResponse,
   readBoundedInspection,
   readControlState,
+  readGlobalRecommendationProjection,
   readProjectInbox,
+  readProjectParticipationSidecars,
+  readTuiHostHealth,
   readUiProjection,
+  submitGlobalActionRequest,
   submitControlRequest,
   submitDecisionRequest,
   submitUiOperationRequest,
@@ -27,6 +33,10 @@ import {
   UI_CAPABILITIES,
   UI_CONTROL_CENTER_SETTINGS_ANCHORS,
   UI_DASHBOARD_BLOCKER_DESTINATIONS,
+  GLOBAL_BRIDGE_SCHEMA_VERSION,
+  GLOBAL_CAPABILITIES,
+  GLOBAL_OPERATION_PROTOCOL_VERSION,
+  GLOBAL_PROJECTION_VERSION,
   UI_OPERATION_PROTOCOL_VERSION,
   UI_PROJECTION_VERSION,
 } from "./self-evolve-ui-protocol.js";
@@ -34,6 +44,8 @@ import {
 const DEFAULT_POLL_MS = 250;
 const MIN_POLL_MS = 25;
 const MAX_POLL_MS = 5_000;
+const DEFAULT_SERVER_RESPONSE_MS = 5_000;
+const MAX_SERVER_RESPONSE_MS = 30_000;
 const MAX_PENDING_RESPONSES = 32;
 const MAX_COMPLETED_RESPONSES = 4;
 const MAX_RESIDENT_DETAILS = 2;
@@ -45,7 +57,15 @@ const CLIENT_OFFER = Object.freeze({
   operationProtocolVersions: Object.freeze([UI_OPERATION_PROTOCOL_VERSION]),
   capabilities: UI_CAPABILITIES,
 });
-const runtimes = new Map();
+const GLOBAL_CLIENT_OFFER = Object.freeze({
+  bridgeSchemaVersions: Object.freeze([GLOBAL_BRIDGE_SCHEMA_VERSION]),
+  projectionVersions: Object.freeze([GLOBAL_PROJECTION_VERSION]),
+  operationProtocolVersions: Object.freeze([GLOBAL_OPERATION_PROTOCOL_VERSION]),
+  capabilities: GLOBAL_CAPABILITIES,
+});
+const projectRuntimes = new Map();
+const globalRuntimes = new Map();
+const terminalStateRoots = new Set();
 const WATCHER_STATUS = Object.freeze({
   active: "Filesystem watcher active",
   polling: "Polling fallback active",
@@ -56,7 +76,14 @@ const BREAKER_STATUS = Object.freeze({
 });
 
 function errorReason(error) {
-  return (error instanceof Error ? error.message : String(error)).slice(0, 240);
+  return boundedDisplayText(error instanceof Error ? error.message : String(error), 240);
+}
+
+function boundedDisplayText(value, max) {
+  const source = String(value);
+  if (source.length <= max) return source;
+  const marker = " [truncated]";
+  return `${source.slice(0, Math.max(0, max - marker.length))}${marker}`;
 }
 
 function hasNativeOperationProtocol(projection) {
@@ -66,6 +93,21 @@ function hasNativeOperationProtocol(projection) {
 
 function hasCurrentNativeAuthority(snapshot) {
   return snapshot?.phase === "ready" && hasNativeOperationProtocol(snapshot.projection);
+}
+
+function hasCurrentActingProjectAuthority(snapshot) {
+  return hasCurrentNativeAuthority(snapshot)
+    && snapshot.controlState?.projectFingerprint === snapshot.projectFingerprint
+    && snapshot.controlState?.stateRootIdentity === snapshot.stateRootIdentity
+    && snapshot.tuiHealth?.projectFingerprint === snapshot.projectFingerprint
+    && snapshot.tuiHealth?.stateRootIdentity === snapshot.stateRootIdentity
+    && snapshot.tuiHealth.expiresAt > snapshot.updatedAt;
+}
+
+function hasCurrentGlobalAuthority(globalSnapshot) {
+  return globalSnapshot?.phase === "ready"
+    && globalSnapshot.projection?.mode === "native"
+    && globalSnapshot.projection?.operationProtocolVersion === GLOBAL_OPERATION_PROTOCOL_VERSION;
 }
 
 function projectionWithoutAuthority(projection) {
@@ -96,6 +138,11 @@ function projectionWithoutFailedClosedAuthority(projection) {
   });
 }
 
+function globalProjectionWithoutAuthority(projection) {
+  if (!projection) return null;
+  return deepFreeze({ ...projection, grants: Object.freeze([]) });
+}
+
 function activityEmptyState(dashboard, activity, filter, enhancedError) {
   if (!dashboard) {
     return enhancedError
@@ -109,6 +156,11 @@ function activityEmptyState(dashboard, activity, filter, enhancedError) {
 function boundedPollMs(value) {
   if (!Number.isFinite(value)) return DEFAULT_POLL_MS;
   return Math.min(MAX_POLL_MS, Math.max(MIN_POLL_MS, Math.trunc(value)));
+}
+
+function boundedServerResponseMs(value) {
+  if (!Number.isFinite(value)) return DEFAULT_SERVER_RESPONSE_MS;
+  return Math.min(MAX_SERVER_RESPONSE_MS, Math.max(1, Math.trunc(value)));
 }
 
 function cleanRuntimeMetadata(value = {}) {
@@ -162,8 +214,10 @@ export function resolveTuiStoreContext(api, config = {}, {
   return deepFreeze({
     ...context,
     key: `${context.stateRootIdentity}:${context.projectFingerprint}`,
+    globalKey: context.stateRootIdentity,
     pathIdentity: pathIdentityFor(context),
     watchPath: path.join(stateRoot, "self-evolve", "bridge", identity.projectFingerprint),
+    globalWatchPath: path.join(stateRoot, "self-evolve", "bridge", "global"),
   });
 }
 
@@ -211,6 +265,15 @@ function defaultClient(context, now) {
     readInspection() {
       return readBoundedInspection(context.stateRoot, context.projectFingerprint);
     },
+    readParticipation() {
+      return readProjectParticipationSidecars(context.stateRoot, context.projectFingerprint, { now: now() });
+    },
+    readTuiHealth() {
+      return readTuiHostHealth(context.stateRoot, context.projectFingerprint, {
+        now: now(),
+        stateRootIdentity: context.stateRootIdentity,
+      });
+    },
     submitDecision(request) {
       return submitDecisionRequest(context.stateRoot, request);
     },
@@ -219,6 +282,30 @@ function defaultClient(context, now) {
     },
     submitOperation(request) {
       return submitUiOperationRequest(context.stateRoot, request);
+    },
+  };
+}
+
+function defaultGlobalClient(context, now) {
+  return {
+    read() {
+      return readGlobalRecommendationProjection(context.stateRoot, {
+        now: now(),
+        clientOffer: GLOBAL_CLIENT_OFFER,
+      });
+    },
+    reconcilePending(entries) {
+      const pending = [];
+      const responses = [];
+      for (const entry of entries) {
+        const response = pollGlobalActionResponse(context.stateRoot, entry.request, { now: now() });
+        if (response) responses.push({ ...entry, response });
+        else pending.push(entry);
+      }
+      return { pending, responses };
+    },
+    submitAction(request) {
+      return submitGlobalActionRequest(context.stateRoot, request);
     },
   };
 }
@@ -237,7 +324,7 @@ function cleanPending(value) {
   if (typeof value.requestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(value.requestId)) {
     throw new TypeError("invalid-pending-request-id");
   }
-  if (!["control", "decision", "operation"].includes(value.kind)) throw new TypeError("invalid-pending-request-kind");
+  if (!["control", "decision", "operation", "global-action"].includes(value.kind)) throw new TypeError("invalid-pending-request-kind");
   if (typeof value.subject !== "string" || value.subject.length < 1 || value.subject.length > 256) {
     throw new TypeError("invalid-pending-request-subject");
   }
@@ -251,7 +338,7 @@ function cleanPending(value) {
     subject: value.subject,
     submittedAt: Number.isSafeInteger(value.submittedAt) && value.submittedAt >= 0 ? value.submittedAt : 0,
     expiresAt: value.expiresAt,
-    ...(value.kind === "operation" && value.request ? { request: value.request } : {}),
+    ...(["operation", "global-action"].includes(value.kind) && value.request ? { request: value.request } : {}),
   });
 }
 
@@ -266,6 +353,7 @@ function controlSubject(action, payload = {}) {
 
 function operationSubject(action, payload = {}, proposalId) {
   if (proposalId) return proposalId;
+  if (action === "set-repo-mode") return "repository-mode";
   if (["export-data", "purge-scope"].includes(action)) return `scope:${String(payload.scope ?? "project")}`;
   return "project";
 }
@@ -293,7 +381,6 @@ function plural(count, singular, pluralValue = `${singular}s`) {
 const MODE_LABELS = Object.freeze({
   manual: "On demand",
   auto: "Recommend automatically",
-  yolo: "Apply automatically (YOLO)",
 });
 const ACTIVE_OPERATION_STATES = new Set(["queued", "running", "accepted-terminal"]);
 const REVIEW_ATTENTION_STATES = new Set(["pending", "approved"]);
@@ -314,6 +401,31 @@ function dashboardFor(snapshot) {
 
 function dashboardErrorFor(snapshot) {
   return snapshot?.dashboardError ?? snapshot?.projection?.dashboardError ?? null;
+}
+
+function globalProjectionFor(snapshot) {
+  return snapshot?.global?.projection ?? null;
+}
+
+function usesGlobalRecommendations(snapshot) {
+  return Boolean(globalProjectionFor(snapshot)?.index);
+}
+
+function reviewsFor(snapshot) {
+  const global = globalProjectionFor(snapshot)?.index?.recommendations;
+  if (Array.isArray(global)) {
+    return global.map((entry) => ({
+      proposalId: entry.recommendationId,
+      recommendationId: entry.recommendationId,
+      recommendationVersion: entry.recommendationVersion,
+      detailHash: entry.detailHash,
+      state: entry.state,
+      target: `${entry.target.label}/SKILL.md`,
+      attention: entry.state === "failed-closed" ? "critical" : entry.state === "pending" ? "warning" : "normal",
+      updatedAt: entry.dates.updatedAt,
+    }));
+  }
+  return snapshot?.projection?.index?.reviews ?? [];
 }
 
 function destination(section, extra = {}) {
@@ -342,21 +454,92 @@ function operationalResult(value) {
   });
 }
 
-function appliedAttention(snapshot, reviews, dashboard) {
-  const acknowledged = new Set(snapshot?.acknowledgedAuditIds ?? []);
-  const activityByProposal = new Map();
-  for (const entry of dashboard?.activity ?? []) {
-    if (entry.outcome !== "applied" || !entry.proposalId) continue;
-    const entries = activityByProposal.get(entry.proposalId) ?? [];
-    entries.push(entry);
-    activityByProposal.set(entry.proposalId, entries);
+function acknowledgementMatches(snapshot, binding) {
+  if (!binding) return false;
+  return (snapshot?.acknowledgedOutcomes ?? []).some((entry) =>
+    entry.scope === binding.scope
+      && entry.subjectId === binding.subjectId
+      && entry.version === binding.version
+      && entry.auditIds.length === binding.auditIds.length
+      && entry.auditIds.every((auditId, index) => auditId === binding.auditIds[index]));
+}
+
+function projectAcknowledgementBinding(review, detail, dashboard) {
+  const version = detail?.detailHash ?? review?.detailHash;
+  if (review?.state !== "applied" || !version) return null;
+  const auditIds = (detail?.audit ?? [])
+    .filter((entry) => entry.kind === "apply")
+    .map((entry) => entry.id)
+    .sort();
+  if (!auditIds.length) {
+    auditIds.push(...(dashboard?.activity ?? [])
+      .filter((entry) => entry.outcome === "applied" && entry.proposalId === review.proposalId)
+      .map((entry) => entry.id)
+      .sort());
   }
+  if (!auditIds.length) return null;
+  return {
+    scope: "project",
+    subjectId: review.proposalId,
+    version,
+    auditIds,
+  };
+}
+
+function globalAcknowledgementBinding(review, detail) {
+  const recommendationVersion = detail?.recommendationVersion ?? review?.recommendationVersion;
+  const detailHash = detail?.detailHash ?? review?.detailHash;
+  if (review?.state !== "applied" || !recommendationVersion || !detailHash) return null;
+  return {
+    scope: "global",
+    subjectId: review.recommendationId,
+    version: `${recommendationVersion}:${detailHash}`,
+    auditIds: [detailHash],
+  };
+}
+
+function currentAcknowledgementBinding(snapshot, subjectId) {
+  if (usesGlobalRecommendations(snapshot)) {
+    const projection = globalProjectionFor(snapshot);
+    const review = projection?.index?.recommendations?.find((entry) => entry.recommendationId === subjectId);
+    const detail = projection?.details?.find((entry) => entry.recommendationId === subjectId);
+    return globalAcknowledgementBinding(review, detail);
+  }
+  const review = snapshot?.projection?.index?.reviews?.find((entry) => entry.proposalId === subjectId);
+  const detail = snapshot?.projection?.details?.find((entry) => entry.proposalId === subjectId);
+  return projectAcknowledgementBinding(review, detail, dashboardFor(snapshot));
+}
+
+function globalFailureAcknowledgementBinding(entry) {
+  if (!entry?.requestId || entry.response?.ok !== false) return null;
+  return {
+    scope: "global",
+    subjectId: entry.requestId,
+    version: entry.response.responseHash
+      ?? `${entry.response.status ?? "failed"}:${entry.response.processedAt ?? entry.expiresAt}:${entry.requestId}`,
+    auditIds: [entry.requestId],
+  };
+}
+
+function appliedAttention(snapshot, reviews, dashboard) {
+  if (usesGlobalRecommendations(snapshot)) {
+    const details = new Map(globalProjectionFor(snapshot)?.details?.map((detail) => [detail.recommendationId, detail]) ?? []);
+    const applied = reviews
+      .map((review, index) => ({ review, index }))
+      .filter(({ review }) => {
+        if (review.state !== "applied") return false;
+        const binding = globalAcknowledgementBinding(review, details.get(review.recommendationId));
+        return !acknowledgementMatches(snapshot, binding);
+      });
+    return { count: applied.length, selectedIndex: applied[0]?.index ?? 0 };
+  }
+  const details = new Map((snapshot?.projection?.details ?? []).map((detail) => [detail.proposalId, detail]));
   const applied = reviews
     .map((review, index) => ({ review, index }))
     .filter(({ review }) => {
-      if (review.state !== "applied" || acknowledged.has(review.proposalId)) return false;
-      const activities = activityByProposal.get(review.proposalId);
-      return !(activities?.length > 0 && activities.every((entry) => acknowledged.has(entry.id)));
+      if (review.state !== "applied") return false;
+      const binding = projectAcknowledgementBinding(review, details.get(review.proposalId), dashboard);
+      return !acknowledgementMatches(snapshot, binding);
     });
   return { count: applied.length, selectedIndex: applied[0]?.index ?? 0 };
 }
@@ -457,6 +640,21 @@ function resultForAutomation(state, snapshot, dashboard, reviews) {
     },
   };
   const failures = reviews.filter((review) => review.state === "failed-closed");
+  const failedGlobalOperations = (snapshot?.global?.responses ?? []).filter((entry) => {
+    const binding = globalFailureAcknowledgementBinding(entry);
+    return binding && !acknowledgementMatches(snapshot, binding);
+  });
+  if (failedGlobalOperations.length && !["terminal", "corrupt", "emergency-stop", "circuit-breaker"].includes(state)) {
+    return operationalResult({
+      state: "failure",
+      tone: "error",
+      label: "Global operation failed",
+      explanation: `${plural(failedGlobalOperations.length, "failed global operation")} needs acknowledgement.`,
+      destination: destination("activity", { filter: "errors" }),
+      nextAction: "Review and acknowledge the bounded failure.",
+      count: failedGlobalOperations.length,
+    });
+  }
   if (failures.length && !["terminal", "corrupt", "emergency-stop", "circuit-breaker"].includes(state)) {
     return operationalResult({
       state: "failure",
@@ -519,10 +717,13 @@ function resultForAutomation(state, snapshot, dashboard, reviews) {
 }
 
 export function deriveOperationalView(snapshot) {
+  if (snapshot?.phase === "terminal") {
+    return resultForAutomation("terminal", snapshot, dashboardFor(snapshot), reviewsFor(snapshot));
+  }
   const projection = snapshot?.projection;
   const index = projection?.index;
   const dashboard = dashboardFor(snapshot);
-  const reviews = Array.isArray(index?.reviews) ? index.reviews : [];
+  const reviews = reviewsFor(snapshot);
   if (!index) {
     if (snapshot?.phase !== "error") {
       return operationalResult({
@@ -552,7 +753,29 @@ export function deriveOperationalView(snapshot) {
   if (["corrupt", "unavailable"].includes(status.state) || snapshot?.phase === "error") {
     return resultForAutomation("corrupt", snapshot, dashboard, reviews);
   }
-  if (dashboard) return resultForAutomation(dashboard.automation.state, snapshot, dashboard, reviews);
+  if (dashboard) {
+    const result = resultForAutomation(dashboard.automation.state, snapshot, dashboard, reviews);
+    if (["initializing", "limited", "error"].includes(snapshot?.global?.phase)
+        && ["recommendation", "applied"].includes(result.state)) {
+      return operationalResult({
+        ...result,
+        explanation: `${result.explanation} Global actions are limited and read-only until protocols align.`,
+        limited: true,
+      });
+    }
+    if (result.state === "ready" && snapshot?.global?.phase === "limited") {
+      return operationalResult({
+        state: "limited",
+        tone: "warning",
+        label: "Limited global view",
+        explanation: "Current-project analysis is available, but global recommendations require an aligned server and TUI.",
+        destination: destination("home"),
+        nextAction: "Use current-project status read-only until global protocols align.",
+        limited: true,
+      });
+    }
+    return result;
+  }
 
   // An older aligned server still supplies the bounded v1 projection. Preserve
   // high-confidence safety and attention states, but never invent enhanced
@@ -671,15 +894,18 @@ export function validateApprovedSkillFolderInput(value, existing = []) {
 }
 
 function modeModel(globalMode, repositoryMode, effectiveMode) {
+  const normalizedGlobal = globalMode === "yolo" ? "auto" : globalMode;
+  const normalizedRepository = repositoryMode === "yolo" ? "auto" : repositoryMode;
+  const normalizedEffective = effectiveMode === "yolo" ? "auto" : effectiveMode;
   return {
-    global: { value: globalMode ?? null, label: MODE_LABELS[globalMode] ?? "Unavailable" },
+    global: { value: normalizedGlobal ?? null, label: MODE_LABELS[normalizedGlobal] ?? "Unavailable" },
     repository: {
-      value: repositoryMode ?? null,
-      label: repositoryMode === "inherit"
+      value: normalizedRepository ?? null,
+      label: normalizedRepository === "inherit"
         ? "Inherit global default"
-        : MODE_LABELS[repositoryMode] ?? "Unavailable",
+        : MODE_LABELS[normalizedRepository] ?? "Unavailable",
     },
-    effective: { value: effectiveMode ?? null, label: MODE_LABELS[effectiveMode] ?? "Unavailable" },
+    effective: { value: normalizedEffective ?? null, label: MODE_LABELS[normalizedEffective] ?? "Unavailable" },
   };
 }
 
@@ -697,6 +923,7 @@ function safeActivityRow(entry, reviews) {
         ? "Waiting"
         : "Info";
   return {
+    scope: "Current project",
     category: entry.category,
     audience: entry.audience,
     outcome: entry.outcome,
@@ -715,6 +942,71 @@ function safeActivityRow(entry, reviews) {
         ? destination("activity", { filter: "errors" })
         : null,
   };
+}
+
+function globalActivityRows(snapshot) {
+  const projection = globalProjectionFor(snapshot);
+  if (!projection?.index) return [];
+  const reviews = projection.index.recommendations;
+  const reviewById = new Map(reviews.map((review, index) => [review.recommendationId, { review, index }]));
+  const rows = [];
+  for (const entry of snapshot?.global?.pending ?? []) {
+    const matched = reviewById.get(entry.subject);
+    rows.push({
+      scope: "Global",
+      category: "recommendation",
+      audience: "default",
+      outcome: "pending",
+      marker: "Waiting",
+      summary: `${actionLabel(entry.action)} is pending fresh global validation.`,
+      target: matched?.review.target.label.replaceAll("-", " ") ?? null,
+      occurredAt: entry.submittedAt,
+      technical: { category: "global-operation", outcome: "pending", reason: null },
+      destination: matched ? destination("recommendations", { selectedIndex: matched.index }) : null,
+    });
+  }
+  for (const entry of snapshot?.global?.responses ?? []) {
+    const matched = reviewById.get(entry.subject);
+    const ok = entry.response?.ok === true;
+    const failureBinding = globalFailureAcknowledgementBinding(entry);
+    rows.push({
+      scope: "Global",
+      category: ok ? "recommendation" : "error",
+      audience: "default",
+      outcome: ok ? `${entry.action}-accepted` : entry.response?.status ?? "failed",
+      marker: ok ? "Done" : "Error",
+      summary: ok
+        ? `${actionLabel(entry.action)} was accepted for the global recommendation.`
+        : `${actionLabel(entry.action)} did not complete: ${boundedDisplayText(entry.response?.reason ?? "unknown", 160)}.`,
+      target: matched?.review.target.label.replaceAll("-", " ") ?? null,
+      occurredAt: entry.response?.processedAt ?? entry.expiresAt,
+      technical: {
+        category: "global-operation",
+        outcome: ok ? "accepted" : entry.response?.status ?? "failed",
+        reason: entry.response?.reason ?? null,
+      },
+      destination: matched ? destination("recommendations", { selectedIndex: matched.index }) : null,
+      acknowledgementRequestId: failureBinding && !acknowledgementMatches(snapshot, failureBinding)
+        ? entry.requestId
+        : null,
+    });
+  }
+  for (const [index, review] of reviews.entries()) {
+    if (!["applied", "rejected", "rolled-back", "failed-closed"].includes(review.state)) continue;
+    rows.push({
+      scope: "Global",
+      category: review.state === "failed-closed" ? "error" : "recommendation",
+      audience: "default",
+      outcome: review.state,
+      marker: review.state === "failed-closed" ? "Error" : "Done",
+      summary: `Global recommendation is ${review.state.replaceAll("-", " ")}.`,
+      target: review.target.label.replaceAll("-", " "),
+      occurredAt: review.dates.updatedAt,
+      technical: { category: "global-recommendation", outcome: review.state, reason: null },
+      destination: destination("recommendations", { selectedIndex: index }),
+    });
+  }
+  return rows.sort((left, right) => right.occurredAt - left.occurredAt);
 }
 
 function emptyHomeState(snapshot, operational, dashboard) {
@@ -747,7 +1039,7 @@ export function buildHomeModel(snapshot) {
   const dashboard = dashboardFor(snapshot);
   const index = snapshot?.projection?.index;
   const operational = deriveOperationalView(snapshot);
-  const reviews = index?.reviews ?? [];
+  const reviews = reviewsFor(snapshot);
   const settings = dashboard?.settings;
   const firstRun = dashboard?.blockers?.some((blocker) => blocker.code === "first-run") === true;
   const recentActivity = (dashboard?.activity ?? [])
@@ -786,6 +1078,13 @@ export function buildHomeModel(snapshot) {
     emptyState: emptyHomeState(snapshot, operational, dashboard),
     limited: !dashboard,
     enhancedError: dashboardErrorFor(snapshot),
+    globalReadiness: snapshot?.global ? {
+      state: snapshot.global.phase,
+      label: snapshot.global.projection?.label ?? "global-server-offer-unavailable",
+      reason: snapshot.global.error ?? snapshot.global.projection?.reason ?? null,
+      recommendationCount: snapshot.global.projection?.index?.recommendations?.length ?? null,
+      stale: snapshot.global.stale === true,
+    } : null,
     manualFallback: "Run /self-evolve scan in the source session. This OpenCode host cannot safely bind a native scan to the selected session.",
   });
 }
@@ -803,18 +1102,139 @@ export function buildRecommendationsModel(snapshot, {
   selectedIndex = 0,
 } = {}) {
   if (!["needs-review", "applied", "dismissed", "all"].includes(filter)) filter = "needs-review";
+  if (usesGlobalRecommendations(snapshot)) {
+    const projection = globalProjectionFor(snapshot);
+    const reviews = projection.index.recommendations;
+    const details = new Map(projection.details.map((detail) => [detail.recommendationId, detail]));
+    const pending = snapshot?.global?.pending ?? [];
+    const responses = snapshot?.global?.responses ?? [];
+    const projectAuthority = hasCurrentActingProjectAuthority(snapshot);
+    const globalAuthority = hasCurrentGlobalAuthority(snapshot?.global);
+    const queue = reviews
+      .map((review, sourceIndex) => ({ review, sourceIndex }))
+      .filter(({ review }) => recommendationFilterMatch(review, filter))
+      .map(({ review, sourceIndex }) => {
+        const detail = details.get(review.recommendationId);
+        const acknowledgement = globalAcknowledgementBinding(review, detail);
+        return {
+          sourceIndex,
+          state: review.state,
+          target: review.target.label.replaceAll("-", " "),
+          targetKind: review.target.kind,
+          attention: review.state === "failed-closed" ? "critical" : review.state === "pending" ? "warning" : "normal",
+          updatedAt: review.dates.updatedAt,
+          rationale: detail?.rationale ?? "Authoritative global detail is not resident yet.",
+          risk: review.safety.criticPassed && review.safety.validDeterministic ? "Low" : "Review required",
+          evidenceCount: review.support.occurrenceCount,
+          supportTier: review.support.tier,
+          currentProjectContributed: snapshot.participation?.[review.recommendationId] ?? null,
+          acknowledged: acknowledgementMatches(snapshot, acknowledgement),
+          loading: !detail,
+        };
+      });
+    const normalizedSelected = queue.length
+      ? Math.max(0, queue.findIndex((item) => item.sourceIndex === selectedIndex))
+      : -1;
+    const selected = normalizedSelected >= 0 ? queue[normalizedSelected] : null;
+    const sourceReview = selected ? reviews[selected.sourceIndex] : null;
+    const detail = sourceReview ? details.get(sourceReview.recommendationId) ?? null : null;
+    const grants = sourceReview && detail && projectAuthority && globalAuthority
+      ? projection.grants.filter((grant) => grant.recommendationId === sourceReview.recommendationId
+        && detail.availableActions.includes(grant.action))
+      : [];
+    const acknowledgement = globalAcknowledgementBinding(sourceReview, detail);
+    const actions = [...grants.map((grant) => ({
+      action: grant.action,
+      label: actionLabel(grant.action),
+      pending: pending.some((entry) => pendingMatches(entry, grant.action, grant.recommendationId)),
+      feedbackSupported: false,
+    })), ...(acknowledgement && !acknowledgementMatches(snapshot, acknowledgement) ? [{
+      action: "acknowledge-audit",
+      label: "Acknowledge",
+      pending: false,
+      feedbackSupported: false,
+    }] : [])];
+    const recommendationResponses = sourceReview
+      ? responses.filter((entry) => entry.subject === sourceReview.recommendationId)
+      : [];
+    return deepFreeze({
+      phase: snapshot?.global?.phase ?? "unavailable",
+      protocolLabel: projection.label,
+      filter,
+      filters: ["needs-review", "applied", "dismissed", "all"],
+      rejectionFeedbackOptions: REJECTION_FEEDBACK_OPTIONS,
+      queue,
+      selectedIndex: normalizedSelected,
+      selected: selected ? {
+        ...selected,
+        summary: detail ? {
+          rationale: detail.rationale,
+          state: detail.priorState,
+          target: detail.target.label.replaceAll("-", " "),
+          targetKind: detail.target.kind,
+          support: detail.support,
+          dates: {
+            synthesizedAt: sourceReview.dates.synthesizedAt,
+            updatedAt: sourceReview.dates.updatedAt,
+            firstSeenDay: detail.support.firstSeenDay,
+            lastSeenDay: detail.support.lastSeenDay,
+          },
+          currentProjectContributed: snapshot.participation?.[sourceReview.recommendationId] ?? null,
+          criticScoreBasisPoints: detail.safety.criticScoreBasisPoints,
+          criticPassed: detail.safety.criticPassed,
+          validDeterministic: detail.safety.validDeterministic,
+          generality: {
+            available: true,
+            passed: detail.generality.passed,
+            basis: detail.generality.basis,
+            status: detail.generality.passed ? "Passed" : "Not passed",
+            explanation: "Passed the deterministic generality gate.",
+          },
+          tokenImpact: {
+            available: false,
+            explanation: "The current global projection does not expose a bounded token estimate.",
+          },
+          rollback: {
+            eligible: detail.availableActions.includes("undo"),
+            reason: detail.availableActions.includes("undo") ? null : "not-currently-granted",
+          },
+        } : null,
+        diff: detail?.diff ?? null,
+        evidence: detail?.evidenceSummary.map((entry) => ({
+          kind: entry.kind,
+          summary: `${entry.count} ${entry.kind.replaceAll("-", " ")}`,
+          occurredAt: sourceReview.dates.updatedAt,
+          redacted: false,
+        })) ?? [],
+        audit: recommendationResponses.map((entry) => ({
+          kind: entry.action,
+          summary: entry.response?.ok === true
+            ? `${actionLabel(entry.action)} accepted by the server.`
+            : `${actionLabel(entry.action)} did not complete: ${boundedDisplayText(entry.response?.reason ?? "unknown", 160)}`,
+          timestamp: entry.response?.processedAt ?? entry.expiresAt,
+        })),
+        actions,
+      } : null,
+      emptyState: queue.length
+        ? null
+        : filter === "needs-review" ? "Nothing needs review"
+          : filter === "applied" ? "Nothing applied"
+            : filter === "dismissed" ? "Nothing dismissed" : "No recommendations yet",
+      limited: snapshot?.global?.phase !== "ready",
+      enhancedError: snapshot?.global?.error ?? null,
+    });
+  }
   const projection = snapshot?.projection;
-  const native = hasCurrentNativeAuthority(snapshot);
+  const native = hasCurrentNativeAuthority(snapshot)
+    && (!snapshot?.global || hasCurrentGlobalAuthority(snapshot.global));
   const reviews = projection?.index?.reviews ?? [];
-  const acknowledged = new Set(snapshot?.acknowledgedAuditIds ?? []);
   const dashboard = dashboardFor(snapshot);
   const queue = reviews
     .map((review, sourceIndex) => ({ review, sourceIndex }))
     .filter(({ review }) => recommendationFilterMatch(review, filter))
     .map(({ review, sourceIndex }) => {
       const detail = (projection?.details ?? []).find((item) => item.proposalId === review.proposalId);
-      const matchingAudits = (dashboard?.activity ?? []).filter((entry) =>
-        entry.outcome === "applied" && entry.proposalId === review.proposalId);
+      const acknowledgement = projectAcknowledgementBinding(review, detail, dashboard);
       return {
         sourceIndex,
         state: review.state,
@@ -824,10 +1244,7 @@ export function buildRecommendationsModel(snapshot, {
         rationale: detail?.summary?.rationale ?? "Enhanced recommendation detail is not loaded.",
         risk: detail?.summary?.risk ?? null,
         evidenceCount: detail?.evidence?.length ?? null,
-        acknowledged: review.state === "applied" && (
-          acknowledged.has(review.proposalId)
-          || (matchingAudits.length > 0 && matchingAudits.every((entry) => acknowledged.has(entry.id)))
-        ),
+        acknowledged: acknowledgementMatches(snapshot, acknowledgement),
         loading: !detail,
       };
     });
@@ -867,7 +1284,15 @@ export function buildRecommendationsModel(snapshot, {
         criticPassed: detail.summary.criticPassed,
         validDeterministic: detail.summary.validDeterministic,
         injectionFlagged: detail.summary.injectionFlagged,
-        tokenImpact: detail.summary.tokenImpact,
+        tokenImpact: {
+          available: true,
+          ...detail.summary.tokenImpact,
+        },
+        generality: {
+          available: false,
+          status: "Unavailable",
+          explanation: "The current project projection does not expose a separate generality result. Deterministic validation is reported separately.",
+        },
         eligibility: detail.summary.eligibility,
         rollback: {
           eligible: detail.summary.rollback.eligible,
@@ -920,13 +1345,15 @@ function activityFilterMatch(entry, filter) {
 export function buildActivityModel(snapshot, { filter = "all" } = {}) {
   if (!ACTIVITY_FILTERS.includes(filter)) filter = "all";
   const dashboard = dashboardFor(snapshot);
-  const reviews = snapshot?.projection?.index?.reviews ?? [];
+  const reviews = reviewsFor(snapshot);
   const status = snapshot?.projection?.index?.status;
   const lastProjectedError = (dashboard?.activity ?? [])
     .find((entry) => entry.category === "error" || ERROR_OUTCOMES.has(entry.outcome));
-  const activity = (dashboard?.activity ?? [])
+  const projectActivity = (dashboard?.activity ?? [])
     .filter((entry) => activityFilterMatch(entry, filter))
     .map((entry) => safeActivityRow(entry, reviews));
+  const activity = [...globalActivityRows(snapshot).filter((entry) => activityFilterMatch(entry, filter)), ...projectActivity]
+    .sort((left, right) => right.occurredAt - left.occurredAt);
   return deepFreeze({
     phase: snapshot?.phase ?? "unavailable",
     filter,
@@ -937,6 +1364,8 @@ export function buildActivityModel(snapshot, { filter = "all" } = {}) {
       refreshedAt: snapshot?.updatedAt ?? null,
       coreProjection: snapshot?.projection?.index ? "available" : "unavailable",
       enhancedProjection: dashboard ? "available" : dashboardErrorFor(snapshot) ? "invalid" : "unavailable",
+      globalProjection: snapshot?.global?.phase ?? "unavailable",
+      globalProtocolLabel: snapshot?.global?.projection?.label ?? null,
       runtime: snapshot?.runtime ?? {
         hostVersion: "unknown",
         hostVersionSource: "Unavailable",
@@ -978,33 +1407,18 @@ export function buildSettingsModel(snapshot) {
   const settings = dashboard?.settings;
   const consent = settings?.consent ?? control?.consent ?? null;
   const supportedControls = dashboard?.supportedControls ?? [];
-  const approvedSkillFolders = control?.allowedSkillRoots ?? [];
+  const globalRootPolicy = settings?.globalRootPolicy ?? control?.globalRootPolicy ?? null;
+  const approvedSkillFolders = globalRootPolicy?.roots?.map((root) => root.canonicalPath) ?? [];
+  const collectionSuggestions = globalRootPolicy ? [] : control?.allowedSkillRoots ?? [];
   const hasControl = control !== undefined && control !== null;
-  const yoloBlockers = [];
-  const addYoloBlocker = (value) => {
-    if (!yoloBlockers.includes(value)) yoloBlockers.push(value);
-  };
-  if (!dashboard) addYoloBlocker("An aligned server is required to verify automatic-apply prerequisites.");
-  if (approvedSkillFolders.length === 0) addYoloBlocker("Approve at least one canonical skill folder.");
-  if (consent?.passiveCalls !== true) addYoloBlocker("Allow Background AI analysis.");
-  if (consent?.durableObservations !== true) addYoloBlocker("Allow Saved structured patterns.");
-  if (dashboard?.rollout?.ready !== true) addYoloBlocker("Complete the configured automatic-apply rollout evidence.");
-  if (settings?.paused) addYoloBlocker("Resume automatic work.");
-  if (settings?.killSwitchActive) addYoloBlocker("Turn off Emergency stop after review.");
-  if (settings?.repositoryExcluded) addYoloBlocker("Include this project.");
-  if (status?.circuitBreakerOpen) addYoloBlocker("Reset the open circuit breaker.");
-  for (const blocker of dashboard?.blockers ?? []) {
-    if (["unsupported-host", "state-root", "provider", "corrupt-state"].includes(blocker.code)) {
-      addYoloBlocker(blocker.summary);
-    }
-  }
   const usage = dashboard?.usage ?? null;
   const budgets = index?.budgets ?? null;
   const inspection = snapshot?.inspection;
   const observationCount = Array.isArray(inspection?.observations)
     ? inspection.observations.length + (inspection?.overflow?.observations ?? 0)
     : null;
-  const native = hasCurrentNativeAuthority(snapshot);
+  const globalAligned = !snapshot?.global || hasCurrentGlobalAuthority(snapshot.global);
+  const native = hasCurrentNativeAuthority(snapshot) && globalAligned;
   const effectiveActions = native ? (snapshot?.projection?.effectiveIndexActions ?? []) : [];
   const granted = new Set(effectiveActions.map((action) => action.action));
   return deepFreeze({
@@ -1037,25 +1451,17 @@ export function buildSettingsModel(snapshot) {
         available: true,
         blockers: [],
       },
-      {
-        value: "yolo",
-        label: MODE_LABELS.yolo,
-        description: "May analyze, recommend, and apply only after every prerequisite passes.",
-        providerUse: "Uses the same consent-gated background provider path as automatic recommendations.",
-        savedData: "Uses only the separately consented bounded evidence and operational records.",
-        writeAuthority: "Restricted to approved skill folders, deterministic validation, critic approval, budgets, rollout history, and fresh server authority.",
-        prerequisites: yoloBlockers.length ? "Unavailable until the listed blockers are resolved." : "All currently projected prerequisites pass.",
-        available: yoloBlockers.length === 0,
-        blockers: yoloBlockers,
-      },
     ],
     controls: {
       globalMode: native && hasControl,
       repositoryMode: native && supportedControls.includes("set-repo-mode")
-        && dashboard?.capabilities?.includes("control-repo-mode-v1") === true,
+        && dashboard?.capabilities?.includes("project-analysis-control-v1") === true
+        && granted.has("set-repo-mode"),
       consent: native && hasControl,
       projectInclusion: native && hasControl,
-      approvedSkillFolders: native && hasControl,
+      approvedSkillFolders: native
+        && dashboard?.capabilities?.includes("operation-global-root-policy-v1") === true
+        && granted.has("replace-global-root-policy"),
       pause: granted.has("set-paused"),
       emergencyStop: granted.has("set-kill-switch"),
     },
@@ -1092,19 +1498,37 @@ export function buildSettingsModel(snapshot) {
       },
       {
         key: "crossRepoAggregation",
-        label: "Cross-project learning (not active yet)",
+        label: globalProjectionFor(snapshot)?.capabilities?.includes("project-participation-v1")
+          ? "Cross-project learning"
+          : "Cross-project learning (limited)",
         scope: "Global",
         enabled: consent.crossRepoAggregation,
-        description: "No production path currently consumes cross-project claims; keep this disabled until that capability is active.",
-        dependency: "Not active in this release. An enabled stored value can still be turned off.",
-        canEnable: false,
+        description: "Publishes identity-free bounded support so recurring patterns can qualify across independent projects.",
+        dependency: "Requires Sanitized evidence excerpts and an aligned global participation protocol.",
+        canEnable: consent.sanitizedExcerpts === true
+          && globalProjectionFor(snapshot)?.capabilities?.includes("project-participation-v1") === true,
       },
     ] : [],
-    approvedSkillFolderCount: settings?.approvedSkillFolderCount ?? control?.allowedSkillRoots?.length ?? null,
+    approvedSkillFolderCount: globalRootPolicy?.roots?.length ?? null,
     approvedSkillFolders,
-    approvedSkillFolderRequiresNonEmpty:
-      settings?.globalMode === "yolo" || settings?.repositoryMode === "yolo",
-    approvedSkillFolderWarning: "Raw paths are shown only in this high-risk editor. Every replacement is revalidated by the server and requires the exact phrase UPDATE ALLOWLIST.",
+    globalRoots: globalRootPolicy?.roots?.map((root) => ({
+      canonicalPath: root.canonicalPath,
+      canUpdate: root.canUpdate,
+      canCreate: root.canCreate,
+      primaryCreationRoot: globalRootPolicy.creationRootPath !== undefined
+        ? root.canonicalPath === globalRootPolicy.creationRootPath
+        : root.rootId === globalRootPolicy.creationRootId,
+    })) ?? [],
+    creationRootConfigured: globalRootPolicy !== null
+      && (globalRootPolicy.creationRootPath !== undefined
+        ? globalRootPolicy.creationRootPath !== null
+        : globalRootPolicy.creationRootId !== null),
+    globalRootPolicyConfirmation: settings?.globalRootPolicyConfirmation ?? null,
+    collectionSuggestions,
+    approvedSkillFolderRequiresNonEmpty: false,
+    approvedSkillFolderWarning: globalRootPolicy
+      ? "Changes replace the complete authoritative root policy after fresh canonical-path, symlink, project-root, and catalog validation."
+      : "No authoritative global roots are configured. Add at least one exact canonical collection root; legacy suggestions below grant no write authority.",
     usage,
     retention: dashboard?.retention ?? null,
     rollout: dashboard?.rollout ?? null,
@@ -1173,10 +1597,17 @@ export function buildSettingsModel(snapshot) {
       configured: `${dashboard.rollout.minSynthesesObserved} required; ${(dashboard.rollout.minSuccessRateBasisPoints / 100).toFixed(2)}% minimum success`,
       ready: dashboard.rollout.ready,
     } : null,
+    globalProtocol: snapshot?.global ? {
+      state: snapshot.global.phase,
+      label: snapshot.global.projection?.label ?? "global-server-offer-unavailable",
+      reason: snapshot.global.error ?? snapshot.global.projection?.reason ?? null,
+      authoritative: hasCurrentGlobalAuthority(snapshot.global),
+    } : null,
+    globalRootPolicy,
     maintenance: {
       scopes: [
         { value: "observations", label: "Observations", explanation: "Bounded structured patterns for this project." },
-        { value: "proposals", label: "Recommendations", explanation: "Recommendation and decision records for this project." },
+        { value: "global-recommendations", label: "Recommendations", explanation: "Global recommendation, support, decision, and rollback records." },
         { value: "project", label: "This project", explanation: "All Self-evolve state in this project partition." },
         { value: "all", label: "Everything", explanation: "All Self-evolve project partitions and authority. Restart is required." },
       ],
@@ -1203,6 +1634,31 @@ export function buildSettingsModel(snapshot) {
   });
 }
 
+export function deriveSidebarModeControl(snapshot) {
+  const settings = buildSettingsModel(snapshot);
+  const pending = (snapshot?.pending ?? []).some((entry) =>
+    entry.action === "set-repo-mode" && entry.subject === "repository-mode");
+  const current = settings.mode.effective.value === "auto" ? "auto" : "manual";
+  const available = snapshot?.phase === "ready"
+    && settings.controls.repositoryMode
+    && settings.globalProtocol?.authoritative !== false
+    && !pending;
+  return deepFreeze({
+    current,
+    pending,
+    available,
+    status: pending ? "pending"
+      : snapshot?.phase === "initializing" ? "starting"
+        : snapshot?.phase === "error" ? "stale"
+          : settings.globalProtocol?.authoritative === false ? "limited"
+            : settings.controls.repositoryMode ? "ready" : "unsupported",
+    options: Object.freeze([
+      Object.freeze({ value: "manual", label: "On demand", confirmationRequired: false }),
+      Object.freeze({ value: "auto", label: "Auto", confirmationRequired: true }),
+    ]),
+  });
+}
+
 export const CONTROL_CENTER_SECTIONS = Object.freeze([
   "home", "recommendations", "activity", "settings",
 ]);
@@ -1220,7 +1676,7 @@ export function parseControlCenterDestination(params, snapshot) {
   const result = { section: params.section };
   if (params.section === "recommendations" && params.recommendation !== undefined) {
     if (typeof params.recommendation !== "string") return deepFreeze({ section: "home" });
-    const reviews = snapshot?.projection?.index?.reviews ?? [];
+    const reviews = reviewsFor(snapshot);
     const selectedIndex = reviews.findIndex((review) => review.state !== "critic-pending"
       && review.proposalId === params.recommendation);
     if (selectedIndex < 0) return deepFreeze({ section: "home" });
@@ -1240,7 +1696,7 @@ export function parseControlCenterDestination(params, snapshot) {
 export function controlCenterRouteParams(value, snapshot) {
   const section = CONTROL_CENTER_SECTIONS.includes(value?.section) ? value.section : "home";
   if (section === "recommendations") {
-    const reviews = snapshot?.projection?.index?.reviews ?? [];
+    const reviews = reviewsFor(snapshot);
     const selectedIndex = Number.isSafeInteger(value?.selectedIndex) ? value.selectedIndex : 0;
     const review = reviews[selectedIndex];
     const recommendation = review?.state === "critic-pending" ? null : review?.proposalId;
@@ -1262,7 +1718,7 @@ export function buildControlCenterModel(snapshot, options = {}) {
     phase: snapshot?.phase ?? "unavailable",
     recovery: snapshot?.phase === "error" ? {
       stale: snapshot?.stale === true,
-      diagnostic: String(snapshot?.error ?? "projection-refresh-failed").slice(0, 240),
+      diagnostic: boundedDisplayText(snapshot?.error ?? "projection-refresh-failed", 240),
       canRetry: true,
     } : null,
     operational: deriveOperationalView(snapshot),
@@ -1291,10 +1747,11 @@ class ProjectRuntime {
     this.now = dependencies.now;
     this.acknowledgements = dependencies.acknowledgements;
     this.runtimeMetadata = dependencies.runtimeMetadata;
-    this.acknowledgedAuditIds = Object.freeze(
+    this.acknowledgedOutcomes = Object.freeze(
       this.acknowledgements?.read?.(context.projectFingerprint) ?? [],
     );
     this.pollMs = dependencies.pollMs;
+    this.serverResponseMs = dependencies.serverResponseMs;
     this.pending = new Map();
     this.pendingReservations = new Set();
     this.responses = [];
@@ -1304,6 +1761,7 @@ class ProjectRuntime {
     this.refreshInFlight = false;
     this.refreshWaiters = [];
     this.disposed = false;
+    this.terminal = false;
     this.epoch = 1;
     this.watcher = null;
     this.watcherError = null;
@@ -1311,22 +1769,29 @@ class ProjectRuntime {
     this.snapshot = this.makeSnapshot({
       phase: "initializing",
       projection: null,
+      participation: null,
       controlState: null,
       latestExport: null,
       inspection: null,
       error: null,
     });
-    this.armWatcher();
-    this.pollTimer = this.setInterval(() => this.poll(), this.pollMs);
-    this.pollTimer?.unref?.();
+    this.pollTimer = null;
+    if (terminalStateRoots.has(context.stateRootIdentity)) this.terminalize();
+    else {
+      this.armWatcher();
+      this.pollTimer = this.setInterval(() => this.poll(), this.pollMs);
+      this.pollTimer?.unref?.();
+    }
   }
 
   makeSnapshot({
     phase,
     projection,
+    participation = this.snapshot?.participation ?? null,
     controlState = this.snapshot?.controlState ?? null,
     latestExport = this.snapshot?.latestExport ?? null,
     inspection = this.snapshot?.inspection ?? null,
+    tuiHealth = this.snapshot?.tuiHealth ?? null,
     error,
   }) {
     const safeProjection = projectionWithoutFailedClosedAuthority(projection);
@@ -1337,18 +1802,20 @@ class ProjectRuntime {
       projectFingerprint: this.context.projectFingerprint,
       worktreePath: this.context.worktreePath,
       projection: safeProjection,
+      participation,
       dashboard: safeProjection?.dashboard ?? null,
       dashboardError: safeProjection?.dashboardError ?? null,
       controlState,
       latestExport,
       inspection,
+      tuiHealth,
       runtime: {
         ...this.runtimeMetadata,
         projectionVersion: safeProjection?.index?.projectionVersion ?? null,
         dashboardVersion: safeProjection?.dashboard?.dashboardVersion ?? null,
         projectionMode: safeProjection?.mode ?? null,
       },
-      acknowledgedAuditIds: this.acknowledgedAuditIds,
+      acknowledgedOutcomes: this.acknowledgedOutcomes,
       pending: [...this.pending.values()],
       responses: this.responses,
       watcher: this.watcher ? "active" : "polling",
@@ -1363,17 +1830,29 @@ class ProjectRuntime {
   attach(owner) {
     if (this.disposed) throw new Error("tui-store-runtime-disposed");
     this.owners.add(owner);
-    owner.receive(this.snapshot);
+    if (this.terminal) {
+      owner.receiveProject(this.snapshot);
+      return;
+    }
+    owner.receiveProject(this.makeSnapshot({
+      phase: "initializing",
+      projection: null,
+      participation: null,
+      controlState: null,
+      latestExport: null,
+      inspection: null,
+      error: null,
+    }));
     this.requestRefresh("owner-attached");
   }
 
   detach(owner) {
     this.owners.delete(owner);
-    if (this.owners.size === 0) this.dispose();
+    if (this.owners.size === 0 && !this.terminal) this.dispose();
   }
 
   notify() {
-    for (const owner of [...this.owners]) owner.receive(this.snapshot);
+    for (const owner of [...this.owners]) owner.receiveProject(this.snapshot);
   }
 
   armWatcher() {
@@ -1405,7 +1884,7 @@ class ProjectRuntime {
   }
 
   poll() {
-    if (this.disposed) return;
+    if (this.disposed || this.terminal) return;
     for (const owner of [...this.owners]) owner.reconcileContext();
     if (this.disposed) return;
     this.armWatcher();
@@ -1413,21 +1892,23 @@ class ProjectRuntime {
   }
 
   selectDetails(ids) {
+    if (this.terminal) return Promise.resolve(this.snapshot);
     const clean = cleanDetailIds(ids);
     if (clean.join("\n") === this.detailProposalIds.join("\n")) return Promise.resolve(this.snapshot);
     this.detailProposalIds = clean;
     return this.requestRefresh("detail-selection");
   }
 
-  acknowledgeAudits(ids) {
-    if (this.disposed) return this.snapshot;
-    this.acknowledgedAuditIds = Object.freeze(
-      this.acknowledgements?.acknowledge?.(this.context.projectFingerprint, ids)
-        ?? this.acknowledgedAuditIds,
+  acknowledgeBinding(binding) {
+    if (this.disposed || this.terminal) return this.snapshot;
+    this.acknowledgedOutcomes = Object.freeze(
+      this.acknowledgements?.acknowledge?.(this.context.projectFingerprint, binding)
+        ?? this.acknowledgedOutcomes,
     );
     this.snapshot = this.makeSnapshot({
       phase: this.snapshot.phase,
       projection: this.snapshot.projection,
+      participation: this.snapshot.participation,
       controlState: this.snapshot.controlState,
       latestExport: this.snapshot.latestExport,
       inspection: this.snapshot.inspection,
@@ -1438,6 +1919,7 @@ class ProjectRuntime {
   }
 
   async trackPending(value) {
+    if (this.terminal) throw new Error("restart-required-after-purge-all");
     const clean = cleanPending(value);
     if (!this.pending.has(clean.requestId) && this.pending.size >= MAX_PENDING_RESPONSES) {
       throw new Error("pending-request-capacity-exhausted");
@@ -1446,6 +1928,7 @@ class ProjectRuntime {
     this.snapshot = this.makeSnapshot({
       phase: this.snapshot.phase,
       projection: this.snapshot.projection,
+      participation: this.snapshot.participation,
       controlState: this.snapshot.controlState,
       latestExport: this.snapshot.latestExport,
       inspection: this.snapshot.inspection,
@@ -1478,6 +1961,7 @@ class ProjectRuntime {
   }
 
   async submitDecision({ proposalId, newState, feedback }) {
+    if (this.terminal) throw new Error("restart-required-after-purge-all");
     await this.requestRefresh("decision-preflight");
     if (!hasCurrentNativeAuthority(this.snapshot)) {
       throw new Error("native-operation-protocol-unavailable");
@@ -1523,6 +2007,8 @@ class ProjectRuntime {
   }
 
   async submitControl(action, payload) {
+    if (this.terminal) throw new Error("restart-required-after-purge-all");
+    if (action === "set-repo-mode") return this.submitOperation(action, payload);
     await this.requestRefresh("control-preflight");
     if (!hasCurrentNativeAuthority(this.snapshot)) {
       throw new Error("native-operation-protocol-unavailable");
@@ -1530,11 +2016,6 @@ class ProjectRuntime {
     const authoritySnapshot = this.snapshot;
     const subject = controlSubject(action, payload);
     this.assertNotPending(action, subject);
-    if (action === "set-repo-mode"
-        && (this.snapshot.dashboard?.capabilities?.includes("control-repo-mode-v1") !== true
-          || this.snapshot.dashboard?.supportedControls?.includes("set-repo-mode") !== true)) {
-      throw new Error("repository-mode-control-not-supported");
-    }
     const reservation = this.reservePending(action, subject);
     try {
       const controlState = await this.client.readControlState();
@@ -1558,6 +2039,7 @@ class ProjectRuntime {
   }
 
   async submitOperation(action, payload = {}, { proposalId } = {}) {
+    if (this.terminal) throw new Error("restart-required-after-purge-all");
     await this.requestRefresh("operation-preflight");
     const projection = this.snapshot.projection;
     if (!hasCurrentNativeAuthority(this.snapshot)) throw new Error("native-operation-protocol-unavailable");
@@ -1565,6 +2047,11 @@ class ProjectRuntime {
     const subject = operationSubject(action, payload, proposalId);
     this.assertNotPending(action, subject);
     if (!projection.index) throw new Error("operation-projection-unavailable");
+    if (action === "set-repo-mode"
+        && (this.snapshot.dashboard?.capabilities?.includes("project-analysis-control-v1") !== true
+          || this.snapshot.dashboard?.supportedControls?.includes("set-repo-mode") !== true)) {
+      throw new Error("repository-mode-control-not-supported");
+    }
     const detail = proposalId
       ? projection.details?.find((item) => item.proposalId === proposalId)
       : null;
@@ -1594,10 +2081,24 @@ class ProjectRuntime {
             appliedHash: detail?.summary?.rollback?.appliedHash,
             decisionVersion: proposal.decisionVersion + 1,
           };
-      } else if (action === "set-kill-switch" || action === "set-paused") {
+      } else if (action === "set-kill-switch" || action === "set-paused" || action === "set-repo-mode") {
         const controlState = await this.client.readControlState();
         if (!controlState) throw new Error("control-state-unavailable");
         wirePayload = { ...payload, settingsVersion: controlState.settingsVersion };
+      } else if (action === "replace-global-root-policy") {
+        const dashboardSettings = this.snapshot.dashboard?.settings;
+        if (!dashboardSettings?.globalSettingsVersion || !dashboardSettings.globalRootPolicyConfirmation) {
+          throw new Error("global-root-policy-authority-unavailable");
+        }
+        if (payload.confirmation !== dashboardSettings.globalRootPolicyConfirmation) {
+          throw new Error("invalid-global-root-policy-confirmation");
+        }
+        wirePayload = {
+          roots: payload.roots,
+          creationRootPath: payload.creationRootPath,
+          confirmation: payload.confirmation,
+          settingsVersion: dashboardSettings.globalSettingsVersion,
+        };
       }
       this.assertAuthoritySnapshot(authoritySnapshot, action, proposalId);
       const timestamp = this.now();
@@ -1638,7 +2139,7 @@ class ProjectRuntime {
   }
 
   requestRefresh() {
-    if (this.disposed) return Promise.resolve(this.snapshot);
+    if (this.disposed || this.terminal) return Promise.resolve(this.snapshot);
     const minimumReadCount = this.readCount + (this.refreshInFlight ? 2 : 1);
     this.refreshQueued = true;
     const completion = new Promise((resolve) => this.refreshWaiters.push({ minimumReadCount, resolve }));
@@ -1653,6 +2154,20 @@ class ProjectRuntime {
     const settled = this.refreshWaiters.filter((waiter) => force || waiter.minimumReadCount <= this.readCount);
     this.refreshWaiters = this.refreshWaiters.filter((waiter) => !force && waiter.minimumReadCount > this.readCount);
     for (const waiter of settled) waiter.resolve(this.snapshot);
+  }
+
+  async boundedServerCall(operation) {
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(operation),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("server-not-responding")), this.serverResponseMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async runRefresh() {
@@ -1692,21 +2207,32 @@ class ProjectRuntime {
         }
         pending = stillPending;
       }
-      const projection = await this.client.read({
-        detailProposalIds: this.detailProposalIds,
-        context: this.context,
-      });
-      const controlState = typeof this.client.readControlState === "function"
-        ? await this.client.readControlState()
-        : null;
-      const latestExport = typeof this.client.readLatestExport === "function"
-        ? await this.client.readLatestExport()
-        : null;
-      const inspection = typeof this.client.readInspection === "function"
-        ? await this.client.readInspection()
-        : null;
+      const terminalResponses = responses.filter((entry) => entry.kind === "operation"
+        && entry.action === "purge-all"
+        && entry.response?.ok === true
+        && entry.response?.status === "accepted-terminal");
+      if (terminalResponses.length) {
+        terminalizeTuiStateRoot(this.context.stateRootIdentity, this, terminalResponses);
+        return;
+      }
+      const [projection, controlState, latestExport, inspection, participation, tuiHealth] = await Promise.all([
+        this.boundedServerCall(() => this.client.read({
+          detailProposalIds: this.detailProposalIds,
+          context: this.context,
+        })),
+        typeof this.client.readControlState === "function"
+          ? this.boundedServerCall(() => this.client.readControlState()) : null,
+        typeof this.client.readLatestExport === "function"
+          ? this.boundedServerCall(() => this.client.readLatestExport()) : null,
+        typeof this.client.readInspection === "function"
+          ? this.boundedServerCall(() => this.client.readInspection()) : null,
+        typeof this.client.readParticipation === "function"
+          ? this.boundedServerCall(() => this.client.readParticipation()) : null,
+        typeof this.client.readTuiHealth === "function"
+          ? this.boundedServerCall(() => this.client.readTuiHealth()) : null,
+      ]);
       if (this.disposed || lease !== this.epoch) return;
-      this.acknowledgedAuditIds = Object.freeze(
+      this.acknowledgedOutcomes = Object.freeze(
         this.acknowledgements?.read?.(this.context.projectFingerprint) ?? [],
       );
       this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
@@ -1715,9 +2241,11 @@ class ProjectRuntime {
       this.snapshot = this.makeSnapshot({
         phase: projection?.mode === "legacy" ? "legacy" : "ready",
         projection,
+        participation,
         controlState,
         latestExport,
         inspection,
+        tuiHealth,
         error: null,
       });
       this.notify();
@@ -1729,6 +2257,7 @@ class ProjectRuntime {
       this.snapshot = this.makeSnapshot({
         phase: "error",
         projection: projectionWithoutAuthority(this.snapshot.projection),
+        participation: this.snapshot.participation,
         controlState: null,
         latestExport: this.snapshot.latestExport,
         inspection: this.snapshot.inspection,
@@ -1747,6 +2276,34 @@ class ProjectRuntime {
     }
   }
 
+  terminalize(responses = []) {
+    if (this.disposed || this.terminal) return;
+    this.terminal = true;
+    this.epoch += 1;
+    this.refreshQueued = false;
+    this.refreshScheduled = false;
+    this.refreshInFlight = false;
+    this.pending.clear();
+    this.pendingReservations.clear();
+    this.closeWatcher();
+    this.clearInterval(this.pollTimer);
+    this.pollTimer = null;
+    this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
+    this.readCount += 1;
+    this.snapshot = this.makeSnapshot({
+      phase: "terminal",
+      projection: projectionWithoutAuthority(this.snapshot.projection),
+      participation: this.snapshot.participation,
+      controlState: null,
+      latestExport: this.snapshot.latestExport,
+      inspection: this.snapshot.inspection,
+      tuiHealth: null,
+      error: "restart-required-after-purge-all",
+    });
+    this.notify();
+    this.settleWaiters(true);
+  }
+
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
@@ -1757,10 +2314,11 @@ class ProjectRuntime {
     this.closeWatcher();
     this.clearInterval(this.pollTimer);
     this.pollTimer = null;
-    runtimes.delete(this.registryKey);
+    projectRuntimes.delete(this.registryKey);
     this.snapshot = this.makeSnapshot({
       phase: "disposed",
       projection: this.snapshot.projection,
+      participation: this.snapshot.participation,
       controlState: this.snapshot.controlState,
       latestExport: this.snapshot.latestExport,
       inspection: this.snapshot.inspection,
@@ -1770,12 +2328,408 @@ class ProjectRuntime {
   }
 }
 
-function runtimeFor(context, dependencies) {
-  const current = runtimes.get(context.key);
+class GlobalRuntime {
+  constructor(context, dependencies) {
+    this.context = context;
+    this.registryKey = context.globalKey;
+    this.owners = new Set();
+    this.client = dependencies.globalClientFactory?.(context) ?? defaultGlobalClient(context, dependencies.now);
+    this.watch = dependencies.watch;
+    this.setInterval = dependencies.setInterval;
+    this.clearInterval = dependencies.clearInterval;
+    this.queueMicrotask = dependencies.queueMicrotask;
+    this.now = dependencies.now;
+    this.pollMs = dependencies.pollMs;
+    this.serverResponseMs = dependencies.serverResponseMs;
+    this.pending = new Map();
+    this.pendingReservations = new Set();
+    this.responses = [];
+    this.selectedRecommendationIds = Object.freeze([]);
+    this.refreshQueued = false;
+    this.refreshScheduled = false;
+    this.refreshInFlight = false;
+    this.refreshWaiters = [];
+    this.disposed = false;
+    this.terminal = false;
+    this.epoch = 1;
+    this.watcher = null;
+    this.watcherError = null;
+    this.readCount = 0;
+    this.snapshot = this.makeSnapshot({ phase: "initializing", projection: null, error: null });
+    this.pollTimer = null;
+    if (terminalStateRoots.has(context.stateRootIdentity)) this.terminalize();
+    else {
+      this.armWatcher();
+      this.pollTimer = this.setInterval(() => this.poll(), this.pollMs);
+      this.pollTimer?.unref?.();
+    }
+  }
+
+  makeSnapshot({ phase, projection, error }) {
+    return deepFreeze({
+      phase,
+      key: this.context.globalKey,
+      stateRootIdentity: this.context.stateRootIdentity,
+      projection,
+      selectedRecommendationIds: this.selectedRecommendationIds,
+      pending: [...this.pending.values()],
+      responses: this.responses,
+      watcher: this.watcher ? "active" : "polling",
+      watcherError: this.watcherError,
+      revision: this.readCount,
+      updatedAt: this.now(),
+      error,
+      stale: phase === "error" && projection !== null,
+    });
+  }
+
+  attach(owner) {
+    if (this.disposed) throw new Error("tui-global-store-runtime-disposed");
+    this.owners.add(owner);
+    owner.receiveGlobal(this.snapshot);
+    this.requestRefresh("owner-attached");
+  }
+
+  detach(owner) {
+    this.owners.delete(owner);
+    if (this.owners.size === 0 && !this.terminal) this.dispose();
+  }
+
+  notify() {
+    for (const owner of [...this.owners]) owner.receiveGlobal(this.snapshot);
+  }
+
+  armWatcher() {
+    if (this.disposed || this.watcher) return;
+    try {
+      const watcher = this.watch(this.context.globalWatchPath, { persistent: false }, (eventType) => {
+        if (this.disposed) return;
+        if (eventType === "rename") this.closeWatcher("watched-global-directory-replaced");
+        this.requestRefresh(`global-watch:${eventType ?? "change"}`);
+      });
+      this.watcher = watcher;
+      this.watcherError = null;
+      watcher?.on?.("error", (error) => {
+        if (this.disposed || watcher !== this.watcher) return;
+        this.closeWatcher(errorReason(error));
+        this.requestRefresh("global-watch:error");
+      });
+    } catch (error) {
+      this.watcher = null;
+      this.watcherError = errorReason(error);
+    }
+  }
+
+  closeWatcher(reason = null) {
+    const watcher = this.watcher;
+    this.watcher = null;
+    if (reason) this.watcherError = reason;
+    try { watcher?.close?.(); } catch {}
+  }
+
+  poll() {
+    if (this.disposed || this.terminal) return;
+    this.armWatcher();
+    this.requestRefresh("global-poll");
+  }
+
+  selectDetails(ids) {
+    if (this.terminal) return Promise.resolve(this.snapshot);
+    const clean = cleanDetailIds(ids);
+    if (clean.join("\n") === this.selectedRecommendationIds.join("\n")) return Promise.resolve(this.snapshot);
+    this.selectedRecommendationIds = clean;
+    this.snapshot = this.makeSnapshot({
+      phase: this.snapshot.phase,
+      projection: this.snapshot.projection,
+      error: this.snapshot.error,
+    });
+    this.notify();
+    return this.requestRefresh("global-detail-selection");
+  }
+
+  assertNotPending(action, subject) {
+    const key = JSON.stringify([action, subject]);
+    if (this.pendingReservations.has(key)
+        || [...this.pending.values()].some((entry) => pendingMatches(entry, action, subject))) {
+      throw new Error("matching-request-already-pending");
+    }
+  }
+
+  reservePending(action, subject) {
+    this.assertNotPending(action, subject);
+    if (this.pending.size + this.pendingReservations.size >= MAX_PENDING_RESPONSES) {
+      throw new Error("pending-request-capacity-exhausted");
+    }
+    const key = JSON.stringify([action, subject]);
+    this.pendingReservations.add(key);
+    return key;
+  }
+
+  async trackPending(value) {
+    if (this.terminal) throw new Error("restart-required-after-purge-all");
+    const clean = cleanPending(value);
+    if (clean.kind !== "global-action") throw new TypeError("global-pending-request-kind-required");
+    if (!this.pending.has(clean.requestId) && this.pending.size >= MAX_PENDING_RESPONSES) {
+      throw new Error("pending-request-capacity-exhausted");
+    }
+    this.pending.set(clean.requestId, clean);
+    this.snapshot = this.makeSnapshot({
+      phase: this.snapshot.phase,
+      projection: this.snapshot.projection,
+      error: this.snapshot.error,
+    });
+    this.notify();
+    return this.requestRefresh("global-pending-request");
+  }
+
+  async submitAction(action, recommendationId, owner) {
+    if (this.terminal) throw new Error("restart-required-after-purge-all");
+    if (!["apply", "reject", "undo"].includes(action)) throw new TypeError("unsupported-global-action");
+    await this.requestRefresh("global-action-preflight");
+    if (!hasCurrentGlobalAuthority(this.snapshot)) throw new Error("global-operation-protocol-unavailable");
+    const authoritySnapshot = this.snapshot;
+    this.assertNotPending(action, recommendationId);
+    const grant = this.snapshot.projection.grants.find((value) =>
+      value.action === action && value.recommendationId === recommendationId);
+    if (!grant) throw new Error("global-action-not-authorized");
+    const reservation = this.reservePending(action, recommendationId);
+    try {
+      const acting = await owner.prepareGlobalAction(this.context.stateRootIdentity);
+      if (this.disposed || this.snapshot !== authoritySnapshot || !hasCurrentGlobalAuthority(this.snapshot)) {
+        throw new Error("global-authority-changed-before-submit");
+      }
+      if (!this.snapshot.projection.grants.some((value) => value.grantHash === grant.grantHash)) {
+        throw new Error("global-authority-changed-before-submit");
+      }
+      const timestamp = this.now();
+      const request = createGlobalActionRequest({
+        grant,
+        actingProjectFingerprint: acting.projectFingerprint,
+        actingHealth: acting.health,
+        timestamp,
+      });
+      await this.client.submitAction(request);
+      await this.trackPending({
+        requestId: request.requestId,
+        kind: "global-action",
+        action,
+        subject: recommendationId,
+        submittedAt: timestamp,
+        expiresAt: request.expiresAt,
+        request,
+      });
+      return request;
+    } finally {
+      this.pendingReservations.delete(reservation);
+    }
+  }
+
+  requestRefresh() {
+    if (this.disposed || this.terminal) return Promise.resolve(this.snapshot);
+    const minimumReadCount = this.readCount + (this.refreshInFlight ? 2 : 1);
+    this.refreshQueued = true;
+    const completion = new Promise((resolve) => this.refreshWaiters.push({ minimumReadCount, resolve }));
+    if (!this.refreshInFlight && !this.refreshScheduled) {
+      this.refreshScheduled = true;
+      this.queueMicrotask(() => void this.runRefresh());
+    }
+    return completion;
+  }
+
+  settleWaiters(force = false) {
+    const settled = this.refreshWaiters.filter((waiter) => force || waiter.minimumReadCount <= this.readCount);
+    this.refreshWaiters = this.refreshWaiters.filter((waiter) => !force && waiter.minimumReadCount > this.readCount);
+    for (const waiter of settled) waiter.resolve(this.snapshot);
+  }
+
+  async boundedServerCall(operation) {
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(operation),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("global-server-not-responding")), this.serverResponseMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async runRefresh() {
+    this.refreshScheduled = false;
+    if (this.disposed || this.refreshInFlight || !this.refreshQueued) return;
+    this.refreshQueued = false;
+    this.refreshInFlight = true;
+    const lease = this.epoch;
+    let pending = [...this.pending.values()];
+    let responses = [];
+    try {
+      if (pending.length) {
+        const reconciled = typeof this.client.reconcilePending === "function"
+          ? await this.client.reconcilePending(pending, { context: this.context })
+          : { pending, responses: [] };
+        const pendingById = new Map((reconciled?.pending ?? pending).map(cleanPending)
+          .map((entry) => [entry.requestId, entry]));
+        const responseById = new Map((reconciled?.responses ?? [])
+          .map((entry) => [entry.requestId, entry]));
+        const timestamp = this.now();
+        const stillPending = [];
+        for (const entry of pending) {
+          const response = responseById.get(entry.requestId);
+          const timely = response && Number.isSafeInteger(response.response?.processedAt)
+            && response.response.processedAt < entry.expiresAt;
+          if (response && (timestamp < entry.expiresAt || timely)) responses.push(response);
+          else if (timestamp >= entry.expiresAt) responses.push(expiredPendingResponse(entry));
+          else stillPending.push(pendingById.get(entry.requestId) ?? entry);
+        }
+        pending = stillPending;
+      }
+      const projection = await this.boundedServerCall(() => this.client.read({
+        detailRecommendationIds: this.selectedRecommendationIds,
+        context: this.context,
+      }));
+      if (this.disposed || lease !== this.epoch) return;
+      this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
+      this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
+      this.readCount += 1;
+      this.snapshot = this.makeSnapshot({
+        phase: projection?.mode === "native" ? "ready" : "limited",
+        projection,
+        error: null,
+      });
+      this.notify();
+    } catch (error) {
+      if (this.disposed || lease !== this.epoch) return;
+      this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
+      this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
+      this.readCount += 1;
+      this.snapshot = this.makeSnapshot({
+        phase: "error",
+        projection: globalProjectionWithoutAuthority(this.snapshot.projection),
+        error: errorReason(error),
+      });
+      this.notify();
+    } finally {
+      if (!this.disposed && lease === this.epoch) {
+        this.refreshInFlight = false;
+        this.settleWaiters();
+        if (this.refreshQueued && !this.refreshScheduled) {
+          this.refreshScheduled = true;
+          this.queueMicrotask(() => void this.runRefresh());
+        }
+      }
+    }
+  }
+
+  terminalize() {
+    if (this.disposed || this.terminal) return;
+    this.terminal = true;
+    this.epoch += 1;
+    this.refreshQueued = false;
+    this.refreshScheduled = false;
+    this.refreshInFlight = false;
+    this.pending.clear();
+    this.pendingReservations.clear();
+    this.closeWatcher();
+    this.clearInterval(this.pollTimer);
+    this.pollTimer = null;
+    this.readCount += 1;
+    this.snapshot = this.makeSnapshot({
+      phase: "terminal",
+      projection: globalProjectionWithoutAuthority(this.snapshot.projection),
+      error: "restart-required-after-purge-all",
+    });
+    this.notify();
+    this.settleWaiters(true);
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.epoch += 1;
+    this.pendingReservations.clear();
+    this.closeWatcher();
+    this.clearInterval(this.pollTimer);
+    this.pollTimer = null;
+    globalRuntimes.delete(this.registryKey);
+    this.snapshot = this.makeSnapshot({
+      phase: "disposed",
+      projection: this.snapshot.projection,
+      error: null,
+    });
+    this.settleWaiters(true);
+  }
+}
+
+function terminalizeTuiStateRoot(stateRootIdentity, sourceRuntime, responses) {
+  terminalStateRoots.add(stateRootIdentity);
+  for (const runtime of projectRuntimes.values()) {
+    if (runtime.context.stateRootIdentity === stateRootIdentity) {
+      runtime.terminalize(runtime === sourceRuntime ? responses : []);
+    }
+  }
+  globalRuntimes.get(stateRootIdentity)?.terminalize();
+}
+
+function projectRuntimeFor(context, dependencies) {
+  const current = projectRuntimes.get(context.key);
   if (current) return current;
   const runtime = new ProjectRuntime(context, dependencies);
-  runtimes.set(context.key, runtime);
+  projectRuntimes.set(context.key, runtime);
   return runtime;
+}
+
+function globalRuntimeFor(context, dependencies) {
+  const current = globalRuntimes.get(context.globalKey);
+  if (current) return current;
+  const runtime = new GlobalRuntime(context, dependencies);
+  globalRuntimes.set(context.globalKey, runtime);
+  return runtime;
+}
+
+function validatedParticipation(projectSnapshot, globalSnapshot) {
+  const participation = projectSnapshot?.participation;
+  const index = globalSnapshot?.projection?.index;
+  if (!participation || !index
+      || participation.stateRootIdentity !== index.stateRootIdentity
+      || participation.generation !== index.generation
+      || participation.indexHash !== index.indexHash
+      || !Array.isArray(participation.entries)) return deepFreeze({});
+  const indexed = new Map(index.recommendations.map((entry) => [entry.recommendationId, entry.supportSetHash]));
+  const result = {};
+  for (const entry of participation.entries) {
+    if (!entry || indexed.get(entry.recommendationId) !== entry.supportSetHash
+        || typeof entry.currentProjectContributed !== "boolean") continue;
+    result[entry.recommendationId] = entry.currentProjectContributed;
+  }
+  return deepFreeze(result);
+}
+
+function composeStoreSnapshot(projectSnapshot, globalSnapshot, runtimeMetadata) {
+  if (!projectSnapshot) {
+    return deepFreeze({
+      phase: "initializing",
+      projection: null,
+      dashboard: null,
+      dashboardError: null,
+      acknowledgedOutcomes: Object.freeze([]),
+      runtime: runtimeMetadata,
+      pending: globalSnapshot?.pending ?? Object.freeze([]),
+      responses: globalSnapshot?.responses ?? Object.freeze([]),
+      global: globalSnapshot ?? null,
+      participation: deepFreeze({}),
+      error: null,
+    });
+  }
+  return deepFreeze({
+    ...projectSnapshot,
+    pending: [...(globalSnapshot?.pending ?? []), ...(projectSnapshot.pending ?? [])],
+    responses: [...(globalSnapshot?.responses ?? []), ...(projectSnapshot.responses ?? [])],
+    global: globalSnapshot ?? null,
+    participation: validatedParticipation(projectSnapshot, globalSnapshot),
+    updatedAt: Math.max(projectSnapshot.updatedAt ?? 0, globalSnapshot?.updatedAt ?? 0),
+  });
 }
 
 class StoreOwner {
@@ -1787,21 +2741,14 @@ class StoreOwner {
     this.unsubscribers = [];
     this.disposed = false;
     this.runtime = null;
+    this.globalRuntime = null;
     this.context = null;
     this.startupStateRootEnabled = true;
     this.startupWorktreeEnabled = true;
     this.lifecycleUnsubscribe = null;
-    this.localSnapshot = deepFreeze({
-      phase: "initializing",
-      projection: null,
-      dashboard: null,
-      dashboardError: null,
-      acknowledgedAuditIds: Object.freeze([]),
-      runtime: dependencies.runtimeMetadata,
-      pending: Object.freeze([]),
-      responses: Object.freeze([]),
-      error: null,
-    });
+    this.projectSnapshot = null;
+    this.globalSnapshot = null;
+    this.localSnapshot = composeStoreSnapshot(null, null, dependencies.runtimeMetadata);
     this.reconcileContext();
     for (const eventType of PATH_EVENTS) {
       const unsubscribe = api.event?.on?.(eventType, () => {
@@ -1816,13 +2763,28 @@ class StoreOwner {
     if (typeof lifecycleUnsubscribe === "function") this.lifecycleUnsubscribe = lifecycleUnsubscribe;
   }
 
-  receive(snapshot) {
-    if (this.disposed) return;
-    this.localSnapshot = snapshot;
+  updateSnapshot() {
+    this.localSnapshot = composeStoreSnapshot(
+      this.projectSnapshot,
+      this.globalSnapshot,
+      this.dependencies.runtimeMetadata,
+    );
     for (const listener of [...this.listeners]) {
       if (this.disposed) break;
-      try { listener(snapshot); } catch {}
+      try { listener(this.localSnapshot); } catch {}
     }
+  }
+
+  receiveProject(snapshot) {
+    if (this.disposed) return;
+    this.projectSnapshot = snapshot;
+    this.updateSnapshot();
+  }
+
+  receiveGlobal(snapshot) {
+    if (this.disposed) return;
+    this.globalSnapshot = snapshot;
+    this.updateSnapshot();
   }
 
   reconcileContext() {
@@ -1837,9 +2799,11 @@ class StoreOwner {
       });
     } catch (error) {
       this.runtime?.detach(this);
+      this.globalRuntime?.detach(this);
       this.runtime = null;
+      this.globalRuntime = null;
       this.context = null;
-      this.receive(deepFreeze({
+      this.projectSnapshot = deepFreeze({
         phase: "error",
         projection: null,
         dashboard: null,
@@ -1847,19 +2811,28 @@ class StoreOwner {
         controlState: null,
         latestExport: null,
         inspection: null,
-        acknowledgedAuditIds: Object.freeze([]),
+        acknowledgedOutcomes: Object.freeze([]),
         runtime: this.dependencies.runtimeMetadata,
         pending: Object.freeze([]),
         responses: Object.freeze([]),
         error: errorReason(error),
-      }));
+      });
+      this.globalSnapshot = null;
+      this.updateSnapshot();
       return true;
     }
     if (this.context?.key === context.key && this.context.pathIdentity === context.pathIdentity) return false;
     this.runtime?.detach(this);
+    if (this.context?.globalKey !== context.globalKey) {
+      this.globalRuntime?.detach(this);
+      this.globalRuntime = null;
+      this.globalSnapshot = null;
+    }
     this.context = context;
-    this.runtime = runtimeFor(context, this.dependencies);
+    this.runtime = projectRuntimeFor(context, this.dependencies);
+    this.globalRuntime ??= globalRuntimeFor(context, this.dependencies);
     this.runtime.attach(this);
+    if (!this.globalRuntime.owners.has(this)) this.globalRuntime.attach(this);
     return true;
   }
 
@@ -1877,12 +2850,18 @@ class StoreOwner {
 
   refresh() {
     this.reconcileContext();
-    return this.runtime?.requestRefresh("owner-refresh") ?? Promise.resolve(this.localSnapshot);
+    return Promise.all([
+      this.runtime?.requestRefresh("owner-refresh"),
+      this.globalRuntime?.requestRefresh("owner-refresh"),
+    ]).then(() => this.localSnapshot);
   }
 
   selectDetails(ids) {
     this.reconcileContext();
-    return this.runtime?.selectDetails(ids) ?? Promise.resolve(this.localSnapshot);
+    if (this.globalSnapshot?.projection?.index) {
+      return this.globalRuntime?.selectDetails(ids).then(() => this.localSnapshot) ?? Promise.resolve(this.localSnapshot);
+    }
+    return this.runtime?.selectDetails(ids).then(() => this.localSnapshot) ?? Promise.resolve(this.localSnapshot);
   }
 
   trackPending(value) {
@@ -1890,15 +2869,44 @@ class StoreOwner {
     return this.runtime?.trackPending(value) ?? Promise.resolve(this.localSnapshot);
   }
 
-  acknowledgeAudits(ids) {
+  trackGlobalPending(value) {
     this.reconcileContext();
-    return this.runtime?.acknowledgeAudits(ids) ?? this.localSnapshot;
+    return this.globalRuntime?.trackPending(value).then(() => this.localSnapshot) ?? Promise.resolve(this.localSnapshot);
+  }
+
+  acknowledgeOutcome(subjectId) {
+    this.reconcileContext();
+    const binding = currentAcknowledgementBinding(this.localSnapshot, subjectId);
+    return binding && this.runtime
+      ? this.runtime.acknowledgeBinding(binding)
+      : this.localSnapshot;
+  }
+
+  acknowledgeGlobalFailure(requestId) {
+    this.reconcileContext();
+    const entry = this.localSnapshot?.global?.responses?.find((response) => response.requestId === requestId);
+    const binding = globalFailureAcknowledgementBinding(entry);
+    return binding && this.runtime
+      ? this.runtime.acknowledgeBinding(binding)
+      : this.localSnapshot;
   }
 
   submitDecision(value) {
     this.reconcileContext();
     if (!this.runtime) return Promise.reject(new Error("tui-store-unavailable"));
+    if (this.globalSnapshot?.projection?.index?.recommendations
+      ?.some((entry) => entry.recommendationId === value.proposalId)) {
+      const action = value.newState === "approved" ? "apply" : value.newState === "rejected" ? "reject" : null;
+      if (!action) return Promise.reject(new Error("unsupported-global-action"));
+      return this.globalRuntime.submitAction(action, value.proposalId, this);
+    }
     return this.runtime.submitDecision(value);
+  }
+
+  submitRecommendationAction(recommendationId, action) {
+    this.reconcileContext();
+    if (!this.globalRuntime) return Promise.reject(new Error("tui-global-store-unavailable"));
+    return this.globalRuntime.submitAction(action, recommendationId, this);
   }
 
   submitControl(action, payload) {
@@ -1910,7 +2918,29 @@ class StoreOwner {
   submitOperation(action, payload, options) {
     this.reconcileContext();
     if (!this.runtime) return Promise.reject(new Error("tui-store-unavailable"));
+    if (action === "rollback-proposal" && options?.proposalId
+        && this.globalSnapshot?.projection?.index?.recommendations
+          ?.some((entry) => entry.recommendationId === options.proposalId)) {
+      return this.globalRuntime.submitAction("undo", options.proposalId, this);
+    }
     return this.runtime.submitOperation(action, payload, options);
+  }
+
+  async prepareGlobalAction(expectedStateRootIdentity) {
+    this.reconcileContext();
+    const runtime = this.runtime;
+    if (!runtime || !this.context || this.context.stateRootIdentity !== expectedStateRootIdentity) {
+      throw new Error("acting-project-unavailable");
+    }
+    await runtime.requestRefresh("global-action-acting-project-preflight");
+    if (this.runtime !== runtime || !hasCurrentActingProjectAuthority(runtime.snapshot)
+        || this.globalSnapshot?.phase !== "ready") {
+      throw new Error("acting-project-authority-unavailable");
+    }
+    return deepFreeze({
+      projectFingerprint: this.context.projectFingerprint,
+      health: runtime.snapshot.tuiHealth,
+    });
   }
 
   dispose() {
@@ -1925,7 +2955,9 @@ class StoreOwner {
     }
     this.listeners.clear();
     this.runtime?.detach(this);
+    this.globalRuntime?.detach(this);
     this.runtime = null;
+    this.globalRuntime = null;
     this.context = null;
   }
 }
@@ -1934,6 +2966,7 @@ export function acquireProjectTuiStore({
   api,
   config = {},
   clientFactory,
+  globalClientFactory,
   watch = watchDirectory,
   now = Date.now,
   setInterval: setIntervalFn = setInterval,
@@ -1942,6 +2975,7 @@ export function acquireProjectTuiStore({
   acknowledgementStore,
   runtimeMetadata,
   pollMs = config.storePollMs,
+  serverResponseMs = config.serverTimeoutMs,
 } = {}) {
   if (!api || typeof api !== "object") throw new TypeError("tui-api-required");
   if (typeof watch !== "function" || typeof now !== "function"
@@ -1951,6 +2985,7 @@ export function acquireProjectTuiStore({
   }
   return new StoreOwner(api, config, {
     clientFactory,
+    globalClientFactory,
     watch,
     now,
     setInterval: setIntervalFn,
@@ -1959,14 +2994,21 @@ export function acquireProjectTuiStore({
     acknowledgements: acknowledgementStore,
     runtimeMetadata: cleanRuntimeMetadata(runtimeMetadata),
     pollMs: boundedPollMs(pollMs),
+    serverResponseMs: boundedServerResponseMs(serverResponseMs),
   });
 }
 
 export const __testTuiStore = Object.freeze({
   clientOffer: CLIENT_OFFER,
-  registrySize: () => runtimes.size,
+  globalClientOffer: GLOBAL_CLIENT_OFFER,
+  registrySize: () => projectRuntimes.size,
+  projectRegistrySize: () => projectRuntimes.size,
+  globalRegistrySize: () => globalRuntimes.size,
   reset() {
-    for (const runtime of [...runtimes.values()]) runtime.dispose();
-    runtimes.clear();
+    for (const runtime of [...projectRuntimes.values()]) runtime.dispose();
+    for (const runtime of [...globalRuntimes.values()]) runtime.dispose();
+    projectRuntimes.clear();
+    globalRuntimes.clear();
+    terminalStateRoots.clear();
   },
 });

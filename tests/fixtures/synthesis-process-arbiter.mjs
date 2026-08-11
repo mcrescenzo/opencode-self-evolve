@@ -70,6 +70,7 @@ function context(output) {
         create: async () => ({ data: { id: "hidden-process-arbiter" } }),
         prompt: async () => ({ data: { info: { structured_output: output } } }),
         abort: async () => ({ data: {} }),
+        delete: async () => ({ data: {} }),
       },
     },
   };
@@ -82,15 +83,12 @@ async function attempt(suffix) {
     action: "no-op",
     targetLogicalName: skill.logicalName,
     proposedContent: content,
-    proposedContentHash: hash(content),
     evidenceMapping: [{ claim: "Keep the current behavior.", observationIds: [evidence.observations[0].id] }],
     expectedBehavior: "Current behavior remains unchanged.",
     counterExamples: [],
     overlap: [],
     riskNotes: "No change.",
     evaluationScenarios: ["The current behavior remains available."],
-    sizeDeltaBytes: 0,
-    approxTokenDelta: 0,
   };
   return runSynthesis({
     ctx: context(output),

@@ -292,12 +292,15 @@ test("live fixture uses the production target and renderer-level operator input"
   }
 });
 
-test("the mixed-version witness stays pinned to the strict Release A 0.2.1 contract", async () => {
+test("the v0.3 state generation ships with the strict Release A 0.2.1 bridge contract", async () => {
   const [schemas, bridge] = await Promise.all([
     fs.readFile(new URL("../self-evolve-schemas.js", import.meta.url), "utf8"),
     fs.readFile(new URL("../self-evolve-bridge.js", import.meta.url), "utf8"),
   ]);
-  assert.match(schemas, /export const SCHEMA_VERSION = "0\.2\.2";/u);
+  // The durable state generation cut over to 0.3.0 while the bridge wire
+  // contract stays frozen at Release A and still accepts its v0.2 inputs.
+  assert.match(schemas, /export const SCHEMA_VERSION = "0\.3\.0";/u);
+  assert.match(schemas, /SUPPORTED_SCHEMA_VERSIONS = Object\.freeze\(\["0\.2\.0", "0\.2\.1", "0\.2\.2", SCHEMA_VERSION\]\)/u);
   assert.match(bridge, /export const BRIDGE_SCHEMA_VERSION = "0\.2\.1";/u);
   assert.match(bridge, /value !== BRIDGE_SCHEMA_VERSION && value !== "0\.2\.2"/u);
   assert.equal(RELEASE_A_TUI_COMMIT, "6a1014a608800b038e8efdf21445b03c161f1a9f");

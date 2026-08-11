@@ -1,6 +1,6 @@
 # Self-Evolve Plugin Guide
 
-This repository is the standalone dual-target `@mcrescenzo/opencode-self-evolve` package. The normative v0.2 behavior is in `docs/autonomy-contract.md`. Use plain Node ESM and no new dependencies. Never add implementation/shell/Git agents, transcript injection, Git or publication behavior, external-tracker mutation, or writes outside canonical skill allowlists.
+This repository is the standalone dual-target `@mcrescenzo/opencode-self-evolve` package. The normative v0.3 global-first contract is in `docs/autonomy-contract.md`; v0.2 state and protocols are migration or compatibility input only. Use plain Node ESM and no new dependencies. Never add implementation/shell/Git agents, transcript injection, Git or publication behavior, external-tracker mutation, repo-local autonomous writes, unattended global writes, or writes outside exact approved global roots.
 
 ## Validation
 
@@ -8,8 +8,8 @@ Run `npm test`, `npm run check`, and `npm run pack:check`. Run `npm run smoke:li
 
 ## Autonomy Modules
 
-- `self-evolve-schemas.js`: immutable records, settings, transitions, authority.
-- `self-evolve-store.js`: durable project partitions, leases, CAS, retention.
+- `self-evolve-schemas.js`: immutable compatibility records plus exact v0.3 project/global schemas, transitions, identity firewall, and authority.
+- `self-evolve-store.js`: durable project evidence and state-root-global records, leases, CAS, retention.
 - `self-evolve-observation.js`: deterministic receipts, correlation, eligibility.
 - `self-evolve-inventory.js`: skill inventory, canonical paths, hashes, safety.
 - `self-evolve-privacy.js`: consent, redaction, quota, export, purge.
@@ -38,7 +38,7 @@ Run `npm test`, `npm run check`, and `npm run pack:check`. Run `npm run smoke:li
 - Dual target: server `.` must not import `./tui`, `@opencode-ai/plugin/tui`, or `@opentui/*`; TUI is available only from `./tui`; shared helpers import neither target.
 - Single export: `self-evolve.js` exports only `default SelfEvolvePlugin`. Test seams stay on `SelfEvolvePlugin.__test`.
 - Single registry: preserve the module-scoped `const registry`; factory calls update options in place and never replace session state.
-- Trigger gate: durable v0.2 is the default; `durableAutonomy: false` is explicit legacy compatibility. Persisted auto/yolo configuration may register a provisional authority-free `event` hook before official state-root validation; that hook must perform no integration, provider call, persistence, or effect until validated boot. Never register passive `chat.message`. Manual analysis remains command-driven.
+- Trigger gate: durable mode always exposes exactly one lifecycle `event` hook, including configured Manual and preboot validation. Before validated boot and whenever configured project analysis mode is `manual`, return before source-lineage hydration, session/message reads, provider calls, durable observation, contribution, or scheduler admission. Never register passive `chat.message`; Manual analysis remains command-driven through `/self-evolve scan`. Project analysis modes are only `manual` and `auto`; the retired `yolo` command and control request are refused, and a stored v0.2 `yolo` value narrows to `auto` without unattended write authority.
 - State split: the legacy registry is in-memory and cleared on dispose. Durable autonomy uses only the OpenCode state-root store.
-- Authority: the applier is the only skill writer and all model output remains advisory until deterministic policy authorizes it.
+- Authority: the applier is the only skill writer; global Apply and Undo always require a fresh explicit operator decision, and all model output remains advisory. Models cannot choose roots, consent, project analysis mode, retention/purge authority, or write authority.
 - Public helper policy: `AGENTS.md` and this file ship as public guidance and must not contain private paths or internal tooling references.

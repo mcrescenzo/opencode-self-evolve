@@ -150,7 +150,8 @@ test("failed child cleanup leaves one durable owner for one concurrent recovery 
   const child = spawnSync(process.execPath, [CLEANUP_FAILURE_CHILD, root, PROJECT], { encoding: "utf8", timeout: 10_000 });
   assert.equal(child.status, 0, child.stderr);
   const created = JSON.parse(child.stdout.trim());
-  assert.equal(created.ok, true);
+  assert.equal(created.ok, false);
+  assert.equal(created.reason, "simulated-delete-failure");
   assert.equal(created.classification, "live-owner");
 
   store = openStore(root, { projectFingerprint: PROJECT, now: () => Date.now(), staleLockMs: 20 });
@@ -158,14 +159,16 @@ test("failed child cleanup leaves one durable owner for one concurrent recovery 
   assert.equal(owner.classification, "abortable");
   assert.equal(owner.nonce, created.nonce);
   let aborts = 0;
+  let deletions = 0;
   let markStarted;
-  let finishAbort;
+  let finishDelete;
   const started = new Promise((resolve) => { markStarted = resolve; });
-  const finished = new Promise((resolve) => { finishAbort = resolve; });
+  const finished = new Promise((resolve) => { finishDelete = resolve; });
   const client = { session: {
     list: async () => ({ data: [{ id: created.sessionId, agent: synthesis.SYNTHESIS_AGENT_NAME, state: "running" }] }),
-    abort: async () => {
-      aborts += 1;
+    abort: async () => { aborts += 1; return { data: {} }; },
+    delete: async () => {
+      deletions += 1;
       markStarted();
       await finished;
       return { data: {} };
@@ -175,11 +178,12 @@ test("failed child cleanup leaves one durable owner for one concurrent recovery 
   const first = recoverOrphanedAnalyzerSessions(client, root, options);
   await started;
   const second = await recoverOrphanedAnalyzerSessions(client, root, options);
-  finishAbort();
+  finishDelete();
   const completed = await first;
 
   assert.equal(aborts, 1);
-  assert.equal(completed[0].action, "aborted");
+  assert.equal(deletions, 1);
+  assert.equal(completed[0].action, "deleted");
   assert.equal(second[0].action, "deferred");
   assert.equal(store.hostOwnerStatus(created.sessionId, options).classification, "unknown");
 });

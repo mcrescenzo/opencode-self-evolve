@@ -63,12 +63,16 @@ function ownerPath(store, sessionId) {
   return path.join(store.stateDir, "host-owners", `${key}.json`);
 }
 
-function recoveryClient(sessions, aborts) {
+function recoveryClient(sessions, aborts, deletions) {
   return {
     session: {
       async list() { return { data: sessions }; },
       async abort(request) {
         aborts.push(request?.path?.id ?? request?.path?.sessionID ?? request?.sessionID ?? request?.id ?? request);
+        return { data: {} };
+      },
+      async delete(request) {
+        deletions.push(request?.path?.id);
         return { data: {} };
       },
     },
@@ -109,7 +113,7 @@ test("malformed and corrupt ownership records are quarantined and not abortable"
   assert.ok(readdirSync(path.join(f.store.stateDir, "quarantine")).some((name) => name.startsWith("host-owner-")));
 });
 
-test("recovery aborts a dead owner once and defers live, reused, unknown, and foreign candidates", async (t) => {
+test("recovery interrupts and deletes a dead owner once while deferring live, unknown, and foreign candidates", async (t) => {
   const f = fixture(t);
   for (const id of ["dead-session", "live-session"]) assert.equal(acquire(f.store, id).ok, true);
   writeOwner(f.store, "foreign-session", { rootIdentity: FOREIGN_ROOT });
@@ -119,23 +123,27 @@ test("recovery aborts a dead owner once and defers live, reused, unknown, and fo
     { id: "foreign-session", agent: "self-evolve-synthesizer", state: "running" },
   ];
   const aborts = [];
-  const client = recoveryClient(sessions, aborts);
+  const deletions = [];
+  const client = recoveryClient(sessions, aborts, deletions);
 
   const first = await recoverOrphanedAnalyzerSessions(client, "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
   const second = await recoverOrphanedAnalyzerSessions(client, "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
 
   assert.deepEqual(aborts, ["dead-session"]);
-  assert.equal(first.find((item) => item.id === "dead-session")?.action, "aborted");
+  assert.deepEqual(deletions, ["dead-session"]);
+  assert.equal(first.find((item) => item.id === "dead-session")?.action, "deleted");
   assert.equal(first.find((item) => item.id === "unknown-session")?.action, "unknown");
   assert.equal(first.find((item) => item.id === "foreign-session")?.action, "foreign");
   assert.equal(second.find((item) => item.id === "dead-session")?.action, "unknown");
 
   f.setAlive(true);
   const liveAborts = [];
+  const liveDeletions = [];
   const live = await recoverOrphanedAnalyzerSessions(recoveryClient([
     { id: "live-session", agent: "self-evolve-synthesizer", state: "running" },
-  ], liveAborts), "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
+  ], liveAborts, liveDeletions), "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
   assert.deepEqual(liveAborts, []);
+  assert.deepEqual(liveDeletions, []);
   assert.equal(live[0].action, "deferred");
 });
 
@@ -203,10 +211,12 @@ test("hidden-session terminal finally removes ownership after a pre-prompt crash
   const target = { canonicalRoot: "/skills", relativePath: "owner-test/SKILL.md", logicalName: "owner-test", currentHash, currentContent };
   let prompts = 0;
   let aborts = 0;
+  let deletions = 0;
   const ctx = { directory: "/workspace", client: { session: {
     async create() { return { data: { id: "prompt-failure-session" } }; },
     async prompt() { prompts += 1; return { data: {} }; },
     async abort() { aborts += 1; return { data: {} }; },
+    async delete() { deletions += 1; return { data: {} }; },
   } } };
 
   const result = await runSynthesis({
@@ -231,5 +241,6 @@ test("hidden-session terminal finally removes ownership after a pre-prompt crash
   assert.equal(result.ok, false);
   assert.equal(prompts, 0);
   assert.ok(aborts >= 1);
+  assert.equal(deletions, 1);
   assert.equal(status(f.store, "prompt-failure-session").classification, "unknown");
 });

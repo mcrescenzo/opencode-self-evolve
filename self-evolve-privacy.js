@@ -1,16 +1,15 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { isActiveProposalChainRecord, isActiveProposalState } from "./self-evolve-store.js";
 import { containsPrivateMaterial } from "./self-evolve-projection.js";
 import {
-  SCHEMA_VERSION,
   ConsentState,
   Observation,
   errorReasonCode,
-  makeAggregateClaim,
   makeAuditEvent,
   makeConsentState,
+  makeEvidenceCapsule,
   makeObservation,
   makeRepoSettings,
   wrapRecord,
@@ -22,19 +21,44 @@ const DEFAULT_EXCERPT_LENGTH = 240;
 const FINGERPRINT = /^[a-f0-9]{64}$/;
 const CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u;
 const CONTROL_GLOBAL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu;
-const ABSOLUTE_PATH = /(?:^|[\s"'(<])(?:\/[^\s"'()<>]+|[A-Za-z]:\\[^\s"'()<>]+)/u;
-const ABSOLUTE_PATH_GLOBAL = /(?:^|[\s"'(<])(?:\/[^\s"'()<>]+|[A-Za-z]:\\[^\s"'()<>]+)/gu;
+const ABSOLUTE_PATH = /(?:^|[\s"'(])(?:\/(?![\/*])[^\s"'()<>]+|[A-Za-z]:\\[^\s"'()<>]+)/u;
+const ABSOLUTE_PATH_GLOBAL = /(?:^|[\s"'(])(?:\/(?![\/*])[^\s"'()<>]+|[A-Za-z]:\\[^\s"'()<>]+)/gu;
 const PROVIDER_TOKEN_PATTERNS = [
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  /\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[oprsu]_[A-Za-z0-9]{20,})\b/g,
-  /\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{20,})\b/g,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+  /\b(?:sk-(?:ant-api03-|proj-|svcacct-)?[A-Za-z0-9_-]{16,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,})\b/gi,
+  /\b(?:gh[oprsu]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,}|glpat-[A-Za-z0-9_-]{20,})\b/gi,
+  /\b(?:xox[a-z]-[A-Za-z0-9-]{10,}|xapp-\d-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{20,})\b/gi,
+  /\b(?:npm_[A-Za-z0-9]{20,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|dop_v1_[A-Fa-f0-9]{32,})\b/g,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi,
+  /\b[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*\s*[:=]\s*["']?[^"'\s,;]{8,}/gi,
 ];
 const PRIVATE_KEY = /-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----[\s\S]*?(?:-----END(?: [A-Z0-9]+)? PRIVATE KEY-----|$)/g;
 const PRIVATE_KEY_MARKER = /-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----/u;
+const JAVASCRIPT_LINK_RE = new RegExp(
+  "(?:"
+    + "(?:!?\\]\\(\\s*|<[^>]*\\b(?:href|src)\\s*=\\s*[\"']?\\s*)javascript:"
+    + "|"
+    + "(?:^|[\\s\"'`=(])javascript:[ \\t]*\\S{2,}"
+  + ")",
+  "iu",
+);
+const DATA_LINK_RE = new RegExp(
+  "(?:"
+    + "(?:!?\\]\\(\\s*|<[^>]*\\b(?:href|src)\\s*=\\s*[\"']?\\s*)data:"
+    + "|"
+    + "(?:^|[\\s\"'`=(])data:[^\\s\"'()<>]{2,}"
+  + ")",
+  "iu",
+);
 const NEVER_STORED_KEY = /(?:^|_)(?:content|body|messageBody|rawMessage|rawText|transcript|completeTranscript)(?:$|_)/iu;
 const REPO_NAME_KEY = /(?:project|repo(?:sitory)?|customer)(?:Name|Id|Identifier)?$/iu;
 const UNIQUE_COMMAND_KEY = /(?:command|commandName|uniqueCommand|rawCommand)$/iu;
-const AGGREGATE_INPUT_FIELDS = Object.freeze(["claimType", "receiptType", "signatureHash", "incidentId", "occurrenceCount", "firstSeenAt", "lastSeenAt"]);
+const CAPSULE_SELF_REFERENCE_RE = /(?:\/self-evolve|\bself-evolve\b|proposal\s+from\s+self-evolve)/iu;
+const PRIVATE_NAME_CANARY_RE = /\b(?:customer|client|tenant|repository|repo|project|private)[-_:\s]+[a-z0-9][a-z0-9._-]{2,}\b/iu;
+const CONTRIBUTION_INPUT_FIELDS = Object.freeze([
+  "claimType", "receiptType", "signatureHash", "incidentId", "capsuleId", "clusterId",
+  "evidenceDomainId", "occurrenceCount", "firstSeenAt", "lastSeenAt",
+]);
 
 function sha256(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -95,8 +119,10 @@ function issueScan(text, blockedNames = []) {
   if (CONTROL.test(source)) issues.add("control-characters");
   if (PROVIDER_TOKEN_PATTERNS.some((pattern) => { pattern.lastIndex = 0; return pattern.test(source); })) issues.add("provider-token");
   if (PRIVATE_KEY_MARKER.test(source)) issues.add("private-key");
-  if (/\bjavascript\s*:/iu.test(source)) issues.add("javascript-link");
-  if (/\bdata\s*:/iu.test(source)) issues.add("data-link");
+  if (JAVASCRIPT_LINK_RE.test(source)) issues.add("javascript-link");
+  if (DATA_LINK_RE.test(source)) issues.add("data-link");
+  if (/```|~~~/u.test(source)) issues.add("code-block");
+  if (PRIVATE_NAME_CANARY_RE.test(source)) issues.add("private-name");
   if (/\b(?:ignore|disregard|override)\s+(?:all\s+)?(?:previous|prior|system)\s+instructions?\b/iu.test(source)) issues.add("prompt-injection-marker");
   if (/\b(?:system\s*:\s*you must now apply|you must now apply|you are now in (?:auto|yolo) mode|you are (?:now )?authorized|grant (?:me|yourself) (?:full |elevated )?(?:authority|permissions?)|bypass (?:the )?(?:approval|permission|authority)|ignore (?:the )?(?:approval|permission) (?:gate|rules?))\b/iu.test(source)) issues.add("authority-escalation");
   if (ABSOLUTE_PATH.test(source)) issues.add("absolute-path");
@@ -241,6 +267,10 @@ export function createPrivacyGuard({
   }
 
   function scrubObservation(observation) {
+    if (!observation || typeof observation !== "object" || Array.isArray(observation)) return { ok: false, reason: "invalid-observation" };
+    if (!observation.projectFingerprint) return { ok: false, reason: "project-fingerprint-required" };
+    if (observation.projectFingerprint !== projectFingerprint) return { ok: false, reason: "project-partition-mismatch" };
+    if (!freshConsent().durableObservations) return { ok: false, reason: "observation-consent-required" };
     return scrubObservationForProject(observation, projectFingerprint);
   }
 
@@ -275,6 +305,40 @@ export function createPrivacyGuard({
     return { ok: true, redacted, hash: sha256(redacted), length: redacted.length };
   }
 
+  function createEvidenceCapsule(input) {
+    if (!freshConsent().durableObservations) return { ok: false, reason: "observation-consent-required" };
+    if (!freshConsent().sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
+    if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "invalid-capsule-input" };
+    const allowed = ["incidentId", "receiptType", "targetLogicalName", "summary"];
+    if (Object.keys(input).some((key) => !allowed.includes(key)) || allowed.some((key) => !(key in input))) {
+      return { ok: false, reason: "invalid-capsule-input" };
+    }
+    const issues = issueScan(input.summary, blockedNames);
+    if (issues.length || CAPSULE_SELF_REFERENCE_RE.test(String(input.summary))) {
+      return { ok: false, reason: "capsule-summary-rejected" };
+    }
+    try {
+      const createdAt = now();
+      const capsule = makeEvidenceCapsule({
+        capsuleId: randomUUID(),
+        incidentId: input.incidentId,
+        receiptType: input.receiptType,
+        targetLogicalName: input.targetLogicalName,
+        summary: input.summary,
+        createdAt,
+        expiresAt: observationExpiresAt(createdAt, freshRetentionDays()),
+      });
+      return requireStore(store).appendEvidenceCapsule(capsule);
+    } catch (error) {
+      return { ok: false, reason: errorReasonCode(error, "capsule-rejected") };
+    }
+  }
+
+  function getEvidenceCapsuleSupport(incidentId) {
+    try { return requireStore(store).getEvidenceCapsuleSupport(incidentId, { nowMs: now() }); }
+    catch (error) { return { available: false, reason: errorReasonCode(error, "evidence-capsule-unavailable") }; }
+  }
+
   function checkPartition(record, requestedScope) {
     const expected = requestedFingerprint(requestedScope);
     const actual = recordFingerprint(record);
@@ -301,59 +365,18 @@ export function createPrivacyGuard({
     return { ok: true, sanitized: [...claims].sort(([a], [b]) => a.localeCompare(b)).map(([signature, occurrences]) => ({ signature, occurrences })) };
   }
 
-  function contributeAggregate(input) {
+  function publishContribution(input) {
     const consentNow = freshConsent();
+    if (!consentNow.durableObservations) return { ok: false, reason: "observation-consent-required" };
     if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
     if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required" };
-    if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "invalid-aggregate-input" };
+    if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "invalid-contribution-input" };
     const keys = Object.keys(input);
-    if (keys.some((key) => !AGGREGATE_INPUT_FIELDS.includes(key)) || AGGREGATE_INPUT_FIELDS.some((key) => !(key in input))) {
-      return { ok: false, reason: "invalid-aggregate-input" };
+    if (keys.some((key) => !CONTRIBUTION_INPUT_FIELDS.includes(key))
+        || CONTRIBUTION_INPUT_FIELDS.some((key) => !(key in input))) {
+      return { ok: false, reason: "invalid-contribution-input" };
     }
-    if (typeof input.incidentId !== "string" || !input.incidentId || input.incidentId.length > 1024) return { ok: false, reason: "invalid-aggregate-input" };
-    try {
-      const firstSeenDay = new Date(input.firstSeenAt).toISOString().slice(0, 10);
-      const lastSeenDay = new Date(input.lastSeenAt).toISOString().slice(0, 10);
-      const incidentHash = sha256(`self-evolve-aggregate-incident-v1\n${projectFingerprint}\n${input.incidentId}`);
-      const aggregateId = sha256(`self-evolve-aggregate-contribution-v1\n${input.claimType}\n${input.receiptType}\n${input.signatureHash}\n${incidentHash}`);
-      const createdAt = now();
-      const record = makeAggregateClaim({
-        schemaVersion: SCHEMA_VERSION,
-        aggregateId,
-        claimType: input.claimType,
-        receiptType: input.receiptType,
-        signatureHash: input.signatureHash,
-        incidentHash,
-        occurrenceCount: input.occurrenceCount,
-        firstSeenDay,
-        lastSeenDay,
-        createdAt,
-        expiresAt: createdAt + freshRetentionDays() * DAY_MS,
-      });
-      const safe = assertSafeGlobalClaim(record, { blockedNames });
-      if (!safe.ok) return { ok: false, reason: safe.reason };
-      return requireStore(store).appendAggregate(record);
-    } catch (error) {
-      return { ok: false, reason: errorReasonCode(error, "privacy-failed") };
-    }
-  }
-
-  function readAggregateClaims({ scope = "global", includeExpired = false } = {}) {
-    const consentNow = freshConsent();
-    if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required", records: [] };
-    if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required", records: [] };
-    try {
-      return { ok: true, records: requireStore(store).readAggregates({ scope, includeExpired, nowMs: now() }) };
-    } catch (error) {
-      return { ok: false, reason: errorReasonCode(error, "privacy-failed"), records: [] };
-    }
-  }
-
-  function retainAggregateClaims(nowMs = now()) {
-    const consentNow = freshConsent();
-    if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
-    if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required" };
-    try { return { ok: true, ...requireStore(store).retainAggregates(nowMs) }; }
+    try { return requireStore(store).publishContribution(input); }
     catch (error) { return { ok: false, reason: errorReasonCode(error, "privacy-failed") }; }
   }
 
@@ -363,11 +386,18 @@ export function createPrivacyGuard({
     const latest = new Map();
     for (const record of archive.records) if (record.kind === "proposal") latest.set(record.payload.id, record.payload);
     const active = new Set([...latest].filter(([, proposal]) => isActiveProposalState(proposal.state)).map(([id]) => id));
-    return archive.records.flatMap((record) => {
+    const records = archive.records.flatMap((record) => {
       if (isActiveProposalChainRecord(record, active)) return [];
       const expiresAt = expirationFor(record, currentRetentionDays);
       return expiresAt !== null && isExpired(expiresAt, nowMs) ? [{ kind: record.kind, id: logicalId(record), expiresAt }] : [];
     });
+    const capsules = (archive.capsules ?? []).flatMap((entry) => {
+      const capsule = entry?.capsule;
+      return capsule && isExpired(capsule.expiresAt, nowMs)
+        ? [{ kind: "evidence-capsule", id: capsule.capsuleId, expiresAt: capsule.expiresAt }]
+        : [];
+    });
+    return [...records, ...capsules];
   }
 
   function checkQuota(currentBytes, budgetBytes = quotaBytes) {
@@ -399,6 +429,7 @@ export function createPrivacyGuard({
   }
 
   function exportScope(fingerprint) {
+    if (fingerprint !== projectFingerprint) throw new Error("cross-project-export-forbidden");
     durableSettings();
     const archive = requireStore(store).exportProject();
     if (archive.projectFingerprint !== fingerprint) return { ...archive, projectName: "", projectFingerprint: fingerprint, records: [] };
@@ -408,14 +439,11 @@ export function createPrivacyGuard({
 
   function exportAll() {
     durableSettings();
-    if (!freshConsent().crossRepoAggregation) {
-      return {
-        ...exportScope(projectFingerprint),
-        exportScope: "all",
-        classification: "sensitive-self-evolve-archive",
-      };
-    }
     const archive = requireStore(store).exportAll();
+    if (archive.projectFingerprint !== projectFingerprint
+        || archive.projects.some((project) => project.projectFingerprint !== projectFingerprint)) {
+      throw new Error("cross-project-export-forbidden");
+    }
     const projects = archive.projects.map((project) => ({
       ...project,
       records: scrubExportRecords(project.records, project.projectFingerprint),
@@ -428,10 +456,15 @@ export function createPrivacyGuard({
     };
   }
 
-  function purgeScope({ scope, projectFingerprint: requestedProject } = {}) {
+  function exportGlobalRecommendations() {
+    durableSettings();
+    return requireStore(store).exportGlobalRecommendations();
+  }
+
+  function purgeScope({ scope, projectFingerprint: requestedProject, recommendationId } = {}) {
     if (scope !== "all" && requestedProject !== undefined && requestedProject !== projectFingerprint) return { ok: false, reason: "project-partition-mismatch", counts: {}, removedPaths: [] };
     const writableStore = requireStore(store);
-    const result = writableStore.purge({ scope });
+    const result = writableStore.purge({ scope, ...(recommendationId === undefined ? {} : { recommendationId }) });
     if (!result.ok) return { ...result, counts: result.counts ?? {}, removedPaths: [] };
     // Per §4/§10: rollback snapshots live under <stateDir>/snapshots/ and must
     // be purged alongside the records they relate to. The store recreates the
@@ -501,17 +534,18 @@ export function createPrivacyGuard({
   return Object.freeze({
     scrubObservation,
     scrubExcerpt,
+    createEvidenceCapsule,
+    getEvidenceCapsuleSupport,
     checkPartition,
     checkGlobalAggregation,
-    contributeAggregate,
-    readAggregateClaims,
-    retainAggregateClaims,
+    publishContribution,
     checkRetention,
     checkQuota,
     scanForForbiddenContent,
     inspectScope,
     exportScope,
     exportAll,
+    exportGlobalRecommendations,
     purgeScope,
     invalidateObservation,
     isObservationEligible,

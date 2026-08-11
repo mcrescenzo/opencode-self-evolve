@@ -535,6 +535,7 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
       await waitForStartup(durableAuto, "durable-auto-startup");
       const durableSkillRoot = path.join(ctx.directory, "durable-control-skills");
       mkdirSync(durableSkillRoot, { recursive: true });
+      // v0.3 retires yolo: the live host must refuse the command outright.
       const durableYoloOutput = { parts: [] };
       await durableAuto["command.execute.before"]({ command: "self-evolve", sessionID: "durable-yolo", arguments: "yolo confirm --allowlist " + durableSkillRoot }, durableYoloOutput);
       await durableAuto.dispose();
@@ -591,7 +592,7 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
         options: { stateRoot: exactStateRoot, projectFingerprint: durableFingerprint },
       });
       const staleBridgeFile = path.join(exactStateRoot, "self-evolve", "bridge", durableFingerprint, "responses", "stale.json");
-      mkdirSync(path.dirname(staleBridgeFile), { recursive: true });
+      mkdirSync(path.dirname(staleBridgeFile), { recursive: true, mode: 0o700 });
       writeFileSync(staleBridgeFile, "{}", "utf8");
       const exactBoot = await exactIntegration.boot({ hostVersion: runningHealth.data.version });
       const mailboxCleanupExecuted = !existsSync(staleBridgeFile);
@@ -623,11 +624,11 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
         startupRetentionExecuted,
         manualCommandRouted: /stored mode|effective mode/u.test(text(durableManualOutput)),
         autoCommandRouted: /changed to auto/u.test(text(durableAutoOutput)),
-        yoloCommandRouted: /changed to yolo/u.test(text(durableYoloOutput)),
+        yoloCommandRetired: /retired in v0\.3/u.test(text(durableYoloOutput)),
         ordinaryDefaultDurableManual: /stored mode manual|effective mode manual/u.test(text(durableManualOutput)),
-        manualPassiveHookAbsent: durableManual.event === undefined && durableManualRestart.event === undefined,
+        stableManualEventHookInstalled: typeof durableManual.event === "function" && typeof durableManualRestart.event === "function",
         autoPassiveHookRegistered: typeof durableAuto.event === "function",
-        yoloPassiveHookRegistered: typeof durableYolo.event === "function",
+        autoRestartPassiveHookRegistered: typeof durableYolo.event === "function",
         noWorkingSessionInjection: injectionCalls.promptAsync === 0 && injectionCalls.appendPrompt === 0,
         disposeCompleted: true,
       };
@@ -718,9 +719,10 @@ export default async function SelfEvolveRestartProbe(ctx) {
         if (phase === "auto") {
           const skillRoot = path.join(ctx.directory, "restart-probe-skills");
           mkdirSync(skillRoot, { recursive: true });
+          // The retired command must be refused without disturbing stored auto.
           command = "yolo confirm --allowlist " + skillRoot;
         }
-        if (phase === "yolo") command = "manual";
+        if (phase === "retired-yolo") command = "manual";
         const changed = command ? await run(command) : "";
         const serverStateRoot = (await ctx.client.path.get({ query: { directory: ctx.directory } })).data.state;
         const tuiStateRoot = initialStateRootSelection({ hostStateRoot: serverStateRoot, environment: {} }).stateRoot;
@@ -833,15 +835,16 @@ export default async function SelfEvolveRestartProbe(ctx) {
     const payload = await withTimeout(smokePayload, "self-evolve live command hook smoke");
     assertSmokePayload(payload);
     const restartPhases = [];
-    for (const phase of ["seed-auto", "auto", "yolo", "manual"]) {
+    for (const phase of ["seed-auto", "auto", "retired-yolo", "manual"]) {
       restartPhases.push(await runRestartProbe({ phase, probePlugin: restartProbePlugin, projectDir, baseEnv: env, configPath: restartProbeConfig }));
     }
-    const [seedAuto, autoRestart, yoloRestart, manualRestart] = restartPhases;
+    const [seedAuto, autoRestart, retiredYolo, manualRestart] = restartPhases;
     const restartChecks = {
-      ordinaryDefaultDurableManual: seedAuto.passiveHook === false && /effective mode manual|stored mode manual/u.test(seedAuto.before),
+      ordinaryDefaultDurableManual: seedAuto.passiveHook === true && /effective mode manual|stored mode manual/u.test(seedAuto.before),
       persistedAutoFreshProcessHook: autoRestart.passiveHook === true && /effective mode auto|stored mode auto/u.test(autoRestart.before),
-      persistedYoloFreshProcessHook: yoloRestart.passiveHook === true && /effective mode yolo|stored mode yolo/u.test(yoloRestart.before),
-      persistedManualFreshProcessNoHook: manualRestart.passiveHook === false && /effective mode manual|stored mode manual/u.test(manualRestart.before),
+      retiredYoloLeavesAutoIntact: retiredYolo.passiveHook === true && /effective mode auto|stored mode auto/u.test(retiredYolo.before)
+        && /retired in v0\.3/u.test(autoRestart.changed),
+      persistedManualFreshProcessStableHook: manualRestart.passiveHook === true && /effective mode manual|stored mode manual/u.test(manualRestart.before),
       noPassiveChatHooks: restartPhases.every((item) => item.chatHookAbsent === true),
       serverTuiStateRootsMatch: restartPhases.every((item) => item.serverStateRoot === item.tuiStateRoot && item.serverStateRoot === path.join(stateHome, "opencode")),
       productionPluginReportsCliVersion: restartPhases.every((item) => item.officialHealth?.version === cliVersion && item.healthText.includes("host " + cliVersion) && item.healthText.includes("source global-health")),
