@@ -12,19 +12,22 @@ const store = openStore(root, {
 });
 
 if (scope === "revoke-excerpts") {
-  store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: false },
-    updatedAt: Math.max(2_000, global.updatedAt + 1),
-  }));
+  const current = store.getAutomationState();
+  store.transitionAutomation({
+    transitionId: `crash-revoke-excerpts-${point}`,
+    expectedGeneration: current.epoch.generation,
+    action: "set-permission",
+    permission: "sanitizedExcerpts",
+    enabled: false,
+  });
 } else if (scope === "global") {
-  store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, mode: "auto", updatedAt: 2_000 }));
+  store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, retentionDays: 31, updatedAt: 2_000 }));
 } else if (scope === "repo") {
-  store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, mode: "auto", excluded: true }));
+  store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, excluded: true }));
 } else {
   store.updateSettings(({ global, repo }) => ({
-    global: makeGlobalSettings({ ...global, mode: "auto", updatedAt: 2_000 }),
-    repo: makeRepoSettings({ ...repo, mode: "auto", excluded: true }),
+    global: makeGlobalSettings({ ...global, retentionDays: 31, updatedAt: 2_000 }),
+    repo: makeRepoSettings({ ...repo, excluded: true }),
   }));
 }
 process.exitCode = 2;

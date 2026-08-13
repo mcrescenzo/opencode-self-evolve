@@ -84,9 +84,7 @@ function projectionIndex(overrides = {}) {
     status: {
       state: "ready",
       reason: null,
-      storedMode: "auto",
-      effectiveMode: "auto",
-      paused: false,
+      automaticRecommendationsEnabled: true,
       killSwitchActive: false,
       repoExcluded: false,
       circuitBreakerOpen: false,
@@ -117,9 +115,9 @@ function projectionIndex(overrides = {}) {
       reason: null,
     }],
     allowedActions: [{
-      action: "set-paused",
-      capability: "operation-pause-v1",
-      nonce: "pause-nonce",
+      action: "set-automatic-recommendations",
+      capability: "automatic-recommendations-control-v1",
+      nonce: "automatic-nonce",
       expiresAt: NOW + 30_000,
     }],
     overflow: {
@@ -141,14 +139,16 @@ function dashboard(overrides = {}) {
     generation: GENERATION,
     indexHash: H("d"),
     generatedAt: NOW - 500,
-    capabilities: UI_DASHBOARD_CAPABILITIES,
+    capabilities: dashboardVersion === 3
+      ? UI_DASHBOARD_CAPABILITIES
+      : ["control-repo-mode-v1", "decision-feedback-v1"],
     automation: { state: "ready", reason: null },
     blockers: [],
     inFlight: { active: false, count: 0, stage: null, startedAt: null },
     lastCycle: {
       outcome: "valid-no-change",
       triggerClass: "idle",
-      mode: "auto",
+      ...(dashboardVersion === 3 ? {} : { mode: "auto" }),
       observationCount: 2,
       eligibilityCount: 1,
       proposalId: null,
@@ -157,7 +157,7 @@ function dashboard(overrides = {}) {
     },
     nextEligibleAt: null,
     usage: {
-      passive: { used: 2, limit: 6, remaining: 4, resetAt: NOW + 30_000 },
+      [dashboardVersion === 3 ? "provider" : "passive"]: { used: 2, limit: 6, remaining: 4, resetAt: NOW + 30_000 },
       synthesis: { used: 4, limit: 24, remaining: 20, resetAt: NOW + 60_000 },
       storage: { usedBytes: 4_096, limitBytes: 8_388_608, remainingBytes: 8_384_512 },
     },
@@ -168,7 +168,23 @@ function dashboard(overrides = {}) {
       successRateBasisPoints: 9_000,
       minSuccessRateBasisPoints: 8_000,
     },
-    settings: {
+    settings: dashboardVersion === 3 ? {
+      automaticRecommendationsEnabled: true,
+      automationGeneration: 1,
+      killSwitchActive: false,
+      repositoryExcluded: false,
+      consent: {
+        durableObservations: true,
+        sanitizedExcerpts: true,
+        crossRepoAggregation: true,
+      },
+      approvedSkillFolderCount: 1,
+      collectionSuggestions: ["/global/skills"],
+      globalSettingsVersion: H("4"),
+      globalRootPolicy: null,
+      globalRootPolicyConfirmation: "REPLACE GLOBAL ROOT POLICY 444444444444",
+      globalRootPolicyAction: null,
+    } : {
       globalMode: "auto",
       repositoryMode: "inherit",
       effectiveMode: "auto",
@@ -190,7 +206,9 @@ function dashboard(overrides = {}) {
       } : {}),
     },
     retention: { observationsDays: 30, operationalDays: 90 },
-    supportedControls: ["set-paused"],
+    supportedControls: dashboardVersion === 3
+      ? ["set-automatic-recommendations"]
+      : ["set-paused"],
     activity: [{
       id: H("9"),
       category: "cycle",
@@ -361,7 +379,7 @@ function operationResponse(request, overrides = {}) {
 
 test("UI protocols version projections and operations independently with canonical hashes", () => {
   assert.equal(UI_PROJECTION_VERSION, 1);
-  assert.equal(UI_OPERATION_PROTOCOL_VERSION, 1);
+  assert.equal(UI_OPERATION_PROTOCOL_VERSION, 2);
   assert.equal(canonicalUiJson({ z: [2, { b: true, a: null }], a: "value" }), '{"a":"value","z":[2,{"a":null,"b":true}]}');
   assert.equal(
     hashUiProtocol("projection-index", { z: 2, a: 1 }),
@@ -406,13 +424,12 @@ test("overflow markers deterministically account for omitted canonical bytes", (
   assert.throws(() => makeUiOverflowMarker(0, Array(4_097).fill(null), "item-limit"), /omitted-items-out-of-bounds/u);
 });
 
-test("capability negotiation is strict and mixed-version peers remain legacy-only", () => {
+test("capability negotiation is strict and mixed-version peers remain read-only", () => {
   assert.deepEqual(UI_CAPABILITIES, [
-    "legacy-control-v1",
+    "automatic-recommendations-control-v1",
     "legacy-decision-v1",
     "operation-export-v1",
     "operation-kill-switch-v1",
-    "operation-pause-v1",
     "operation-purge-all-v1",
     "operation-purge-scope-v1",
     "operation-retry-bootstrap-v1",
@@ -420,12 +437,11 @@ test("capability negotiation is strict and mixed-version peers remain legacy-onl
     "operation-snooze-v1",
     "projection-index-v1",
     "projection-review-detail-v1",
-  ], "v1 offer and index capabilities stay byte-schema compatible with Release A");
+  ]);
   assert.deepEqual(UI_DASHBOARD_CAPABILITIES, [
-    "control-repo-mode-v1",
     "decision-feedback-v1",
     "operation-global-root-policy-v1",
-    "project-analysis-control-v1",
+    "project-participation-v1",
   ]);
   const server = makeUiProtocolOffer({
     projectionVersions: [UI_PROJECTION_VERSION],
@@ -441,7 +457,7 @@ test("capability negotiation is strict and mixed-version peers remain legacy-onl
   assert.deepEqual(negotiateUiProtocol(server, server), {
     mode: "native",
     projectionVersion: 1,
-    operationProtocolVersion: 1,
+    operationProtocolVersion: 2,
     capabilities: UI_CAPABILITIES,
     reason: null,
   });
@@ -479,7 +495,7 @@ test("capability negotiation is strict and mixed-version peers remain legacy-onl
   assert.deepEqual(negotiateUiProtocol(futureServer, server), {
     mode: "native",
     projectionVersion: 1,
-    operationProtocolVersion: 1,
+    operationProtocolVersion: 2,
     capabilities: UI_CAPABILITIES,
     reason: null,
   });
@@ -490,26 +506,32 @@ test("capability negotiation is strict and mixed-version peers remain legacy-onl
     capabilities: [],
     reason: "projection-version-unavailable",
   });
-  assert.deepEqual(negotiateUiProtocol({ ...futureServer, operationProtocolVersions: [2] }, server), {
+  assert.deepEqual(negotiateUiProtocol({ ...futureServer, operationProtocolVersions: [1] }, server), {
     mode: "read-only",
     projectionVersion: 1,
     operationProtocolVersion: null,
-    capabilities: UI_CAPABILITIES.filter((capability) => !capability.startsWith("operation-")),
+    capabilities: UI_CAPABILITIES.filter((capability) => capability !== "automatic-recommendations-control-v1"
+      && !capability.startsWith("operation-")),
     reason: "operation-version-unavailable",
   });
 
   assert.throws(() => makeUiProtocolOffer({ ...server, projectionVersions: [2] }), /unsupported-projection-version/u);
-  assert.throws(() => makeUiProtocolOffer({ ...server, operationProtocolVersions: [2] }), /unsupported-operation-version/u);
+  assert.throws(() => makeUiProtocolOffer({ ...server, operationProtocolVersions: [3] }), /unsupported-operation-version/u);
   assert.throws(() => makeUiProtocolOffer({ ...server, capabilities: [...server.capabilities, "unknown"] }), /unknown-capability/u);
   assert.throws(() => makeUiProtocolOffer({ ...server, extra: true }), /unknown-field/u);
   assert.throws(() => makeUiProtocolOffer({ ...server, capabilities: [...server.capabilities].reverse() }), /capabilities-not-sorted/u);
 });
 
-test("Release A core offer and index bytes stay literal while Release B remains a sidecar", () => {
+test("current offer and index bytes are deterministic while legacy input stays parseable", () => {
   const offer = makeUiProtocolOffer({
     projectionVersions: [1],
     operationProtocolVersions: [1],
-    capabilities: UI_CAPABILITIES,
+    capabilities: [
+      "legacy-control-v1", "legacy-decision-v1", "operation-export-v1", "operation-kill-switch-v1",
+      "operation-pause-v1", "operation-purge-all-v1", "operation-purge-scope-v1",
+      "operation-retry-bootstrap-v1", "operation-rollback-v1", "operation-snooze-v1",
+      "projection-index-v1", "projection-review-detail-v1",
+    ],
   });
   assert.equal(
     `${JSON.stringify(offer)}\n`,
@@ -526,10 +548,9 @@ test("Release A core offer and index bytes stay literal while Release B remains 
       allowedActions: overflow(0),
     },
   }), projectionContext());
-  assert.equal(
-    `${JSON.stringify(coreIndex)}\n`,
-    '{"projectionVersion":1,"projectFingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stateRootIdentity":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","issuedAt":999000,"expiresAt":1060000,"capabilities":["legacy-control-v1","legacy-decision-v1","operation-export-v1","operation-kill-switch-v1","operation-pause-v1","operation-purge-all-v1","operation-purge-scope-v1","operation-retry-bootstrap-v1","operation-rollback-v1","operation-snooze-v1","projection-index-v1","projection-review-detail-v1"],"status":{"state":"ready","reason":null,"storedMode":"auto","effectiveMode":"auto","paused":false,"killSwitchActive":false,"repoExcluded":false,"circuitBreakerOpen":false},"budgets":{"passiveCallsPerHour":6,"synthesisPerDay":24,"tokensPerSynthesis":8000,"concurrentObservationsPerProject":1,"concurrentSynthesesGlobal":1,"idleDebounceMs":1500,"storageQuotaMiB":8},"reviews":[],"operations":[],"allowedActions":[],"overflow":{"reviews":{"truncated":false,"includedCount":0,"omittedCount":0,"omittedBytes":0,"reason":"none"},"operations":{"truncated":false,"includedCount":0,"omittedCount":0,"omittedBytes":0,"reason":"none"},"allowedActions":{"truncated":false,"includedCount":0,"omittedCount":0,"omittedBytes":0,"reason":"none"}},"projectionHash":"f35d83607018928e7c61eb04108529518c159483ff15f5fa2dd1dd9aa78f348c"}\n',
-  );
+  assert.equal(coreIndex.status.automaticRecommendationsEnabled, true);
+  assert.equal("storedMode" in coreIndex.status, false);
+  assert.match(`${JSON.stringify(coreIndex)}\n`, /automaticRecommendationsEnabled/u);
   assert.equal("dashboardVersion" in coreIndex, false);
   assert.equal(offer.capabilities.some((capability) => UI_DASHBOARD_CAPABILITIES.includes(capability)), false);
 });
@@ -570,12 +591,12 @@ test("future artifact versions fail as unsupported before their newer fields are
     () => makeUiReviewDetail({ ...detail, futureDetailField: true }, detailContext(detail)),
     /unsupported-projection-version/u,
   );
-  const request = operationRequest("snooze-proposal", undefined, { operationProtocolVersion: 2 });
+  const request = operationRequest("snooze-proposal", undefined, { operationProtocolVersion: 3 });
   assert.throws(
     () => makeUiOperationRequest({ ...request, futureRequestField: true }, operationContext(request)),
     /unsupported-operation-version/u,
   );
-  const response = operationResponse(operationRequest(), { operationProtocolVersion: 2 });
+  const response = operationResponse(operationRequest(), { operationProtocolVersion: 3 });
   assert.throws(
     () => makeUiOperationResponse({ ...response, futureResponseField: true }, {
       projectFingerprint: PROJECT,
@@ -677,7 +698,7 @@ test("current dashboard is exact, hash-bound to the core index, bounded, and dee
   assert.deepEqual(clean.capabilities, UI_DASHBOARD_CAPABILITIES);
   assert.equal(clean.indexHash, H("d"));
   assert.equal(clean.lastCycle.outcome, "valid-no-change");
-  assert.equal(clean.usage.passive.remaining, 4);
+  assert.equal(clean.usage.provider.remaining, 4);
   assert.equal(Object.isFrozen(clean), true);
   assert.equal(Object.isFrozen(clean.activity), true);
   assert.equal(Object.isFrozen(clean.settings.consent), true);
@@ -710,10 +731,10 @@ test("current dashboard is exact, hash-bound to the core index, bounded, and dee
     blockers: [{
       code: "first-run",
       summary: "Automatic recommendations have not been set up yet.",
-      destination: "settings",
+      destination: "home",
     }],
   });
-  assert.equal(UI_DASHBOARD_BLOCKER_DESTINATIONS["first-run"].dashboard, "home");
+  assert.equal(UI_DASHBOARD_BLOCKER_DESTINATIONS["first-run"].dashboard, "settings");
   assert.throws(
     () => makeUiDashboard(mismatchedBlocker, dashboardContext(mismatchedBlocker)),
     /dashboard-blocker-destination-mismatch/u,
@@ -725,10 +746,10 @@ test("current dashboard rejects inconsistent usage, rollout, activity, and in-fl
   const invalidUsage = dashboard({
     usage: {
       ...value.usage,
-      passive: { ...value.usage.passive, remaining: 5 },
+      provider: { ...value.usage.provider, remaining: 5 },
     },
   });
-  assert.throws(() => makeUiDashboard(invalidUsage, dashboardContext(invalidUsage)), /passive-remaining-mismatch/u);
+  assert.throws(() => makeUiDashboard(invalidUsage, dashboardContext(invalidUsage)), /provider-remaining-mismatch/u);
 
   const invalidRollout = dashboard({
     rollout: { ...value.rollout, ready: false },
@@ -957,7 +978,7 @@ test("operation requests are an exact capability-gated union bound to fresh proj
     () => makeUiOperationRequest(operationRequest("scan-session", {}, { capability: "operation-snooze-v1" }), operationContext(input)),
     /unknown-operation-action/u,
   );
-  assert.throws(() => makeUiOperationRequest(operationRequest("snooze-proposal", input.payload, { operationProtocolVersion: 2 }), operationContext(input)), /unsupported-operation-version/u);
+  assert.throws(() => makeUiOperationRequest(operationRequest("snooze-proposal", input.payload, { operationProtocolVersion: 1 }), operationContext(input)), /unsupported-operation-version/u);
   assert.throws(() => makeUiOperationRequest(operationRequest("snooze-proposal", input.payload, { projectFingerprint: H("9") }), operationContext(input)), /cross-project/u);
   assert.throws(() => makeUiOperationRequest(operationRequest("snooze-proposal", input.payload, { stateRootIdentity: H("9") }), operationContext(input)), /cross-root/u);
   assert.throws(() => makeUiOperationRequest(operationRequest("snooze-proposal", input.payload, { generation: H("9") }), operationContext(input)), /stale-generation/u);
@@ -1033,7 +1054,7 @@ test("operation responses bind exact requests and reserve accepted-terminal for 
     /invalid-request-lifetime/u,
   );
 
-  const purge = operationRequest("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" });
+  const purge = operationRequest("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.4.0" });
   const terminal = operationResponse(purge);
   assert.equal(makeUiOperationResponse(terminal, { ...context, requestId: purge.requestId, action: purge.action, requestHash: purge.operationHash }).status, "accepted-terminal");
 });
@@ -1045,9 +1066,10 @@ test("every operation action has a closed bounded payload and no native scan act
       decisionVersion: 4, snoozedUntil: NOW + 60_000,
     }],
     ["rollback-proposal", { proposalId: "proposal-1", appliedHash: H("e"), decisionVersion: 5 }],
+    ["set-automatic-recommendations", { enabled: false, settingsVersion: H("4") }],
     ["set-kill-switch", { enabled: true, settingsVersion: H("4") }],
-    ["set-paused", { paused: true, settingsVersion: H("4") }],
-    ["set-repo-mode", { mode: "auto", settingsVersion: H("4") }],
+    ["set-permission", { permission: "sanitizedExcerpts", enabled: false, settingsVersion: H("4") }],
+    ["set-repo-excluded", { excluded: true, settingsVersion: H("4") }],
     ["replace-global-root-policy", {
       roots: [{ canonicalPath: "/global/skills", canUpdate: true, canCreate: true }],
       creationRootPath: "/global/skills",
@@ -1055,7 +1077,7 @@ test("every operation action has a closed bounded payload and no native scan act
       settingsVersion: H("4"),
     }],
     ["purge-scope", { scope: "observations", confirmation: "PURGE OBSERVATIONS" }],
-    ["purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" }],
+    ["purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.4.0" }],
     ["export-data", { scope: "project", confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA" }],
     ["retry-bootstrap", {}],
   ];
@@ -1093,8 +1115,12 @@ test("every operation action has a closed bounded payload and no native scan act
   assert.throws(() => makeUiOperationRequest(invalidExportConfirmation, operationContext(invalidExportConfirmation)), /invalid-export-confirmation/u);
   const invalidRetry = operationRequest("retry-bootstrap", { force: true });
   assert.throws(() => makeUiOperationRequest(invalidRetry, operationContext(invalidRetry)), /unknown-field/u);
-  const legacyYolo = operationRequest("set-repo-mode", { mode: "yolo", settingsVersion: H("4") });
-  assert.throws(() => makeUiOperationRequest(legacyYolo, operationContext(legacyYolo)), /project-analysis-mode/u);
+  const legacyMode = operationRequest(
+    "set-repo-mode",
+    { mode: "auto", settingsVersion: H("4") },
+    { capability: "legacy-control-v1" },
+  );
+  assert.throws(() => makeUiOperationRequest(legacyMode, operationContext(legacyMode)), /invalid-operation-grant-action|unknown-operation-action/u);
   const rootPolicyPayload = cases.find(([action]) => action === "replace-global-root-policy")[1];
   for (const invalid of [
     { ...rootPolicyPayload, roots: [] },

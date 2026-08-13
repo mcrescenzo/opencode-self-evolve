@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import { createApplier } from "../self-evolve-applier.js";
 import { createCommandPolicy } from "../self-evolve-commands.js";
-import { createIntegration, recoverOrphanedAnalyzerSessions } from "../self-evolve-integration.js";
+import { createIntegration, recoverOrphanedHiddenSessions } from "../self-evolve-integration.js";
 import * as inventory from "../self-evolve-inventory.js";
 import * as observation from "../self-evolve-observation.js";
 import { createPipeline } from "../self-evolve-pipeline.js";
@@ -17,7 +17,6 @@ import { openStore } from "../self-evolve-store.js";
 import * as synthesis from "../self-evolve-synthesis.js";
 
 const CHILD = path.join(import.meta.dirname, "fixtures", "apply-live-owner.mjs");
-const SYNTHESIS_CHILD = path.join(import.meta.dirname, "fixtures", "synthesis-live-owner.mjs");
 const CLEANUP_FAILURE_CHILD = path.join(import.meta.dirname, "fixtures", "hidden-cleanup-failure.mjs");
 const PROJECT = inventory.hashSkillContent("live-owner-project");
 const CURRENT = "---\nname: live-owner\ndescription: Handles process lease recovery safely.\n---\n# Live Owner\nKeep the current instruction.\n";
@@ -40,8 +39,13 @@ function seed(root) {
   fs.writeFileSync(target, CURRENT);
   const records = inventory.discoverSkills(inventory.loadAllowlist({ globalSkillRoots: [skillRoot] }).canonicalRoots);
   const store = openStore(stateRoot, { projectFingerprint: PROJECT, now: () => Date.now(), staleLockMs: 20 });
-  const settings = store.getSettings();
-  store.setGlobalSettings(schemas.makeGlobalSettings({ ...settings.global, mode: "auto", allowedSkillRoots: [skillRoot], updatedAt: Date.now() }));
+  const configured = store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+    ...global,
+    allowedSkillRoots: [skillRoot],
+    updatedAt: Math.max(Date.now(), global.updatedAt + 1),
+  }));
+  assert.equal(configured.ok, true, configured.reason);
+  assert.deepEqual(store.getSettings().global.allowedSkillRoots, [skillRoot]);
   const proposal = schemas.makeProposal({
     id: "live-owner-proposal", projectFingerprint: PROJECT, clusterId: inventory.hashSkillContent("cluster"),
     skillTarget: { canonicalRoot: skillRoot, relativePath: "live-owner/SKILL.md", currentHash: records[0].currentHash },
@@ -103,44 +107,7 @@ for (const point of ["apply-before-pending-audit", "apply-after-pending-audit", 
   });
 }
 
-test("live synthesis provider owner defers boot recovery and completes one accepted outcome", async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-live-synthesis-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const barrier = path.join(root, "provider-open");
-  const release = path.join(root, "release");
-  const marker = path.join(root, "provider-calls.log");
-  fs.writeFileSync(marker, "");
-  const child = spawn(process.execPath, [SYNTHESIS_CHILD, root, PROJECT, barrier, release, marker], { stdio: ["ignore", "pipe", "pipe"] });
-  let stderr = "";
-  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-  await waitFor(() => fs.existsSync(barrier), "synthesis provider barrier");
-
-  let store = openStore(root, { projectFingerprint: PROJECT, now: () => Date.now(), staleLockMs: 20 });
-  let pipeline = createPipeline({ store, inventory, privacy: {}, synthesis: {}, applier: { close() {} }, commands: {}, schemas, observation, now: () => Date.now() });
-  const deferred = pipeline.recoverSynthesisAttempts();
-  assert.equal(deferred.length, 1);
-  assert.equal(deferred[0].deferred, true);
-  assert.equal(store.readRecords("audit-event").map((record) => schemas.parseSynthesisOutcomeAuditEvent(record.payload)).filter(Boolean).length, 0);
-  assert.equal(store.readRecords("proposal").some((record) => record.payload.state === "failed-closed"), false);
-  pipeline.close();
-
-  fs.writeFileSync(release, "release");
-  const exit = await new Promise((resolve, reject) => { child.on("error", reject); child.on("close", (code, signal) => resolve({ code, signal })); });
-  assert.deepEqual(exit, { code: 0, signal: null }, stderr);
-  store = openStore(root, { projectFingerprint: PROJECT, now: () => Date.now(), staleLockMs: 20 });
-  const outcomes = store.readRecords("audit-event").map((record) => schemas.parseSynthesisOutcomeAuditEvent(record.payload)).filter(Boolean);
-  assert.equal(store.readRecords("synthesis-attempt").length, 1);
-  assert.equal(outcomes.length, 1);
-  assert.equal(outcomes[0].status, "accepted");
-  assert.equal(store.readRecords("proposal").at(-1).payload.state, "pending");
-  const calls = fs.readFileSync(marker, "utf8").trim().split("\n");
-  assert.deepEqual(calls, [synthesis.SYNTHESIS_AGENT_NAME, synthesis.CRITIC_AGENT_NAME]);
-  pipeline = createPipeline({ store, inventory, privacy: {}, synthesis: {}, applier: { close() {} }, commands: {}, schemas, observation, now: () => Date.now() });
-  assert.deepEqual(pipeline.recoverSynthesisAttempts(), []);
-  pipeline.close();
-});
-
-test("failed child cleanup leaves one durable owner for one concurrent recovery claimant", async (t) => {
+test("exited child leaves one durable owner for one concurrent recovery claimant", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-hidden-cleanup-"));
   let store;
   t.after(() => {
@@ -150,8 +117,7 @@ test("failed child cleanup leaves one durable owner for one concurrent recovery 
   const child = spawnSync(process.execPath, [CLEANUP_FAILURE_CHILD, root, PROJECT], { encoding: "utf8", timeout: 10_000 });
   assert.equal(child.status, 0, child.stderr);
   const created = JSON.parse(child.stdout.trim());
-  assert.equal(created.ok, false);
-  assert.equal(created.reason, "simulated-delete-failure");
+  assert.equal(created.ok, true);
   assert.equal(created.classification, "live-owner");
 
   store = openStore(root, { projectFingerprint: PROJECT, now: () => Date.now(), staleLockMs: 20 });
@@ -175,9 +141,9 @@ test("failed child cleanup leaves one durable owner for one concurrent recovery 
     },
   } };
   const options = { store, projectFingerprint: PROJECT, rootIdentity: store.rootIdentity, now: Date.now() };
-  const first = recoverOrphanedAnalyzerSessions(client, root, options);
+  const first = recoverOrphanedHiddenSessions(client, root, options);
   await started;
-  const second = await recoverOrphanedAnalyzerSessions(client, root, options);
+  const second = await recoverOrphanedHiddenSessions(client, root, options);
   finishDelete();
   const completed = await first;
 

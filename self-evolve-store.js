@@ -24,9 +24,19 @@ import {
   validateStateRootBoundary,
   walkStateRootDirectories,
 } from "./self-evolve-state-root.js";
+import { createDurableFilesystem, syncDirectoryFsync } from "./self-evolve-durable.js";
 import {
-  LEGACY_SELF_EVOLVE_AGENTS,
-  SELF_EVOLVE_ANALYZER_AGENT,
+  AUTOMATION_EPOCH_INVALID_REASON,
+  BREAKER_EPOCH_RESET_CONFIRMATION,
+  BREAKER_EPOCH_TRIPPED_REASON,
+  ROOT_EPOCH_TERMINAL_REASON,
+  createAutomationEpochManager,
+  createBreakerEpochManager,
+  createRootEpochManager,
+} from "./self-evolve-epoch.js";
+import {
+  HISTORICAL_SELF_EVOLVE_AGENTS,
+  HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT,
   SELF_EVOLVE_CRITIC_AGENT,
   SELF_EVOLVE_SYNTHESIZER_AGENT,
 } from "./self-evolve-core.js";
@@ -39,7 +49,10 @@ import {
   assertContributionPublicationBinding,
   errorReasonCode,
   evaluateGlobalSupportEligibility,
+  evaluateV4PermissionTransition,
   evaluateV3ConsentTransition,
+  evaluateContributionConsentAuthority,
+  evaluateContributionConsentVersion,
   globalApplyIntentId,
   globalDecisionId,
   globalDecisionOutcomeId,
@@ -63,7 +76,10 @@ import {
   makeGlobalSynthesisAttempt,
   makeGlobalSupportSet,
   makeGlobalSkillSnapshot,
+  makeV4GlobalSettings,
+  makeV4RepoSettings,
   makeCandidateTargetBinding,
+  migrateLegacySettingsToV4,
   migrateSettings,
   makeProposal,
   makeProposalContent,
@@ -80,6 +96,9 @@ import {
   transitionGlobalLease,
   transitionGlobalRecommendation,
   transitionGlobalSynthesisAttempt,
+  v4AutomationPermissionsHash,
+  V4_AUTOMATION_PERMISSION_FIELDS,
+  V4_SCHEMA_VERSION,
   wrapRecord,
 } from "./self-evolve-schemas.js";
 
@@ -105,6 +124,7 @@ const MAX_GLOBAL_SNAPSHOT_RECORD_BYTES = 192 * 1024;
 const MAX_VERSION_MARKER_BYTES = 4 * 1024;
 const DECISION_TRANSACTION_VERSION = 2;
 const SETTINGS_TRANSACTION_VERSION = 2;
+const AUTOMATION_TRANSACTION_VERSION = 1;
 const MAX_EXPORT_BYTES = 64 * 1024 * 1024;
 const EXPORT_NOFOLLOW = Number.isInteger(constants.O_NOFOLLOW) && constants.O_NOFOLLOW !== 0 ? constants.O_NOFOLLOW : null;
 const ACTIVE_PROPOSAL_STATES = new Set(["critic-pending", "pending", "approved", "applied"]);
@@ -118,11 +138,35 @@ const CONTRIBUTION_INPUT_FIELDS = Object.freeze([
   "claimType", "receiptType", "signatureHash", "incidentId", "capsuleId", "clusterId",
   "evidenceDomainId", "occurrenceCount", "firstSeenAt", "lastSeenAt",
 ]);
-const HIDDEN_HOST_OWNER_AGENTS = new Set([
-  SELF_EVOLVE_ANALYZER_AGENT,
+// First-time v0.3 global-settings migration inspects every legacy partition's
+// combined settings.json and migrates ONLY values every valid partition agrees
+// on. Any divergence in a consent/authority-bearing field fails closed to the
+// Manual+all-false-defaults and writes a durable reconciliation conflict record
+// at <globalDir>/migration-conflict.json. The list below is the authority surface
+// captured by GlobalSettings excluding metadata (schemaVersion/createdAt/updatedAt),
+// budgets, and retentionDays, which default conservatively on conflict. The
+// consent.* bits are compared individually so a single disagreeing bit triggers
+// the conservative fallback for the whole settings document.
+const GLOBAL_MIGRATION_CONFLICT_REASON = "legacy-global-consent-conflict";
+const GLOBAL_MIGRATION_CONFLICT_PATH = "migration-conflict.json";
+const GLOBAL_MIGRATION_RECONCILIATION_FIELDS = Object.freeze([
+  "mode",
+  "paused",
+  "killSwitchActive",
+  "allowedSkillRoots",
+  "globalRootPolicy",
+]);
+const GLOBAL_MIGRATION_RECONCILIATION_CONSENT_BITS = Object.freeze([
+  "passiveCalls",
+  "durableObservations",
+  "sanitizedExcerpts",
+  "crossRepoAggregation",
+]);
+const KNOWN_HIDDEN_HOST_OWNER_AGENTS = new Set([
+  HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT,
   SELF_EVOLVE_SYNTHESIZER_AGENT,
   SELF_EVOLVE_CRITIC_AGENT,
-  ...Object.values(LEGACY_SELF_EVOLVE_AGENTS),
+  ...Object.values(HISTORICAL_SELF_EVOLVE_AGENTS),
 ]);
 const STORE_FILES = Object.freeze({
   observation: "observations.jsonl",
@@ -222,6 +266,9 @@ function atomicFilesystemWrite(filePath, contents, syncFile = fsyncSync) {
     closeSync(descriptor);
     descriptor = undefined;
     renameSync(temporary, filePath);
+    // Authoritative namespace mutation: fsync the parent directory so the
+    // renamed entry survives power loss, not only the file content.
+    syncDirectoryFsync(path.dirname(filePath));
   } catch (error) {
     if (descriptor !== undefined) try { closeSync(descriptor); } catch {}
     try { unlinkSync(temporary); } catch {}
@@ -275,6 +322,7 @@ export function openStore(rootDir, {
   faultInjection,
   processIsAlive: hostProcessIsAlive = processIsAlive,
   filesystemSync = fsyncSync,
+  filesystemSyncDirectory = syncDirectoryFsync,
 } = {}) {
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
   if (!/^[a-f0-9]{64}$/.test(String(projectFingerprint))) throw new TypeError("invalid-project-fingerprint");
@@ -285,12 +333,53 @@ export function openStore(rootDir, {
   if (!Number.isSafeInteger(projectQuotaFiles) || projectQuotaFiles < 1) throw new TypeError("invalid-project-file-quota");
   if (typeof hostProcessIsAlive !== "function") throw new TypeError("process-is-alive-must-be-function");
   if (typeof filesystemSync !== "function") throw new TypeError("filesystem-sync-must-be-function");
+  if (typeof filesystemSyncDirectory !== "function") throw new TypeError("filesystem-sync-directory-must-be-function");
   const rootBoundary = validateStateRootBoundary(rootDir, {
     create: true,
     beforeCreate: (details) => injectFault("state-root-before-create", details),
   });
   injectFault("state-root-after-boundary-validation", { stateRoot: rootBoundary.path });
   const root = revalidateStateRootBoundary(rootBoundary);
+  // Bound durable namespace mutation for the authoritative write path. Capability
+  // is probed once against the validated state root: a host that cannot fsync a
+  // directory descriptor disables authoritative writes with a stable reason while
+  // read-only analysis paths (which never call these primitives) keep working.
+  const durable = createDurableFilesystem({
+    syncFile: filesystemSync,
+    syncDirectory: filesystemSyncDirectory,
+    probeDirectory: root,
+    faultInjection: (point, details) => injectFault(point, details),
+  });
+  // Root-global epoch manager bound to the validated state root and the shared
+  // durable namespace primitive. The epoch file lives at the root level (outside
+  // the deletable `self-evolve/` subtree) so it survives purge-all and is
+  // visible to every process sharing the state root. The store reads it at open
+  // and re-reads it under every mutation-lock acquisition so a peer's terminal
+  // write fails this process's next authoritative mutation closed.
+  const rootEpoch = createRootEpochManager({
+    stateRoot: root,
+    durable,
+    now,
+  });
+  // Root-global circuit-breaker epoch: a sibling durable authority truth that
+  // composes with the terminal/reinitialize root epoch (same state-root
+  // boundary, same durable namespace primitive) but tracks the cross-process
+  // circuit-breaker open/closed state separately. Every admission, provider,
+  // and effect boundary freshly reads this so a peer process's trip is visible
+  // without restart. The terminal/reinitialize epoch owns purge terminality;
+  // the breaker epoch owns breaker truth. A corrupt breaker epoch fails closed
+  // (treated as tripped) so a tampered root cannot regain autonomy by erasing
+  // the trip marker.
+  const breakerEpoch = createBreakerEpochManager({
+    stateRoot: root,
+    durable,
+    now,
+  });
+  const automationEpoch = createAutomationEpochManager({
+    stateRoot: root,
+    durable,
+    now,
+  });
   const baseDir = path.join(root, "self-evolve");
   const globalDir = path.join(baseDir, "global");
   const stateDir = path.join(baseDir, projectFingerprint);
@@ -301,6 +390,10 @@ export function openStore(rootDir, {
   const snapshotsDir = path.join(stateDir, "snapshots");
   const repoSettingsPath = path.join(stateDir, "settings.json");
   const globalSettingsPath = path.join(globalDir, "settings.json");
+  const automationGlobalSettingsPath = path.join(globalDir, "automation-settings.json");
+  const automationRepoSettingsPath = path.join(stateDir, "automation-settings.json");
+  const automationTransactionPath = path.join(baseDir, "automation-transition.json");
+  const globalMigrationConflictPath = path.join(globalDir, GLOBAL_MIGRATION_CONFLICT_PATH);
   const aggregatesPath = path.join(globalDir, "aggregates.jsonl");
   const contributionsDir = path.join(globalDir, "contributions");
   const globalCandidatesDir = path.join(globalDir, "candidates");
@@ -339,6 +432,23 @@ export function openStore(rootDir, {
   let partitionVersion = null;
   let closed = false;
   let terminal = false;
+  let terminalEpochReason = null;
+  // Cached tripped reason for the breaker epoch. Refreshed under the mutation
+  // lock (alongside the root epoch) and on demand via breakerEpochTripped(). A
+  // null reason means healthy; a non-null reason means tripped (or corrupt,
+  // which fails closed as breaker-epoch-tripped). Peers see each other's
+  // trip/reset writes at the next boundary read because the source-byte cache
+  // invalidates on any on-disk change.
+  let breakerEpochReason = null;
+  // Set when THIS process wrote the terminal epoch via markRootTerminal but has
+  // not yet deleted the subtree. While pending, the local store skips the
+  // durable-epoch refresh inside the mutation lock so cleanup reads/audits
+  // (accepted-terminal response recording, in-flight cycle-outcome audits)
+  // continue to function until store.purge({ scope:"all" }) performs the actual
+  // deletion and sets the definitive local terminal flag. Peer processes do not
+  // set this flag, so their very next mutation-lock acquisition refreshes the
+  // durable epoch and fails closed.
+  let localTerminalPending = false;
 
   function boundaryComponents(directory) {
     const resolved = path.resolve(directory);
@@ -386,13 +496,15 @@ export function openStore(rootDir, {
     revalidateStateRootBoundary(rootBoundary);
     ensureDir(path.dirname(filePath));
     revalidateStateRootBoundary(rootBoundary);
-    atomicFilesystemWrite(filePath, contents, filesystemSync);
+    durable.durableReplaceFile(filePath, contents);
     revalidateStateRootBoundary(rootBoundary);
   }
 
-  function ensureOpen({ allowIncompatible = false } = {}) {
+  function ensureOpen({ allowIncompatible = false, allowTerminal = false } = {}) {
     if (closed) throw new Error("store-closed");
-    if (terminal || terminalRoots.has(root)) throw new Error("restart-required-after-purge-all");
+    if (!allowTerminal && (terminal || terminalRoots.has(root) || terminalEpochReason !== null)) {
+      throw new Error(terminalEpochReason ?? "restart-required-after-purge-all");
+    }
     if (partitionAdmissionError && !allowIncompatible) throw new Error(partitionAdmissionError);
   }
 
@@ -402,17 +514,66 @@ export function openStore(rootDir, {
       : scope;
   }
 
+  // Refresh the cached durable epoch truth from disk. Called at open and under
+  // every mutation-lock acquisition so a peer process's terminal write fails
+  // this process's next authoritative boundary closed even though the in-memory
+  // `terminal` flag was set only by this process's own purge. A corrupt epoch
+  // file fails closed (treated as terminal) so a tampered root cannot regain
+  // authority by erasing the terminal marker.
+  function refreshRootEpochUnlocked() {
+    // Skip the durable-epoch disk read when THIS process has already written the
+    // terminal epoch and is in the pre-deletion grace window. Peers never set
+    // localTerminalPending and so always hit the disk read.
+    if (localTerminalPending) return terminalEpochReason;
+    try {
+      const reason = rootEpoch.readTerminalReason();
+      terminalEpochReason = reason;
+    } catch (error) {
+      terminalEpochReason = errorReasonCode(error, ROOT_EPOCH_TERMINAL_REASON);
+    }
+    if (terminalEpochReason !== null) terminal = true;
+    return terminalEpochReason;
+  }
+
+  // Refresh the cached durable breaker epoch truth from disk. Called under the
+  // mutation lock (alongside the root epoch) and on demand by every admission,
+  // provider, and effect boundary. A corrupt breaker epoch fails closed
+  // (treated as tripped) so a tampered root cannot regain autonomy.
+  function refreshBreakerEpochUnlocked() {
+    try {
+      breakerEpochReason = breakerEpoch.readTrippedReason();
+    } catch (error) {
+      breakerEpochReason = errorReasonCode(error, BREAKER_EPOCH_TRIPPED_REASON);
+    }
+    return breakerEpochReason;
+  }
+
   function withMutationLock(action, {
     requireStoreAncestors = true,
     allowIncompatible = false,
     recoverTransactions = true,
+    skipEpochRefresh = false,
+    allowTerminal = false,
   } = {}) {
-    ensureOpen({ allowIncompatible });
+    ensureOpen({ allowIncompatible, allowTerminal });
     revalidateStateRootBoundary(rootBoundary);
     return withStateMutationLock(root, () => {
       revalidateStateRootBoundary(rootBoundary);
+      if (!skipEpochRefresh && !allowTerminal) refreshRootEpochUnlocked();
+      // Refresh the breaker epoch under the lock so every boundary that reads
+      // the cached state observes the latest peer trip/reset. The breaker does
+      // NOT gate store mutations (it gates autonomy, and trip/reset audits must
+      // remain writable); the actual suppression happens at admission/provider/
+      // effect boundaries via breakerEpochTripped().
+      if (!skipEpochRefresh) refreshBreakerEpochUnlocked();
+      if (!allowTerminal && terminalEpochReason !== null) {
+        throw new Error(terminalEpochReason ?? "restart-required-after-purge-all");
+      }
       if (requireStoreAncestors) revalidateStoreAncestors();
-      if (recoverTransactions) recoverSettingsTransactionUnlocked();
+      if (recoverTransactions) {
+        recoverSettingsTransactionUnlocked();
+        recoverAutomationTransactionUnlocked();
+      }
       const result = action();
       revalidateStateRootBoundary(rootBoundary);
       return result;
@@ -1268,27 +1429,109 @@ export function openStore(rootDir, {
     } catch { return null; }
   }
 
-  function findLegacyGlobalUnlocked() {
-    if (!existsSync(baseDir)) return null;
-    const candidates = readdirSync(baseDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name))
-      .map((entry) => path.join(baseDir, entry.name, "settings.json"))
-      .sort();
-    for (const candidatePath of candidates) {
+  function collectLegacyGlobalPartitionsUnlocked() {
+    if (!existsSync(baseDir)) return [];
+    const partitions = [];
+    for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name)) continue;
+      const candidatePath = path.join(baseDir, entry.name, "settings.json");
       const legacy = readLegacyCombined(candidatePath);
       if (!legacy?.global) continue;
-      try { return makeGlobalSettings(legacy.global); } catch {}
+      try {
+        partitions.push({ fingerprint: entry.name, settings: makeGlobalSettings(legacy.global) });
+      } catch {}
     }
-    return null;
+    // Sort by fingerprint so the audit trail and any derived ordering are
+    // reproducible across processes and independent of readdir() order. The
+    // reconciliation result itself never depends on this order.
+    partitions.sort((left, right) => (left.fingerprint < right.fingerprint ? -1 : left.fingerprint > right.fingerprint ? 1 : 0));
+    return partitions;
+  }
+
+  function globalSettingsFieldSignature(settings) {
+    return {
+      mode: settings.mode,
+      paused: settings.paused,
+      killSwitchActive: settings.killSwitchActive,
+      allowedSkillRoots: [...settings.allowedSkillRoots].sort(),
+      globalRootPolicy: settings.globalRootPolicy === null ? null : settings.globalRootPolicy.rootSetHash,
+      consent: { ...settings.consent },
+    };
+  }
+
+  function describeLegacyGlobalDivergences(partitions) {
+    const reference = partitions[0].settings;
+    const divergent = [];
+    for (const field of GLOBAL_MIGRATION_RECONCILIATION_FIELDS) {
+      const referenceValue = globalSettingsFieldSignature(reference)[field];
+      const unanimous = partitions.every((entry) => {
+        const signature = globalSettingsFieldSignature(entry.settings);
+        return JSON.stringify(signature[field]) === JSON.stringify(referenceValue);
+      });
+      if (!unanimous) divergent.push(field);
+    }
+    for (const bit of GLOBAL_MIGRATION_RECONCILIATION_CONSENT_BITS) {
+      const referenceValue = reference.consent[bit];
+      const unanimous = partitions.every((entry) => entry.settings.consent[bit] === referenceValue);
+      if (!unanimous) divergent.push(`consent.${bit}`);
+    }
+    return divergent.sort();
+  }
+
+  function buildLegacyGlobalReconciliation(partitions, timestamp) {
+    if (partitions.length === 0) return null;
+    const reference = partitions[0].settings;
+    const consentUnanimous = partitions.every((entry) =>
+      GLOBAL_MIGRATION_RECONCILIATION_CONSENT_BITS.every((bit) => entry.settings.consent[bit] === reference.consent[bit]));
+    const authorityUnanimous = partitions.every((entry) => {
+      const signature = globalSettingsFieldSignature(entry.settings);
+      const referenceSignature = globalSettingsFieldSignature(reference);
+      return GLOBAL_MIGRATION_RECONCILIATION_FIELDS.every((field) =>
+        JSON.stringify(signature[field]) === JSON.stringify(referenceSignature[field]));
+    });
+    if (consentUnanimous && authorityUnanimous) {
+      return { settings: reference, conflict: null };
+    }
+    const conflict = {
+      schemaVersion: SCHEMA_VERSION,
+      kind: "global-migration-conflict",
+      reason: GLOBAL_MIGRATION_CONFLICT_REASON,
+      createdAt: timestamp,
+      partitionFingerprints: Object.freeze(partitions.map((entry) => entry.fingerprint)),
+      divergentFields: Object.freeze(describeLegacyGlobalDivergences(partitions)),
+      appliedDefaults: Object.freeze({
+        mode: "manual",
+        consent: Object.freeze({
+          passiveCalls: false,
+          durableObservations: false,
+          sanitizedExcerpts: false,
+          crossRepoAggregation: false,
+        }),
+      }),
+      resolution: Object.freeze({
+        path: "operator-settings-control",
+        authorizesPublication: false,
+        selectsModel: false,
+      }),
+    };
+    return Object.freeze({ settings: null, conflict: Object.freeze(conflict) });
+  }
+
+  function reconcileLegacyGlobalUnlocked() {
+    return buildLegacyGlobalReconciliation(collectLegacyGlobalPartitionsUnlocked(), now());
   }
 
   function loadGlobalSettingsUnlocked() {
     if (!existsSync(globalSettingsPath)) {
       const defaults = makeGlobalSettings({ createdAt: now(), updatedAt: now() });
-      const initial = findLegacyGlobalUnlocked() ?? defaults;
-      const source = json(initial);
-      assertGlobalQuotaUnlocked(new Map([[path.resolve(globalSettingsPath), source]]));
-      atomicWrite(globalSettingsPath, source);
+      const reconciled = reconcileLegacyGlobalUnlocked();
+      const initial = reconciled?.settings ?? defaults;
+      const changes = new Map([[path.resolve(globalSettingsPath), json(initial)]]);
+      if (reconciled?.conflict && !existsSync(globalMigrationConflictPath)) {
+        changes.set(path.resolve(globalMigrationConflictPath), json(reconciled.conflict));
+      }
+      assertGlobalQuotaUnlocked(changes);
+      for (const [resolved, source] of changes) atomicWrite(resolved, source);
       return initial;
     }
     let source;
@@ -1345,7 +1588,6 @@ export function openStore(rootDir, {
     const global = loadGlobalSettingsUnlocked();
     const repo = loadRepoSettingsUnlocked();
     if (!global || !repo) throw new Error("corrupt-settings");
-    if (!global.consent.sanitizedExcerpts && existsSync(evidenceCapsulesPath)) rmSync(evidenceCapsulesPath, { force: true });
     lastKnownProjectQuotaBytes = (repo.budgets.storageQuotaMiB ?? global.budgets.storageQuotaMiB) * 1024 * 1024;
     return { global, repo };
   }
@@ -1354,18 +1596,123 @@ export function openStore(rootDir, {
     return withMutationLock(getSettingsUnlocked);
   }
 
+  function loadAutomationGlobalSettingsUnlocked(legacy) {
+    if (!existsSync(automationGlobalSettingsPath)) {
+      const migrated = migrateLegacySettingsToV4(
+        { schemaVersion: SCHEMA_VERSION, global: legacy.global, repo: legacy.repo },
+        { projectFingerprint, now: now() },
+      );
+      if (!migrated) return null;
+      const source = json(migrated.global);
+      assertGlobalQuotaUnlocked(new Map([[path.resolve(automationGlobalSettingsPath), source]]));
+      atomicWrite(automationGlobalSettingsPath, source);
+      return migrated.global;
+    }
+    let source;
+    try {
+      source = readFileSync(automationGlobalSettingsPath, "utf8");
+      const stored = makeV4GlobalSettings(JSON.parse(source));
+      // v0.4 owns automation authority, while retained root, budget, and
+      // retention management still use the established crash-safe settings
+      // transaction. Mirror only those non-authority fields; retired mode,
+      // pause, and passive-consent values can never flow back into v0.4.
+      const synchronized = makeV4GlobalSettings({
+        ...stored,
+        allowedSkillRoots: legacy.global.allowedSkillRoots,
+        globalRootPolicy: legacy.global.globalRootPolicy,
+        budgets: legacy.global.budgets,
+        retentionDays: legacy.global.retentionDays,
+      });
+      if (JSON.stringify(synchronized) !== JSON.stringify(stored)) {
+        const nextSource = json(synchronized);
+        assertGlobalQuotaUnlocked(new Map([[path.resolve(automationGlobalSettingsPath), nextSource]]));
+        atomicWrite(automationGlobalSettingsPath, nextSource);
+      }
+      return synchronized;
+    } catch (error) {
+      try { quarantineGlobal(source ?? "unreadable automation settings", errorReasonCode(error, "corrupt-record"), "automation-global-settings"); } catch {}
+      return null;
+    }
+  }
+
+  function loadAutomationRepoSettingsUnlocked(legacy) {
+    if (!existsSync(automationRepoSettingsPath)) {
+      const migrated = migrateLegacySettingsToV4(
+        { schemaVersion: SCHEMA_VERSION, global: legacy.global, repo: legacy.repo },
+        { projectFingerprint, now: now() },
+      );
+      if (!migrated) return null;
+      atomicProjectWrite(automationRepoSettingsPath, json(migrated.repo));
+      return migrated.repo;
+    }
+    let source;
+    try {
+      source = readFileSync(automationRepoSettingsPath, "utf8");
+      const stored = makeV4RepoSettings(JSON.parse(source));
+      const synchronized = makeV4RepoSettings({ ...stored, budgets: legacy.repo.budgets });
+      if (JSON.stringify(synchronized) !== JSON.stringify(stored)) {
+        atomicProjectWrite(automationRepoSettingsPath, json(synchronized));
+      }
+      return synchronized;
+    } catch (error) {
+      try { quarantineSettings(source ?? "unreadable automation repository settings", errorReasonCode(error, "corrupt-record"), "automation-repo-settings"); } catch {}
+      return null;
+    }
+  }
+
+  function getAutomationStateUnlocked() {
+    if (startupCorruptionScope) return { ok: false, enabled: false, reason: "corrupt-state" };
+    const legacy = { global: loadGlobalSettingsUnlocked(), repo: loadRepoSettingsUnlocked() };
+    if (!legacy.global || !legacy.repo) return { ok: false, enabled: false, reason: "corrupt-settings" };
+    lastKnownProjectQuotaBytes = (legacy.repo.budgets.storageQuotaMiB ?? legacy.global.budgets.storageQuotaMiB) * 1024 * 1024;
+    const global = loadAutomationGlobalSettingsUnlocked(legacy);
+    const repo = loadAutomationRepoSettingsUnlocked(legacy);
+    if (!global || !repo) return { ok: false, enabled: false, reason: "corrupt-automation-settings" };
+    let epoch;
+    let stamp;
+    try {
+      epoch = automationEpoch.read();
+      stamp = automationEpoch.stamp();
+    } catch {
+      return { ok: false, enabled: false, reason: AUTOMATION_EPOCH_INVALID_REASON };
+    }
+    const permissionsHash = v4AutomationPermissionsHash(global.consent);
+    if (permissionsHash !== epoch.permissionsHash
+      || global.automaticRecommendationsEnabled !== epoch.enabled) {
+      return { ok: false, enabled: false, reason: "automation-authority-mismatch" };
+    }
+    return { ok: true, enabled: epoch.enabled, global, repo, epoch, stamp };
+  }
+
+  function getAutomationState() {
+    try { return withMutationLock(getAutomationStateUnlocked); }
+    catch (error) { return { ok: false, enabled: false, reason: errorReasonCode(error, "automation-state-unavailable") }; }
+  }
+
+  function compareAutomationStamp(stamp) {
+    try { return withMutationLock(() => automationEpoch.compare(stamp)); }
+    catch { return false; }
+  }
+
+  function assertAutomationStampUnlocked(stamp, { requireEnabled = true } = {}) {
+    if (!automationEpoch.compare(stamp)) throw new Error("stale-automation-generation");
+    const current = getAutomationStateUnlocked();
+    if (!current.ok) throw new Error(current.reason ?? "automation-state-unavailable");
+    if (requireEnabled && !current.enabled) throw new Error("automatic-recommendations-disabled");
+    return current;
+  }
+
   function readProjectionSnapshot() {
     return withMutationLock(() => {
       if (existsSync(decisionTransactionPath)) throw new Error("projection-snapshot-recovery-pending");
-      let global;
-      let repo;
+      let automation;
       try {
-        global = makeGlobalSettings(JSON.parse(readFileSync(globalSettingsPath, "utf8")));
-        repo = makeRepoSettings(JSON.parse(readFileSync(repoSettingsPath, "utf8")));
+        automation = getAutomationStateUnlocked();
+        if (!automation.ok) throw new Error(automation.reason);
       } catch {
         throw new Error("projection-snapshot-corrupt-settings");
       }
-      const settings = { global, repo };
+      const settings = { global: automation.global, repo: automation.repo };
       const records = [];
       for (const fileName of [...new Set(Object.values(STORE_FILES))].sort()) {
         const read = readValidatedSource(path.join(stateDir, fileName));
@@ -1390,7 +1737,8 @@ export function openStore(rootDir, {
         )
       ));
       const generation = hashContent(JSON.stringify([
-        "self-evolve-projection-store-snapshot-v1",
+        "self-evolve-projection-store-snapshot-v2",
+        automation.stamp,
         settings.global,
         settings.repo,
         generationRecords,
@@ -1413,7 +1761,7 @@ export function openStore(rootDir, {
           resetAt: relevant.length ? relevant[0].timestamp + windowMs : null,
         });
       };
-      const passiveLimit = settings.repo.budgets.passiveCallsPerHour
+      const providerLimit = settings.repo.budgets.passiveCallsPerHour
         ?? settings.global.budgets.passiveCallsPerHour;
       const synthesisLimit = settings.repo.budgets.synthesisPerDay
         ?? settings.global.budgets.synthesisPerDay;
@@ -1421,7 +1769,7 @@ export function openStore(rootDir, {
         ?? settings.global.budgets.storageQuotaMiB) * 1024 * 1024;
       const storageBytesUsed = projectedProjectBytesUnlocked();
       const usage = Object.freeze({
-        passive: budgetUsage("passive", 60 * 60 * 1000, passiveLimit),
+        provider: budgetUsage("passive", 60 * 60 * 1000, providerLimit),
         synthesis: budgetUsage("synthesis", DAY_MS, synthesisLimit),
         storage: Object.freeze({
           usedBytes: storageBytesUsed,
@@ -1432,7 +1780,7 @@ export function openStore(rootDir, {
       return Object.freeze({
         projectFingerprint,
         generation,
-        settings: Object.freeze({ global: settings.global, repo: settings.repo }),
+        settings: Object.freeze({ global: settings.global, repo: settings.repo, automationStamp: automation.stamp }),
         records: Object.freeze([...records]),
         usage,
       });
@@ -1728,6 +2076,12 @@ export function openStore(rootDir, {
         const nextGlobal = proposed.global === undefined ? current.global : makeGlobalSettings(proposed.global);
         const nextRepo = proposed.repo === undefined ? current.repo : makeRepoSettings(proposed.repo);
         if (nextRepo.projectFingerprint !== projectFingerprint) return { ok: false, reason: "project-partition-mismatch" };
+        if (nextGlobal.mode !== current.global.mode
+          || nextGlobal.paused !== current.global.paused
+          || JSON.stringify(nextGlobal.consent) !== JSON.stringify(current.global.consent)
+          || nextRepo.mode !== current.repo.mode) {
+          return { ok: false, reason: "retired-v04-control" };
+        }
         const globalChanged = JSON.stringify(nextGlobal) !== JSON.stringify(current.global);
         const repoChanged = JSON.stringify(nextRepo) !== JSON.stringify(current.repo);
         if (!globalChanged && !repoChanged) return { ok: true, changed: false, settings: current };
@@ -1787,11 +2141,301 @@ export function openStore(rootDir, {
     return result.ok ? result.settings[scope] : result;
   }
 
-  function appendRecord(envelope) {
-    try { return withMutationLock(() => appendValidUnlocked(envelope)); }
+  function automationRequest(request) {
+    if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("invalid-automation-transition");
+    const allowed = ["action", "enabled", "expectedGeneration", "permission", "transitionId"];
+    if (Object.keys(request).some((key) => !allowed.includes(key))) throw new Error("invalid-automation-transition");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(String(request.transitionId))) throw new Error("invalid-automation-transition-id");
+    if (!Number.isSafeInteger(request.expectedGeneration) || request.expectedGeneration < 1) throw new Error("invalid-automation-generation");
+    if (typeof request.enabled !== "boolean") throw new Error("invalid-automation-enabled");
+    if (!["set-automatic-recommendations", "set-permission", "set-emergency-stop"].includes(request.action)) {
+      throw new Error("invalid-automation-action");
+    }
+    const permission = request.action === "set-permission"
+      ? String(request.permission ?? "")
+      : null;
+    if (request.action === "set-permission" && !V4_AUTOMATION_PERMISSION_FIELDS.includes(permission)) {
+      throw new Error("invalid-automation-permission");
+    }
+    if (request.action !== "set-permission" && request.permission !== undefined && request.permission !== null) {
+      throw new Error("invalid-automation-permission");
+    }
+    const clean = {
+      transitionId: request.transitionId,
+      expectedGeneration: request.expectedGeneration,
+      action: request.action,
+      permission,
+      enabled: request.enabled,
+    };
+    return { ...clean, transitionHash: hashContent(JSON.stringify(["self-evolve-automation-transition-v1", clean])) };
+  }
+
+  function buildAutomationTransaction(current, nextGlobal, request, audit) {
+    const body = {
+      protocolVersion: AUTOMATION_TRANSACTION_VERSION,
+      schemaVersion: V4_SCHEMA_VERSION,
+      projectFingerprint,
+      transitionId: request.transitionId,
+      transitionHash: request.transitionHash,
+      expectedGeneration: request.expectedGeneration,
+      enabled: nextGlobal.automaticRecommendationsEnabled,
+      permissionsHash: v4AutomationPermissionsHash(nextGlobal.consent),
+      prior: current.global,
+      next: nextGlobal,
+      audit,
+    };
+    return { ...body, intentHash: hashContent(JSON.stringify(body)) };
+  }
+
+  function validateAutomationTransaction(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("malformed-automation-transaction");
+    const keys = [
+      "audit", "enabled", "expectedGeneration", "intentHash", "next", "permissionsHash",
+      "prior", "projectFingerprint", "protocolVersion", "schemaVersion", "transitionHash", "transitionId",
+    ];
+    if (Object.keys(value).sort().join(",") !== keys.sort().join(",")) throw new Error("malformed-automation-transaction");
+    if (value.protocolVersion !== AUTOMATION_TRANSACTION_VERSION || value.schemaVersion !== V4_SCHEMA_VERSION) {
+      throw new Error("unsupported-automation-transaction");
+    }
+    if (!/^[a-f0-9]{64}$/u.test(String(value.projectFingerprint))) throw new Error("cross-scope");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(String(value.transitionId))) throw new Error("malformed-automation-transaction");
+    if (!/^[a-f0-9]{64}$/u.test(String(value.transitionHash)) || !/^[a-f0-9]{64}$/u.test(String(value.permissionsHash))) {
+      throw new Error("malformed-automation-transaction");
+    }
+    if (!Number.isSafeInteger(value.expectedGeneration) || value.expectedGeneration < 1 || typeof value.enabled !== "boolean") {
+      throw new Error("malformed-automation-transaction");
+    }
+    const prior = makeV4GlobalSettings(value.prior);
+    const next = makeV4GlobalSettings(value.next);
+    if (JSON.stringify(prior) === JSON.stringify(next)
+      || next.automaticRecommendationsEnabled !== value.enabled
+      || v4AutomationPermissionsHash(next.consent) !== value.permissionsHash) {
+      throw new Error("malformed-automation-transaction");
+    }
+    const audit = assertRecord(value.audit);
+    if (audit.kind !== "audit-event" || audit.payload.kind !== "mode-change"
+      || audit.payload.details?.action !== "automation-control") {
+      throw new Error("malformed-automation-transaction");
+    }
+    const { intentHash, ...body } = value;
+    if (intentHash !== hashContent(JSON.stringify(body))) throw new Error("corrupt-automation-transaction");
+    return { ...body, intentHash, prior, next, audit };
+  }
+
+  function recoverAutomationTransactionUnlocked({ inject = false } = {}) {
+    if (!existsSync(automationTransactionPath)) return null;
+    let source;
+    let intent;
+    try {
+      source = readFileSync(automationTransactionPath, "utf8");
+      intent = validateAutomationTransaction(JSON.parse(source));
+    } catch (error) {
+      try { quarantineGlobal(source ?? "unreadable automation transaction", errorReasonCode(error, "corrupt-record"), "automation-transaction"); }
+      finally { rmSync(automationTransactionPath, { force: true }); }
+      throw new Error(errorReasonCode(error, "corrupt-record"));
+    }
+
+    automationEpoch.transition({
+      transitionId: intent.transitionId,
+      transitionHash: intent.transitionHash,
+      expectedGeneration: intent.expectedGeneration,
+      enabled: intent.enabled,
+      permissionsHash: intent.permissionsHash,
+      rootIdentityHash: rootBoundary.identity,
+    });
+    if (inject) injectFault("automation-after-epoch-write");
+
+    let current;
+    try { current = makeV4GlobalSettings(JSON.parse(readFileSync(automationGlobalSettingsPath, "utf8"))); }
+    catch { throw new Error("automation-transaction-state-conflict"); }
+    if (JSON.stringify(current) === JSON.stringify(intent.prior)) {
+      const nextSource = json(intent.next);
+      assertGlobalQuotaUnlocked(new Map([[path.resolve(automationGlobalSettingsPath), nextSource]]));
+      atomicWrite(automationGlobalSettingsPath, nextSource);
+    } else if (JSON.stringify(current) !== JSON.stringify(intent.next)) {
+      throw new Error("automation-transaction-state-conflict");
+    }
+    if (inject) injectFault("automation-after-settings-write");
+
+    const targetStateDir = path.join(baseDir, intent.projectFingerprint);
+    ensureDir(targetStateDir);
+    const auditPath = path.join(targetStateDir, STORE_FILES["audit-event"]);
+    const parsedAudit = readValidatedSource(auditPath);
+    if (parsedAudit.damaged.length) throw new Error("automation-transaction-audit-conflict");
+    const matches = parsedAudit.records.filter((record) => record.id === intent.audit.id
+      || (record.kind === "audit-event" && record.payload.id === intent.audit.payload.id));
+    if (matches.some((record) => JSON.stringify(record) !== JSON.stringify(intent.audit)) || matches.length > 1) {
+      throw new Error("automation-transaction-audit-conflict");
+    }
+    if (matches.length === 0) {
+      let auditSource = parsedAudit.source ?? "";
+      if (auditSource && !auditSource.endsWith("\n")) auditSource += "\n";
+      auditSource += `${JSON.stringify(intent.audit)}\n`;
+      atomicWrite(auditPath, auditSource);
+      cacheParsedRecords(auditPath, auditSource, [...parsedAudit.records, intent.audit]);
+    }
+    if (inject) injectFault("automation-after-audit-write");
+
+    const consentEffects = evaluateV4PermissionTransition(intent.prior.consent, intent.next.consent);
+    const capsuleSupport = consentEffects.deleteProjectCapsules
+      ? deleteEvidenceCapsulesUnlocked("sanitized-excerpts-consent-revoked")
+      : null;
+    // A reversible Off/permission transition fences future autonomous work but
+    // does not retract recommendations that were already published for
+    // operator review. Their immutable support/content remains reviewable;
+    // only unfinished work from the closed generation is settled below.
+    const invalidatedGlobalRecommendations = 0;
+    const automationSettlement = !intent.next.automaticRecommendationsEnabled
+      ? settleAutomationGenerationUnlocked(intent.expectedGeneration, intent.audit.payload.timestamp)
+      : { candidates: 0, attempts: 0 };
+    if (inject) injectFault("automation-after-privacy-effects");
+    rmSync(automationTransactionPath, { force: true });
+    if (inject) injectFault("automation-after-transaction-remove");
+    return {
+      ok: true,
+      recovered: true,
+      changed: true,
+      settings: intent.next,
+      epoch: automationEpoch.read(),
+      auditEvent: intent.audit.payload,
+      consentEffects,
+      invalidatedGlobalRecommendations,
+      automationSettlement,
+      ...(capsuleSupport ? { capsuleSupport } : {}),
+    };
+  }
+
+  function transitionAutomation(request) {
+    try {
+      const cleanRequest = automationRequest(request);
+      return withMutationLock(() => {
+        const current = getAutomationStateUnlocked();
+        if (!current.ok) return current;
+        if (current.epoch.lastTransitionId === cleanRequest.transitionId) {
+          if (current.epoch.lastTransitionHash !== cleanRequest.transitionHash) {
+            return { ok: false, reason: "automation-transition-conflict" };
+          }
+          return { ok: true, changed: false, duplicate: true, settings: current.global, epoch: current.epoch };
+        }
+        if (current.epoch.generation !== cleanRequest.expectedGeneration) {
+          return { ok: false, reason: "stale-automation-generation" };
+        }
+        let consent = current.global.consent;
+        let enabled = current.global.automaticRecommendationsEnabled;
+        let killSwitchActive = current.global.killSwitchActive;
+        if (cleanRequest.action === "set-automatic-recommendations") {
+          enabled = cleanRequest.enabled;
+          if (enabled) consent = { durableObservations: true, sanitizedExcerpts: true, crossRepoAggregation: true };
+        } else if (cleanRequest.action === "set-permission") {
+          consent = { ...consent, [cleanRequest.permission]: cleanRequest.enabled };
+          if (!cleanRequest.enabled) enabled = false;
+        } else {
+          killSwitchActive = cleanRequest.enabled;
+        }
+        if (enabled === current.global.automaticRecommendationsEnabled
+          && killSwitchActive === current.global.killSwitchActive
+          && JSON.stringify(consent) === JSON.stringify(current.global.consent)) {
+          return { ok: true, changed: false, duplicate: false, settings: current.global, epoch: current.epoch };
+        }
+        const next = makeV4GlobalSettings({
+          ...current.global,
+          automaticRecommendationsEnabled: enabled,
+          killSwitchActive,
+          consent,
+          updatedAt: Math.max(now(), current.global.updatedAt),
+        });
+        const audit = makeAudit("mode-change", {
+          action: "automation-control",
+          transitionIdHash: hashContent(cleanRequest.transitionId),
+          control: cleanRequest.action,
+          permission: cleanRequest.permission ?? undefined,
+          enabled: next.automaticRecommendationsEnabled,
+          ...(cleanRequest.action === "set-emergency-stop" ? { emergencyStopActive: next.killSwitchActive } : {}),
+          nextGeneration: current.epoch.generation + 1,
+        });
+        const intent = buildAutomationTransaction(current, next, cleanRequest, audit);
+        const auditPath = path.join(stateDir, STORE_FILES["audit-event"]);
+        const currentAudit = readValidatedSource(auditPath);
+        if (currentAudit.damaged.length) return { ok: false, reason: "automation-transaction-audit-conflict" };
+        let auditSource = currentAudit.source ?? "";
+        if (auditSource && !auditSource.endsWith("\n")) auditSource += "\n";
+        auditSource += `${JSON.stringify(audit)}\n`;
+        assertProjectQuotaUnlocked(new Map([[path.resolve(auditPath), auditSource]]), {
+          mandatoryAuditBytes: Buffer.byteLength(JSON.stringify(audit), "utf8") + 1,
+        });
+        assertGlobalQuotaUnlocked(new Map([
+          [path.resolve(automationGlobalSettingsPath), json(next)],
+          [path.resolve(automationTransactionPath), json(intent)],
+        ]));
+        injectFault("automation-before-intent-write");
+        atomicWrite(automationTransactionPath, json(intent));
+        try {
+          injectFault("automation-after-intent-write");
+          return { ...recoverAutomationTransactionUnlocked({ inject: true }), recovered: false };
+        } catch (error) {
+          if (!existsSync(automationTransactionPath)) {
+            return { ok: true, changed: true, recovered: false, settings: next, epoch: automationEpoch.read(), auditEvent: audit.payload };
+          }
+          return { ...recoverAutomationTransactionUnlocked(), recovered: true };
+        }
+      });
+    } catch (error) {
+      return { ok: false, reason: errorReasonCode(error, "automation-transition-failed") };
+    }
+  }
+
+  function setAutomationProjectExcluded(excluded) {
+    try {
+      if (typeof excluded !== "boolean") throw new Error("invalid-project-exclusion");
+      return withMutationLock(() => {
+        const current = getAutomationStateUnlocked();
+        if (!current.ok) return current;
+        if (current.repo.excluded === excluded) {
+          return { ok: true, changed: false, settings: current.repo };
+        }
+        const next = makeV4RepoSettings({ ...current.repo, excluded });
+        const audit = makeAudit("mode-change", {
+          action: excluded ? "exclude" : "include",
+          scope: "project",
+          excluded,
+        });
+        const auditPath = path.join(stateDir, STORE_FILES["audit-event"]);
+        const parsedAudit = readValidatedSource(auditPath);
+        if (parsedAudit.damaged.length) return { ok: false, reason: "project-exclusion-audit-conflict" };
+        let auditSource = parsedAudit.source ?? "";
+        if (auditSource && !auditSource.endsWith("\n")) auditSource += "\n";
+        auditSource += `${JSON.stringify(audit)}\n`;
+        assertProjectQuotaUnlocked(new Map([
+          [path.resolve(automationRepoSettingsPath), json(next)],
+          [path.resolve(auditPath), auditSource],
+        ]), {
+          mandatoryAuditBytes: Buffer.byteLength(JSON.stringify(audit), "utf8") + 1,
+        });
+        atomicProjectWrite(automationRepoSettingsPath, json(next));
+        atomicWrite(auditPath, auditSource);
+        cacheParsedRecords(auditPath, auditSource, [...parsedAudit.records, audit]);
+        return { ok: true, changed: true, settings: next, auditEvent: audit.payload };
+      });
+    } catch (error) {
+      return { ok: false, reason: errorReasonCode(error, "project-exclusion-update-failed") };
+    }
+  }
+
+  function appendRecord(envelope, { automationStamp = null } = {}) {
+    try { return withMutationLock(() => {
+      if (automationStamp != null) assertAutomationStampUnlocked(automationStamp);
+      return appendValidUnlocked(envelope);
+    }); }
     catch (error) {
-      try { withMutationLock(() => quarantine(envelope, errorReasonCode(error, "corrupt-record"))); } catch {}
-      return { ok: false, reason: errorReasonCode(error, "corrupt-record") };
+      const reason = errorReasonCode(error, "corrupt-record");
+      // A fenced automatic result is valid data from a generation that no
+      // longer owns authority. Refusing it must be side-effect free: writing a
+      // quarantine record after Off would itself be an autonomous durable
+      // mutation under the revoked generation.
+      if (!["stale-automation-generation", "automatic-recommendations-disabled"].includes(reason)) {
+        try { withMutationLock(() => quarantine(envelope, reason)); } catch {}
+      }
+      return { ok: false, reason };
     }
   }
 
@@ -1992,9 +2636,10 @@ export function openStore(rootDir, {
     }
   }
 
-  function acquireLease(leaseKey, { ttlMs, actor }) {
+  function acquireLease(leaseKey, { ttlMs, actor, automationStamp = null }) {
     try {
       return withMutationLock(() => {
+      if (automationStamp != null) assertAutomationStampUnlocked(automationStamp);
       if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) return { ok: false, reason: "invalid-ttl" };
       const cleanActor = String(actor ?? "");
       if (!cleanActor || cleanActor.length > 256) return { ok: false, reason: "invalid-actor" };
@@ -2118,7 +2763,7 @@ export function openStore(rootDir, {
       && value.sessionId === sessionId
       && typeof value.sessionId === "string" && value.sessionId.length > 0 && value.sessionId.length <= 512
       && Buffer.byteLength(value.sessionId, "utf8") <= 1024 && !value.sessionId.includes("\0")
-      && HIDDEN_HOST_OWNER_AGENTS.has(value.agent)
+      && KNOWN_HIDDEN_HOST_OWNER_AGENTS.has(value.agent)
       && Number.isSafeInteger(value.pid) && value.pid > 0
       && Number.isSafeInteger(value.generation) && value.generation >= 0
       && /^[a-f0-9]{64}$/.test(value.projectFingerprint)
@@ -2177,11 +2822,12 @@ export function openStore(rootDir, {
     return { classification: "abortable", reason: "host-owner-process-dead", owner, nonce: owner.nonce };
   }
 
-  function acquireHostOwner(sessionId, { agent, projectFingerprint: ownerProject, rootIdentity, generation, ttlMs = HOST_OWNER_TTL_MS, pid = process.pid } = {}) {
+  function acquireHostOwner(sessionId, { agent, projectFingerprint: ownerProject, rootIdentity, generation, ttlMs = HOST_OWNER_TTL_MS, pid = process.pid, automationStamp = null } = {}) {
     try {
       return withMutationLock(() => {
+        if (automationStamp != null) assertAutomationStampUnlocked(automationStamp);
         hostOwnerKey(sessionId);
-        if (!HIDDEN_HOST_OWNER_AGENTS.has(agent)) return { ok: false, reason: "invalid-host-owner-agent" };
+        if (!KNOWN_HIDDEN_HOST_OWNER_AGENTS.has(agent)) return { ok: false, reason: "invalid-host-owner-agent" };
         if (ownerProject !== projectFingerprint) return { ok: false, reason: "invalid-host-owner-project" };
         if (rootIdentity !== hashContent(JSON.stringify(["self-evolve-state-root-v1", root]))) return { ok: false, reason: "invalid-host-owner-root" };
         if (!Number.isSafeInteger(generation) || generation < 0) return { ok: false, reason: "invalid-host-owner-generation" };
@@ -2301,9 +2947,10 @@ export function openStore(rootDir, {
     });
   }
 
-  function runCas(kind, id, expectedPriorState, mutateFn, selectPriorState = (payload) => payload?.state) {
+  function runCas(kind, id, expectedPriorState, mutateFn, selectPriorState = (payload) => payload?.state, { automationStamp = null } = {}) {
     try {
       return withMutationLock(() => {
+        if (automationStamp != null) assertAutomationStampUnlocked(automationStamp);
         const current = getRecordUnlocked(kind, id);
         if (!current) return { ok: false, reason: "record-not-found" };
         if (selectPriorState(current.payload) !== expectedPriorState) return { ok: false, reason: "stale-prior-state" };
@@ -2617,6 +3264,77 @@ export function openStore(rootDir, {
     return clean;
   }
 
+  // H3-001: reload-time identity firewall patterns. A durable global record is
+  // content-addressed over kind+payload and re-derived on every read, so a
+  // schema-valid tampered record is the threat model. These patterns detect raw
+  // private material (provider tokens, private keys, absolute paths, remote
+  // URLs, private-name canaries) that must never appear in any identity-free
+  // global record. The "content" key is skipped because recommendation-content
+  // and snapshot payloads are canonical base64, not free text.
+  const RELOAD_PROVIDER_TOKEN_PATTERNS = Object.freeze([
+    /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+    /\bsk-(?:ant-api03-|proj-|svcacct-)?[A-Za-z0-9_-]{16,}\b/gi,
+    /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/gi,
+    /\bgh[oprsu]_[A-Za-z0-9_]{20,}\b/gi,
+    /\bgithub_pat_[A-Za-z0-9_]{30,}\b/gi,
+    /\bglpat-[A-Za-z0-9_-]{20,}\b/gi,
+    /\bxox[a-z]-[A-Za-z0-9-]{10,}\b/gi,
+    /\bnpm_[A-Za-z0-9]{20,}\b/g,
+    /\bAIza[A-Za-z0-9_-]{20,}\b/gi,
+  ]);
+  const RELOAD_PRIVATE_KEY_MARKER = /-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----/u;
+  const RELOAD_ABSOLUTE_PATH = /(?:^|[\s"'(=])(?:\/(?![\/*])[^\s"'()<>]+|[A-Za-z]:\\[^\s"'()<>]+)/u;
+  const RELOAD_REMOTE_URL = /\b(?:git|ssh|https?|ftp):\/\/[^\s"'<>]+|\bgit@[^\s@"':]+:[^\s"'<>]+/u;
+  const RELOAD_PRIVATE_NAME_RE = /\b(?:customer|client|tenant|repository|repo|project|private)[-_:\s]+[a-z0-9][a-z0-9._-]{2,}\b/iu;
+
+  function scanGlobalRecordForPrivateMaterial(record) {
+    const issues = new Set();
+    const visit = (value, key) => {
+      if (typeof value === "string") {
+        if (key === "content") return;
+        for (const pattern of RELOAD_PROVIDER_TOKEN_PATTERNS) {
+          pattern.lastIndex = 0;
+          if (pattern.test(value)) { issues.add("provider-token"); break; }
+        }
+        if (RELOAD_PRIVATE_KEY_MARKER.test(value)) issues.add("private-key");
+        if (RELOAD_ABSOLUTE_PATH.test(value)) issues.add("absolute-path");
+        if (RELOAD_REMOTE_URL.test(value)) issues.add("remote-url");
+        if (RELOAD_PRIVATE_NAME_RE.test(value)) issues.add("private-name");
+      } else if (Array.isArray(value)) {
+        for (const item of value) visit(item, key);
+      } else if (value && typeof value === "object") {
+        for (const [childKey, child] of Object.entries(value)) visit(child, childKey);
+      }
+    };
+    visit(record, "");
+    return [...issues];
+  }
+
+  // Reads, schema-validates with bounded identity-firewall context, canonically
+  // round-trips, and content-scans a durable global record. Returns the cleaned
+  // record, or signals identity-unsafety so the caller can quarantine the file
+  // under the mutation lock before it reaches projection/recovery/export. The
+  // firewall context is reconstructed from partition-safe material only: the
+  // project fingerprint and its deterministic hashes.
+  function readReloadSafeGlobalRecord(filePath, maxBytes, makeFn, label) {
+    const source = readStableRegularFile(filePath, maxBytes);
+    let record;
+    try {
+      record = makeFn(JSON.parse(source), { forbiddenIdentityValues: globalDecisionIdentityFirewallValues() });
+    } catch {
+      return { unsafe: true, source, label };
+    }
+    if (source !== json(record)) return { unsafe: true, source, label };
+    if (scanGlobalRecordForPrivateMaterial(record).length) return { unsafe: true, source, label };
+    return { record };
+  }
+
+  function quarantineReloadedGlobalRecord(filePath, result) {
+    if (!result?.unsafe) return;
+    try { quarantineGlobal(result.source ?? "unreadable", "global-record-identity-unsafe", result.label); } catch {}
+    try { rmSync(filePath, { force: true }); } catch {}
+  }
+
   function localContributionIdentityValues(targetFingerprint, intent, additional = []) {
     const direct = [
       targetFingerprint,
@@ -2685,13 +3403,25 @@ export function openStore(rootDir, {
   }
 
   function readGlobalContributionsUnlocked() {
-    return contributionFiles(contributionsDir).map(({ filePath, id }) => {
-      const contribution = readCanonicalJson(filePath, MAX_CONTRIBUTION_RECORD_BYTES, makeGlobalContribution, "corrupt-global-contribution");
+    return contributionFiles(contributionsDir).flatMap(({ filePath, id }) => {
+      const result = readReloadSafeGlobalRecord(filePath, MAX_CONTRIBUTION_RECORD_BYTES, makeGlobalContribution, "global-contribution");
+      if (result.unsafe) { quarantineReloadedGlobalRecord(filePath, result); return []; }
+      const contribution = result.record;
       if (contribution.contributionId !== id) throw new Error("global-contribution-path-mismatch");
-      return { filePath, contribution };
+      return [{ filePath, contribution }];
     });
   }
 
+  // Authoritative create-exclusive journal write. The namespace mutation
+  // (open/O_EXCL/write/fsync/close followed by parent-directory fsync) is routed
+  // through the shared `durable.durableCreateExclusive` primitive so every
+  // journal stage fails closed with the stable capability reason on hosts that
+  // cannot fsync a directory descriptor, and so a power loss after the create
+  // can never leave a surviving-but-not-namespace-durable journal entry. The
+  // label-specific before/after-create seams and the post-commit readback are
+  // preserved; `${label}-after-create` now fires AFTER the durable namespace
+  // commit so a test injecting there models "loss after this journal stage is
+  // fully durable".
   function exclusiveJsonWrite(filePath, value, validator, label, maxBytes = MAX_CONTRIBUTION_RECORD_BYTES) {
     const source = json(value);
     if (existsSync(filePath)) {
@@ -2700,21 +3430,24 @@ export function openStore(rootDir, {
       return { duplicate: true, record: current };
     }
     ensureDir(path.dirname(filePath));
-    let descriptor;
-    let created = false;
+    let committed = false;
     try {
-      descriptor = openSync(filePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, FILE_MODE);
-      created = true;
-      injectFault(`${label}-after-create`, { filePath, descriptor });
-      writeFileSync(descriptor, source, "utf8");
-      filesystemSync(descriptor);
-      closeSync(descriptor);
-      descriptor = undefined;
+      injectFault(`${label}-before-create`, { filePath });
+      durable.durableCreateExclusive(filePath, source);
+      committed = true;
+      injectFault(`${label}-after-create`, { filePath });
       const readback = readCanonicalJson(filePath, maxBytes, validator, `${label}-readback-failed`);
       return { duplicate: false, record: readback };
     } catch (error) {
-      if (descriptor !== undefined) try { closeSync(descriptor); } catch {}
-      if (created) try { unlinkSync(filePath); } catch {}
+      // After a successful durable create the file is content- AND namespace-
+      // durable; remove it through the same durable primitive so a failed
+      // readback can never leave a surviving partial-exclusive artifact that
+      // claims authority it does not have. durableCreateExclusive cleans up its
+      // own partial state on internal failure, so we only durable-unlink when it
+      // returned successfully.
+      if (committed) {
+        try { durable.durableUnlink(filePath); } catch {}
+      }
       throw error;
     }
   }
@@ -2765,6 +3498,7 @@ export function openStore(rootDir, {
       evidenceDomainId: intent.evidenceDomainId,
       linkedAt,
       state: "active",
+      ...(intent.automationGeneration === undefined ? {} : { automationGeneration: intent.automationGeneration }),
     });
   }
 
@@ -2785,8 +3519,23 @@ export function openStore(rootDir, {
     }
     const global = loadGlobalSettingsUnlocked();
     if (!global) throw new Error("corrupt-settings");
-    const consent = global.consent;
-    if (!consent.sanitizedExcerpts || !consent.crossRepoAggregation) {
+    const automation = transaction.intent.automationGeneration === undefined
+      ? null
+      : getAutomationStateUnlocked();
+    const governingConsent = automation?.ok ? automation.global.consent : global.consent;
+    // H6-001: contribution recovery reuses the unified three-bit contribution
+    // authority predicate together with the intent's allocation-time consent
+    // stamp. A pending transaction is terminalized to "revoked" only when a
+    // governing consent bit was REVOKED after allocation (current authority is
+    // insufficient AND the consent version changed). Stable-but-partial consent
+    // that has not changed since allocation is left intact, while a crash inside
+    // a revocation window leaves no surviving contribution, link, or support.
+    const authority = evaluateContributionConsentAuthority(governingConsent);
+    const currentVersion = evaluateContributionConsentVersion(governingConsent);
+    const generationClosed = transaction.intent.automationGeneration !== undefined
+      && (!automation?.ok || !automation.enabled
+        || automation.epoch.generation !== transaction.intent.automationGeneration);
+    if (generationClosed || (!authority.ok && transaction.intent.consentVersionHash !== currentVersion)) {
       const revoked = settleContributionTransactionUnlocked(filePath, transaction, "revoked", targetStateDir);
       return { ok: true, state: revoked.intent.state, transaction: revoked };
     }
@@ -2902,7 +3651,7 @@ export function openStore(rootDir, {
       && contribution.lastSeenDay === lastSeenDay;
   }
 
-  function publishContribution(input) {
+  function publishContribution(input, { automationStamp = null } = {}) {
     try {
       return withMutationLock(() => {
         if (!input || typeof input !== "object" || Array.isArray(input)
@@ -2910,11 +3659,20 @@ export function openStore(rootDir, {
             || CONTRIBUTION_INPUT_FIELDS.some((key) => !(key in input))) {
           return { ok: false, reason: "invalid-contribution-input" };
         }
+        const automation = automationStamp === null
+          ? null
+          : assertAutomationStampUnlocked(automationStamp);
         const recovered = recoverContributionTransactionsUnlocked();
         if (!recovered.ok) return { ok: false, reason: "contribution-recovery-failed" };
         const settings = getSettingsUnlocked();
-        if (!settings.global.consent.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
-        if (!settings.global.consent.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required" };
+        const consent = automation?.global.consent ?? settings.global.consent;
+        // The privacy guard enforces the full three-bit contribution authority
+        // (durableObservations + sanitizedExcerpts + crossRepoAggregation) at the
+        // public creation boundary. This primitive rechecks the two
+        // publication-specific bits as defense-in-depth; durableObservations is
+        // captured in the intent's consent-version stamp and enforced on recovery.
+        if (!consent.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
+        if (!consent.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required" };
 
         const existing = readContributionTransactionsUnlocked().filter(({ transaction }) => transaction.intent.incidentId === input.incidentId);
         if (existing.length > 1) throw new Error("contribution-incident-conflict");
@@ -2967,7 +3725,8 @@ export function openStore(rootDir, {
           firstSeenDay: new Date(input.firstSeenAt).toISOString().slice(0, 10),
           lastSeenDay: new Date(input.lastSeenAt).toISOString().slice(0, 10),
           createdAt,
-          expiresAt: createdAt + settings.global.retentionDays * DAY_MS,
+          expiresAt: createdAt + (automation?.global.retentionDays ?? settings.global.retentionDays) * DAY_MS,
+          ...(automation ? { automationGeneration: automation.epoch.generation } : {}),
         }, {
           forbiddenIdentityValues: [...new Set([
             projectFingerprint,
@@ -2984,15 +3743,11 @@ export function openStore(rootDir, {
           capsuleId: input.capsuleId,
           clusterId: input.clusterId,
           evidenceDomainId: input.evidenceDomainId,
-          consentVersionHash: hashContent(JSON.stringify([
-            "self-evolve-contribution-consent-v1",
-            settings.global.updatedAt,
-            settings.global.consent.sanitizedExcerpts,
-            settings.global.consent.crossRepoAggregation,
-          ])),
+          consentVersionHash: evaluateContributionConsentVersion(consent),
           state: "allocated",
           createdAt,
           updatedAt: createdAt,
+          ...(automation ? { automationGeneration: automation.epoch.generation } : {}),
         });
         const transaction = validateContributionTransaction({
           schemaVersion: intent.schemaVersion,
@@ -3123,18 +3878,22 @@ export function openStore(rootDir, {
   }
 
   function readGlobalCandidatesUnlocked() {
-    return globalHashRecordFiles(globalCandidatesDir, "global-candidate").map(({ filePath, id }) => {
-      const candidate = readCanonicalJson(filePath, MAX_GLOBAL_CANDIDATE_RECORD_BYTES, makeGlobalCandidate, "corrupt-global-candidate");
+    return globalHashRecordFiles(globalCandidatesDir, "global-candidate").flatMap(({ filePath, id }) => {
+      const result = readReloadSafeGlobalRecord(filePath, MAX_GLOBAL_CANDIDATE_RECORD_BYTES, makeGlobalCandidate, "global-candidate");
+      if (result.unsafe) { quarantineReloadedGlobalRecord(filePath, result); return []; }
+      const candidate = result.record;
       if (candidate.candidateId !== id) throw new Error("global-candidate-path-mismatch");
-      return { filePath, candidate };
+      return [{ filePath, candidate }];
     });
   }
 
   function readGlobalSupportSetsUnlocked() {
-    return globalHashRecordFiles(globalSupportSetsDir, "global-support-set").map(({ filePath, id }) => {
-      const supportSet = readCanonicalJson(filePath, MAX_GLOBAL_CANDIDATE_RECORD_BYTES, makeGlobalSupportSet, "corrupt-global-support-set");
+    return globalHashRecordFiles(globalSupportSetsDir, "global-support-set").flatMap(({ filePath, id }) => {
+      const result = readReloadSafeGlobalRecord(filePath, MAX_GLOBAL_CANDIDATE_RECORD_BYTES, makeGlobalSupportSet, "global-support-set");
+      if (result.unsafe) { quarantineReloadedGlobalRecord(filePath, result); return []; }
+      const supportSet = result.record;
       if (supportSet.supportSetHash !== id) throw new Error("global-support-set-path-mismatch");
-      return { filePath, supportSet };
+      return [{ filePath, supportSet }];
     });
   }
 
@@ -3195,7 +3954,9 @@ export function openStore(rootDir, {
           && intent.incidentId === link.incidentId
           && intent.capsuleId === link.capsuleId
           && intent.clusterId === link.clusterId
-          && intent.evidenceDomainId === link.evidenceDomainId;
+          && intent.evidenceDomainId === link.evidenceDomainId
+          && intent.automationGeneration === link.automationGeneration
+          && intent.automationGeneration === contribution.automationGeneration;
         const cluster = clusters.get(link.clusterId) ?? null;
         const matching = observations.filter(({ value }) => value.incidentId === link.incidentId);
         const selected = matching[0]?.value ?? null;
@@ -3204,7 +3965,8 @@ export function openStore(rootDir, {
           && selected.receiptIds.includes(contribution.signatureHash)
           && selected.structuredFields?.receiptType === contribution.receiptType
           && selected.structuredFields?.scopeFingerprint === cluster?.scopeFingerprint
-          && (selected.structuredFields?.targetLogicalName ?? null) === (cluster?.targetLogicalName ?? null);
+          && (selected.structuredFields?.targetLogicalName ?? null) === (cluster?.targetLogicalName ?? null)
+          && selected.automationGeneration === contribution.automationGeneration;
         const integrity = integrityFor(cluster);
         facts.push({
           claimType: contribution.claimType,
@@ -3219,6 +3981,7 @@ export function openStore(rootDir, {
           firstSeenDay: contribution.firstSeenDay,
           lastSeenDay: contribution.lastSeenDay,
           expiresAt: contribution.expiresAt,
+          automationGeneration: contribution.automationGeneration,
           rootLineageHash: selected?.rootLineageHash ?? UNKNOWN_ROOT_LINEAGE_HASH,
           originKind: selected?.originKind ?? "unknown",
           contradictionFree: localBindingValid && integrity.contradictionFree,
@@ -3253,7 +4016,7 @@ export function openStore(rootDir, {
     return JSON.stringify(left) === JSON.stringify(right);
   }
 
-  function materializeGlobalCandidatesUnlocked({ targetBindings, rootPolicy, nowMs }) {
+  function materializeGlobalCandidatesUnlocked({ targetBindings, rootPolicy, nowMs, automationStamp = null }) {
     if (!Array.isArray(targetBindings) || targetBindings.length === 0) throw new Error("candidate-target-bindings-required");
     if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error("invalid-candidate-materialization-time");
     const policy = makeGlobalRootPolicy(rootPolicy);
@@ -3267,7 +4030,12 @@ export function openStore(rootDir, {
       if (byTarget.has(key) && byTarget.get(key).bindingHash !== binding.bindingHash) throw new Error("candidate-target-binding-conflict");
       byTarget.set(key, binding);
     }
-    const facts = candidateSupportFactsUnlocked(nowMs).filter((fact) => byTarget.has(fact.targetLogicalName));
+    const automation = automationStamp === null
+      ? null
+      : assertAutomationStampUnlocked(automationStamp);
+    const facts = candidateSupportFactsUnlocked(nowMs).filter((fact) =>
+      byTarget.has(fact.targetLogicalName)
+      && (!automation || fact.automationGeneration === automation.epoch.generation));
     const groups = new Map();
     for (const fact of facts) {
       const targetBinding = byTarget.get(fact.targetLogicalName);
@@ -3303,6 +4071,7 @@ export function openStore(rootDir, {
         lastSeenDay: summary.lastSeenDay,
         createdAt: nowMs,
         updatedAt: nowMs,
+        ...(automation ? { automationGeneration: automation.epoch.generation } : {}),
       }, identityOptions);
       let supportSet = makeGlobalSupportSet({
         candidateId: skeleton.candidateId,
@@ -3315,6 +4084,7 @@ export function openStore(rootDir, {
         lastSeenDay: summary.lastSeenDay,
         evaluatedAt: nowMs,
         expiresAt: summary.expiresAt,
+        ...(automation ? { automationGeneration: automation.epoch.generation } : {}),
       }, identityOptions);
       const persistedSupport = existingSupportSets.get(supportSet.supportSetHash)?.supportSet;
       if (persistedSupport) supportSet = persistedSupport;
@@ -3371,9 +4141,9 @@ export function openStore(rootDir, {
     };
   }
 
-  function materializeGlobalCandidates({ targetBindings, rootPolicy, nowMs = now() } = {}) {
+  function materializeGlobalCandidates({ targetBindings, rootPolicy, nowMs = now(), automationStamp = null } = {}) {
     try {
-      return withMutationLock(() => materializeGlobalCandidatesUnlocked({ targetBindings, rootPolicy, nowMs }));
+      return withMutationLock(() => materializeGlobalCandidatesUnlocked({ targetBindings, rootPolicy, nowMs, automationStamp }));
     } catch (error) {
       return { ok: false, reason: errorReasonCode(error, "global-candidate-materialization-failed"), candidates: [], supportSets: [], changed: 0 };
     }
@@ -3406,15 +4176,13 @@ export function openStore(rootDir, {
   function recomputePendingGlobalCandidatesUnlocked(nowMs) {
     recoverGlobalLifecycleInvalidationsUnlocked();
     const policy = getSettingsUnlocked().global.globalRootPolicy;
-    const supportRecords = readGlobalSupportSetsUnlocked();
-    const candidates = readGlobalCandidatesUnlocked();
-    const validBindings = new Map();
+    let supportRecords = readGlobalSupportSetsUnlocked();
+    let candidates = readGlobalCandidatesUnlocked();
     const invalidBindingHashes = new Set();
     for (const { supportSet } of supportRecords) {
       try {
         if (!policy) throw new Error("global-root-policy-required");
-        const binding = makeCandidateTargetBinding(supportSet.targetBinding, policy);
-        validBindings.set(binding.bindingHash, binding);
+        makeCandidateTargetBinding(supportSet.targetBinding, policy);
       } catch {
         invalidBindingHashes.add(supportSet.targetBinding.bindingHash);
       }
@@ -3425,9 +4193,25 @@ export function openStore(rootDir, {
         rmSync(filePath, { force: true });
       }
     }
-    if (validBindings.size) {
-      materializeGlobalCandidatesUnlocked({ targetBindings: [...validBindings.values()], rootPolicy: policy, nowMs });
+    // Maintenance and purge may remove the contributions underlying an
+    // unfinished candidate. Delete that now-inert projection; never recompute
+    // it from remaining historical evidence here, because doing so would
+    // backfill automatic work outside a freshly stamped live pipeline cycle.
+    const storedContributionIds = new Set(readGlobalContributionsUnlocked().map(({ contribution }) => contribution.contributionId));
+    const supportByHash = new Map(supportRecords.map(({ supportSet }) => [supportSet.supportSetHash, supportSet]));
+    for (const { filePath, candidate } of readGlobalCandidatesUnlocked()) {
+      if (!["collecting", "eligible", "synthesis-pending"].includes(candidate.state)) continue;
+      const supportSet = supportByHash.get(candidate.supportSetHash);
+      if (!supportSet || supportSet.contributionIds.some((contributionId) => !storedContributionIds.has(contributionId))) {
+        rmSync(filePath, { force: true });
+      }
     }
+    candidates = readGlobalCandidatesUnlocked();
+    supportRecords = readGlobalSupportSetsUnlocked();
+    // Retention and purge maintenance may delete or invalidate support, but it
+    // must never create work. Candidate creation is admitted only by the live
+    // automatic pipeline with a freshly checked generation stamp; otherwise a
+    // later maintenance pass could backfill evidence collected before Off.
     const retainedCandidateSupport = new Set(readGlobalCandidatesUnlocked().map(({ candidate }) => candidate.supportSetHash));
     const retainedRecommendationSupport = new Set(readGlobalRecommendationsUnlocked()
       .map(({ recommendation }) => recommendation.supportSetHash));
@@ -3435,7 +4219,6 @@ export function openStore(rootDir, {
     // contributions a support set was built from. Superseded support sets that
     // nothing references are reclaimed here so purged evidence leaves no
     // dangling global reference and no unbounded storage.
-    const storedContributionIds = new Set(readGlobalContributionsUnlocked().map(({ contribution }) => contribution.contributionId));
     let expiredSupportSets = 0;
     for (const { filePath, supportSet } of readGlobalSupportSetsUnlocked()) {
       if (retainedCandidateSupport.has(supportSet.supportSetHash)
@@ -3470,7 +4253,9 @@ export function openStore(rootDir, {
   function readGlobalLeaseUnlocked(leaseKeyHash) {
     const filePath = globalLeasePath(leaseKeyHash);
     if (!existsSync(filePath)) return null;
-    const lease = readCanonicalJson(filePath, MAX_CONTRIBUTION_RECORD_BYTES, makeGlobalLease, "corrupt-global-lease");
+    const result = readReloadSafeGlobalRecord(filePath, MAX_CONTRIBUTION_RECORD_BYTES, makeGlobalLease, "global-lease");
+    if (result.unsafe) { quarantineReloadedGlobalRecord(filePath, result); return null; }
+    const lease = result.record;
     if (lease.leaseKeyHash !== String(leaseKeyHash).toLowerCase()) throw new Error("global-lease-path-mismatch");
     return { filePath, lease };
   }
@@ -3521,9 +4306,12 @@ export function openStore(rootDir, {
     return { ok: true, lease };
   }
 
-  function acquireGlobalLease(request) {
+  function acquireGlobalLease(request, { automationStamp = null } = {}) {
     try {
-      return withMutationLock(() => acquireGlobalLeaseUnlocked(request, now()));
+      return withMutationLock(() => {
+        if (automationStamp != null) assertAutomationStampUnlocked(automationStamp);
+        return acquireGlobalLeaseUnlocked(request, now());
+      });
     } catch (error) {
       return { ok: false, reason: errorReasonCode(error, "global-lease-acquire-failed") };
     }
@@ -3556,6 +4344,81 @@ export function openStore(rootDir, {
     return withMutationLock(() => readGlobalLeaseUnlocked(leaseKeyHash)?.lease ?? null);
   }
 
+  // Renewable generation-fenced target lease (H9-002). A target-write lease is
+  // authoritative immediately adjacent to every filesystem effect only if it is
+  // still owned by the renewing owner and has not expired at the renewal
+  // instant. Renewal rotates the opaque ownerToken (the lease "generation") and
+  // extends the expiry under the mutation lock, so a peer that acquired the
+  // lease after this owner expired is observed here: the on-disk ownerToken no
+  // longer matches and renewal fails closed BEFORE any skill effect. The lease
+  // identity (leaseId/leaseKeyHash) is preserved across renewals of the same
+  // logical lease; only the authorizing generation (ownerToken) rotates.
+  function renewGlobalLease(request) {
+    try {
+      return withMutationLock(() => {
+        if (!request || typeof request !== "object" || Array.isArray(request)
+            || Object.keys(request).sort().join(",") !== "leaseKeyHash,nowMs,ownerToken,ttlMs"
+            || !Number.isSafeInteger(request.nowMs) || request.nowMs < 0) {
+          return { ok: false, reason: "invalid-global-lease-renew" };
+        }
+        if (!Number.isSafeInteger(request.ttlMs) || request.ttlMs < 1 || request.ttlMs > 3_600_000) {
+          return { ok: false, reason: "invalid-global-lease-ttl" };
+        }
+        const existing = readGlobalLeaseUnlocked(request.leaseKeyHash);
+        if (!existing) return { ok: false, reason: "global-lease-not-found" };
+        const current = existing.lease;
+        // Reject a stale owner BEFORE any effect: the renewing caller must still
+        // be the live active owner and the lease must not have expired. A peer
+        // that force-acquired after expiry has a different ownerToken; an
+        // unexpired-by-time owner that no longer holds the lease is rejected by
+        // the ownerToken comparison. Either way this returns closed.
+        if (current.state !== "active" || current.ownerToken !== request.ownerToken
+            || current.expiresAt <= request.nowMs) {
+          return { ok: false, reason: "global-target-lease-invalid" };
+        }
+        const renewed = makeGlobalLease({
+          leaseId: current.leaseId,
+          leaseKind: current.leaseKind,
+          leaseKeyHash: current.leaseKeyHash,
+          ownerToken: randomUUID(),
+          state: "active",
+          acquiredAt: request.nowMs,
+          expiresAt: request.nowMs + request.ttlMs,
+          releasedAt: null,
+        });
+        // Namespace-durable in-place replacement of the lease file: renewal
+        // rotates the authorizing generation (ownerToken) and extends the
+        // expiry over the existing lease record via a durable rename.
+        atomicWrite(existing.filePath, json(renewed));
+        return { ok: true, lease: renewed };
+      });
+    } catch (error) {
+      return { ok: false, reason: errorReasonCode(error, "global-lease-renew-failed") };
+    }
+  }
+
+  // Request/consumer deadline admission (H10-001). Immutable request and
+  // consumer deadlines are carried into durable decision admission and compared
+  // against the real admission timestamp without clamping. A request that
+  // expired after consumption but before admission fails closed here, before any
+  // intent, recommendation, or decision write.
+  function assertDecisionDeadlinesUnlocked(nowMs, requestDeadline, consumerDeadline) {
+    if (Number.isSafeInteger(requestDeadline) && nowMs >= requestDeadline) throw new Error("global-request-expired");
+    if (Number.isSafeInteger(consumerDeadline) && nowMs >= consumerDeadline) throw new Error("global-consumer-claim-expired");
+  }
+
+  function extractDecisionDeadlines(request) {
+    const requestDeadline = request?.requestDeadline;
+    const consumerDeadline = request?.consumerDeadline;
+    if (requestDeadline !== undefined && (!Number.isSafeInteger(requestDeadline) || requestDeadline < 0)) {
+      throw new Error("invalid-global-decision-deadline");
+    }
+    if (consumerDeadline !== undefined && (!Number.isSafeInteger(consumerDeadline) || consumerDeadline < 0)) {
+      throw new Error("invalid-global-decision-deadline");
+    }
+    return { requestDeadline, consumerDeadline };
+  }
+
   function globalOpaqueRecordPath(directory, id) {
     const value = String(id).toLowerCase();
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value)) {
@@ -3578,22 +4441,26 @@ export function openStore(rootDir, {
   }
 
   function readGlobalSynthesisAttemptsUnlocked() {
-    return globalOpaqueRecordFiles(globalSynthesisAttemptsDir, "global-synthesis-attempt").map(({ filePath, id }) => {
-      const attempt = readCanonicalJson(filePath, MAX_GLOBAL_CANDIDATE_RECORD_BYTES, makeGlobalSynthesisAttempt, "corrupt-global-synthesis-attempt");
+    return globalOpaqueRecordFiles(globalSynthesisAttemptsDir, "global-synthesis-attempt").flatMap(({ filePath, id }) => {
+      const result = readReloadSafeGlobalRecord(filePath, MAX_GLOBAL_CANDIDATE_RECORD_BYTES, makeGlobalSynthesisAttempt, "global-synthesis-attempt");
+      if (result.unsafe) { quarantineReloadedGlobalRecord(filePath, result); return []; }
+      const attempt = result.record;
       if (attempt.attemptId !== id) throw new Error("global-synthesis-attempt-path-mismatch");
-      return { filePath, attempt };
+      return [{ filePath, attempt }];
     });
   }
 
   function readGlobalRecommendationsUnlocked() {
-    return globalHashRecordFiles(globalRecommendationsDir, "global-recommendation").map(({ filePath, id }) => {
-      const recommendation = readCanonicalJson(filePath, MAX_GLOBAL_RECOMMENDATION_RECORD_BYTES, makeGlobalRecommendation, "corrupt-global-recommendation");
+    return globalHashRecordFiles(globalRecommendationsDir, "global-recommendation").flatMap(({ filePath, id }) => {
+      const result = readReloadSafeGlobalRecord(filePath, MAX_GLOBAL_RECOMMENDATION_RECORD_BYTES, makeGlobalRecommendation, "global-recommendation");
+      if (result.unsafe) { quarantineReloadedGlobalRecord(filePath, result); return []; }
+      const recommendation = result.record;
       if (recommendation.recommendationId !== id) throw new Error("global-recommendation-path-mismatch");
-      return { filePath, recommendation };
+      return [{ filePath, recommendation }];
     });
   }
 
-  function globalRecommendationSupportCurrentUnlocked(recommendation, nowMs) {
+  function globalRecommendationSupportCurrentUnlocked(recommendation, nowMs, rootPolicy = null) {
     const supportSet = readGlobalSupportSetsUnlocked()
       .find(({ supportSet: item }) => item.supportSetHash === recommendation.supportSetHash)?.supportSet;
     const candidate = readGlobalCandidatesUnlocked()
@@ -3606,7 +4473,7 @@ export function openStore(rootDir, {
         || candidate.targetBindingHash !== recommendation.candidateTargetBindingHash) return false;
     const activeContributionIds = new Set(candidateSupportFactsUnlocked(nowMs).map((fact) => fact.contributionId));
     if (supportSet.contributionIds.some((contributionId) => !activeContributionIds.has(contributionId))) return false;
-    const policy = getSettingsUnlocked().global.globalRootPolicy;
+    const policy = rootPolicy ?? getSettingsUnlocked().global.globalRootPolicy;
     if (!policy) return false;
     try { return evaluateGlobalSupportEligibility(supportSet, policy).eligible; }
     catch { return false; }
@@ -3780,16 +4647,18 @@ export function openStore(rootDir, {
     const id = String(recommendationId).toLowerCase();
     if (!/^[a-f0-9]{64}$/u.test(id)) throw new Error("invalid-global-recommendation-id");
     const directory = path.join(globalRecommendationContentDir, id.slice(0, 2), id);
-    return safeTreeFiles(directory).map((filePath) => {
+    return safeTreeFiles(directory).flatMap((filePath) => {
       const relative = path.relative(directory, filePath);
       if (!/^\d{6}\.json$/u.test(relative) || relative.includes(path.sep)) {
         throw new Error("global-recommendation-content-storage-path-rejected");
       }
-      const chunk = readCanonicalJson(filePath, MAX_GLOBAL_RECOMMENDATION_CONTENT_BYTES, makeGlobalRecommendationContent, "corrupt-global-recommendation-content");
+      const result = readReloadSafeGlobalRecord(filePath, MAX_GLOBAL_RECOMMENDATION_CONTENT_BYTES, makeGlobalRecommendationContent, "global-recommendation-content");
+      if (result.unsafe) { quarantineReloadedGlobalRecord(filePath, result); return []; }
+      const chunk = result.record;
       if (chunk.recommendationId !== id || filePath !== recommendationContentPath(id, chunk.chunkIndex)) {
         throw new Error("global-recommendation-content-path-mismatch");
       }
-      return { filePath, chunk };
+      return [{ filePath, chunk }];
     }).sort((left, right) => left.chunk.chunkIndex - right.chunk.chunkIndex);
   }
 
@@ -3897,16 +4766,19 @@ export function openStore(rootDir, {
     return current;
   }
 
-  function globalDecisionSuppressorReason(settings, suppressors) {
+  function globalDecisionSuppressorReason(action, settings, suppressors) {
     if (!suppressors || typeof suppressors !== "object" || Array.isArray(suppressors)
         || Object.keys(suppressors).sort().join(",") !== "circuitBreakerOpen,emergencyStop"
         || Object.values(suppressors).some((value) => typeof value !== "boolean")) {
       return "global-decision-suppressors-required";
     }
-    if (settings.global.killSwitchActive) return "kill-switch";
-    if (settings.global.paused) return "paused";
-    if (suppressors.circuitBreakerOpen) return "circuit-breaker";
-    if (suppressors.emergencyStop) return "emergency-stop";
+    if (action === "apply") {
+      const automation = getAutomationStateUnlocked();
+      if (!automation.ok) return automation.reason ?? "automation-state-unavailable";
+      if (automation.global.killSwitchActive) return "kill-switch";
+      if (suppressors.circuitBreakerOpen) return "circuit-breaker";
+      if (suppressors.emergencyStop) return "emergency-stop";
+    }
     return null;
   }
 
@@ -3944,9 +4816,11 @@ export function openStore(rootDir, {
   // evaluated before support, drift, or state checks. Revoking consent also
   // supersedes affected recommendations, and without this ordering the operator
   // would see a downstream support/drift code instead of the real cause.
-  function assertGlobalApplyConsentUnlocked(action, settings = getSettingsUnlocked()) {
+  function assertGlobalApplyConsentUnlocked(action) {
     if (action !== "apply") return;
-    const consent = settings.global.consent;
+    const automation = getAutomationStateUnlocked();
+    if (!automation.ok) throw new Error(automation.reason ?? "automation-state-unavailable");
+    const consent = automation.global.consent;
     if (!consent.durableObservations || !consent.sanitizedExcerpts || !consent.crossRepoAggregation) {
       throw new Error("global-apply-consent-required");
     }
@@ -3963,7 +4837,7 @@ export function openStore(rootDir, {
     return persistedOperatorDecision;
   }
 
-  function validateGlobalDecisionLeaseEdgeUnlocked(action, decision, nowMs) {
+  function validateGlobalDecisionLeaseEdgeUnlocked(action, decision, nowMs, rootPolicy = null) {
     const expectedPrior = action === "apply" ? "pending" : "applied";
     const expectedNext = action === "apply" ? "approved" : "undo-approved";
     if (!["apply", "undo"].includes(action) || decision.actorRole !== "operator"
@@ -3986,7 +4860,7 @@ export function openStore(rootDir, {
         || recommendation.proposedContentHash !== decision.proposedContentHash) {
       throw new Error("stale-global-decision");
     }
-    if (action === "apply" && !globalRecommendationSupportCurrentUnlocked(recommendation, nowMs)) {
+    if (action === "apply" && !globalRecommendationSupportCurrentUnlocked(recommendation, nowMs, rootPolicy)) {
       throw new Error("global-support-invalid");
     }
     const canTransition = recommendation.state === decision.priorState
@@ -4009,20 +4883,27 @@ export function openStore(rootDir, {
   }
 
   function acquireGlobalDecisionLease(request) {
-    const keys = Object.keys(request ?? {}).sort().join(",");
+    let deadlines = { requestDeadline: undefined, consumerDeadline: undefined };
+    try { deadlines = extractDecisionDeadlines(request); }
+    catch (error) { return { ok: false, reason: errorReasonCode(error, "invalid-global-decision-lease-request") }; }
+    const { requestDeadline, consumerDeadline } = deadlines;
+    const keys = Object.keys(request ?? {}).filter((key) => key !== "requestDeadline" && key !== "consumerDeadline").sort().join(",");
     if (!request || typeof request !== "object" || Array.isArray(request)
         || ![
           "action,decision,nowMs,ttlMs",
           "action,decision,forbiddenIdentityValues,nowMs,ttlMs",
+          "action,decision,nowMs,rootPolicy,ttlMs",
+          "action,decision,forbiddenIdentityValues,nowMs,rootPolicy,ttlMs",
         ].includes(keys)
         || !Number.isSafeInteger(request.nowMs) || request.nowMs < 0) {
       return { ok: false, reason: "invalid-global-decision-lease-request" };
     }
     try {
       return withMutationLock(() => {
+        assertDecisionDeadlinesUnlocked(request.nowMs, requestDeadline, consumerDeadline);
         const identityOptions = { forbiddenIdentityValues: globalDecisionIdentityFirewallValues(request.forbiddenIdentityValues) };
         const decision = makeGlobalDecision(request.decision, identityOptions);
-        const recommendation = validateGlobalDecisionLeaseEdgeUnlocked(request.action, decision, request.nowMs);
+        const recommendation = validateGlobalDecisionLeaseEdgeUnlocked(request.action, decision, request.nowMs, request.rootPolicy);
         const acquired = acquireGlobalLeaseUnlocked({
           leaseKind: "target-write",
           leaseKeyHash: globalTargetLeaseKey(recommendation.targetBinding),
@@ -4036,11 +4917,17 @@ export function openStore(rootDir, {
   }
 
   function beginGlobalDecision(request) {
-    const requestKeys = Object.keys(request ?? {}).sort().join(",");
+    let deadlines = { requestDeadline: undefined, consumerDeadline: undefined };
+    try { deadlines = extractDecisionDeadlines(request); }
+    catch (error) { return { ok: false, reason: errorReasonCode(error, "invalid-global-decision-request") }; }
+    const { requestDeadline, consumerDeadline } = deadlines;
+    const requestKeys = Object.keys(request ?? {}).filter((key) => key !== "requestDeadline" && key !== "consumerDeadline").sort().join(",");
     if (!request || typeof request !== "object" || Array.isArray(request)
         || ![
           "action,decision,leaseKeyHash,nowMs,ownerToken,suppressors",
           "action,decision,forbiddenIdentityValues,leaseKeyHash,nowMs,ownerToken,suppressors",
+          "action,decision,leaseKeyHash,nowMs,ownerToken,rootPolicy,suppressors",
+          "action,decision,forbiddenIdentityValues,leaseKeyHash,nowMs,ownerToken,rootPolicy,suppressors",
         ].includes(requestKeys)) {
       return { ok: false, reason: "invalid-global-decision-request" };
     }
@@ -4059,37 +4946,45 @@ export function openStore(rootDir, {
         const intentId = globalApplyIntentId(decision);
         const existingOutcome = readGlobalDecisionOutcomesUnlocked().find(({ outcome }) => outcome.intentId === intentId)?.outcome;
         if (existingOutcome) return persistedGlobalOutcomeResult(existingOutcome);
+        // Durable admission fence (H10-001): a request or consumer claim that
+        // expired after consumption but before this admission boundary cannot
+        // drive a durable decision. The real deadline is compared without
+        // clamping; a duplicate completed outcome above still returns normally.
+        assertDecisionDeadlinesUnlocked(request.nowMs, requestDeadline, consumerDeadline);
         assertGlobalApplyConsentUnlocked(request.action);
         const recommendationRecord = readGlobalRecommendationsUnlocked().find(({ recommendation }) => recommendation.recommendationId === decision.recommendationId);
         if (!recommendationRecord) throw new Error("global-recommendation-not-found");
         const recommendation = recommendationRecord.recommendation;
-        if (request.action === "apply" && !globalRecommendationSupportCurrentUnlocked(recommendation, request.nowMs)) {
+        if (request.action === "apply" && !globalRecommendationSupportCurrentUnlocked(recommendation, request.nowMs, request.rootPolicy)) {
           throw new Error("global-support-invalid");
         }
         const persistedOperatorDecision = canonicalOperatorDecisionUnlocked(decision);
         const settings = getSettingsUnlocked();
-        const suppressed = globalDecisionSuppressorReason(settings, request.suppressors);
+        const suppressed = globalDecisionSuppressorReason(request.action, settings, request.suppressors);
         if (suppressed) throw new Error(suppressed);
         assertGlobalApplyConsentUnlocked(request.action, settings);
-        if (!settings.global.globalRootPolicy) throw new Error("global-root-policy-required");
-        const policy = makeGlobalRootPolicy(settings.global.globalRootPolicy);
+        if (!request.rootPolicy && !settings.global.globalRootPolicy) throw new Error("global-root-policy-required");
+        const policy = makeGlobalRootPolicy(request.rootPolicy ?? settings.global.globalRootPolicy);
         if (recommendation.targetBinding.rootSetHash !== policy.rootSetHash) throw new Error("stale-root-set");
         const root = policy.roots.find((item) => item.rootId === recommendation.targetBinding.rootId);
         if (!root || (request.action === "apply" && recommendation.targetBinding.targetKind === "existing-global-skill" && !root.canUpdate)
-            || (recommendation.targetBinding.targetKind === "new-global-skill" && (!root.canCreate || policy.creationRootId !== root.rootId))) {
+            || (request.action === "apply" && recommendation.targetBinding.targetKind === "new-global-skill"
+              && (!root.canCreate || policy.creationRootId !== root.rootId))) {
           throw new Error("root-not-validated");
         }
-        if (!recommendation.criticPassed || !recommendation.validDeterministic) throw new Error("release-gates-failed");
-        const supportRecord = readGlobalSupportSetsUnlocked().find(({ supportSet }) => supportSet.supportSetHash === recommendation.supportSetHash);
-        if (!supportRecord || supportRecord.supportSet.candidateId !== recommendation.candidateId
-            || supportRecord.supportSet.targetBinding.bindingHash !== recommendation.candidateTargetBindingHash
-            || supportRecord.supportSet.expiresAt <= request.nowMs) throw new Error("global-support-invalid");
-        const eligibility = evaluateGlobalSupportEligibility(supportRecord.supportSet, policy);
-        if (!eligibility.eligible) throw new Error("global-support-ineligible");
-        const candidate = readGlobalCandidatesUnlocked().find(({ candidate: item }) => item.candidateId === recommendation.candidateId)?.candidate;
-        if (!candidate || candidate.state !== "recommended" || candidate.supportSetHash !== recommendation.supportSetHash
-            || candidate.targetBindingHash !== recommendation.candidateTargetBindingHash
-            || candidate.eligibilityRoute !== eligibility.route) throw new Error("global-candidate-drift");
+        if (request.action === "apply") {
+          if (!recommendation.criticPassed || !recommendation.validDeterministic) throw new Error("release-gates-failed");
+          const supportRecord = readGlobalSupportSetsUnlocked().find(({ supportSet }) => supportSet.supportSetHash === recommendation.supportSetHash);
+          if (!supportRecord || supportRecord.supportSet.candidateId !== recommendation.candidateId
+              || supportRecord.supportSet.targetBinding.bindingHash !== recommendation.candidateTargetBindingHash
+              || supportRecord.supportSet.expiresAt <= request.nowMs) throw new Error("global-support-invalid");
+          const eligibility = evaluateGlobalSupportEligibility(supportRecord.supportSet, policy);
+          if (!eligibility.eligible) throw new Error("global-support-ineligible");
+          const candidate = readGlobalCandidatesUnlocked().find(({ candidate: item }) => item.candidateId === recommendation.candidateId)?.candidate;
+          if (!candidate || candidate.state !== "recommended" || candidate.supportSetHash !== recommendation.supportSetHash
+              || candidate.targetBindingHash !== recommendation.candidateTargetBindingHash
+              || candidate.eligibilityRoute !== eligibility.route) throw new Error("global-candidate-drift");
+        }
         globalDecisionLeaseUnlocked(recommendation.targetBinding, request.leaseKeyHash, request.ownerToken, request.nowMs);
         const content = decodeGlobalRecommendationContentUnlocked(recommendation.recommendationId);
         if (content === null || hashContent(content) !== recommendation.proposedContentHash) throw new Error("global-recommendation-content-unavailable");
@@ -4157,6 +5052,7 @@ export function openStore(rootDir, {
           assertGlobalQuotaUnlocked(new Map([[path.resolve(intentPath), json(intent)]]));
           exclusiveJsonWrite(intentPath, intent, makeGlobalApplyIntent, "global-apply-intent", MAX_GLOBAL_DECISION_RECORD_BYTES);
           injectFault("global-decision-after-intent", { intentId: intent.intentId });
+          injectFault("journal-after-intent", { intentId: intent.intentId });
         }
         if (nextRecommendation !== recommendation) {
           const source = json(nextRecommendation);
@@ -4164,6 +5060,7 @@ export function openStore(rootDir, {
           injectFault("global-decision-before-cas", { intentId: intent.intentId });
           atomicWrite(recommendationRecord.filePath, source);
           injectFault("global-decision-after-cas", { intentId: intent.intentId });
+          injectFault("journal-after-recommendation-cas", { intentId: intent.intentId });
         } else if (recommendation.state !== decision.newState || recommendation.decisionVersion !== decision.decisionVersion
             || !recommendation.burnedNonceHashes.includes(hashContent(decision.nonce))) {
           if (!persistedOperatorDecision && !priorIntent) throw new Error("stale-global-decision");
@@ -4172,12 +5069,14 @@ export function openStore(rootDir, {
           assertGlobalQuotaUnlocked(new Map([[path.resolve(decisionPath), json(decision)]]));
           exclusiveJsonWrite(decisionPath, decision, makeGlobalDecision, "global-decision", MAX_GLOBAL_DECISION_RECORD_BYTES);
           injectFault("global-decision-after-record", { intentId: intent.intentId });
+          injectFault("journal-after-decision-record", { intentId: intent.intentId });
         }
         if (currentIntent.state === "decision-pending") {
           currentIntent = committedIntent;
           assertGlobalQuotaUnlocked(new Map([[path.resolve(intentPath), json(currentIntent)]]));
           atomicWrite(intentPath, json(currentIntent));
           injectFault("global-decision-after-commit", { intentId: intent.intentId });
+          injectFault("journal-after-intent-commit", { intentId: intent.intentId });
         }
         return { ok: true, duplicate: Boolean(priorIntent), intent: currentIntent, recommendation: nextRecommendation, content };
       });
@@ -4192,6 +5091,8 @@ export function openStore(rootDir, {
         || ![
           "intentId,leaseKeyHash,nowMs,ownerToken,suppressors",
           "forbiddenIdentityValues,intentId,leaseKeyHash,nowMs,ownerToken,suppressors",
+          "intentId,leaseKeyHash,nowMs,ownerToken,rootPolicy,suppressors",
+          "forbiddenIdentityValues,intentId,leaseKeyHash,nowMs,ownerToken,rootPolicy,suppressors",
         ].includes(requestKeys)
         || !Number.isSafeInteger(request.nowMs) || request.nowMs < 0) {
       return { ok: false, reason: "invalid-global-decision-revalidation" };
@@ -4227,34 +5128,37 @@ export function openStore(rootDir, {
             || recommendation.proposedContentHash !== intent.appliedHash) {
           throw new Error("global-recommendation-drift");
         }
-        if (intent.action === "apply" && !globalRecommendationSupportCurrentUnlocked(recommendation, request.nowMs)) {
+        if (intent.action === "apply" && !globalRecommendationSupportCurrentUnlocked(recommendation, request.nowMs, request.rootPolicy)) {
           throw new Error("global-support-invalid");
         }
         const settings = getSettingsUnlocked();
-        const suppressed = globalDecisionSuppressorReason(settings, request.suppressors);
+        const suppressed = globalDecisionSuppressorReason(intent.action, settings, request.suppressors);
         if (suppressed) throw new Error(suppressed);
         assertGlobalApplyConsentUnlocked(intent.action, settings);
-        if (!settings.global.globalRootPolicy) throw new Error("global-root-policy-required");
-        const policy = makeGlobalRootPolicy(settings.global.globalRootPolicy);
+        if (!request.rootPolicy && !settings.global.globalRootPolicy) throw new Error("global-root-policy-required");
+        const policy = makeGlobalRootPolicy(request.rootPolicy ?? settings.global.globalRootPolicy);
         if (recommendation.targetBinding.rootSetHash !== policy.rootSetHash) throw new Error("stale-root-set");
         const root = policy.roots.find((item) => item.rootId === intent.rootId);
         if (!root || (intent.action === "apply" && intent.targetKind === "existing-global-skill" && !root.canUpdate)
-            || (intent.targetKind === "new-global-skill" && (!root.canCreate || policy.creationRootId !== root.rootId))) {
+            || (intent.action === "apply" && intent.targetKind === "new-global-skill"
+              && (!root.canCreate || policy.creationRootId !== root.rootId))) {
           throw new Error("root-not-validated");
         }
-        if (!recommendation.criticPassed || !recommendation.validDeterministic) throw new Error("release-gates-failed");
-        const supportSet = readGlobalSupportSetsUnlocked()
-          .find(({ supportSet: item }) => item.supportSetHash === intent.supportSetHash)?.supportSet;
-        if (!supportSet || supportSet.candidateId !== recommendation.candidateId
-            || supportSet.targetBinding.bindingHash !== recommendation.candidateTargetBindingHash
-            || supportSet.expiresAt <= request.nowMs) throw new Error("global-support-invalid");
-        const eligibility = evaluateGlobalSupportEligibility(supportSet, policy);
-        if (!eligibility.eligible) throw new Error("global-support-ineligible");
-        const candidate = readGlobalCandidatesUnlocked()
-          .find(({ candidate: item }) => item.candidateId === recommendation.candidateId)?.candidate;
-        if (!candidate || candidate.state !== "recommended" || candidate.supportSetHash !== intent.supportSetHash
-            || candidate.targetBindingHash !== recommendation.candidateTargetBindingHash
-            || candidate.eligibilityRoute !== eligibility.route) throw new Error("global-candidate-drift");
+        if (intent.action === "apply") {
+          if (!recommendation.criticPassed || !recommendation.validDeterministic) throw new Error("release-gates-failed");
+          const supportSet = readGlobalSupportSetsUnlocked()
+            .find(({ supportSet: item }) => item.supportSetHash === intent.supportSetHash)?.supportSet;
+          if (!supportSet || supportSet.candidateId !== recommendation.candidateId
+              || supportSet.targetBinding.bindingHash !== recommendation.candidateTargetBindingHash
+              || supportSet.expiresAt <= request.nowMs) throw new Error("global-support-invalid");
+          const eligibility = evaluateGlobalSupportEligibility(supportSet, policy);
+          if (!eligibility.eligible) throw new Error("global-support-ineligible");
+          const candidate = readGlobalCandidatesUnlocked()
+            .find(({ candidate: item }) => item.candidateId === recommendation.candidateId)?.candidate;
+          if (!candidate || candidate.state !== "recommended" || candidate.supportSetHash !== intent.supportSetHash
+              || candidate.targetBindingHash !== recommendation.candidateTargetBindingHash
+              || candidate.eligibilityRoute !== eligibility.route) throw new Error("global-candidate-drift");
+        }
         globalDecisionLeaseUnlocked(intent, request.leaseKeyHash, request.ownerToken, request.nowMs);
         const content = decodeGlobalRecommendationContentUnlocked(intent.recommendationId);
         if (content === null || hashContent(content) !== intent.appliedHash) throw new Error("global-recommendation-content-unavailable");
@@ -4280,6 +5184,7 @@ export function openStore(rootDir, {
         assertGlobalQuotaUnlocked(new Map([[path.resolve(record.filePath), json(intent)]]));
         atomicWrite(record.filePath, json(intent));
         injectFault("global-apply-after-published", { intentId: intent.intentId });
+        injectFault("journal-after-publication-commit", { intentId: intent.intentId });
         return { ...revalidated, intent };
       });
     } catch (error) {
@@ -4352,10 +5257,12 @@ export function openStore(rootDir, {
             MAX_GLOBAL_SNAPSHOT_RECORD_BYTES,
           );
           injectFault("global-apply-after-snapshot", { intentId: intent.intentId });
+          injectFault("journal-after-snapshot", { intentId: intent.intentId });
         }
         intent = nextIntent;
         assertGlobalQuotaUnlocked(new Map([[path.resolve(record.filePath), json(intent)]]));
         atomicWrite(record.filePath, json(intent));
+        injectFault("journal-after-snapshot-intent", { intentId: intent.intentId });
         return { ok: true, duplicate: false, intent, snapshot };
       });
     } catch (error) {
@@ -4397,6 +5304,7 @@ export function openStore(rootDir, {
         assertGlobalQuotaUnlocked(new Map([[path.resolve(record.filePath), json(intent)]]));
         atomicWrite(record.filePath, json(intent));
         injectFault(`global-apply-after-${request.state}`, { intentId: intent.intentId });
+        injectFault("journal-after-intent-transition", { intentId: intent.intentId, state: request.state });
         return { ok: true, duplicate: false, intent };
       });
     } catch (error) {
@@ -4493,17 +5401,22 @@ export function openStore(rootDir, {
       injectFault("global-outcome-before-recommendation-cas", { intentId: intent.intentId });
       atomicWrite(recommendationRecord.filePath, json(recommendation));
       injectFault("global-outcome-after-recommendation-cas", { intentId: intent.intentId });
+      injectFault("journal-after-outcome-recommendation-cas", { intentId: intent.intentId });
     }
     exclusiveJsonWrite(decisionPath, decision, (value) => makeGlobalDecision(value, identityOptions), "global-decision", MAX_GLOBAL_DECISION_RECORD_BYTES);
     injectFault("global-outcome-after-decision", { intentId: intent.intentId });
+    injectFault("journal-after-outcome-decision", { intentId: intent.intentId });
     exclusiveJsonWrite(auditPath, audit, (value) => makeGlobalAuditEvent(value, identityOptions), "global-audit", MAX_GLOBAL_DECISION_RECORD_BYTES);
     injectFault("global-outcome-after-audit", { intentId: intent.intentId });
+    injectFault("journal-after-outcome-audit", { intentId: intent.intentId });
     exclusiveJsonWrite(outcomePath, outcome, (value) => makeGlobalDecisionOutcome(value, identityOptions), "global-decision-outcome", MAX_GLOBAL_DECISION_RECORD_BYTES);
     injectFault("global-outcome-after-record", { intentId: intent.intentId });
+    injectFault("journal-after-outcome-record", { intentId: intent.intentId });
     intent = terminalIntent;
     assertGlobalQuotaUnlocked(new Map([[path.resolve(intentRecord.filePath), json(intent)]]));
     atomicWrite(intentRecord.filePath, json(intent));
     injectFault("global-outcome-after-intent", { intentId: intent.intentId });
+    injectFault("journal-after-outcome-intent", { intentId: intent.intentId });
     return { ok: true, duplicate: false, intent, recommendation, decision, audit, outcome };
   }
 
@@ -4569,25 +5482,32 @@ export function openStore(rootDir, {
     return null;
   }
 
-  function globalSynthesisStateUnlocked({ candidateId, supportSetHash, targetBindingHash, leaseKeyHash, ownerToken, suppressors, nowMs, expectedCandidateState }) {
+  function globalSynthesisStateUnlocked({ candidateId, supportSetHash, targetBindingHash, leaseKeyHash, ownerToken, suppressors, nowMs, expectedCandidateState, automationStamp, rootPolicy }) {
     if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error("invalid-global-synthesis-time");
-    const settings = getSettingsUnlocked();
+    const candidateRecord = readGlobalCandidatesUnlocked().find(({ candidate }) => candidate.candidateId === candidateId);
+    const automation = automationStamp === undefined && candidateRecord?.candidate.automationGeneration === undefined
+      ? getAutomationStateUnlocked()
+      : assertAutomationStampUnlocked(automationStamp);
+    if (!automation.ok || !automation.enabled) throw new Error(automation.reason ?? "automatic-recommendations-disabled");
+    const settings = { global: automation.global, repo: automation.repo };
     if (!settings.global.consent.sanitizedExcerpts || !settings.global.consent.crossRepoAggregation) {
       throw new Error("global-synthesis-consent-required");
     }
     const suppressed = globalSynthesisSuppressorReason(settings, suppressors);
     if (suppressed) throw new Error(suppressed);
-    if (!settings.global.globalRootPolicy) throw new Error("global-root-policy-required");
-    const policy = makeGlobalRootPolicy(settings.global.globalRootPolicy);
-    const candidateRecord = readGlobalCandidatesUnlocked().find(({ candidate }) => candidate.candidateId === candidateId);
+    if (!rootPolicy && !settings.global.globalRootPolicy) throw new Error("global-root-policy-required");
+    const policy = makeGlobalRootPolicy(rootPolicy ?? settings.global.globalRootPolicy);
     if (!candidateRecord || candidateRecord.candidate.supportSetHash !== supportSetHash
         || candidateRecord.candidate.targetBindingHash !== targetBindingHash
+        || (candidateRecord.candidate.automationGeneration !== undefined
+          && candidateRecord.candidate.automationGeneration !== automation.epoch.generation)
         || candidateRecord.candidate.state !== expectedCandidateState) {
       throw new Error("global-candidate-drift");
     }
     const supportRecord = readGlobalSupportSetsUnlocked().find(({ supportSet }) => supportSet.supportSetHash === supportSetHash);
     if (!supportRecord || supportRecord.supportSet.candidateId !== candidateId
         || supportRecord.supportSet.targetBinding.bindingHash !== targetBindingHash
+        || supportRecord.supportSet.automationGeneration !== candidateRecord.candidate.automationGeneration
         || supportRecord.supportSet.expiresAt <= nowMs) {
       throw new Error("global-support-drift");
     }
@@ -4602,14 +5522,15 @@ export function openStore(rootDir, {
         || leaseRecord.lease.leaseKind !== "candidate-synthesis" || leaseRecord.lease.ownerToken !== ownerToken) {
       throw new Error("global-candidate-synthesis-lease-invalid");
     }
-    return { settings, policy, candidateRecord, supportRecord, binding, eligibility, leaseRecord };
+    return { automation, settings, policy, candidateRecord, supportRecord, binding, eligibility, leaseRecord };
   }
 
   function globalSynthesisPacketUnlocked(supportSet, nowMs) {
     const supportIds = new Set(supportSet.contributionIds);
     const bindings = new Map();
     const privateIdentityValues = candidateSupportFactsUnlocked(nowMs)
-      .filter((fact) => supportIds.has(fact.contributionId))
+      .filter((fact) => supportIds.has(fact.contributionId)
+        && fact.automationGeneration === supportSet.automationGeneration)
       .flatMap((fact) => fact.privateIdentityValues);
     for (const targetStateDir of projectStateDirectoriesUnlocked()) {
       const transactions = new Map(readContributionTransactionsUnlocked(targetStateDir)
@@ -4625,7 +5546,12 @@ export function openStore(rootDir, {
             || transaction.intent.incidentId !== link.incidentId
             || transaction.intent.capsuleId !== link.capsuleId
             || transaction.intent.evidenceDomainId !== link.evidenceDomainId
-            || !capsule || capsule.incidentId !== link.incidentId || capsule.expiresAt <= nowMs) {
+            || transaction.intent.automationGeneration !== supportSet.automationGeneration
+            || link.automationGeneration !== supportSet.automationGeneration
+            || transaction.contribution.automationGeneration !== supportSet.automationGeneration
+            || !capsule || capsule.incidentId !== link.incidentId
+            || capsule.automationGeneration !== supportSet.automationGeneration
+            || capsule.expiresAt <= nowMs) {
           throw new Error("global-evidence-packet-support-unavailable");
         }
         if (bindings.has(link.contributionId)) throw new Error("global-evidence-packet-support-ambiguous");
@@ -4674,12 +5600,19 @@ export function openStore(rootDir, {
     return { used, limit };
   }
 
+  function validGlobalSynthesisRequest(request, expected) {
+    if (!request || typeof request !== "object" || Array.isArray(request)) return false;
+    const allowed = new Set(expected);
+    const required = expected.filter((key) => !["automationStamp", "rootPolicy"].includes(key));
+    return Object.keys(request).every((key) => allowed.has(key))
+      && required.every((key) => Object.hasOwn(request, key));
+  }
+
   function admitGlobalSynthesisAttempt(request) {
     try {
       return withMutationLock(() => {
-        const expected = ["attemptId", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "supportSetHash", "suppressors", "targetBindingHash"];
-        if (!request || typeof request !== "object" || Array.isArray(request)
-            || Object.keys(request).sort().join(",") !== expected.sort().join(",")) {
+        const expected = ["attemptId", "automationStamp", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "rootPolicy", "supportSetHash", "suppressors", "targetBindingHash"];
+        if (!validGlobalSynthesisRequest(request, expected)) {
           return { ok: false, reason: "invalid-global-synthesis-admission" };
         }
         const state = globalSynthesisStateUnlocked({ ...request, expectedCandidateState: "eligible" });
@@ -4696,6 +5629,9 @@ export function openStore(rootDir, {
           state: "admitted",
           admittedAt: request.nowMs,
           updatedAt: request.nowMs,
+          ...(state.candidateRecord.candidate.automationGeneration === undefined
+            ? {}
+            : { automationGeneration: state.automation.epoch.generation }),
         }, { forbiddenIdentityValues: evidence.privateIdentityValues });
         const candidate = transitionGlobalCandidateState(state.candidateRecord.candidate, {
           state: "synthesis-pending",
@@ -4722,9 +5658,8 @@ export function openStore(rootDir, {
   function dispatchGlobalSynthesisAttempt(request) {
     try {
       return withMutationLock(() => {
-        const expected = ["attemptId", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "supportSetHash", "suppressors", "targetBindingHash"];
-        if (!request || typeof request !== "object" || Array.isArray(request)
-            || Object.keys(request).sort().join(",") !== expected.sort().join(",")) {
+        const expected = ["attemptId", "automationStamp", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "rootPolicy", "supportSetHash", "suppressors", "targetBindingHash"];
+        if (!validGlobalSynthesisRequest(request, expected)) {
           return { ok: false, reason: "invalid-global-synthesis-dispatch" };
         }
         const state = globalSynthesisStateUnlocked({ ...request, expectedCandidateState: "synthesis-pending" });
@@ -4732,6 +5667,7 @@ export function openStore(rootDir, {
         if (!current || current.attempt.candidateId !== request.candidateId
             || current.attempt.supportSetHash !== request.supportSetHash
             || current.attempt.targetBindingHash !== request.targetBindingHash
+            || current.attempt.automationGeneration !== state.candidateRecord.candidate.automationGeneration
             || current.attempt.state !== "admitted") throw new Error("global-synthesis-attempt-drift");
         assertGlobalSynthesisBudgetUnlocked(state.settings, request.nowMs, { admitted: true });
         const evidence = globalSynthesisPacketUnlocked(state.supportRecord.supportSet, request.nowMs);
@@ -4750,16 +5686,16 @@ export function openStore(rootDir, {
   function revalidateGlobalSynthesisAttempt(request) {
     try {
       return withMutationLock(() => {
-        const expected = ["attemptId", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "supportSetHash", "suppressors", "targetBindingHash"];
-        if (!request || typeof request !== "object" || Array.isArray(request)
-            || Object.keys(request).sort().join(",") !== expected.sort().join(",")) {
+        const expected = ["attemptId", "automationStamp", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "rootPolicy", "supportSetHash", "suppressors", "targetBindingHash"];
+        if (!validGlobalSynthesisRequest(request, expected)) {
           return { ok: false, reason: "invalid-global-synthesis-revalidation" };
         }
         const state = globalSynthesisStateUnlocked({ ...request, expectedCandidateState: "synthesis-pending" });
         const current = readGlobalSynthesisAttemptsUnlocked().find(({ attempt }) => attempt.attemptId === request.attemptId);
         if (!current || current.attempt.state !== "dispatched" || current.attempt.candidateId !== request.candidateId
             || current.attempt.supportSetHash !== request.supportSetHash
-            || current.attempt.targetBindingHash !== request.targetBindingHash) throw new Error("global-synthesis-attempt-drift");
+            || current.attempt.targetBindingHash !== request.targetBindingHash
+            || current.attempt.automationGeneration !== state.candidateRecord.candidate.automationGeneration) throw new Error("global-synthesis-attempt-drift");
         assertGlobalSynthesisBudgetUnlocked(state.settings, request.nowMs, { admitted: true });
         const evidence = globalSynthesisPacketUnlocked(state.supportRecord.supportSet, request.nowMs);
         return { ok: true, attempt: current.attempt, packet: evidence.packet };
@@ -4786,16 +5722,16 @@ export function openStore(rootDir, {
   function completeGlobalSynthesisAttempt(request) {
     try {
       return withMutationLock(() => {
-        const expected = ["attemptId", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "proposedContent", "recommendation", "supportSetHash", "suppressors", "targetBindingHash"];
-        if (!request || typeof request !== "object" || Array.isArray(request)
-            || Object.keys(request).sort().join(",") !== expected.sort().join(",")) {
+        const expected = ["attemptId", "automationStamp", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "proposedContent", "recommendation", "rootPolicy", "supportSetHash", "suppressors", "targetBindingHash"];
+        if (!validGlobalSynthesisRequest(request, expected)) {
           return { ok: false, reason: "invalid-global-synthesis-completion" };
         }
         const state = globalSynthesisStateUnlocked({ ...request, expectedCandidateState: "synthesis-pending" });
         const current = readGlobalSynthesisAttemptsUnlocked().find(({ attempt }) => attempt.attemptId === request.attemptId);
         if (!current || current.attempt.state !== "dispatched" || current.attempt.candidateId !== request.candidateId
             || current.attempt.supportSetHash !== request.supportSetHash
-            || current.attempt.targetBindingHash !== request.targetBindingHash) throw new Error("global-synthesis-attempt-drift");
+            || current.attempt.targetBindingHash !== request.targetBindingHash
+            || current.attempt.automationGeneration !== state.candidateRecord.candidate.automationGeneration) throw new Error("global-synthesis-attempt-drift");
         assertGlobalSynthesisBudgetUnlocked(state.settings, request.nowMs, { admitted: true });
         const evidence = globalSynthesisPacketUnlocked(state.supportRecord.supportSet, request.nowMs);
         if (typeof request.proposedContent !== "string" || hashContent(request.proposedContent) !== request.recommendation?.proposedContentHash) {
@@ -4864,16 +5800,16 @@ export function openStore(rootDir, {
   function completeGlobalSynthesisNoChange(request) {
     try {
       return withMutationLock(() => {
-        const expected = ["attemptId", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "supportSetHash", "suppressors", "targetBindingHash"];
-        if (!request || typeof request !== "object" || Array.isArray(request)
-            || Object.keys(request).sort().join(",") !== expected.sort().join(",")) {
+        const expected = ["attemptId", "automationStamp", "candidateId", "leaseKeyHash", "nowMs", "ownerToken", "rootPolicy", "supportSetHash", "suppressors", "targetBindingHash"];
+        if (!validGlobalSynthesisRequest(request, expected)) {
           return { ok: false, reason: "invalid-global-synthesis-no-change-completion" };
         }
         const state = globalSynthesisStateUnlocked({ ...request, expectedCandidateState: "synthesis-pending" });
         const current = readGlobalSynthesisAttemptsUnlocked().find(({ attempt }) => attempt.attemptId === request.attemptId);
         if (!current || current.attempt.state !== "dispatched" || current.attempt.candidateId !== request.candidateId
             || current.attempt.supportSetHash !== request.supportSetHash
-            || current.attempt.targetBindingHash !== request.targetBindingHash) throw new Error("global-synthesis-attempt-drift");
+            || current.attempt.targetBindingHash !== request.targetBindingHash
+            || current.attempt.automationGeneration !== state.candidateRecord.candidate.automationGeneration) throw new Error("global-synthesis-attempt-drift");
         assertGlobalSynthesisBudgetUnlocked(state.settings, request.nowMs, { admitted: true });
         globalSynthesisPacketUnlocked(state.supportRecord.supportSet, request.nowMs);
         const candidate = transitionGlobalCandidateState(state.candidateRecord.candidate, {
@@ -5026,6 +5962,40 @@ export function openStore(rootDir, {
     atomicWrite(current.filePath, json(attempt));
     if (candidate && candidateRecord) atomicWrite(candidateRecord.filePath, json(candidate));
     return { attempt, candidate };
+  }
+
+  function settleAutomationGenerationUnlocked(closedGeneration, nowMs) {
+    const belongsToClosedGeneration = (record) => record.automationGeneration === closedGeneration
+      || (closedGeneration === 1 && record.automationGeneration === undefined);
+    let attempts = 0;
+    for (const current of readGlobalSynthesisAttemptsUnlocked()) {
+      if (!belongsToClosedGeneration(current.attempt)
+          || !["admitted", "dispatched"].includes(current.attempt.state)) continue;
+      const attempt = transitionGlobalSynthesisAttempt(
+        current.attempt,
+        "failed-closed",
+        Math.max(nowMs, current.attempt.updatedAt),
+      );
+      injectFault("automation-before-attempt-settlement", { attemptId: attempt.attemptId, closedGeneration });
+      atomicWrite(current.filePath, json(attempt));
+      injectFault("automation-after-attempt-settlement", { attemptId: attempt.attemptId, closedGeneration });
+      attempts += 1;
+    }
+    let candidates = 0;
+    for (const current of readGlobalCandidatesUnlocked()) {
+      if (!belongsToClosedGeneration(current.candidate)
+          || !["collecting", "eligible", "synthesis-pending"].includes(current.candidate.state)) continue;
+      const candidate = transitionGlobalCandidateState(current.candidate, {
+        state: "superseded",
+        supportSetHash: current.candidate.supportSetHash,
+        eligibilityRoute: current.candidate.eligibilityRoute,
+      }, Math.max(nowMs, current.candidate.updatedAt));
+      injectFault("automation-before-candidate-settlement", { candidateId: candidate.candidateId, closedGeneration });
+      atomicWrite(current.filePath, json(candidate));
+      injectFault("automation-after-candidate-settlement", { candidateId: candidate.candidateId, closedGeneration });
+      candidates += 1;
+    }
+    return { candidates, attempts };
   }
 
   function readGlobalSynthesisAttempts() {
@@ -5280,13 +6250,19 @@ export function openStore(rootDir, {
     else atomicWrite(filePath, source);
   }
 
-  function appendEvidenceCapsule(capsule) {
+  function appendEvidenceCapsule(capsule, { automationStamp = null } = {}) {
     try {
       return withMutationLock(() => {
-        if (!getSettingsUnlocked().global.consent.sanitizedExcerpts) {
+        const automation = automationStamp === null
+          ? null
+          : assertAutomationStampUnlocked(automationStamp);
+        if (!(automation?.global.consent ?? getSettingsUnlocked().global.consent).sanitizedExcerpts) {
           return { ok: false, reason: "sanitized-excerpts-consent-required" };
         }
-        const clean = makeEvidenceCapsule(capsule);
+        const clean = makeEvidenceCapsule({
+          ...capsule,
+          ...(automation ? { automationGeneration: automation.epoch.generation } : {}),
+        });
         const records = readEvidenceCapsulesUnlocked();
         const existing = records.find((record) => record.incidentId === clean.incidentId);
         if (existing) {
@@ -5311,12 +6287,15 @@ export function openStore(rootDir, {
     });
   }
 
-  function getEvidenceCapsuleSupport(incidentId, { nowMs = now() } = {}) {
+  function getEvidenceCapsuleSupport(incidentId, { nowMs = now(), automationStamp = null } = {}) {
     return withMutationLock(() => {
       if (typeof incidentId !== "string" || !incidentId || incidentId.length > 128 || !Number.isSafeInteger(nowMs) || nowMs < 0) {
         return Object.freeze({ available: false, reason: "invalid-capsule-support-query" });
       }
-      if (!getSettingsUnlocked().global.consent.sanitizedExcerpts) {
+      const automation = automationStamp === null
+        ? null
+        : assertAutomationStampUnlocked(automationStamp);
+      if (!(automation?.global.consent ?? getSettingsUnlocked().global.consent).sanitizedExcerpts) {
         return Object.freeze({ available: false, reason: "sanitized-excerpts-consent-required" });
       }
       const capsule = readEvidenceCapsulesUnlocked().find((item) => item.incidentId === incidentId);
@@ -5954,6 +6933,14 @@ export function openStore(rootDir, {
         } else {
           removed = before;
           removedCapsules = capsulesBefore;
+          // The integration writes the terminal epoch durably at acceptance time
+          // (via markRootTerminal); this in-lock write is an idempotent safety net
+          // so a direct store purge-all also publishes the cross-process terminal
+          // truth for peer processes. Clear the pre-deletion grace window and set
+          // the definitive local terminal flag.
+          try { rootEpoch.writeTerminalEpoch({ terminalOperationId: `store-purge-${now()}` }); } catch {}
+          localTerminalPending = false;
+          refreshRootEpochUnlocked();
           rmSync(baseDir, { recursive: true, force: true });
           ownedLeases.clear();
           ownedHostOwners.clear();
@@ -5965,10 +6952,12 @@ export function openStore(rootDir, {
         const counts = countKinds(removed, removedCapsules);
         appendAuditUnlocked("purge", { action: scope, removed: removed.length });
         return { ok: true, counts };
-      }, partitionAdmissionError ? {
+      }, (scope === "all" || partitionAdmissionError) ? {
         requireStoreAncestors: false,
         allowIncompatible: true,
         recoverTransactions: false,
+        allowTerminal: scope === "all",
+        skipEpochRefresh: scope === "all",
       } : undefined);
     } catch (error) { return { ok: false, reason: errorReasonCode(error, "corrupt-record"), counts: countKinds([]) }; }
   }
@@ -6058,6 +7047,14 @@ export function openStore(rootDir, {
   }
 
   preflightStoreAncestors();
+  // Read the durable root epoch before any subtree recreation. A terminal epoch
+  // (written by any process sharing this state root) means this store opens
+  // inert: no directory recreation, no partition admission, no authority. The
+  // epoch file lives outside the deletable `self-evolve/` subtree so it survives
+  // purge-all and is the cross-process terminal truth; restart alone cannot
+  // clear it.
+  refreshRootEpochUnlocked();
+  refreshBreakerEpochUnlocked();
   const partitionAdmission = inspectPartitionVersion();
   if (!partitionAdmission.ok) {
     partitionAdmissionError = partitionAdmission.reason;
@@ -6067,7 +7064,10 @@ export function openStore(rootDir, {
   // The first inspection is advisory only: another process may be between
   // creating the admitted preboot/base directories and publishing version.json.
   // Serialize the authoritative inspection before either rejecting or writing.
-  withMutationLock(() => {
+  // Skip entirely when the root epoch is terminal: a purged root must not be
+  // reconstructed by a mere restart (restart-alone-inert invariant).
+  if (terminalEpochReason === null) {
+    withMutationLock(() => {
     const lockedAdmission = inspectPartitionVersion();
     if (!lockedAdmission.ok) {
       partitionAdmissionError = lockedAdmission.reason;
@@ -6082,6 +7082,7 @@ export function openStore(rootDir, {
     const repo = loadRepoSettingsUnlocked();
     if (global && repo) {
       lastKnownProjectQuotaBytes = (repo.budgets.storageQuotaMiB ?? global.budgets.storageQuotaMiB) * 1024 * 1024;
+      getAutomationStateUnlocked();
       const contributionRecovery = recoverContributionTransactionsUnlocked();
       if (!contributionRecovery.ok) markStartupCorruption("global");
       else recoverGlobalLifecycleInvalidationsUnlocked();
@@ -6103,9 +7104,14 @@ export function openStore(rootDir, {
       markStartupCorruption(repo ? "global" : "all");
     }
   }, { requireStoreAncestors: false, allowIncompatible: true, recoverTransactions: false });
+  }
 
   return Object.freeze({
     getSettings,
+    getAutomationState,
+    compareAutomationStamp,
+    transitionAutomation,
+    setAutomationProjectExcluded,
     updateSettings,
     updateGlobalSettings,
     updateRepoSettings,
@@ -6150,6 +7156,7 @@ export function openStore(rootDir, {
     acquireGlobalLease,
     acquireGlobalDecisionLease,
     releaseGlobalLease,
+    renewGlobalLease,
     getGlobalLease,
     admitGlobalSynthesisAttempt,
     dispatchGlobalSynthesisAttempt,
@@ -6188,7 +7195,122 @@ export function openStore(rootDir, {
     purge,
     getRecoveryPending,
     close,
-    isTerminal: () => terminal || terminalRoots.has(root),
+    isTerminal: () => terminal || terminalRoots.has(root) || terminalEpochReason !== null,
+    rootEpochTerminalReason: () => terminalEpochReason,
+    // Stable power-loss durability capability bound at open time. Read-only
+    // consumers (health/projection) read the stable reason to report disabled
+    // authoritative writes; the applier checks `available` before any skill
+    // filesystem effect so a host that cannot fsync a directory descriptor can
+    // never publish a surviving target mutation whose journal evidence could not
+    // be made namespace-durable. Reads never touch the durable primitive and so
+    // remain available regardless of this capability.
+    durableCapability: durable.capability,
+    refreshRootEpoch: () => {
+      refreshRootEpochUnlocked();
+      return terminalEpochReason;
+    },
+    // Durably mark the root epoch terminal. Called by the integration at purge-all
+    // acceptance (via scheduleTerminalPurge, after the accepted-terminal response
+    // is recorded) so every peer process sharing the state root fails closed at
+    // its next mutation-lock acquisition or admission cycle. Sets
+    // localTerminalPending so THIS process's pre-deletion cleanup reads/audits
+    // keep functioning until store.purge({ scope:"all" }) performs the deletion.
+    // Idempotent within a generation. Does NOT delete the subtree.
+    markRootTerminal: ({ terminalOperationId } = {}) => {
+      const record = rootEpoch.writeTerminalEpoch({ terminalOperationId });
+      localTerminalPending = true;
+      return record;
+    },
+    // Authenticated explicit reinitialize: the sole recovery path from a terminal
+    // epoch. Requires the epoch to be terminal, an exact operator-typed
+    // confirmation, and a full authenticated commitment (fresh root/project
+    // identity, schema/protocol versions, one-use nonce, consent snapshot,
+    // operator authority). Increments the generation and clears terminal. The
+    // subtree is recreated on the next open (restart); reinitialize itself only
+    // advances the epoch truth. Replay-safe and cannot be model-selected.
+    reinitializeRoot: ({ confirmation, authentication } = {}) => {
+      return withStateMutationLock(root, () => {
+        const record = rootEpoch.reinitialize({ confirmation, authentication, rootIdentityHash: rootBoundary.identity });
+        const transitionId = `root-reinitialize-${record.generation}`;
+        const transitionHash = hashContent(JSON.stringify([
+          "self-evolve-automation-reinitialize-v1",
+          record.generation,
+          record.reinitializeCommitment?.nonceHash,
+        ]));
+        const automation = automationEpoch.reinitializeBaseline({
+          rootEpochRecord: record,
+          transitionId,
+          transitionHash,
+          rootIdentityHash: rootBoundary.identity,
+        });
+        terminalEpochReason = null;
+        terminal = false;
+        localTerminalPending = false;
+        terminalRoots.delete(root);
+        initializeDirs();
+        const timestamp = now();
+        const global = makeV4GlobalSettings({ createdAt: timestamp, updatedAt: timestamp });
+        const repo = makeV4RepoSettings({ projectFingerprint });
+        atomicWrite(automationGlobalSettingsPath, json(global));
+        atomicProjectWrite(automationRepoSettingsPath, json(repo));
+        return { ...record, automation: automation.record };
+      }, { lockTimeoutMs, staleLockMs });
+    },
+    // ----- Root-global circuit-breaker epoch -----
+    // The breaker epoch is the cross-process open/closed truth for the
+    // autonomous-work circuit breaker. It composes with the terminal epoch
+    // (same module, same durable primitive, sibling file) but tracks a separate
+    // concern. breakerEpochTripped() is the FRESH read every admission, provider,
+    // and effect boundary must call; refreshBreakerEpoch() re-reads under the
+    // mutation lock. tripBreakerEpoch/resetBreakerEpoch are the sole durable
+    // write paths. A corrupt breaker epoch fails closed (tripped).
+    breakerEpochTripped: () => {
+      refreshBreakerEpochUnlocked();
+      return breakerEpochReason !== null;
+    },
+    breakerEpochReason: () => breakerEpochReason,
+    breakerEpochState: () => {
+      try {
+        const epoch = breakerEpoch.read();
+        return {
+          ok: true,
+          generation: epoch.generation,
+          tripped: epoch.tripped,
+          trippedAt: epoch.trippedAt,
+          trippedReason: epoch.trippedReason,
+          tripOperationId: epoch.tripOperationId,
+          updatedAt: epoch.updatedAt,
+          corrupt: false,
+        };
+      } catch (error) {
+        return { ok: false, corrupt: true, reason: errorReasonCode(error, BREAKER_EPOCH_TRIPPED_REASON) };
+      }
+    },
+    refreshBreakerEpoch: () => {
+      refreshBreakerEpochUnlocked();
+      return breakerEpochReason;
+    },
+    // Durably trip the breaker epoch so every peer process sharing the state
+    // root sees the open state at its next boundary read. Idempotent within a
+    // generation. Called by the applier/scheduler trip paths alongside the
+    // existing per-trip circuit-breaker audit record. Does NOT throw when
+    // already tripped.
+    tripBreakerEpoch: ({ reason, operationId } = {}) => {
+      const record = breakerEpoch.trip({ reason, operationId, rootIdentityHash: rootBoundary.identity });
+      breakerEpochReason = BREAKER_EPOCH_TRIPPED_REASON;
+      return record;
+    },
+    // Authenticated explicit reset: the sole recovery path from a tripped
+    // breaker epoch. Requires the breaker to be tripped, an exact operator-typed
+    // confirmation, and a full authenticated commitment. Advances the
+    // generation and clears tripped. Replay-safe (a replayed reset on a healthy
+    // breaker fails) and cannot be model-selected. After reset, every process
+    // sees the healthy state at its next boundary read.
+    resetBreakerEpoch: ({ confirmation, authentication } = {}) => {
+      const record = breakerEpoch.reset({ confirmation, authentication, rootIdentityHash: rootBoundary.identity });
+      breakerEpochReason = null;
+      return record;
+    },
     getProjectUsage: () => withMutationLock(() => {
       const bytesUsed = projectedProjectBytesUnlocked();
       const quotaBytes = projectQuotaBytesUnlocked();

@@ -199,6 +199,7 @@ export function validateException(record, disposition, today) {
   boundedString(record.owner, "audit exception owner", 256);
   const reviewDate = isoDate(record.reviewDate, "audit exception reviewDate");
   const expiresOn = isoDate(record.expiresOn, "audit exception expiresOn");
+  if (reviewDate > today) fail(`audit exception reviewDate must not be in the future: ${reviewDate} > ${today}`);
   if (reviewDate > expiresOn) fail("audit exception reviewDate must not be after expiresOn");
   if (expiresOn < today) fail(`audit exception expired on ${expiresOn}`);
   return record;

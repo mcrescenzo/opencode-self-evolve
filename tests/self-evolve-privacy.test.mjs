@@ -14,8 +14,10 @@ import {
   makeObservation,
   makeProposal,
   makeProposalContent,
+  makeRollbackRecord,
   wrapRecord,
 } from "../self-evolve-schemas.js";
+import { errorReasonCode } from "../self-evolve-schemas.js";
 import { hashContent, openStore } from "../self-evolve-store.js";
 import {
   assertSafeGlobalClaim,
@@ -23,6 +25,7 @@ import {
   isExpired,
   observationExpiresAt,
   proposalExpiresAt,
+  redactPrivateMaterial,
 } from "../self-evolve-privacy.js";
 
 const H = (character) => character.repeat(64);
@@ -103,12 +106,6 @@ function runStoreChild(root, fingerprint, operation, value) {
 function fixture({ excerpts = true, aggregate = false, fingerprint = PROJECT_A, storeOptions = {} } = {}) {
   const root = ownedTempRoot("self-evolve-privacy-");
   const store = openStore(root, { projectName: "private-project", projectFingerprint: fingerprint, now: () => NOW, ...storeOptions });
-  const updated = store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: true, sanitizedExcerpts: excerpts, crossRepoAggregation: aggregate },
-    updatedAt: NOW,
-  }));
-  assert.equal(updated.ok, true);
   const guard = createPrivacyGuard({
     consent: { durableObservations: true, sanitizedExcerpts: excerpts, crossRepoAggregation: aggregate },
     projectFingerprint: fingerprint,
@@ -119,6 +116,22 @@ function fixture({ excerpts = true, aggregate = false, fingerprint = PROJECT_A, 
     blockedNames: ["private-project", "customer-zephyr"],
   });
   return { root, store, guard };
+}
+
+function transitionAutomation(store, request) {
+  const current = store.getAutomationState();
+  assert.equal(current.ok, true, current.reason);
+  const result = store.transitionAutomation({
+    ...request,
+    transitionId: request.transitionId ?? `privacy-${request.action}-${current.epoch.generation}`,
+    expectedGeneration: current.epoch.generation,
+  });
+  assert.equal(result.ok, true, result.reason);
+  return result;
+}
+
+function currentGuard(store, projectFingerprint = PROJECT_A) {
+  return createPrivacyGuard({ projectFingerprint, now: () => NOW, store });
 }
 
 function observation(overrides = {}) {
@@ -403,7 +416,7 @@ test("excerpt scrub applies bounded heuristic redaction", () => {
   store.close();
 });
 
-test("consented capsule admission persists one exact project-local v0.3 record", () => {
+test("consented capsule admission persists one exact project-local record with its automation generation", () => {
   const { store, guard } = fixture();
   const result = guard.createEvidenceCapsule({
     incidentId: "capsule-incident-1",
@@ -416,7 +429,7 @@ test("consented capsule admission persists one exact project-local v0.3 record",
   assert.match(result.capsule.capsuleId, /^[0-9a-f-]{36}$/u);
   assert.deepEqual(Object.keys(result.capsule), [
     "schemaVersion", "capsuleId", "incidentId", "receiptType", "targetLogicalName",
-    "summary", "summaryHash", "createdAt", "expiresAt",
+    "summary", "summaryHash", "createdAt", "expiresAt", "automationGeneration",
   ]);
   assert.equal(result.capsule.createdAt, NOW);
   assert.equal(result.capsule.expiresAt, NOW + 30 * DAY);
@@ -525,7 +538,8 @@ test("absolute-path detector still flags and correctly redacts real paths", () =
 });
 
 test("an already-created guard observes same-process consent revocation immediately", () => {
-  const { store, guard } = fixture({ excerpts: true, aggregate: true });
+  const { store } = fixture({ excerpts: true, aggregate: true });
+  const guard = currentGuard(store);
   assert.equal(guard.scrubExcerpt({ text: "before revocation" }).ok, true);
   const capsule = guard.createEvidenceCapsule({
     incidentId: "revoked-capsule",
@@ -538,12 +552,11 @@ test("an already-created guard observes same-process consent revocation immediat
     available: true,
     capsuleId: capsule.capsule.capsuleId,
   });
-  const revoked = store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: false },
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(revoked.ok, true);
+  const revoked = transitionAutomation(store, {
+    action: "set-permission",
+    permission: "sanitizedExcerpts",
+    enabled: false,
+  });
   assert.deepEqual(revoked.capsuleSupport, {
     available: false,
     reason: "sanitized-excerpts-consent-revoked",
@@ -555,28 +568,29 @@ test("an already-created guard observes same-process consent revocation immediat
     reason: "sanitized-excerpts-consent-required",
   });
   assert.equal(guard.scrubExcerpt({ text: "after revocation" }).reason, "sanitized-excerpts-consent-required");
-  assert.equal(guard.publishContribution(contributionInput({ incidentId: "revoked" })).reason, "sanitized-excerpts-consent-required");
+  assert.equal(guard.publishContribution(contributionInput({ incidentId: "revoked" })).reason, "observation-consent-required");
   store.close();
 });
 
 test("an already-created guard observes cross-process consent revocation immediately", async () => {
-  const { root, store, guard } = fixture({ excerpts: true, aggregate: true });
+  const { root, store } = fixture({ excerpts: true, aggregate: true });
+  const guard = currentGuard(store);
   const input = seedContributionContext(store, guard, { incidentId: "before-cross-process-revocation" });
   assert.equal(guard.publishContribution(input).ok, true);
   assert.equal((await runStoreChild(root, PROJECT_A, "update-global-consent", "false")).ok, true);
-  assert.equal(guard.publishContribution({ ...input, incidentId: "after-cross-process-revocation" }).reason, "sanitized-excerpts-consent-required");
+  assert.equal(guard.publishContribution({ ...input, incidentId: "after-cross-process-revocation" }).reason, "observation-consent-required");
   assert.equal(store.readContributions({ scope: "project", includeExpired: true }).length, 1);
   store.close();
 });
 
 test("durable observation revocation immediately blocks observations capsules and contributions", () => {
-  const { store, guard } = fixture({ excerpts: true, aggregate: true });
-  const revoked = store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: false },
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(revoked.ok, true);
+  const { store } = fixture({ excerpts: true, aggregate: true });
+  const guard = currentGuard(store);
+  const revoked = transitionAutomation(store, {
+    action: "set-permission",
+    permission: "durableObservations",
+    enabled: false,
+  });
   assert.equal(revoked.consentEffects.stopDurableObservation, true);
   assert.equal(revoked.consentEffects.stopGlobalContributions, true);
   assert.equal(revoked.consentEffects.invalidateGlobalSupport, true);
@@ -596,11 +610,6 @@ test("cross-process excerpt revocation deletes capsules from every project parti
   const root = ownedTempRoot("self-evolve-capsule-revocation-child-");
   const storeA = openStore(root, { projectFingerprint: PROJECT_A, now: () => NOW });
   const storeB = openStore(root, { projectFingerprint: PROJECT_B, now: () => NOW });
-  assert.equal(storeA.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: true, sanitizedExcerpts: true },
-    updatedAt: NOW,
-  })).ok, true);
   const guardFor = (store, projectFingerprint) => createPrivacyGuard({
     projectFingerprint,
     now: () => NOW,
@@ -863,7 +872,7 @@ test("inspection reports counts and byte usage without raw record content", () =
     observations: 1,
     proposals: 1,
     decisions: 1,
-    auditEvents: 2,
+    auditEvents: 1,
     bytesUsed: 0,
     quotaFraction: 0,
   });
@@ -878,7 +887,7 @@ test("export filters project records and scrubs every observation", () => {
   store.appendRecord(wrapRecord("observation", makeObservation(observation({ id: H("5"), projectFingerprint: PROJECT_B })), NOW));
   store.appendRecord(wrapRecord("proposal", proposal(), NOW));
   const archive = guard.exportScope(PROJECT_A);
-  assert.equal(archive.records.length, 3);
+  assert.equal(archive.records.length, 2);
   assert.equal(archive.records.every((record) => !record.payload.projectFingerprint || record.payload.projectFingerprint === PROJECT_A), true);
   assert.equal(archive.records.find((record) => record.kind === "observation").payload.id, H("1"));
   assert.deepEqual(JSON.parse(JSON.stringify(archive)), archive);
@@ -933,22 +942,20 @@ test("durable file enumeration proves capsule isolation through create export re
   assert.deepEqual(files.map((entry) => entry.path), beforeExportPaths, "export must not create durable capsule artifacts");
   assertGlobalCapsuleFree(files, [first]);
 
-  const revoked = store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: false },
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(revoked.ok, true);
+  const revoked = transitionAutomation(store, {
+    action: "set-permission",
+    permission: "sanitizedExcerpts",
+    enabled: false,
+  });
   assert.equal(revoked.capsuleSupport.available, false);
   files = enumerateDurableFiles(stateRoot);
   assert.equal(files.some((entry) => entry.path.endsWith("evidence-capsules.jsonl")), false);
   assertGlobalCapsuleFree(files, [first]);
 
-  assert.equal(store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: true },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  assert.equal(transitionAutomation(store, {
+    action: "set-automatic-recommendations",
+    enabled: true,
+  }).ok, true);
   const second = guard.createEvidenceCapsule({
     incidentId: "lifecycle-capsule-2",
     receiptType: "repeated-command",
@@ -969,11 +976,6 @@ test("export all includes global state but never another project's private parti
   const root = ownedTempRoot("self-evolve-private-export-all-");
   const first = openStore(root, { projectName: "first-project", projectFingerprint: PROJECT_A, now: () => NOW });
   const second = openStore(root, { projectName: "second-project", projectFingerprint: PROJECT_B, now: () => NOW });
-  assert.equal(first.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: true, crossRepoAggregation: false },
-    updatedAt: NOW,
-  })).ok, true);
   first.appendRecord(wrapRecord("observation", makeObservation(observation({ incidentId: "first-incident" })), NOW));
   second.appendRecord(wrapRecord("observation", makeObservation(observation({
     id: H("5"),
@@ -1033,11 +1035,6 @@ test("export all does not inspect or leak an unauthorized project's unsafe obser
   const root = ownedTempRoot("self-evolve-scrubbed-export-all-");
   const first = openStore(root, { projectName: "first-project", projectFingerprint: PROJECT_A, now: () => NOW });
   const second = openStore(root, { projectName: "second-project", projectFingerprint: PROJECT_B, now: () => NOW });
-  assert.equal(first.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: true, crossRepoAggregation: true },
-    updatedAt: NOW,
-  })).ok, true);
   first.appendRecord(wrapRecord("observation", makeObservation(observation({ incidentId: "first-incident" })), NOW));
   second.appendRecord(wrapRecord("observation", makeObservation(observation({
     id: H("5"),
@@ -1132,7 +1129,7 @@ test("one incident publishes one immutable identity-free contribution and reuses
   assert.match(first.contribution.contributionId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
   assert.deepEqual(Object.keys(first.contribution), [
     "schemaVersion", "contributionId", "claimType", "receiptType", "signatureHash",
-    "occurrenceCount", "firstSeenDay", "lastSeenDay", "createdAt", "expiresAt",
+    "occurrenceCount", "firstSeenDay", "lastSeenDay", "createdAt", "expiresAt", "automationGeneration",
   ]);
   assert.deepEqual(store.readContributions({ scope: "global", includeExpired: true }), [first.contribution]);
   assert.deepEqual(store.readContributions({ scope: "project", includeExpired: true }), [first.contribution]);
@@ -1151,24 +1148,86 @@ test("one incident publishes one immutable identity-free contribution and reuses
 });
 
 test("consent revocation stops new admission without silently erasing committed retained contributions", () => {
-  const { root, store, guard } = fixture({ aggregate: true });
+  const { root, store } = fixture({ aggregate: true });
+  const guard = currentGuard(store);
   const input = seedContributionContext(store, guard, { incidentId: "committed-before-revocation" });
   const published = guard.publishContribution(input);
   assert.equal(published.ok, true);
 
-  const revoked = store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, crossRepoAggregation: false },
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(revoked.ok, true);
+  transitionAutomation(store, {
+    action: "set-permission",
+    permission: "crossRepoAggregation",
+    enabled: false,
+  });
   const beforeDeniedAttempt = enumerateDurableFiles(path.join(root, "self-evolve"));
-  assert.equal(guard.publishContribution({ ...input, incidentId: "denied-after-revocation" }).reason, "cross-repo-consent-required");
+  assert.equal(guard.publishContribution({ ...input, incidentId: "denied-after-revocation" }).reason, "observation-consent-required");
   assert.deepEqual(enumerateDurableFiles(path.join(root, "self-evolve")), beforeDeniedAttempt);
   assert.deepEqual(store.readContributions({ scope: "global", includeExpired: true }), [published.contribution]);
   assert.deepEqual(store.readContributionIntents().map((intent) => intent.state), ["committed"]);
   assert.deepEqual(store.readContributionLinks(), [published.link]);
   store.close();
+});
+
+test("revoking each contribution-authority consent bit during a crash window terminalizes the pending transaction", () => {
+  for (const bit of ["durableObservations", "sanitizedExcerpts", "crossRepoAggregation"]) {
+    // Crash after the global contribution and link are written but before the
+    // intent is committed, then revoke exactly one authority bit, then recover.
+    let armed = true;
+    const { root, store } = fixture({
+      aggregate: true,
+      storeOptions: {
+        faultInjection(point) {
+          if (armed && point === "contribution-after-link-write") {
+            armed = false;
+            throw new Error(`fixture-fault:${point}`);
+          }
+        },
+      },
+    });
+    const guard = currentGuard(store);
+    const input = seedContributionContext(store, guard, { incidentId: `revoked-${bit}` });
+    assert.equal(guard.publishContribution(input).ok, false, `${bit}: crash expected`);
+    // The global contribution and link exist on disk before revocation.
+    assert.equal(
+      enumerateDurableFiles(path.join(root, "self-evolve", "global", "contributions")).length,
+      1,
+      `${bit}: global contribution written before crash`,
+    );
+
+    // Revoke exactly one contribution-authority consent bit.
+    assert.equal(transitionAutomation(store, {
+      transitionId: `privacy-revoke-${bit}`,
+      action: "set-permission",
+      permission: bit,
+      enabled: false,
+    }).ok, true, `${bit}: consent revoked`);
+
+    // Boot recovery terminalizes the revoked pending transaction.
+    assert.equal(store.recoverContributionTransactions().ok, true, `${bit}: recovery`);
+
+    // No contribution, link, or surviving authority remains.
+    assert.deepEqual(
+      store.readContributions({ scope: "global", includeExpired: true }),
+      [],
+      `${bit}: no global contribution survives`,
+    );
+    assert.deepEqual(
+      store.readContributionLinks().filter((link) => link.incidentId === input.incidentId),
+      [],
+      `${bit}: no contribution link survives`,
+    );
+    assert.deepEqual(
+      store.readContributionIntents().filter((intent) => intent.incidentId === input.incidentId).map((intent) => intent.state),
+      ["revoked"],
+      `${bit}: pending transaction terminalized`,
+    );
+    assert.equal(
+      enumerateDurableFiles(path.join(root, "self-evolve", "global", "contributions")).length,
+      0,
+      `${bit}: global contribution removed`,
+    );
+    store.close();
+  }
 });
 
 test("every contribution transaction interruption converges to one canonical committed result", async (t) => {
@@ -1300,4 +1359,88 @@ test("projected project and global contribution quotas fail before publication a
     assert.deepEqual(enumerateDurableFiles(path.join(root, "self-evolve")), before, label);
     store.close();
   }
+});
+
+const CANARY_TOKEN = "sk-canary1234567890abcdef";
+const CANARY_PATH = "/home/secret/canary-path";
+const CANARY_NAME = "project-zephyr-secret";
+const CANARY_MESSAGE = "the user typed a secret message body here";
+
+test("errorReasonCode never echoes raw host errors containing private material", () => {
+  // Safe dashed/uppercase codes (before the first colon) pass through; the
+  // private detail after the colon is never part of the code.
+  assert.equal(errorReasonCode(new Error("ENOENT: open '/home/secret/key'"), "safe-fallback"), "ENOENT");
+  assert.equal(errorReasonCode(new Error("storage-quota-exceeded: detail"), "safe-fallback"), "storage-quota-exceeded");
+  // Raw messages that would carry paths, tokens, or message bodies collapse to
+  // the caller's safe fallback instead of leaking private material.
+  assert.equal(errorReasonCode(new Error(`permission denied for ${CANARY_PATH}`), "safe-fallback"), "safe-fallback");
+  assert.equal(errorReasonCode(new Error(`leaked ${CANARY_TOKEN} in body`), "safe-fallback"), "safe-fallback");
+  assert.equal(errorReasonCode(new Error(CANARY_MESSAGE), "safe-fallback"), "safe-fallback");
+  assert.equal(errorReasonCode(new Error(`project failed: ${CANARY_NAME} on ${CANARY_PATH}`), "safe-fallback"), "safe-fallback");
+});
+
+test("redactPrivateMaterial strips tokens, paths, private names, and message bodies", () => {
+  const redacted = redactPrivateMaterial(`failed at ${CANARY_PATH} using ${CANARY_TOKEN} for ${CANARY_NAME}: ${CANARY_MESSAGE}`);
+  assert.equal(redacted.includes(CANARY_TOKEN), false, "token redacted");
+  assert.equal(redacted.includes(CANARY_PATH), false, "path redacted");
+  assert.equal(redacted.includes(CANARY_NAME), false, "private name redacted");
+  assert.ok(redacted.includes("<token>") && redacted.includes("<path>") && redacted.includes("<private-name>"), "placeholders inserted");
+});
+
+test("export redacts private material from every record kind so canaries never surface", () => {
+  const { store, guard } = fixture();
+  // An audit-event whose details carry raw host-error canaries.
+  const audit = makeAuditEvent({
+    id: H("9"),
+    kind: "decision",
+    actor: "reviewer",
+    timestamp: NOW,
+    payloadHash: hashContent(JSON.stringify({ reason: CANARY_TOKEN })),
+    details: {
+      action: "verified",
+      state: "closed",
+      reason: `failed at ${CANARY_PATH} using ${CANARY_TOKEN} for ${CANARY_NAME}`,
+      body: CANARY_MESSAGE,
+    },
+  });
+  assert.equal(store.appendRecord(wrapRecord("audit-event", audit, NOW)).ok, true);
+  // A rollback-record whose reason carries a canary.
+  const rollback = makeRollbackRecord({
+    proposalId: "proposal-canary",
+    appliedHash: CURRENT,
+    rolledBackAt: NOW,
+    reason: `rollback after ${CANARY_TOKEN} at ${CANARY_PATH}`,
+  });
+  assert.equal(store.appendRecord(wrapRecord("rollback-record", rollback, NOW)).ok, true);
+
+  const archive = guard.exportScope(PROJECT_A);
+  const exported = JSON.stringify(archive.records);
+  assert.equal(exported.includes(CANARY_TOKEN), false, "token must not appear in export");
+  assert.equal(exported.includes(CANARY_PATH), false, "path must not appear in export");
+  assert.equal(exported.includes(CANARY_NAME), false, "private name must not appear in export");
+  assert.equal(exported.includes(CANARY_MESSAGE), false, "message body must not appear in export");
+  // The audit and rollback records are still present (redacted, not dropped).
+  assert.ok(archive.records.some((record) => record.kind === "audit-event"), "audit-event retained after redaction");
+  assert.ok(archive.records.some((record) => record.kind === "rollback-record"), "rollback-record retained after redaction");
+  store.close();
+});
+
+test("privacy audits never persist raw private material in detail strings", () => {
+  const { store, guard } = fixture();
+  // seedContributionContext appends a clean observation; invalidate it with a
+  // reason carrying canaries. appendPrivacyAudit scrubs detail strings, so the
+  // persisted audit must not contain the raw canaries.
+  const obs = observation();
+  const clean = guard.scrubObservation(obs);
+  assert.equal(clean.ok, true);
+  store.appendRecord(wrapRecord("observation", clean.sanitized, NOW));
+  const observationId = clean.sanitized.id;
+  // invalidateObservation hashes the reason, but route a canary through the
+  // details path by appending a privacy audit directly via the guard surface.
+  assert.equal(guard.invalidateObservation(observationId, `secret ${CANARY_TOKEN} at ${CANARY_PATH}`).ok, true);
+  const archive = guard.exportScope(PROJECT_A);
+  const exported = JSON.stringify(archive.records);
+  assert.equal(exported.includes(CANARY_TOKEN), false, "token must not persist in audit");
+  assert.equal(exported.includes(CANARY_PATH), false, "path must not persist in audit");
+  store.close();
 });

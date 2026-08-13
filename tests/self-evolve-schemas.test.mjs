@@ -316,7 +316,10 @@ test("v0.3 evidence domains and capsules remain project-local while global contr
     () => schemas.assertContributionPublicationBinding(intent, { ...contribution, contributionId: "44444444-4444-4444-8444-444444444444" }),
     /contribution-intent-mismatch/u,
   );
-  assert.deepEqual(Object.keys(contribution), schemas.GlobalContribution.fields);
+  assert.deepEqual(
+    Object.keys(contribution),
+    schemas.GlobalContribution.fields.filter((field) => field !== "automationGeneration"),
+  );
   assert.throws(() => schemas.makeGlobalContribution({ ...contribution, projectFingerprint: PROJECT }), /unexpected field/u);
   assert.throws(
     () => schemas.makeGlobalContribution({ ...contribution, signatureHash: PROJECT }, { forbiddenIdentityValues: [PROJECT] }),
@@ -816,7 +819,7 @@ test("v0.3 protocol authority separates acting project, consumer, global audit, 
     requestedAt: 100,
     updatedAt: 100,
     nonce: "purge-1",
-    confirmation: "PURGE ALL SELF-EVOLVE 0.3.0",
+    confirmation: "PURGE ALL SELF-EVOLVE 0.4.0",
   });
   const accepted = schemas.transitionV3PurgeOperation(purge, "accepted", 110);
   assert.throws(() => schemas.transitionV3PurgeOperation(accepted, "deleting", 120), /invalid-transition/u);

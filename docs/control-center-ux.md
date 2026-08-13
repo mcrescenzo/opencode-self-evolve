@@ -1,411 +1,116 @@
-# Self-evolve Control Center UX Contract
+# Self-Evolve v0.4 Control Center UX
 
-This document is the normative native UX contract for Self-evolve Release B.
-It defines presentation and navigation only. Server-authored projections and
-fresh server-side validation remain the authority for every effect. The TUI
-must never derive permission from what it renders.
+**Status:** Normative native-UX contract for Self-Evolve v0.4.
 
-## Product promise
+The persistent sidebar is the normal entry point. It opens one full-screen control center with exactly four mounted sections: Home, Recommendations, Activity, and Settings. Slash commands remain headless recovery and compatibility tools; no normal workflow depends on them.
 
-At every point, the native UI answers five questions without requiring other
-documentation:
+## Product language
 
-1. What is Self-evolve doing?
-2. Why is it waiting?
-3. What needs attention?
-4. What did it recommend or change?
-5. What can I safely do next?
+Use these terms exactly on current surfaces:
 
-The primary navigation has exactly four sections, in this order:
-
-1. **Home**
-2. **Recommendations**
-3. **Activity**
-4. **Settings**
-
-Overview, Reviews, Safety, Evidence, Health/Budgets, Maintenance, and Help are
-not primary destinations. Their useful content moves into the four sections.
-
-## Shared language
-
-Primary copy uses these human labels. Stored keys and protocol values may
-appear only as secondary technical detail.
-
-| Concept | Primary label | Meaning |
+| Domain value | Product label | Meaning |
 |---|---|---|
-| `manual` | On demand | Self-evolve analyzes only when the user runs the headless scan command. |
-| `auto` | Recommend automatically | Self-evolve may analyze at safe idle points and prepare recommendations, but cannot apply them without approval. |
-| durable observations | Saved structured patterns | Bounded structured facts retained for evidence; never transcript text. |
-| passive provider calls | Background AI analysis | Hidden analysis that may run at safe idle points when consent and budget allow it. |
-| allowlist | Approved skill folders | The only canonical skill roots eligible for writes. |
-| circuit breaker | Paused after repeated failures | Automatic work stopped after repeated failures and requires recovery or reset. |
-| bootstrap/boot health | Startup checks | Host, state-root, schema, recovery, and compatibility checks that must finish before native authority is available. |
-| repository exclusion | Disabled for this project | Global behavior remains configured, but this project cannot run autonomous work. |
-| valid synthesis no-op | No useful change found | Analysis completed successfully and found no safe improvement worth proposing. |
-
-Do not use "failed", "error", or warning styling for a valid no-change
-analysis, no new observations, or evidence that is not eligible yet.
-
-## One shared operational model
-
-The sidebar, header, and Home use the same pure operational view model. The
-first matching row wins. They may vary in detail but must not disagree about
-state, explanation, or primary next action. The operational destination follows
-the table below. The sidebar entry destination follows the Sidebar contract;
-only on-demand entry differs, opening Home while its explicit mode-setting
-action remains in Settings.
-
-| Priority | State | Primary copy | Explanation | Destination | Primary next action |
-|---:|---|---|---|---|---|
-| 1 | Terminal shutdown or purge-all accepted | Restart required | Self-evolve stopped authority after accepting a full purge or terminal shutdown. | Home | Restart OpenCode. |
-| 2 | Corrupt or unsupported state/protocol/host | Self-evolve needs recovery | Stored state, protocol, or host compatibility cannot be trusted, so autonomous work is off. | Activity, Errors | Inspect the bounded error and use the offered recovery action. |
-| 3 | Emergency stop on | Emergency stop is on | All autonomous provider and write authority is disabled. | Settings | Turn off Emergency stop only after reviewing the reason. |
-| 4 | Circuit breaker open | Paused after repeated failures | Repeated failures stopped automatic work. | Activity, Errors | Review failures, then reset when safe. |
-| 5 | Paused | Self-evolve is paused | Scheduling is paused without changing configured mode or consent. | Home | Resume. |
-| 6 | Repository excluded | Disabled for this project | Global settings remain intact, but this project is excluded. | Settings | Include this project if automatic work is wanted here. |
-| 7 | Effective mode is manual | Runs on demand | Manual mode runs only explicit scans. Auto mode also needs Background analysis and Saved observations consent. | Settings / mode | Choose Auto and enable both required consents, or run `/self-evolve scan` on demand. |
-| 8 | Required setup missing | Setup needed | The current analysis mode lacks one or more consent, provider, state-root, or host prerequisites. | Settings | Complete the first missing prerequisite. |
-| 9 | Work in flight | Analysis in progress / Applying safely | One admitted cycle or operation is active. | Home | Wait; the mounted view updates in place. |
-| 10 | Backoff active | Waiting after a failure | Automatic work will retry after the bounded backoff. | Activity | Review the last failure or wait until the shown time. |
-| 11 | Budget exhausted | Budget used for now | The relevant rolling or daily budget has no remaining capacity. | Home | Wait until the shown reset time. |
-| 12 | Quiet period active | Quiet period | Automatic work is intentionally deferred until the shown time. | Home | Wait, or use an available on-demand path. |
-| 13 | Recommendation needs review | Recommendation ready | A safe bounded recommendation is waiting for a decision. | Recommendations, selected item | Review the selected recommendation. |
-| 14 | Applied result needs acknowledgement | Change applied | A verified Self-evolve change has not yet been acknowledged locally. | Recommendations, selected item | Review and acknowledge or undo while eligible. |
-| 15 | Startup checks pending | Starting Self-evolve | Compatibility and state checks are still running; no authority is available yet. | Home | Wait for Startup checks. |
-| 16 | Healthy Auto | Ready | Self-evolve is ready to analyze and recommend within the displayed safeguards. | Home | No action required. |
-
-Within priority 8, missing prerequisites use this stable order: supported host
-and validated state root; usable provider; required consent; included project.
-Approved skill folders affect explicit Apply target authority, not analysis. The UI
-shows all blockers but offers only the first as the primary action.
-
-A recommendation or applied acknowledgement may be shown as secondary
-attention while a higher-priority operational blocker is active. It must not
-hide terminal, corruption, emergency, breaker, pause, exclusion, or setup
-state.
-
-## Sidebar contract
-
-The sidebar is a persistent entry point in startup, healthy, and attention
-states. It is never removed merely because there is no recommendation.
-
-The card contains, in order:
-
-- the product label, **Self-evolve**;
-- one bounded operational summary from the shared model;
-- one bounded explanation or relevant count/time;
-- one explicit action hint, such as `Open Home` or `Review recommendation`.
-
-Click and focused Enter open the exact sidebar entry destination:
-
-- setup opens **Settings** at the first unmet prerequisite;
-- recommendation or applied attention opens **Recommendations** with the item
-  selected;
-- corruption, breaker, backoff, and failure open **Activity** filtered to
-  **Errors**;
-- healthy, startup, in-flight, paused, budget, quiet-period, and on-demand
-  states open **Home**.
-
-For on-demand state, this Home deep link applies equally to pointer click and
-focused Enter or Space. Explicit actions that change global or repository mode
-continue to open **Settings** at the mode controls.
-
-The normal path never opens a separate state-dependent review dialog. The
-Release A dialog was retained only until Recommendations reached equivalent
-queue, detail, actions, focus, and outcome behavior; Release B removes it from
-normal routing. Background refresh never opens a route, dialog, or
-notification.
-
-## Route and shell contract
-
-The route accepts only bounded validated parameters:
-
-- `section`: `home`, `recommendations`, `activity`, or `settings`;
-- `recommendation`: an opaque projected selection token, used only if present
-  in the current project projection;
-- `activityFilter`: `all`, `recommendations`, `system`, or `errors`;
-- an optional settings anchor from a closed renderer-owned list.
-
-Missing, malformed, stale, or cross-project parameters fall back to Home
-without causing an effect. Opening the palette command without parameters
-opens Home. Replacing a deep link does not add nested history entries.
-
-The header is always visible and contains:
-
-- **Self-evolve**;
-- current operational state and human mode label;
-- Pause or Resume only when currently granted;
-- Emergency stop state and control only when currently granted.
-
-Pause/Resume is an immediate reversible operation. Enabling Emergency stop is
-immediate; disabling it uses a simple confirmation. Pending, accepted,
-completed, stale, and failed outcomes remain inline in the mounted shell.
-
-## Section contracts
-
-### Home
-
-Home is the default landing section. It shows, in this order:
-
-1. current operational state, explanation, and one next action;
-2. effective mode, global default, and this-project override;
-3. on a fresh manual install, a Home setup card with separate confirmed actions
-   for automatic recommendations and optional sanitized excerpts; otherwise,
-   setup blockers with Settings deep links;
-4. active operation or last cycle result;
-5. recommendation/applied attention;
-6. actual passive, synthesis, and storage usage beside configured limits and
-   reset periods;
-7. up to three recent non-diagnostic activity entries;
-8. manual-mode guidance plus the separate source-session on-demand fallback.
-
-The fallback copy is: **Run `/self-evolve scan` in the source session. This
-OpenCode host cannot safely bind a native scan to the selected session.**
-
-Distinct Home empty states are:
-
-| Condition | Heading | Explanation |
-|---|---|---|
-| no activity retained | No activity yet | Self-evolve has not completed a retained cycle for this project. |
-| evidence below threshold | Still learning | Saved structured patterns are not yet strong or independent enough for a recommendation. |
-| background analysis disabled | Background analysis is off | Current mode or consent prevents passive provider calls. |
-| paused | Self-evolve is paused | Existing records remain available; no automatic cycle will start. |
-| excluded | Disabled for this project | Global settings are unchanged; this project is excluded. |
-| valid no-change | No useful change found | The last analysis completed successfully and found no safe improvement worth proposing. |
-| old server | Limited view | Review data is available, but activity, actual usage, and enhanced readiness require an aligned server. |
-
-### Recommendations
-
-Recommendations is a complete queue and detail workspace.
-
-Queue filters are **Needs review**, **Applied**, **Dismissed**, and **All**.
-Each row shows bounded human rationale, safe target label, state, risk, relative
-time, evidence count, and attention marker. Raw proposal IDs, hashes, canonical
-paths, and state-root identity are not row copy.
-
-Selecting a row loads that detail and at most the adjacent details permitted by
-the existing two-resident-detail cap. The detail order is:
-
-1. Why this was suggested
-2. Proposed change
-3. Evidence
-4. Safety checks
-5. Token impact
-6. Rollback
-7. Technical details, collapsed by default
-
-Only freshly server-projected actions render. The lifecycle may include Apply,
-Reject, Snooze, Acknowledge, Undo, and Open in Activity. Pending, accepted,
-completed, stale, and failed states replace or disable the affected action
-inline without dismissing the detail.
-
-If the selected dashboard sidecar advertises `decision-feedback-v1`, Reject may add one reason:
-**Incorrect evidence**, **Already covered**, **Wrong scope**, **Too specific**,
-**Not worth the token cost**, or **Other** with bounded optional text. Feedback
-is audit-only and never becomes evidence. Without the capability, Reject uses
-the legacy exact decision request.
-
-Empty states are **No recommendations yet**, **Nothing needs review**,
-**Nothing applied**, and **Nothing dismissed**. A degraded projection keeps
-valid core review data usable and labels unavailable enhanced fields.
-
-### Activity
-
-Activity is a bounded semantic history, not a raw log viewer.
-
-Filters are **All**, **Recommendations**, **System**, and **Errors**.
-Diagnostic-audience entries are excluded from All. Every row has a text marker
-in addition to color, relative time, plain-language outcome, safe target label
-when applicable, and a deep link when the current projection supports one.
-
-Allowlisted activity categories are:
-
-- cycle outcome: no new cursor, no observations, not eligible, valid no-change,
-  recommendation created, applied, deferred, failed closed, or failed;
-- recommendation decision: approved/applied, rejected, snoozed, acknowledged,
-  superseded, rolled back, or rollback unavailable;
-- scheduling: quiet period, passive or synthesis budget, backoff, breaker trip,
-  breaker recovery, pause, resume, exclusion, or inclusion;
-- lifecycle: startup, bootstrap, recovery, provider readiness, projection
-  degradation, or terminal shutdown;
-- maintenance: export completed/expired/failed, scoped purge completed, or
-  purge-all accepted-terminal.
-
-Technical expansion may show only allowlisted bounded reason, status, protocol,
-host, and plugin-version fields. It never shows generic audit details.
-
-When activity was truncated, the section states that older entries were
-omitted by the bounded projection and points to the existing sensitive export
-for complete classified records. Empty states distinguish no retained activity,
-no match for the selected filter, old-server limited view, malformed enhanced
-projection, and temporarily unavailable refresh.
-
-The diagnostics panel shows:
-
-- projection refresh time and core/enhanced protocol status;
-- host and plugin version plus bounded source label;
-- scheduler, watcher, backoff, breaker, and in-flight state;
-- actual used and remaining passive/synthesis budgets;
-- actual storage usage and configured quota;
-- one last bounded allowlisted error.
-
-### Settings
-
-Settings is ordered as Project analysis, Privacy and scope, Approved skill folders, Limits
-and retention, Maintenance, then a compact version/help footer.
-
-#### Mode cards
-
-| Label | What happens | Provider use and saved data | Write authority | Why change it |
-|---|---|---|---|---|
-| On demand | Runs only from a source-session scan command. | No passive calls or passive writes; an invoked scan may save bounded structured observations. | Requires an explicit decision for each apply. | Choose maximum control or hosts without passive setup. |
-| Recommend automatically | Analyzes at safe idle points and prepares recommendations. | Requires Background AI analysis and the relevant Saved structured patterns consent. | Cannot apply without explicit approval. | Choose proactive review without automatic writes. |
-
-The UI shows **Installation default**, **This project override**, **Configured
-analysis**, and the separate **Operational state** together. This-project choices
-are Inherit global default, On demand, or Recommend automatically. Pause,
-exclusion, and other temporary suppressors never rewrite configured analysis.
-
-#### Privacy and scope settings
-
-| Primary label | Stored key | Scope | Dependency/effect | Why change it |
-|---|---|---|---|---|
-| Include this project | `repo.excluded` (inverse) | This project | Exclusion overrides any automatic global mode. | Stop or permit autonomous work in only this checkout. |
-| Background AI analysis | `passiveCalls` | Global | Required for automatic hidden provider calls; does not itself allow durable evidence or writes. | Control passive provider use. |
-| Saved structured patterns | `durableObservations` | Global | Required for passive structured observations; never stores transcripts. | Control whether learning persists across sessions. |
-| Sanitized evidence excerpts | `sanitizedExcerpts` | Global | Optional bounded evidence text; redaction is not a secrecy guarantee. Required by cross-project learning. | Allow richer evidence with an explicit privacy tradeoff. |
-| Cross-project learning | `crossRepoAggregation` | Global | Requires sanitized excerpts. The server publishes immutable identity-free contributions; UI activation remains hidden until the current projection advertises the capability. | Allow bounded cross-project pattern support without contributor identity. |
-| Emergency stop | `killSwitch` | Global | Overrides every automatic mode and provider/write path. | Immediately stop autonomous authority. |
-| Pause automatic work | `paused` | Global | Temporarily stops scheduling without changing mode or consent. | Temporarily stop automatic work while preserving configuration. |
-
-Consent is never enabled as a side effect of choosing a mode. Dependencies,
-configured analysis, and separate operational suppressors are visible before confirmation.
-
-The fresh-install Home card follows the same rule: **Turn on automatic
-recommendations** changes only the global mode, while **Allow sanitized
-excerpts** is an adjacent, separately armed and confirmed privacy choice.
-
-#### Approved skill folders
-
-Display one canonical folder per row with Add and Remove. Validate containment,
-canonical form, symlinks, duplicates, supported roots, and the resulting
-non-empty requirement inline. Raw paths appear only in this editor and in its
-exact confirmation. Replacing the list requires the exact phrase displayed by
-the server-projected operation.
-
-#### Limits and retention
-
-Limits are read-only in Release B. Show actual and configured values together:
-passive calls per rolling hour and reset, synthesis per day and reset, storage
-bytes and quota, observation retention, proposal/audit retention, concurrency,
-quiet periods, and retained compatibility rollout diagnostics. Explain what each limit bounds and
-whether changing it requires startup configuration. Do not introduce a general
-numeric settings API.
-
-#### Maintenance
-
-One scope selector offers **Observations**, **Recommendations**,
-**This project**, or **Everything**. Available actions are Export or Delete as
-granted. Sensitive export shows private path metadata, size, hash, and expiry
-without opening the file. Purge-all reports **Accepted; restart required** and
-the TUI stops authority before the mailbox subtree is deleted.
-
-## Interaction and layout
-
-- Tab and Shift+Tab move through visible controls in a stable order.
-- Left/Right changes primary section with wrap; Up/Down moves within queues and
-  lists when that child owns focus.
-- Enter/Space activates the focused control. Pointer click selects and
-  activates the same semantics; hover alone has no effect.
-- Every focused control has a non-color focus marker.
-- Escape is owned by the active control-center mode, not a root renderable.
-  Child dialogs close first; otherwise Escape restores the exact route that was
-  active before the control center opened. It must work from inputs, buttons,
-  queues, scroll views, and confirmation dialogs.
-- Route replacement and project switching clear stale selection, pending local
-  presentation state, and incompatible deep-link parameters before render.
-- A narrow terminal uses one column: navigation becomes a wrapped four-item
-  strip, list precedes detail, tables become labeled rows, and actions wrap
-  without horizontal scrolling. At approximately 64x20, the state, next action,
-  section label, and focused control remain visible.
-- Long rationale, evidence, errors, diffs, and folders are bounded before
-  rendering, wrap without corrupting layout, and disclose deterministic
-  truncation. Diffs may scroll inside their detail region.
-- Loading retains the shell and announces the section being refreshed. A
-  refresh error keeps the last validated immutable snapshot, labels it stale,
-  disables expired actions, and offers Retry. Malformed enhanced data degrades
-  only enhanced views; malformed core projection removes native authority.
-
-No flow emits proposal/status/settings toasts, attention notifications,
-polling-triggered dialogs, or automatically opened routes.
-
-## Confirmation tiers
-
-| Tier | Behavior | Actions |
-|---|---|---|
-| Immediate | Execute once through the current grant and show lifecycle inline. | Pause, Resume, enable Emergency stop, snooze, acknowledge, open/deep-link, risk-reducing mode or consent changes. |
-| Simple confirm | Explain the additional authority or privacy exposure and require Confirm/Cancel. | Disable Emergency stop; enable a consent; change On demand to Recommend automatically; other risk-increasing non-destructive scope changes. |
-| Exact typed confirm | Display the exact server-required phrase and affected scope. | Approved skill folder replacement, destructive purge, purge-all, and sensitive export where required. |
-
-Reject is immediate unless optional free-text feedback is present, in which
-case submission remains one explicit action. Apply uses the existing explicit
-review action and server grant; the proposed diff and safety facts must remain
-visible. Undo is immediate only while the current projection says rollback is
-safe and granted.
-
-## Privacy and trust boundary
-
-Home, sidebar, Recommendations, Activity, diagnostics, errors, and export
-metadata must not display or project:
-
-- transcript or message text;
-- raw host session/message IDs;
-- proposal IDs, request IDs, nonces, hashes, project fingerprints, or
-  state-root identity as primary UI;
-- raw state-root paths or canonical allowlist paths outside the high-risk
-  Approved skill folders editor;
-- arbitrary audit detail objects, provider errors, secrets, prompts, or model
-  output;
-- any field that grants authority.
-
-Activity is built only from exact allowlisted semantic events. Summary strings
-are bounded before publication. Technical details remain bounded and
-allowlisted. The sensitive export is the explicit path for complete classified
-records.
-
-## Compatibility
-
-- `dashboard-v2` and its `dashboard-v1` compatibility sidecar are optional and additive beside the unchanged v1 review index.
-- The v1 offer and index retain the exact Release A capability vocabulary.
-  Release B capabilities are exact fields inside the dashboard sidecar.
-- A current TUI prefers v2 and falls back to an old server's v1 sidecar without
-  rejecting independently bounded v1 retention values.
-- An older dashboard TUI with a current server continues to read the v1
-  compatibility sidecar; the existing review, grant, mailbox, headless, and
-  recovery contracts remain unchanged.
-- A missing dashboard is compatible. A malformed, newer, stale, wrong-project,
-  wrong-root, wrong-generation, or wrong-index dashboard is rejected for
-  enhanced presentation without invalidating an otherwise valid core review
-  projection.
-- Structured rejection feedback and repository mode override render only when
-  their exact dashboard capabilities are advertised. Their absence uses legacy Reject
-  and hides repository-mode editing respectively.
-- Headless commands, including manual scan and recovery controls, remain
-  compatibility paths. Normal native navigation does not depend on slash
-  commands except the explicitly explained source-session manual scan.
-
-## Acceptance checklist
-
-Release B native UX is not complete until current evidence proves:
-
-- exactly four primary sections and Home default routing;
-- one shared operational model across sidebar, header, and Home;
-- every precedence state, destination, and next action above;
-- recommendation queue/detail/action parity and removal of the normal
-  ReviewDialog path;
-- bounded privacy-safe activity and truthful actual usage;
-- settings labels, descriptions, scope, dependencies, and confirmation tiers;
-- keyboard, pointer, narrow layout, long text, route replacement, project
-  switch, and exact Escape restoration;
-- missing/malformed/mixed-version degradation without added authority;
-- deterministic checks and real operator evidence recorded as separate gates.
+| `automaticRecommendationsEnabled: true` | Automatic recommendations On | Future eligible activity may be observed and used to prepare recommendations. No write authority is granted. |
+| `automaticRecommendationsEnabled: false` | Automatic recommendations Off | New automatic work is stopped across processes. Existing recommendations and explicit actions remain available. |
+| `repo.excluded: false` | Project Included | This project may participate when all global and operational gates pass. |
+| `repo.excluded: true` | Project Excluded | This project is suppressed without changing the global preference. |
+| `killSwitchActive: true` | Emergency Stop On | Automatic work and new Apply are suppressed without changing the preference. |
+| breaker open | Paused after repeated failures | The circuit breaker suppressed work; this is not a user-configurable pause. |
+
+Current UI must not present Manual, Auto, Yolo, on-demand, scan, installation/project/repository modes, inheritance, ordinary Pause/Resume/Disable, or passive-call consent. Read-only legacy data may be parsed only to explain that a mixed-version pairing is limited.
+
+## Shared operational model
+
+The sidebar, header, and Home derive from the same server-authored dashboard. Higher-priority safety states always win over lower-priority attention or readiness:
+
+1. accepted-terminal or corrupt state;
+2. Emergency Stop;
+3. circuit breaker;
+4. project Excluded;
+5. Automatic recommendations Off;
+6. missing host, root, provider, or required permission setup;
+7. active work, backoff, budget, or quiet period;
+8. recommendation or applied-change attention;
+9. ready.
+
+Operational suppressors never rewrite the On/Off preference. The UI therefore shows both the stored preference and the active suppressor when they differ.
+
+## Sidebar
+
+The sidebar card shows one truthful status, the last checked time or bounded explanation, and one exact deep link:
+
+- setup or Automatic recommendations Off → Settings at the relevant control;
+- a recommendation → selected Recommendation detail;
+- a failure or breaker → Activity filtered to Errors;
+- healthy, startup, waiting, or in-flight → Home.
+
+The compact On/Off control uses the same operation-v2 authority as Settings. Turning On requires confirmation because it enables the complete required data-permission bundle. Turning Off is immediate, preserves retained data, and grants no other authority. If the v0.4 server/TUI protocols are not aligned, the control is read-only and says why.
+
+## Home
+
+Home contains:
+
+- the shared operational status and next action;
+- Automatic recommendations On/Off and project Included/Excluded;
+- global-recommendation protocol readiness;
+- actionable blockers with exact deep links;
+- last-cycle outcome without any retired mode field;
+- recommendation/applied-change attention;
+- actual provider, synthesis, and storage use;
+- bounded recent semantic activity;
+- honest empty, unavailable, stale, and limited states.
+
+Home never invents healthy readiness from a missing or invalid dashboard. It never offers scan or a fallback manual path.
+
+## Recommendations
+
+Recommendations is the single normal review path. Queue, detail, and action outcomes remain mounted in the control center; no separate review dialog is opened by polling.
+
+Apply, Reject, and Undo come only from fresh server grants. Each action is bound to the exact recommendation, version, support set, target binding, target hash, proposed content hash, nonce, projection generation, and current authority. Automatic recommendations On is never an Apply grant. Off does not hide or suppress an otherwise valid explicit action.
+
+Apply reasons and Undo reasons are projected independently. Privacy revocation may block Apply while exact transaction-proven Undo stays available. Emergency Stop and breaker state follow the same action-specific server policy.
+
+## Activity
+
+Activity is bounded semantic history, not a raw-log viewer. Filters are All, Recommendations, System, and Errors. It may narrate:
+
+- recommendation creation, decisions, Apply, Undo, and acknowledgement;
+- Automatic recommendations On/Off;
+- project Include/Exclude;
+- Emergency Stop changes;
+- quiet period, budgets, backoff, breaker trip/reset, startup, recovery, export, and purge;
+- bounded failures with reason codes and destinations.
+
+Raw audit objects, prompts, provider payloads, secrets, transcript text, and host session/message identifiers never render.
+
+## Settings
+
+Settings presents these groups in order:
+
+1. **Automatic recommendations** — one truthful On/Off preference and automation generation.
+2. **Privacy and project scope** — Project Include/Exclude plus exactly three retained data permissions: Saved structured patterns, Sanitized evidence excerpts, and Cross-project learning.
+3. **Emergency Stop** — an operational safety suppressor, clearly distinct from Off.
+4. **Approved global skill folders** — exact host-authoritative roots and the explicit creation-root policy.
+5. **Limits and retention** — actual and configured provider/synthesis/storage/concurrency/quiet-period values.
+6. **Maintenance** — export, scoped purge, purge-all, retry/recovery, breaker reset, and authenticated reinitialize where freshly granted.
+
+Turning On atomically enables all three required permissions. Revoking any required permission atomically turns Automatic recommendations Off and performs the existing permission-specific cleanup or invalidation. Restoring a permission leaves the preference Off. Copy must explain those effects before confirmation.
+
+Project Include/Exclude and Emergency Stop do not change the global preference. Root-policy suggestions are non-authoritative; changes replace the complete explicit policy only after fresh server-side host/catalog validation.
+
+## Interaction and focus
+
+- Mouse and keyboard activation are equivalent; focused Enter or Space activates.
+- The full-screen control center owns a mode-scoped Escape binding so any focused descendant returns to the exact prior route.
+- Deep links focus and scroll the exact destination control after mount.
+- Outcomes remain mounted; background refresh updates state in place.
+- No proposal/status/settings toasts, attention notifications, polling-triggered dialogs, or automatically opened routes are allowed.
+- Pending actions disable duplicate submission and remain visible until a bounded response, expiry, or refresh reconciliation.
+
+## Protocol compatibility
+
+Dashboard v3 and operation v2 are the only writable settings/control plane. Dashboard v1/v2, operation v1, and legacy control mailboxes are read-only compatibility input. A new-TUI/old-server or old-TUI/new-server pairing must be visibly limited and must not submit writes.
+
+The TUI publishes only strict create-exclusive decision, global-action, and operation envelopes. The server freshly revalidates root/project identity, projection and grant generation, settings version, automation generation, nonce, permissions, participation, and action-specific authority immediately before every effect.
+
+Purge-all is accepted-terminal: publish the terminal response, stop authority, and only then delete the mailbox subtree. The UI displays the accepted terminal outcome and requires restart/reinitialize rather than pretending the project remains active.

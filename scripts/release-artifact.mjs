@@ -8,6 +8,7 @@ import {
   artifactProvenance,
   assertSpawnSucceeded,
   parsePackResult,
+  runDependencyAudit,
   validatePackedArtifact,
 } from "./pack-artifact-check.mjs";
 
@@ -84,6 +85,15 @@ export function createReleaseArtifact({ repoRoot = defaultRepoRoot, outputDir, c
   checkTuiArtifact({ root: repoRoot, check: true });
   assertExactCommit(commit, run("git", ["rev-parse", "HEAD"], { cwd: repoRoot }).stdout);
   assertCleanCheckout(checkoutStatus(repoRoot), "before packing");
+
+  // The dependency audit is a mandatory publication gate. It runs after the
+  // Node-only TUI/commit/checkout structural checks (which must precede any
+  // `npm` invocation) and immediately before any pack or publication-capable
+  // operation. It runs the dependency-free `npm run audit:dependencies`
+  // (Bun JSON audit plus owner-exception verification, including the
+  // no-future-reviewDate rule) and fails closed on any unresolved or malformed
+  // finding.
+  runDependencyAudit(repoRoot);
 
   if (!outputDir) fail("release artifact output directory is required");
   mkdirSync(outputDir, { recursive: true });

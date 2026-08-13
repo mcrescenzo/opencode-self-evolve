@@ -11,10 +11,9 @@ const [stateRoot, projectFingerprint, skillRoot, readyFile] = process.argv.slice
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const store = openStore(stateRoot, { projectFingerprint, projectName: "bridge-process" });
 const current = store.getSettings();
-if (current.global.mode === "manual" && current.global.allowedSkillRoots.length === 0 && current.global.updatedAt === current.global.createdAt) {
+if (current.global.allowedSkillRoots.length === 0) {
   store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
     ...global,
-    mode: "auto",
     allowedSkillRoots: [skillRoot],
     updatedAt: Date.now(),
   }));

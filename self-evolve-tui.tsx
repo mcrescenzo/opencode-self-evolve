@@ -9,12 +9,13 @@ import { setTimeout as delay } from "node:timers/promises"
 // typecheck time; its named package-owned exports are present at runtime because
 // Bun transpiles this raw TUI target. Suppress the resolver limitation here.
 // @ts-ignore
-import legacyModule, { TUI_IDENTITIES, claimTuiSurfaceOwnership } from "./self-evolve-tui.js"
+import legacyModule, { TUI_IDENTITIES, attemptTuiStartup, claimTuiSurfaceOwnership } from "./self-evolve-tui.js"
 import {
   CONTROL_CENTER_SECTIONS,
   acquireProjectTuiStore,
   buildControlCenterModel,
   controlCenterRouteParams,
+  createInertRecoveryStore,
   deriveSidebarCard,
   deriveSidebarModeControl,
   parseControlCenterDestination,
@@ -184,11 +185,11 @@ function SidebarModeControl(props: {
   })
   useKeyboard((event) => {
     if (event.name !== "tab") return
-    const node = nodes.get("manual") ?? nodes.get("auto")
+    const node = nodes.get("off") ?? nodes.get("on")
     let root = node as FocusableRenderable | undefined
     while (root?.parent) root = root.parent as FocusableRenderable
     const card = root?.findDescendantById(CARD_ID)
-    const candidates = [card, nodes.get("manual"), nodes.get("auto")]
+    const candidates = [card, nodes.get("off"), nodes.get("on")]
       .filter((value): value is FocusableRenderable => Boolean(value?.focusable && value.visible))
     const current = candidates.findIndex((value) => value.focused)
     if (current < 0) return
@@ -198,21 +199,21 @@ function SidebarModeControl(props: {
     const offset = navigationEvent.shift ? -1 : 1
     candidates[(current + offset + candidates.length) % candidates.length].focus()
   })
-  const activate = async (value: "manual" | "auto") => {
+  const activate = async (value: "off" | "on") => {
     const current = model()
     if (!current.available || current.pending || current.current === value) return
-    if (value === "auto" && !confirmation()) {
+    if (value === "on" && !confirmation()) {
       setConfirmation(true)
-      setFeedback("Auto analyzes at safe idle points but never applies without approval. Activate Confirm Auto to continue.")
+      setFeedback("Turning On also enables Saved structured patterns, Sanitized evidence excerpts, and Cross-project learning. Recommendations never apply without approval. Activate Confirm On to continue.")
       return
     }
     try {
-      await props.store.submitControl("set-repo-mode", { mode: value })
+      await props.store.submitOperation("set-automatic-recommendations", { enabled: value === "on" })
       setConfirmation(false)
-      setFeedback(value === "manual" ? "On demand requested for this project." : "Auto requested for this project.")
+      setFeedback(value === "off" ? "Automatic recommendations were turned off." : "Automatic recommendations were turned on.")
     } catch (error) {
       setConfirmation(false)
-      setFeedback(`Mode was not changed: ${error instanceof Error ? error.message : String(error)}`)
+      setFeedback(`Automatic recommendations were not changed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   return (
@@ -222,7 +223,7 @@ function SidebarModeControl(props: {
           const key = `sidebar-mode:${option.value}`
           const selected = () => model().current === option.value
           const enabled = () => model().available
-          const label = () => option.value === "auto" && confirmation() ? "Confirm Auto" : option.label
+          const label = () => option.value === "on" && confirmation() ? "Confirm On" : option.label
           return (
             <box
               id={`self-evolve-sidebar-mode-${option.value}`}
@@ -238,11 +239,11 @@ function SidebarModeControl(props: {
               on:focused={() => setFocused(key)}
               on:blurred={() => setFocused((value) => value === key ? null : value)}
               onMouseDown={() => nodes.get(option.value)?.focus()}
-              onMouseUp={() => { if (enabled()) void activate(option.value as "manual" | "auto") }}
+              onMouseUp={() => { if (enabled()) void activate(option.value as "off" | "on") }}
               onKeyDown={(event: KeyEvent) => {
                 if (!isActivationKey(event) || !enabled()) return
                 event.preventDefault()
-                void activate(option.value as "manual" | "auto")
+                void activate(option.value as "off" | "on")
               }}
             >
               <text fg={enabled() ? props.api.theme.current.text : props.api.theme.current.textMuted}>
@@ -254,7 +255,7 @@ function SidebarModeControl(props: {
       </box>
       <Show when={!model().available || feedback()}>
         <text fg={!model().available ? props.api.theme.current.textMuted : props.api.theme.current.info} wrapMode="word">
-          {feedback() ?? `Project mode is read-only: ${model().status}.`}
+          {feedback() ?? `Automatic recommendations are read-only: ${model().status}.`}
         </text>
       </Show>
     </box>
@@ -584,17 +585,13 @@ function ControlCenter(props: {
     </box>
     )
   }
-  const paused = () => props.snapshot().dashboard?.settings?.paused === true
   const emergencyStop = () => props.snapshot().dashboard?.settings?.killSwitchActive === true
   const home = () => model().sections.home
   const recommendations = () => model().sections.recommendations
   const activity = () => model().sections.activity
   const settings = () => model().sections.settings
   const settingsAnchorControl = (anchor: string) => {
-    if (anchor === "modes" || anchor === "setup") {
-      // Modes is a multi-control group. Focus its exact group anchor so the
-      // effective/global/project summary stays in view instead of implying
-      // that the current global-mode button is the only destination.
+    if (anchor === "automatic-recommendations" || anchor === "setup") {
       return `anchor:${anchor}`
     }
     if (anchor === "emergency-stop") {
@@ -603,9 +600,7 @@ function ControlCenter(props: {
     if (anchor === "project-scope") {
       return `action:${settings().projectExcluded ? "include-project" : "exclude-project"}`
     }
-    const consentKey = anchor === "passive-consent"
-      ? "passiveCalls"
-      : anchor === "observation-consent"
+    const consentKey = anchor === "observation-consent"
         ? "durableObservations"
         : null
     if (consentKey) {
@@ -631,8 +626,6 @@ function ControlCenter(props: {
       targetId = focusId(`activity-filter:${next.filter}`)
     } else if (next.section === "settings" && next.anchor) {
       targetId = focusId(settingsAnchorControl(next.anchor))
-    } else if (next.section === "home" && home().firstRun) {
-      targetId = focusId("action:automatic-recommendations")
     }
     const liveFocusable = (candidate: FocusableRenderable | undefined) => Boolean(
       candidate
@@ -770,28 +763,16 @@ function ControlCenter(props: {
       ? "Retry did not restore a fresh projection. Read-only stale context remains available."
       : "Projection refreshed. Only newly negotiated actions are available.")
   }
-  const modeRank = (value: string | null) => ({ manual: 0, auto: 1 }[value ?? ""] ?? 0)
-  const projectedModeFor = (target: string, scope: "global" | "project") => {
-    if (scope === "global") return target
-    return target === "inherit" ? settings().mode.global.value : target
-  }
-  const submitMode = (scope: "global" | "project", mode: "inherit" | "manual" | "auto") => {
-    const current = scope === "global" ? settings().mode.global.value : settings().mode.effective.value
-    const riskIncreasing = modeRank(projectedModeFor(mode, scope)) > modeRank(current)
-    const action = scope === "global" ? "set-mode" : "set-repo-mode"
-    void invoke(
-      `${scope}-mode-${mode}`,
-      () => props.store.submitControl(action, { mode }),
-      riskIncreasing,
-    )
-  }
-  const enableAutomaticRecommendations = () => props.store.submitControl("set-mode", { mode: "auto" })
+  const setAutomaticRecommendations = (enabled: boolean) => props.store.submitOperation(
+    "set-automatic-recommendations",
+    { enabled },
+  )
   const openConsentDisclosure = (key: string) => {
     setConsentIntent(key)
     setFeedback("Review the privacy disclosure, then confirm or cancel the consent change.")
   }
   const confirmConsent = async (key: string) => {
-    await props.store.submitControl("set-consent", { key, enabled: true })
+    await props.store.submitOperation("set-permission", { permission: key, enabled: true })
     await delay(0)
     setConsentIntent(null)
   }
@@ -808,7 +789,7 @@ function ControlCenter(props: {
               `Confirm allow ${entry().label}`,
               () => confirmConsent(key),
               false,
-              { action: "set-consent", subject: `consent:${key}` },
+              { action: "set-permission", subject: `permission:${key}` },
             )}
             {localActionButton("Cancel consent change", () => setConsentIntent(null), false, undefined, undefined, `cancel-consent:${key}`)}
           </box>
@@ -898,7 +879,7 @@ function ControlCenter(props: {
   const maintenancePhrase = () => maintenanceIntent() === "export"
     ? "EXPORT SENSITIVE SELF-EVOLVE DATA"
     : maintenanceScope() === "all"
-      ? "PURGE ALL SELF-EVOLVE 0.3.0"
+      ? "PURGE ALL SELF-EVOLVE 0.4.0"
       : `PURGE ${maintenanceScope().toUpperCase()}`
   const submitMaintenance = async () => {
     const intent = maintenanceIntent()
@@ -1015,18 +996,9 @@ function ControlCenter(props: {
         <box flexDirection="column" flexGrow={1}>
           <text fg={props.api.theme.current.text}><b>Self-evolve</b></text>
           <text fg={props.api.theme.current.textMuted} wrapMode="word">
-            {model().operational.label} · {home().mode.effective.label}
+            {model().operational.label} · Automatic recommendations {home().automaticRecommendationsEnabled ? "On" : "Off"}
           </text>
         </box>
-        <Show when={settings().controls.pause}>
-          {actionButton(
-            paused() ? "resume" : "pause",
-            paused() ? "Resume" : "Pause",
-            () => props.store.submitOperation("set-paused", { paused: !paused() }),
-            false,
-            { action: "set-paused", subject: "project" },
-          )}
-        </Show>
         <Show when={settings().controls.emergencyStop}>
           {actionButton(
             emergencyStop() ? "disable-emergency-stop" : "enable-emergency-stop",
@@ -1098,10 +1070,9 @@ function ControlCenter(props: {
             <text wrapMode="word">{home().operational.explanation}</text>
             <text fg={props.api.theme.current.textMuted} wrapMode="word">{home().operational.nextAction}</text>
             <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
-              <text><b>Mode and scope</b></text>
-              <text wrapMode="word">Effective: {home().mode.effective.label}</text>
-              <text wrapMode="word">Global default: {home().mode.global.label}</text>
-              <text wrapMode="word">This project: {home().mode.repository.label}</text>
+              <text><b>Automation and scope</b></text>
+              <text wrapMode="word">Automatic recommendations: {home().automaticRecommendationsEnabled ? "On" : "Off"}</text>
+              <text wrapMode="word">This project: {settings().projectExcluded ? "Excluded" : "Included"}</text>
             </box>
             <Show when={home().globalReadiness}>
               {(globalReadiness) => (
@@ -1114,36 +1085,6 @@ function ControlCenter(props: {
                   <Show when={globalReadiness().reason}><text fg={props.api.theme.current.textMuted} wrapMode="word">{globalReadiness().reason}</text></Show>
                 </box>
               )}
-            </Show>
-            <Show when={home().firstRun}>
-              <box border borderColor={props.api.theme.current.info} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
-                <text><b>Get automatic recommendations</b></text>
-                <text wrapMode="word">Choose proactive review without granting automatic writes or privacy consent. Background AI analysis and saved structured patterns remain separate consent gates in Settings.</text>
-                <Show when={settings().controls.globalMode}>
-                  {actionButton(
-                    "automatic-recommendations",
-                    "Turn on automatic recommendations",
-                    enableAutomaticRecommendations,
-                    true,
-                    { action: "set-mode", subject: "global-mode" },
-                  )}
-                </Show>
-                <Show when={!settings().controls.globalMode}>
-                  <text fg={props.api.theme.current.textMuted}>Controls are unavailable until the aligned server publishes fresh authority.</text>
-                </Show>
-                <text><b>Optional evidence excerpts</b></text>
-                <text wrapMode="word">Sanitized excerpts can make evidence richer, but redaction is not a secrecy guarantee. This choice is independent of automatic recommendations.</text>
-                <Show when={settings().controls.consent}>
-                  {localActionButton(
-                    "Review consent for Sanitized evidence excerpts",
-                    () => openConsentDisclosure("sanitizedExcerpts"),
-                  )}
-                </Show>
-                <Show when={!settings().controls.consent}>
-                  <text fg={props.api.theme.current.textMuted}>Excerpt consent can be changed later in Settings.</text>
-                </Show>
-                {consentDisclosure("sanitizedExcerpts")}
-              </box>
             </Show>
             <Show when={home().blockers.length}>
               <box flexDirection="column">
@@ -1207,8 +1148,8 @@ function ControlCenter(props: {
               {(usage) => (
                 <box flexDirection="column">
                   <text><b>Actual usage</b></text>
-                   <text>Background analysis: {usage().passive.used} / {usage().passive.limit}</text>
-                   <text>Background analysis resets: {usage().passive.resetAt ? new Date(usage().passive.resetAt).toISOString() : "Unavailable"}</text>
+                   <text>Provider calls: {usage().provider.used} / {usage().provider.limit}</text>
+                   <text>Provider calls reset: {usage().provider.resetAt ? new Date(usage().provider.resetAt).toISOString() : "Unavailable"}</text>
                    <text>Recommendation synthesis: {usage().synthesis.used} / {usage().synthesis.limit}</text>
                    <text>Recommendation synthesis resets: {usage().synthesis.resetAt ? new Date(usage().synthesis.resetAt).toISOString() : "Unavailable"}</text>
                   <text>Storage: {usage().storage.usedBytes} / {usage().storage.limitBytes} bytes</text>
@@ -1229,7 +1170,6 @@ function ControlCenter(props: {
                 </box>
               )}
             </Show>
-            <text fg={props.api.theme.current.textMuted} wrapMode="word">{home().manualFallback}</text>
           </box>
         </Show>
         <Show when={section() === "recommendations"}>
@@ -1407,7 +1347,6 @@ function ControlCenter(props: {
                       </box>
                       <Show when={technicalExpanded()}>
                         <text>State: {summary().state}</text>
-                        <Show when={summary().effectiveMode}><text>Effective mode: {summary().effectiveMode}</text></Show>
                         <Show when={summary().operation}><text>Operation: {summary().operation.status}</text></Show>
                         {reactiveChild(() => selected().audit.map((entry) =>
                           <text wrapMode="word">{entry.kind}: {entry.summary}</text>))}
@@ -1680,13 +1619,13 @@ function ControlCenter(props: {
                 <Show when={activity().diagnostics.usage}>
                   {(usage) => (
                     <>
-                      <text wrapMode="word">Background analysis used/remaining: {usage().passive.used} / {usage().passive.remaining}</text>
+                      <text wrapMode="word">Provider calls used/remaining: {usage().provider.used} / {usage().provider.remaining}</text>
                       <text wrapMode="word">Recommendation synthesis used/remaining: {usage().synthesis.used} / {usage().synthesis.remaining}</text>
                       <text wrapMode="word">Storage used/quota: {usage().storage.usedBytes} / {usage().storage.limitBytes} bytes</text>
                       <Show when={activity().diagnostics.budgetResetAt}>
                         {(budgetResetAt) => (
                           <>
-                            <text wrapMode="word">Background analysis resets: {new Date(budgetResetAt().passive).toISOString()}</text>
+                            <text wrapMode="word">Provider calls reset: {new Date(budgetResetAt().provider).toISOString()}</text>
                             <text wrapMode="word">Recommendation synthesis resets: {new Date(budgetResetAt().synthesis).toISOString()}</text>
                           </>
                         )}
@@ -1724,7 +1663,7 @@ function ControlCenter(props: {
             </Show>
             <Show when={settings().limited}>
               <text fg={props.api.theme.current.warning} wrapMode="word">
-                Limited view: enhanced usage, repository-mode editing, and prerequisite status require an aligned server.
+                Limited view: enhanced usage and automation controls require an aligned server.
               </text>
             </Show>
             <Show when={settings().enhancedError}>
@@ -1738,84 +1677,45 @@ function ControlCenter(props: {
               )}
             </Show>
 
-            <text><b>Project analysis</b></text>
-            <text wrapMode="word">Configured analysis: {settings().mode.effective.label}</text>
-            <text wrapMode="word">Operational state: {model().operational.label}</text>
-            <text wrapMode="word">Installation default: {settings().mode.global.label}</text>
-            <text wrapMode="word">This project override: {settings().mode.repository.label}</text>
-            <text fg={props.api.theme.current.textMuted} wrapMode="word">
-              Pause, exclusion, and other temporary suppressors do not rewrite configured analysis. “Use for this project” creates an override here only.
-            </text>
-            <Show when={settings().controls.globalMode && modeRank(settings().mode.global.value) < modeRank("auto")}>
-              <box border borderColor={props.api.theme.current.info} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>
-                <text><b>Automatic recommendations setup</b></text>
-                <text wrapMode="word">
-                  This confirmation changes only the global mode. Background AI analysis, saved structured patterns, and sanitized excerpts remain separate consent choices below.
-                </text>
+            <text><b>Automatic recommendations</b></text>
+            <box
+              id={focusId("anchor:automatic-recommendations")}
+              border
+              borderColor={props.api.theme.current.borderSubtle}
+              paddingLeft={1}
+              paddingRight={1}
+              flexDirection="column"
+              gap={1}
+            >
+              <text><b>{settings().automaticRecommendations.enabled ? "On" : "Off"}</b></text>
+              <text wrapMode="word">{settings().automaticRecommendations.description}</text>
+              <text fg={props.api.theme.current.textMuted} wrapMode="word">
+                Turning On enables all three required data permissions in the same server-validated operation. Turning Off does not purge retained data or remove existing recommendations and actions.
+              </text>
+              <text fg={props.api.theme.current.textMuted} wrapMode="word">
+                Emergency Stop, project exclusion, circuit breaker, budgets, and unavailable providers can suppress work without rewriting this preference.
+              </text>
+              <Show when={settings().controls.automaticRecommendations}>
                 {actionButton(
                   "automatic-recommendations",
-                  "Turn on automatic recommendations",
-                  enableAutomaticRecommendations,
-                  true,
-                  { action: "set-mode", subject: "global-mode" },
+                  settings().automaticRecommendations.enabled ? "Turn Off" : "Turn On",
+                  () => setAutomaticRecommendations(!settings().automaticRecommendations.enabled),
+                  settings().automaticRecommendations.enabled !== true,
+                  { action: "set-automatic-recommendations", subject: "automatic-recommendations" },
                 )}
-              </box>
-            </Show>
-            {reactiveChild(() => settings().modes.map((mode) => (
-              <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
-                <text><b>{mode.label}</b>{settings().mode.effective.value === mode.value ? " · Effective now" : ""}</text>
-                <text wrapMode="word">{mode.description}</text>
-                <text fg={props.api.theme.current.textMuted} wrapMode="word">Provider use: {mode.providerUse}</text>
-                <text fg={props.api.theme.current.textMuted} wrapMode="word">Saved data: {mode.savedData}</text>
-                <text fg={props.api.theme.current.textMuted} wrapMode="word">Write authority: {mode.writeAuthority}</text>
-                <text fg={props.api.theme.current.textMuted} wrapMode="word">Prerequisites: {mode.prerequisites}</text>
-                <Show when={mode.blockers.length}>
-                  {reactiveChild(() => mode.blockers.map((blocker) => <text fg={props.api.theme.current.warning} wrapMode="word">• {blocker}</text>))}
-                </Show>
-                <Show when={mode.available}>
-                  <box flexDirection="row" flexWrap="wrap" gap={1}>
-                    <Show when={settings().controls.globalMode}>
-                      {localActionButton(
-                        settings().mode.global.value === mode.value ? "Global default ✓" : "Set global default",
-                        () => submitMode("global", mode.value as "manual" | "auto"),
-                        mode.value === "auto",
-                        `global-mode-${mode.value}`,
-                        { action: "set-mode", subject: "global-mode" },
-                      )}
-                    </Show>
-                    <Show when={settings().controls.repositoryMode}>
-                      {localActionButton(
-                        settings().mode.repository.value === mode.value ? "This project ✓" : "Use for this project",
-                        () => submitMode("project", mode.value as "manual" | "auto"),
-                        mode.value === "auto",
-                        `project-mode-${mode.value}`,
-                        { action: "set-repo-mode", subject: "repository-mode" },
-                      )}
-                    </Show>
-                  </box>
-                </Show>
-              </box>
-            )))}
-            <Show when={settings().controls.repositoryMode}>
-              {localActionButton(
-                settings().mode.repository.value === "inherit" ? "Inherit global default ✓" : "Make this project inherit global default",
-                () => submitMode("project", "inherit"),
-                false,
-                "project-mode-inherit",
-                { action: "set-repo-mode", subject: "repository-mode" },
-              )}
-            </Show>
+              </Show>
+            </box>
             <text><b>Privacy and project scope</b></text>
             <box border borderColor={props.api.theme.current.borderSubtle} paddingLeft={1} paddingRight={1} flexDirection="column">
               <text><b>Include this project</b>: {settings().projectExcluded ? "No" : "Yes"}</text>
               <text wrapMode="word">
-                Excluding this project overrides automatic global modes without changing global settings.
+                Excluding this project suppresses automatic work here without changing the global On/Off preference.
               </text>
               <Show when={settings().controls.projectInclusion}>
                 {actionButton(
                   settings().projectExcluded ? "include-project" : "exclude-project",
                   settings().projectExcluded ? "Include this project" : "Exclude this project",
-                  () => props.store.submitControl("set-repo-excluded", { excluded: !settings().projectExcluded }),
+                  () => props.store.submitOperation("set-repo-excluded", { excluded: !settings().projectExcluded }),
                   settings().projectExcluded === true,
                   { action: "set-repo-excluded", subject: "project-inclusion" },
                 )}
@@ -1831,9 +1731,9 @@ function ControlCenter(props: {
                     ? actionButton(
                       `consent-${entry.key}-off`,
                       `Stop allowing ${entry.label}`,
-                      () => props.store.submitControl("set-consent", { key: entry.key, enabled: false }),
+                      () => props.store.submitOperation("set-permission", { permission: entry.key, enabled: false }),
                       false,
-                      { action: "set-consent", subject: `consent:${entry.key}` },
+                      { action: "set-permission", subject: `permission:${entry.key}` },
                     )
                     : localActionButton(
                       `Review consent for ${entry.label}`,
@@ -1850,7 +1750,6 @@ function ControlCenter(props: {
                 </Show>
               </box>
             )))}
-            <text wrapMode="word">Pause automatic work: {settings().paused ? "Paused" : "Running when eligible"}. Pause preserves modes and consent.</text>
             <text wrapMode="word">Emergency stop: {settings().emergencyStop ? "On" : "Off"}. It overrides every automatic provider and write path.</text>
 
             <text><b>Approved global skill folders</b></text>
@@ -2185,6 +2084,12 @@ const tui: TuiPlugin = async (api, options, meta) => {
     if (!releaseWithNativeCleanup) surfaceOwnership.release?.()
   })
   let projectStore: ProjectStore | undefined
+  let inertStore: ReturnType<typeof createInertRecoveryStore> | undefined
+  const startupConfig = (options as { selfEvolve?: Record<string, unknown> } | undefined)?.selfEvolve ?? options ?? {}
+  const retryStartup = async (): Promise<{ ok: boolean; diagnostic?: string }> => {
+    const result = await attemptTuiStartup(api, startupConfig as Record<string, unknown>)
+    return result.ok ? { ok: true } : { ok: false, diagnostic: result.diagnostic }
+  }
   const projectStoreFactory = (options as {
     __testTuiStoreFactory?: (input: Parameters<typeof acquireProjectTuiStore>[0]) => ProjectStore
   } | undefined)?.__testTuiStoreFactory ?? acquireProjectTuiStore
@@ -2195,16 +2100,25 @@ const tui: TuiPlugin = async (api, options, meta) => {
       projectStore = projectStoreFactory(input)
       return projectStore
     },
+    __nativeStartupFailure(failure: { diagnostic: string }) {
+      if (inertStore || projectStore) return
+      inertStore = createInertRecoveryStore({
+        diagnostic: failure.diagnostic,
+        retry: retryStartup,
+      })
+    },
   }
   await legacyModule.tui(api, compatibilityOptions, meta)
-  if (!projectStore) return
+  const store = (projectStore ?? inertStore) as ProjectStore | undefined
+  if (!store) return
   releaseWithNativeCleanup = true
+  api.lifecycle.onDispose(() => { inertStore?.dispose?.() })
   const [priorRoute, setPriorRoute] = createSignal<{ name: string; params?: Record<string, unknown> }>({ name: "home" })
   const [routeRevision, setRouteRevision] = createSignal(0)
-  const initialSnapshot = projectStore.getSnapshot()
+  const initialSnapshot = store.getSnapshot()
   const [snapshot, setSnapshot] = createSignal(initialSnapshot)
   let activeGlobalIdentity = globalSnapshotIdentity(initialSnapshot)
-  const unsubscribe = projectStore.subscribe((next) => {
+  const unsubscribe = store.subscribe((next) => {
     const nextGlobalIdentity = globalSnapshotIdentity(next)
     const currentParams = api.route.current.name === CONTROL_CENTER_ROUTE && "params" in api.route.current
       ? api.route.current.params as Record<string, unknown>
@@ -2248,7 +2162,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     name: CONTROL_CENTER_ROUTE,
     render: () => <ControlCenter
       api={api}
-      store={projectStore!}
+      store={store}
       snapshot={snapshot}
       prior={priorRoute}
       routeRevision={routeRevision}
@@ -2302,7 +2216,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
               openControlCenter(card.destination)
             }}
           />
-          <SidebarModeControl api={api} store={projectStore!} snapshot={snapshot} />
+          <SidebarModeControl api={api} store={store} snapshot={snapshot} />
         </box>
       },
     },

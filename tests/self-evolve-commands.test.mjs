@@ -117,16 +117,16 @@ function seedApplyAudit(store, id, currentHash, appliedHash, timestamp = 950) {
 
 test("parser covers the complete command surface and rejects malformed input", () => {
   const cases = [
-    ["/self-evolve help", "help"], ["?", "help"], ["scan", "scan"], ["status", "status"],
-    ["pause", "pause"], ["resume", "resume"], ["review se-1", "review"], [approvalInput(), "approve"],
+    ["/self-evolve help", "help"], ["?", "help"], ["status", "status"], ["on", "automatic-recommendations"], ["off", "automatic-recommendations"],
+    ["scan", "removed"], ["pause", "removed"], ["resume", "removed"], ["review se-1", "review"], [approvalInput(), "approve"],
     ["reject se-1", "reject"], ["snooze se-1 7d", "snooze"], ["undo se-1", "undo"],
-    ["exclude", "repo-override"], ["include", "repo-override"], ["repo inherit", "repo-mode"],
-    ["consent passive on", "consent"], ["allowlist list", "allowlist"],
+    ["exclude", "repo-override"], ["include", "repo-override"], ["repo inherit", "removed"],
+    ["consent passive on", "removed"], ["consent observations off", "consent"], ["allowlist list", "allowlist"],
     ["allowlist add /skills --confirm UPDATE ALLOWLIST", "allowlist"], ["inspect observations 3", "inspect"],
     ["inspect eligibility", "inspect"], ["inbox", "inbox"], ["export all", "export"],
     ["export global-recommendations", "export"], ["purge global-recommendations", "purge"],
     [`purge global-recommendation ${HASH_A}`, "purge"],
-    ["purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0", "purge"],
+    ["purge --all --confirm PURGE ALL SELF-EVOLVE 0.4.0", "purge"],
     ["budget", "budget"], ["health", "health"], ["kill-switch on", "kill-switch"],
   ];
   for (const [input, verb] of cases) assert.equal(command(input).verb, verb, input);
@@ -135,16 +135,16 @@ test("parser covers the complete command surface and rejects malformed input", (
     scope: "global-recommendation",
     recommendationId: HASH_A,
   });
-  assert.deepEqual(command("purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0"), {
+  assert.deepEqual(command("purge --all --confirm PURGE ALL SELF-EVOLVE 0.4.0"), {
     verb: "purge",
     scope: "all",
-    confirmation: "PURGE ALL SELF-EVOLVE 0.3.0",
+    confirmation: "PURGE ALL SELF-EVOLVE 0.4.0",
   });
   for (const input of [
     "purge --all",
     "purge all",
     "purge --all --confirm PURGE ALL SELF-EVOLVE 0.2.0",
-    "purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0 extra",
+    "purge --all --confirm PURGE ALL SELF-EVOLVE 0.4.0 extra",
   ]) assert.equal(parseSelfEvolveCommand(input).ok, false, input);
   assert.equal(parseSelfEvolveCommand("approve").ok, false);
   assert.equal(parseSelfEvolveCommand("allowlist add /skills").ok, false);
@@ -179,14 +179,14 @@ test("command tokenizer rejects malformed quoting and escaping fail closed", () 
   }
 });
 
-test("status exposes consent and approved skill folders headlessly", (t) => {
+test("status exposes binary preference, permissions, and creation-policy suggestions headlessly", (t) => {
   const { policy, store } = fixture(t);
-  policy.execute(command("consent passive on"), { projectFingerprint: FINGERPRINT });
   const current = store.getSettings().global;
   assert.equal(store.updateGlobalSettings(() => ({ ...current, allowedSkillRoots: ["/skills"], updatedAt: current.updatedAt + 1 })).ok, true);
   const status = policy.execute(command("status"), { projectFingerprint: FINGERPRINT }).responseText;
-  assert.match(status, /Consent: passive on; observations off; excerpts off; cross-repo off/u);
-  assert.match(status, /Approved skill folders \(1\):\n- \/skills/u);
+  assert.match(status, /Automatic recommendations: On; project Included; Emergency Stop Off/u);
+  assert.match(status, /Permissions: observations on; excerpts on; cross-repo on/u);
+  assert.match(status, /Creation-policy suggestions \(1\):\n- \/skills/u);
 });
 
 test("observation inspection limit accepts only bounded positive safe integers", () => {
@@ -229,126 +229,81 @@ test("approval parser requires one exact tuple and rejects every malformed shape
   ]) assert.equal(parseSelfEvolveCommand(input).ok, false, input);
 });
 
-test("bare command migration and help preserve legacy mappings", () => {
-  assert.equal(command("/self-evolve", { legacy: true }).verb, "scan");
-  assert.equal(command("/self-evolve", { legacy: false }).verb, "default");
-  const disabled = command("/self-evolve disable");
-  assert.deepEqual(disabled, { verb: "pause", deprecatedAlias: "disable" });
+test("bare command opens status and help documents the binary migration", () => {
+  assert.equal(command("/self-evolve").verb, "default");
+  for (const removed of ["manual", "auto", "yolo", "scan", "pause", "resume", "disable", "repo manual", "consent passive on"]) {
+    assert.equal(command(removed).verb, "removed", removed);
+  }
   const help = buildResponse(command("help"));
-  assert.match(help, /disable -> pause \(deprecated\)/);
-  assert.match(help, /dismiss/);
+  assert.match(help, /\/self-evolve on \| off/u);
+  assert.match(help, /dismiss/u);
   assert.match(help, new RegExp(MIGRATION_NOTE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
-test("global modes transition both directions and lifecycle admission changes immediately", (t) => {
+test("On and Off update the sole automation preference and On restores required permissions", (t) => {
   const { policy } = fixture(t);
-  let result = policy.execute(command("auto"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getMode(), "auto");
-  assert.match(result.responseText, /next eligible lifecycle event observes the new analysis mode/i);
-  policy.execute(command("manual"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getMode(), "manual");
-  result = policy.execute(command("auto"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getMode(), "auto");
-  assert.match(result.responseText, /No proposal was accepted and no files were applied/);
-  policy.execute(command("manual"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getMode(), "manual");
+  let result = policy.execute(command("off"), { projectFingerprint: FINGERPRINT });
+  assert.equal(policy.getAutomation().enabled, false);
+  assert.match(result.responseText, /Future analysis is stopped/u);
+  assert.match(result.responseText, /retained data was not purged/u);
+
+  result = policy.execute(command("on"), { projectFingerprint: FINGERPRINT });
+  assert.equal(policy.getAutomation().enabled, true);
+  assert.deepEqual(policy.getConsent(), {
+    durableObservations: true,
+    sanitizedExcerpts: true,
+    crossRepoAggregation: true,
+  });
+  assert.match(result.responseText, /Required data permissions are On/u);
 });
 
-test("yolo is retired and can never be configured or stored in v0.3", (t) => {
-  const { policy, store } = fixture(t);
-  for (const input of ["yolo", "yolo confirm", "yolo confirm --allowlist /skills", "repo yolo"]) {
-    const parsedCommand = parseSelfEvolveCommand(input);
-    assert.equal(parsedCommand.ok, false, input);
-    assert.match(parsedCommand.error, /retired in v0\.3|Usage: \/self-evolve repo/u, input);
-  }
-  assert.equal(policy.setMode("yolo").ok, false);
-  assert.equal(policy.getMode(), "manual");
-  assert.equal(store.getSettings().global.mode, "manual");
-  assert.equal(buildResponse(command("help")).includes("yolo"), false);
-});
-
-test("a stored legacy yolo preference narrows to auto without unattended write authority", (t) => {
-  const { policy, store } = fixture(t);
-  const current = store.getSettings().global;
-  const saved = store.updateGlobalSettings(() => ({ ...current, mode: "yolo", updatedAt: current.updatedAt + 1 }));
-  assert.equal(saved.ok, true, saved.reason);
-  assert.equal(store.getSettings().global.mode, "auto");
-  assert.equal(policy.getMode(), "auto");
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "auto");
-});
-
-test("kill switch downgrades effective mode without rewriting the stored analysis mode", (t) => {
+test("permission revocation turns automation Off and restoration leaves it Off", (t) => {
   const { policy } = fixture(t);
-  policy.execute(command("auto"), { projectFingerprint: FINGERPRINT });
-  const result = policy.execute(command("kill-switch on"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getMode(), "auto");
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "manual");
-  assert.equal(policy.getHealth().killSwitchActive, true);
-  assert.match(result.responseText, /Stored mode remains auto/);
-  policy.execute(command("kill-switch off"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "auto");
-});
-
-test("repo mode precedence and exclusion coexist with the global preference", (t) => {
-  const { policy, store } = fixture(t);
-  policy.execute(command("auto"), { projectFingerprint: FINGERPRINT });
-  policy.execute(command("repo manual"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getMode(), "auto");
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "manual");
-  assert.equal(parseSelfEvolveCommand("repo yolo").ok, false);
-  assert.equal(store.getSettings().repo.mode, "manual", "repo yolo must fail without changing the existing override");
-  policy.execute(command("repo auto"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "auto");
-  const excluded = policy.execute(command("exclude"), { projectFingerprint: FINGERPRINT });
-  assert.equal(store.getSettings().repo.excluded, true);
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "manual");
-  assert.match(excluded.responseText, /autonomous work will be skipped/);
-});
-
-test("all consent keys toggle with first-enable disclosures and cross-repo requires excerpts", (t) => {
-  const { policy } = fixture(t);
-  for (const name of ["passive", "observations", "excerpts"]) {
-    const first = policy.execute(command(`consent ${name} on`), { projectFingerprint: FINGERPRINT });
-    assert.match(first.responseText, /Disclosure:/);
-    const again = policy.execute(command(`consent ${name} on`), { projectFingerprint: FINGERPRINT });
-    assert.doesNotMatch(again.responseText, /Disclosure:/);
-    policy.execute(command(`consent ${name} off`), { projectFingerprint: FINGERPRINT });
-  }
-  const blocked = policy.execute(command("consent cross-repo on"), { projectFingerprint: FINGERPRINT });
-  assert.match(blocked.responseText, /sanitized-excerpts-consent-required/);
-  policy.execute(command("consent excerpts on"), { projectFingerprint: FINGERPRINT });
-  const enabled = policy.execute(command("consent cross-repo on"), { projectFingerprint: FINGERPRINT });
-  assert.match(enabled.responseText, /Disclosure:/);
-  assert.equal(policy.getConsent().crossRepoAggregation, true);
-  policy.execute(command("consent cross-repo off"), { projectFingerprint: FINGERPRINT });
-  assert.equal(policy.getConsent().crossRepoAggregation, false);
-});
-
-test("disabling sanitized excerpts also revokes dependent cross-repo aggregation", (t) => {
-  const { policy } = fixture(t);
-  policy.execute(command("consent excerpts on"), { projectFingerprint: FINGERPRINT });
-  const enabled = policy.execute(command("consent cross-repo on"), { projectFingerprint: FINGERPRINT });
-  assert.match(enabled.responseText, /Disclosure:/);
-  assert.equal(policy.getConsent().crossRepoAggregation, true);
   const revoked = policy.execute(command("consent excerpts off"), { projectFingerprint: FINGERPRINT });
   assert.match(revoked.responseText, /disabled/u);
+  assert.equal(policy.getAutomation().enabled, false);
   assert.equal(policy.getConsent().sanitizedExcerpts, false);
-  assert.equal(policy.getConsent().crossRepoAggregation, false);
+
+  const restored = policy.execute(command("consent excerpts on"), { projectFingerprint: FINGERPRINT });
+  assert.match(restored.responseText, /Disclosure:/u);
+  assert.equal(policy.getConsent().sanitizedExcerpts, true);
+  assert.equal(policy.getAutomation().enabled, false);
 });
 
-test("newer settings fail closed to manual and refuse writes with a health message", (t) => {
-  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-commands-corrupt-"));
-  const stateDir = path.join(root, "self-evolve", FINGERPRINT);
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(path.join(stateDir, "settings.json"), `${JSON.stringify({ schemaVersion: "9.9.9" })}\n`);
-  const store = openStore(root, { projectFingerprint: FINGERPRINT, now: () => 1_000 });
-  const privacy = createPrivacyGuard({ consent: {}, projectFingerprint: FINGERPRINT, store, now: () => 1_000 });
-  const policy = createCommandPolicy({ store, privacy, schemaVersion: SCHEMA_VERSION, hostVersion: "1.18.3", now: () => 1_000 });
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  assert.equal(policy.getMode(), "manual");
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: FINGERPRINT }), "manual");
-  assert.match(policy.execute(command("auto"), { projectFingerprint: FINGERPRINT }).responseText, /Manual\/no-write mode/);
-  assert.match(policy.execute(command("health"), { projectFingerprint: FINGERPRINT }).responseText, /Corrupt or unsupported settings/);
+test("project exclusion and Emergency Stop do not rewrite the automation preference", (t) => {
+  const { policy } = fixture(t);
+  const excluded = policy.execute(command("exclude"), { projectFingerprint: FINGERPRINT });
+  assert.equal(policy.getAutomation().repo.excluded, true);
+  assert.equal(policy.getAutomation().enabled, true);
+  assert.match(excluded.responseText, /Project Excluded/u);
+  policy.execute(command("include"), { projectFingerprint: FINGERPRINT });
+  assert.equal(policy.getAutomation().repo.excluded, false);
+
+  const stopped = policy.execute(command("kill-switch on"), { projectFingerprint: FINGERPRINT });
+  assert.equal(policy.getHealth().killSwitchActive, true);
+  assert.equal(policy.getAutomation().enabled, true);
+  assert.match(stopped.responseText, /preference is unchanged/u);
+  policy.execute(command("kill-switch off"), { projectFingerprint: FINGERPRINT });
+  assert.equal(policy.getHealth().killSwitchActive, false);
+  assert.equal(policy.getAutomation().enabled, true);
+});
+
+test("removed controls return deterministic migration guidance without material reads", () => {
+  const policy = createCommandPolicy({
+    store: {
+      getSettings() { throw new Error("material-read-attempted"); },
+    },
+    privacy: {
+      exportScope() { throw new Error("material-effect-attempted"); },
+      purgeScope() { throw new Error("material-effect-attempted"); },
+    },
+    now: () => 1_000,
+  });
+  for (const input of ["manual", "auto", "yolo", "scan", "pause", "resume", "disable", "repo auto", "consent passive on"]) {
+    const result = policy.execute(command(input));
+    assert.match(result.responseText, /was removed in Self-evolve v0\.4/u, input);
+    assert.match(result.responseText, /Automatic recommendations On or Off/u, input);
+  }
 });
 
 test("inbox lists pending proposals and review shows one proposal headlessly", (t) => {
@@ -425,7 +380,7 @@ test("purge observations, proposals, and project report correct counts while pur
   }
   const terminal = awaitFixture(t);
   seedObservation(terminal.store, "obs-all");
-  const result = terminal.policy.execute(command("purge --all --confirm PURGE ALL SELF-EVOLVE 0.3.0"), { projectFingerprint: FINGERPRINT });
+  const result = terminal.policy.execute(command("purge --all --confirm PURGE ALL SELF-EVOLVE 0.4.0"), { projectFingerprint: FINGERPRINT });
   assert.equal(result.ok, false);
   assert.equal(result.reason, "purge-all-requires-terminal-integration");
   assert.equal(terminal.store.readRecords("observation").length, 1, "command policy cannot delete before integration accepts terminal");
@@ -451,7 +406,7 @@ test("undo eligibility requires an applied proposal and an unchanged applied has
   assert.match(refused.responseText, /No files were changed/);
 });
 
-test("headless commands return plain text and manual commands schedule no passive work", (t) => {
+test("headless commands return plain text and removed commands schedule no automatic work", (t) => {
   const { policy, store } = fixture(t);
   seedProposal(store, "se-headless");
   for (const input of ["status", "health", "inbox", "review se-headless", "budget", "scan", "help"]) {
@@ -462,29 +417,28 @@ test("headless commands return plain text and manual commands schedule no passiv
     assert.equal("scheduledAutonomousWork" in result, false);
     assert.doesNotMatch(result.responseText, /promptAsync|appendPrompt|passive-call-token/);
   }
-  assert.equal(policy.getMode(), "manual");
+  assert.equal(policy.getAutomation().enabled, true);
 });
 
-test("disable response is deprecated pause and the new default opens status plus inbox", (t) => {
+test("removed disable is side-effect free and the default opens preference plus inbox", (t) => {
   const { policy, store } = fixture(t);
   seedProposal(store, "se-default");
   const disabled = policy.execute(command("disable"), { projectFingerprint: FINGERPRINT });
-  assert.match(disabled.responseText, /Deprecated/);
-  assert.equal(store.getSettings().global.paused, true);
+  assert.match(disabled.responseText, /was removed in Self-evolve v0\.4/u);
+  assert.equal(policy.getAutomation().enabled, true);
   const opened = policy.execute(command("/self-evolve"), { projectFingerprint: FINGERPRINT });
-  assert.match(opened.responseText, /Self-evolve status/);
+  assert.match(opened.responseText, /Automatic recommendations: On/u);
   assert.match(opened.responseText, /Inbox: 1 pending proposal/);
 });
 
-test("v0.3 keeps scan headless and command-driven while retiring unattended write copy", (t) => {
+test("v0.4 retires scan and mode help while preserving unrelated headless commands", (t) => {
   const { policy } = fixture(t);
   const parsedScan = parseSelfEvolveCommand("scan");
-  assert.deepEqual(parsedScan, { ok: true, command: { verb: "scan" } });
+  assert.deepEqual(parsedScan, { ok: true, command: { verb: "removed", removedCommand: "scan" } });
   const scan = policy.execute(command("scan"), { projectFingerprint: FINGERPRINT });
-  assert.match(scan.responseText, /schedules no passive work and applies no files/u);
+  assert.match(scan.responseText, /was removed in Self-evolve v0\.4/u);
   const help = buildResponse(command("help"));
-  assert.match(help, /\/self-evolve manual \| auto/u);
-  assert.match(help, /repo <manual\|auto\|inherit>/u);
-  assert.equal(/yolo/iu.test(help), false);
+  assert.match(help, /\/self-evolve on \| off/u);
+  assert.doesNotMatch(help, /repo <manual\|auto\|inherit>/u);
   assert.equal(/unattended/iu.test(help), false);
 });

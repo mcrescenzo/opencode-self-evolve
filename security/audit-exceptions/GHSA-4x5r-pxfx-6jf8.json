@@ -8,6 +8,6 @@
   "applicability": "trusted-repository-source-only",
   "scope": "TUI compilation of trusted repository source only; attacker-controlled source is excluded.",
   "owner": "Michael Crescenzo",
-  "reviewDate": "2026-09-05",
+  "reviewDate": "2026-08-12",
   "expiresOn": "2026-11-05"
 }

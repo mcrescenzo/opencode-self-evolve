@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const SCHEMA_VERSION = "0.3.0";
+export const V4_SCHEMA_VERSION = "0.4.0";
 // Earlier schema versions whose persisted records and settings the current validators still read.
 // Values are normalized to SCHEMA_VERSION on read, so durable state written by a previous release
 // is migrated in place instead of being quarantined as damaged. Record identity is content-addressed
@@ -36,6 +37,37 @@ export const V3_PROTOCOL_CONTRACT = deepFreeze({
     "global-transaction-v1",
     "project-analysis-control-v1",
     "project-participation-v1",
+  ],
+});
+export const V4_VERSION_CONTRACT = deepFreeze({
+  packageVersion: "0.4.0",
+  tuiVersion: "0.4.0",
+  stateSchemaVersion: V4_SCHEMA_VERSION,
+  migrationInputVersions: ["0.2.0", "0.2.1", "0.2.2", "0.3.0"],
+  writableStateVersions: [V4_SCHEMA_VERSION],
+  legacyWritableAuthority: false,
+});
+export const V4_PROTOCOL_CONTRACT = deepFreeze({
+  dashboardVersion: 3,
+  uiOperationVersion: 2,
+  automaticRecommendationsControlVersion: 1,
+  retainedGlobalRecommendationVersion: 1,
+  retainedGlobalActionVersion: 1,
+  retainedProjectParticipationVersion: 1,
+  capabilities: [
+    "automatic-recommendations-control-v1",
+    "global-action-grant-v1",
+    "global-action-request-v1",
+    "global-recommendation-detail-v1",
+    "global-recommendation-index-v1",
+    "global-transaction-v1",
+    "project-participation-v1",
+  ],
+  rejectedWritableCompatibility: [
+    "project-analysis-control-v1",
+    "legacy-control-v1",
+    "control-repo-mode-v1",
+    "operation-pause-v1",
   ],
 });
 export const V3_ELIGIBILITY_THRESHOLDS = deepFreeze({
@@ -151,6 +183,20 @@ export const DEFAULT_BUDGETS = Object.freeze({
   notificationsPerHour: 3,
 });
 
+// Catalog traversal limits. These bound skill-catalog discovery
+// (`discoverSkills`, `buildGlobalSkillCatalog`) against resource exhaustion
+// without relying on Infinity-like ceilings. The defaults are deliberately
+// generous: the largest real-world SKILL.md in this repository tree is ~36 KiB
+// and the largest known collection is <60 entries, so the defaults provide
+// roughly 28x per-file, 16x per-collection, and ~19x entry headroom while
+// remaining bounded and deterministic. See docs/configuration.md.
+export const DEFAULT_CATALOG_LIMITS = Object.freeze({
+  maxCatalogEntries: 1024,
+  maxCatalogPerFileBytes: 262144,
+  maxCatalogAggregateBytes: 16777216,
+  maxCatalogScanDepth: 8,
+});
+
 function fail(code, detail = "") {
   throw new TypeError(detail ? `${code}: ${detail}` : code);
 }
@@ -172,6 +218,10 @@ function exactKeys(value, allowed, label, required = allowed) {
   if (missing.length) fail("malformed-payload", `${label} is missing ${missing[0]}`);
 }
 
+function optionalAutomationGeneration(value) {
+  return value === undefined ? undefined : asInt(value, { min: 1, max: Number.MAX_SAFE_INTEGER });
+}
+
 export function deepFreeze(value) {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     Object.freeze(value);
@@ -180,9 +230,17 @@ export function deepFreeze(value) {
   return value;
 }
 
+const SAFE_REASON_CODE = /^[A-Za-z][A-Za-z0-9-]{0,127}$/u;
+
 export function errorReasonCode(error, fallback = "error") {
   const message = error instanceof Error ? error.message : String(error ?? fallback);
-  return message.split(":", 1)[0] || fallback;
+  const candidate = message.split(":", 1)[0] || fallback;
+  // Diagnostic scrubbing: only emit a bounded safe reason code (lowercase/dashed
+  // identifiers or uppercase host codes such as ENOENT). Raw host messages that
+  // may carry absolute paths, tokens, remote URLs, or private names collapse to
+  // the caller-supplied fallback so audits, exports, and response text never
+  // echo unredacted private material. Persisted audits/outcomes keep fixed codes.
+  return SAFE_REASON_CODE.test(candidate) ? candidate : fallback;
 }
 
 export function latestByLogicalId(records, { withPayload = false } = {}) {
@@ -375,7 +433,7 @@ export function makeGlobalRootPolicy(data) {
     schemaVersion: v3SchemaVersion(data.schemaVersion),
     roots,
     creationRootId,
-    selectedBy: asEnum(data.selectedBy, ["operator"]),
+    selectedBy: asEnum(data.selectedBy, ["operator", "host"]),
     updatedAt: asTimestamp(data.updatedAt),
     rootSetHash,
   });
@@ -479,16 +537,56 @@ export const ConsentState = deepFreeze({
   fields: ["passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation"],
   defaults: { passiveCalls: false, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false },
 });
+export const V4_AUTOMATION_PERMISSION_FIELDS = Object.freeze([
+  "durableObservations",
+  "sanitizedExcerpts",
+  "crossRepoAggregation",
+]);
+export const V4ConsentState = deepFreeze({
+  fields: V4_AUTOMATION_PERMISSION_FIELDS,
+  defaults: {
+    durableObservations: true,
+    sanitizedExcerpts: true,
+    crossRepoAggregation: true,
+  },
+});
 export const Budgets = deepFreeze({ fields: Object.keys(DEFAULT_BUDGETS), defaults: DEFAULT_BUDGETS });
+export const CatalogLimits = deepFreeze({
+  fields: Object.keys(DEFAULT_CATALOG_LIMITS),
+  defaults: DEFAULT_CATALOG_LIMITS,
+  ranges: Object.freeze({
+    maxCatalogEntries: Object.freeze({ min: 1, max: 1_000_000 }),
+    maxCatalogPerFileBytes: Object.freeze({ min: 1, max: 16_777_216 }),
+    maxCatalogAggregateBytes: Object.freeze({ min: 1, max: 1_073_741_824 }),
+    maxCatalogScanDepth: Object.freeze({ min: 1, max: 64 }),
+  }),
+});
 export const GlobalSettings = deepFreeze({
   fields: ["schemaVersion", "mode", "createdAt", "updatedAt", "paused", "killSwitchActive", "allowedSkillRoots", "globalRootPolicy", "consent", "budgets", "retentionDays"],
 });
 export const RepoSettings = deepFreeze({
   fields: ["schemaVersion", "projectFingerprint", "mode", "excluded", "budgets"],
 });
-export const EpisodeCursor = deepFreeze({ fields: ["sessionIDHash", "lastIdleAt", "lastObservedMessageHash", "leaseNonce"] });
+export const V4GlobalSettings = deepFreeze({
+  fields: [
+    "schemaVersion",
+    "automaticRecommendationsEnabled",
+    "createdAt",
+    "updatedAt",
+    "killSwitchActive",
+    "allowedSkillRoots",
+    "globalRootPolicy",
+    "consent",
+    "budgets",
+    "retentionDays",
+  ],
+});
+export const V4RepoSettings = deepFreeze({
+  fields: ["schemaVersion", "projectFingerprint", "excluded", "budgets"],
+});
+export const EpisodeCursor = deepFreeze({ fields: ["sessionIDHash", "lastIdleAt", "lastObservedMessageHash", "leaseNonce", "automationGeneration"] });
 export const Receipt = deepFreeze({ fields: ["receiptType", "signatureHash", "occurrences", "firstSeenAt", "lastSeenAt", "projectFingerprint", "scopeFingerprint", "targetLogicalName"] });
-export const Observation = deepFreeze({ fields: ["id", "projectFingerprint", "receiptIds", "structuredFields", "incidentId", "sessionLineageHash", "rootLineageHash", "originKind", "createdAt", "injectionFlagged", "redacted"] });
+export const Observation = deepFreeze({ fields: ["id", "projectFingerprint", "receiptIds", "structuredFields", "incidentId", "sessionLineageHash", "rootLineageHash", "originKind", "createdAt", "injectionFlagged", "redacted", "automationGeneration"] });
 export const EvidenceCluster = deepFreeze({ fields: ["id", "receiptType", "projectFingerprint", "incidentIds", "scopeFingerprint", "targetLogicalName", "occurrencesSum", "firstSeenAt", "lastSeenAt"] });
 export const EligibilityExplanation = deepFreeze({ fields: ["clusterId", "eligible", "reasons", "thresholdsMet", "thresholdsMissed"] });
 export const Proposal = deepFreeze({
@@ -511,25 +609,25 @@ export const AggregateClaim = deepFreeze({
 });
 export const EvidenceDomain = deepFreeze({ fields: ["domainId", "lineageStatus", "sourceLineageHash", "distributedEligible"] });
 export const EvidenceCapsule = deepFreeze({
-  fields: ["schemaVersion", "capsuleId", "incidentId", "receiptType", "targetLogicalName", "summary", "summaryHash", "createdAt", "expiresAt"],
+  fields: ["schemaVersion", "capsuleId", "incidentId", "receiptType", "targetLogicalName", "summary", "summaryHash", "createdAt", "expiresAt", "automationGeneration"],
 });
 export const ContributionIntent = deepFreeze({
-  fields: ["schemaVersion", "intentId", "contributionId", "incidentId", "capsuleId", "clusterId", "evidenceDomainId", "consentVersionHash", "state", "createdAt", "updatedAt"],
+  fields: ["schemaVersion", "intentId", "contributionId", "incidentId", "capsuleId", "clusterId", "evidenceDomainId", "consentVersionHash", "state", "createdAt", "updatedAt", "automationGeneration"],
 });
 export const ProjectContributionLink = deepFreeze({
-  fields: ["schemaVersion", "contributionId", "intentId", "incidentId", "capsuleId", "clusterId", "evidenceDomainId", "linkedAt", "state"],
+  fields: ["schemaVersion", "contributionId", "intentId", "incidentId", "capsuleId", "clusterId", "evidenceDomainId", "linkedAt", "state", "automationGeneration"],
 });
 export const GlobalContribution = deepFreeze({
-  fields: ["schemaVersion", "contributionId", "claimType", "receiptType", "signatureHash", "occurrenceCount", "firstSeenDay", "lastSeenDay", "createdAt", "expiresAt"],
+  fields: ["schemaVersion", "contributionId", "claimType", "receiptType", "signatureHash", "occurrenceCount", "firstSeenDay", "lastSeenDay", "createdAt", "expiresAt", "automationGeneration"],
 });
 export const GlobalSupportSet = deepFreeze({
-  fields: ["schemaVersion", "supportSetHash", "candidateId", "targetBinding", "contributionIds", "strongestSingleDomain", "distributed", "integrity", "firstSeenDay", "lastSeenDay", "evaluatedAt", "expiresAt"],
+  fields: ["schemaVersion", "supportSetHash", "candidateId", "targetBinding", "contributionIds", "strongestSingleDomain", "distributed", "integrity", "firstSeenDay", "lastSeenDay", "evaluatedAt", "expiresAt", "automationGeneration"],
 });
 export const GlobalEligibility = deepFreeze({
   fields: ["eligible", "route", "reasons", "singleDomainEligible", "distributedEligible", "supportSetHash", "targetBindingHash"],
 });
 export const GlobalCandidate = deepFreeze({
-  fields: ["schemaVersion", "candidateId", "claimType", "receiptType", "signatureHash", "targetBindingHash", "supportSetHash", "state", "eligibilityRoute", "independentDomainCount", "independentIncidentCount", "occurrenceCount", "firstSeenDay", "lastSeenDay", "createdAt", "updatedAt"],
+  fields: ["schemaVersion", "candidateId", "claimType", "receiptType", "signatureHash", "targetBindingHash", "supportSetHash", "state", "eligibilityRoute", "independentDomainCount", "independentIncidentCount", "occurrenceCount", "firstSeenDay", "lastSeenDay", "createdAt", "updatedAt", "automationGeneration"],
 });
 export const GlobalRecommendation = deepFreeze({
   fields: ["schemaVersion", "recommendationId", "candidateId", "supportSetHash", "candidateTargetBindingHash", "targetBinding", "proposedContentHash", "rationaleText", "synthesizedAt", "synthesizerModelId", "criticScore", "criticPassed", "validDeterministic", "state", "decisionVersion", "burnedNonceHashes"],
@@ -550,7 +648,7 @@ export const GlobalDecisionOutcome = deepFreeze({
   fields: ["schemaVersion", "outcomeId", "intentId", "action", "recommendationId", "decisionVersion", "state", "priorHash", "appliedHash", "auditId", "completedAt", "reason"],
 });
 export const GlobalSynthesisAttempt = deepFreeze({
-  fields: ["schemaVersion", "attemptId", "candidateId", "supportSetHash", "targetBindingHash", "state", "admittedAt", "updatedAt"],
+  fields: ["schemaVersion", "attemptId", "candidateId", "supportSetHash", "targetBindingHash", "state", "admittedAt", "updatedAt", "automationGeneration"],
 });
 export const GlobalLease = deepFreeze({
   fields: ["schemaVersion", "leaseId", "leaseKind", "leaseKeyHash", "ownerToken", "state", "acquiredAt", "expiresAt", "releasedAt"],
@@ -580,6 +678,20 @@ export function makeConsentState(data = {}) {
   });
 }
 
+export function makeV4ConsentState(data = {}) {
+  exactKeys(data, V4ConsentState.fields, "V4ConsentState", []);
+  return deepFreeze({
+    durableObservations: asBoolean(data.durableObservations, "durableObservations", true),
+    sanitizedExcerpts: asBoolean(data.sanitizedExcerpts, "sanitizedExcerpts", true),
+    crossRepoAggregation: asBoolean(data.crossRepoAggregation, "crossRepoAggregation", true),
+  });
+}
+
+export function v4AutomationPermissionsHash(consent) {
+  const current = makeV4ConsentState(consent);
+  return sha256(`self-evolve-automation-permissions-v1\n${canonicalize(current)}`);
+}
+
 function validateBudgets(data = {}, partial = false) {
   exactKeys(data, Budgets.fields, "Budgets", []);
   const result = {};
@@ -592,6 +704,20 @@ function validateBudgets(data = {}, partial = false) {
 
 export function makeBudgets(data = {}) {
   return validateBudgets(data, false);
+}
+
+export function makeCatalogLimits(data = {}) {
+  exactKeys(data, CatalogLimits.fields, "CatalogLimits", []);
+  const result = {};
+  for (const key of CatalogLimits.fields) {
+    if (!(key in data)) {
+      result[key] = DEFAULT_CATALOG_LIMITS[key];
+      continue;
+    }
+    const { min, max } = CatalogLimits.ranges[key];
+    result[key] = asInt(data[key], { min, max });
+  }
+  return deepFreeze(result);
 }
 
 export function makeGlobalSettings(data = {}) {
@@ -625,6 +751,124 @@ export function makeRepoSettings(data) {
     mode: asRepoMode(data.mode ?? "inherit"),
     excluded: asBoolean(data.excluded, "excluded", false),
     budgets: validateBudgets(data.budgets ?? {}, true),
+  });
+}
+
+function v4SchemaVersion(value = V4_SCHEMA_VERSION) {
+  if (value !== V4_SCHEMA_VERSION) fail("unsupported-v4-schema-version", String(value));
+  return value;
+}
+
+export function makeV4GlobalSettings(data = {}) {
+  exactKeys(data, V4GlobalSettings.fields, "V4GlobalSettings", []);
+  const createdAt = asTimestamp(data.createdAt ?? 0);
+  const updatedAt = asTimestamp(data.updatedAt ?? createdAt);
+  if (updatedAt < createdAt) fail("out-of-order", "updatedAt precedes createdAt");
+  const roots = boundedList(data.allowedSkillRoots, "allowedSkillRoots", MAX.roots, absolutePath, { dedupe: true, defaultValue: [] });
+  return deepFreeze({
+    schemaVersion: v4SchemaVersion(data.schemaVersion),
+    automaticRecommendationsEnabled: asBoolean(data.automaticRecommendationsEnabled, "automaticRecommendationsEnabled", true),
+    createdAt,
+    updatedAt,
+    killSwitchActive: asBoolean(data.killSwitchActive, "killSwitchActive", false),
+    allowedSkillRoots: roots,
+    globalRootPolicy: data.globalRootPolicy === null || data.globalRootPolicy === undefined
+      ? null
+      : makeGlobalRootPolicy(data.globalRootPolicy),
+    consent: makeV4ConsentState(data.consent ?? {}),
+    budgets: makeBudgets(data.budgets ?? {}),
+    retentionDays: asInt(data.retentionDays ?? 30, { min: 1, max: 3650 }),
+  });
+}
+
+export function makeV4RepoSettings(data) {
+  exactKeys(data, V4RepoSettings.fields, "V4RepoSettings", ["projectFingerprint"]);
+  return deepFreeze({
+    schemaVersion: v4SchemaVersion(data.schemaVersion),
+    projectFingerprint: asFingerprint(data.projectFingerprint),
+    excluded: asBoolean(data.excluded, "excluded", false),
+    budgets: validateBudgets(data.budgets ?? {}, true),
+  });
+}
+
+export function makeV4SettingsBaseline({ projectFingerprint, now = 0, enabled = true } = {}) {
+  const timestamp = asTimestamp(now);
+  const automaticRecommendationsEnabled = asBoolean(enabled, "enabled");
+  const consent = automaticRecommendationsEnabled
+    ? makeV4ConsentState()
+    : makeV4ConsentState({ durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false });
+  return deepFreeze({
+    global: makeV4GlobalSettings({
+      automaticRecommendationsEnabled,
+      consent,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }),
+    repo: makeV4RepoSettings({ projectFingerprint }),
+  });
+}
+
+function legacyCombinedSettings(input, projectFingerprint) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const migrated = migrateSettings(input);
+  if (!migrated) return null;
+  const legacyGlobal = migrated.global ?? ("mode" in migrated && !("projectFingerprint" in migrated) ? migrated : null);
+  const legacyRepo = migrated.repo ?? ("projectFingerprint" in migrated ? migrated : null);
+  if (!legacyGlobal) return null;
+  const global = makeGlobalSettings(legacyGlobal);
+  const repo = legacyRepo
+    ? makeRepoSettings(legacyRepo)
+    : makeRepoSettings({ projectFingerprint });
+  if (repo.projectFingerprint !== projectFingerprint) fail("project-partition-mismatch");
+  return { global, repo };
+}
+
+// Bounded v0.2/v0.3 migration reader. Every valid legacy operating-mode and
+// pause combination intentionally converges to the same v0.4 On bundle; none
+// of those retired fields retains writable authority. Project exclusion and
+// Emergency Stop are the two authority-relevant legacy values preserved.
+export function migrateLegacySettingsToV4(input, { projectFingerprint, now = 0 } = {}) {
+  try {
+    const legacy = legacyCombinedSettings(input, asFingerprint(projectFingerprint));
+    if (!legacy) return null;
+    const timestamp = asTimestamp(now);
+    return deepFreeze({
+      global: makeV4GlobalSettings({
+        automaticRecommendationsEnabled: true,
+        createdAt: legacy.global.createdAt,
+        updatedAt: Math.max(legacy.global.updatedAt, timestamp),
+        killSwitchActive: legacy.global.killSwitchActive,
+        allowedSkillRoots: legacy.global.allowedSkillRoots,
+        globalRootPolicy: legacy.global.globalRootPolicy,
+        consent: makeV4ConsentState(),
+        budgets: legacy.global.budgets,
+        retentionDays: legacy.global.retentionDays,
+      }),
+      repo: makeV4RepoSettings({
+        projectFingerprint: legacy.repo.projectFingerprint,
+        excluded: legacy.repo.excluded,
+        budgets: legacy.repo.budgets,
+      }),
+      migratedFrom: legacy.global.schemaVersion,
+    });
+  } catch {
+    return null;
+  }
+}
+
+export function evaluateV4PermissionTransition(previous, next) {
+  const before = makeV4ConsentState(previous);
+  const after = makeV4ConsentState(next);
+  const durableRevoked = before.durableObservations && !after.durableObservations;
+  const excerptsRevoked = before.sanitizedExcerpts && !after.sanitizedExcerpts;
+  const aggregationRevoked = before.crossRepoAggregation && !after.crossRepoAggregation;
+  return deepFreeze({
+    requiredPermissionRevoked: durableRevoked || excerptsRevoked || aggregationRevoked,
+    stopDurableObservation: durableRevoked,
+    deleteProjectCapsules: excerptsRevoked,
+    stopGlobalContributions: durableRevoked || excerptsRevoked || aggregationRevoked,
+    invalidateGlobalSupport: durableRevoked || excerptsRevoked || aggregationRevoked,
+    blockGlobalApply: durableRevoked || excerptsRevoked || aggregationRevoked,
   });
 }
 
@@ -748,7 +992,7 @@ function evidenceCapsuleSummary(value) {
 }
 
 export function makeEvidenceCapsule(data) {
-  exactKeys(data, EvidenceCapsule.fields, "EvidenceCapsule", EvidenceCapsule.fields.filter((field) => !["schemaVersion", "summaryHash"].includes(field)));
+  exactKeys(data, EvidenceCapsule.fields, "EvidenceCapsule", EvidenceCapsule.fields.filter((field) => !["schemaVersion", "summaryHash", "automationGeneration"].includes(field)));
   const createdAt = asTimestamp(data.createdAt);
   const expiresAt = asTimestamp(data.expiresAt);
   if (expiresAt <= createdAt) fail("out-of-order", "capsule must expire after creation");
@@ -765,6 +1009,7 @@ export function makeEvidenceCapsule(data) {
     summaryHash,
     createdAt,
     expiresAt,
+    ...(data.automationGeneration === undefined ? {} : { automationGeneration: optionalAutomationGeneration(data.automationGeneration) }),
   });
 }
 
@@ -778,7 +1023,7 @@ const CONTRIBUTION_INTENT_TRANSITIONS = deepFreeze({
 });
 
 export function makeContributionIntent(data) {
-  exactKeys(data, ContributionIntent.fields, "ContributionIntent", ContributionIntent.fields.filter((field) => field !== "schemaVersion"));
+  exactKeys(data, ContributionIntent.fields, "ContributionIntent", ContributionIntent.fields.filter((field) => !["schemaVersion", "automationGeneration"].includes(field)));
   const createdAt = asTimestamp(data.createdAt);
   const updatedAt = asTimestamp(data.updatedAt);
   if (updatedAt < createdAt) fail("out-of-order", "intent update precedes creation");
@@ -794,6 +1039,7 @@ export function makeContributionIntent(data) {
     state: asEnum(data.state, Object.keys(CONTRIBUTION_INTENT_TRANSITIONS)),
     createdAt,
     updatedAt,
+    ...(data.automationGeneration === undefined ? {} : { automationGeneration: optionalAutomationGeneration(data.automationGeneration) }),
   });
 }
 
@@ -807,7 +1053,7 @@ export function transitionContributionIntent(intent, nextState, now) {
 }
 
 export function makeProjectContributionLink(data) {
-  exactKeys(data, ProjectContributionLink.fields, "ProjectContributionLink", ProjectContributionLink.fields.filter((field) => field !== "schemaVersion"));
+  exactKeys(data, ProjectContributionLink.fields, "ProjectContributionLink", ProjectContributionLink.fields.filter((field) => !["schemaVersion", "automationGeneration"].includes(field)));
   return deepFreeze({
     schemaVersion: v3SchemaVersion(data.schemaVersion),
     contributionId: asOpaqueRandomId(data.contributionId),
@@ -818,11 +1064,12 @@ export function makeProjectContributionLink(data) {
     evidenceDomainId: asSha256Hex(data.evidenceDomainId),
     linkedAt: asTimestamp(data.linkedAt),
     state: asEnum(data.state, ["active", "revoked"]),
+    ...(data.automationGeneration === undefined ? {} : { automationGeneration: optionalAutomationGeneration(data.automationGeneration) }),
   });
 }
 
 export function makeGlobalContribution(data, options = {}) {
-  exactKeys(data, GlobalContribution.fields, "GlobalContribution", GlobalContribution.fields.filter((field) => field !== "schemaVersion"));
+  exactKeys(data, GlobalContribution.fields, "GlobalContribution", GlobalContribution.fields.filter((field) => !["schemaVersion", "automationGeneration"].includes(field)));
   const firstSeenDay = utcDay(data.firstSeenDay, "firstSeenDay");
   const lastSeenDay = utcDay(data.lastSeenDay, "lastSeenDay");
   const createdAt = asTimestamp(data.createdAt);
@@ -840,6 +1087,7 @@ export function makeGlobalContribution(data, options = {}) {
     lastSeenDay,
     createdAt,
     expiresAt,
+    ...(data.automationGeneration === undefined ? {} : { automationGeneration: optionalAutomationGeneration(data.automationGeneration) }),
   });
   assertGlobalIdentitySafe(contribution, options);
   return contribution;
@@ -848,8 +1096,14 @@ export function makeGlobalContribution(data, options = {}) {
 export function assertContributionPublicationBinding(intent, contribution, options = {}) {
   const localIntent = makeContributionIntent(intent);
   const globalContribution = makeGlobalContribution(contribution, options);
-  if (!["allocated", "published", "linked", "committed"].includes(localIntent.state)) fail("contribution-intent-not-publishable");
+  // Terminal states (revoked, failed-closed) retain their contribution binding:
+  // the contribution was allocated before terminalization, so the binding is
+  // still valid when validating a transaction that recovery settled to a
+  // terminal state. makeContributionIntent has already rejected any state
+  // outside the contribution-intent transition graph.
+  if (!["allocated", "published", "linked", "committed", "revoked", "failed-closed"].includes(localIntent.state)) fail("contribution-intent-not-publishable");
   if (localIntent.contributionId !== globalContribution.contributionId) fail("contribution-intent-mismatch");
+  if (localIntent.automationGeneration !== globalContribution.automationGeneration) fail("contribution-generation-mismatch");
   return true;
 }
 
@@ -922,7 +1176,7 @@ function supportIntegrity(value) {
 }
 
 export function makeGlobalSupportSet(data, options = {}) {
-  exactKeys(data, GlobalSupportSet.fields, "GlobalSupportSet", GlobalSupportSet.fields.filter((field) => !["schemaVersion", "supportSetHash"].includes(field)));
+  exactKeys(data, GlobalSupportSet.fields, "GlobalSupportSet", GlobalSupportSet.fields.filter((field) => !["schemaVersion", "supportSetHash", "automationGeneration"].includes(field)));
   const firstSeenDay = utcDay(data.firstSeenDay, "firstSeenDay");
   const lastSeenDay = utcDay(data.lastSeenDay, "lastSeenDay");
   const evaluatedAt = asTimestamp(data.evaluatedAt);
@@ -941,6 +1195,7 @@ export function makeGlobalSupportSet(data, options = {}) {
     lastSeenDay,
     evaluatedAt,
     expiresAt,
+    ...(data.automationGeneration === undefined ? {} : { automationGeneration: optionalAutomationGeneration(data.automationGeneration) }),
   };
   if (body.contributionIds.length === 0) fail("out-of-bounds", "support set needs at least one opaque contribution");
   const hashBody = { ...body };
@@ -988,7 +1243,7 @@ const GLOBAL_CANDIDATE_STATES = Object.freeze([
 ]);
 
 export function makeGlobalCandidate(data, options = {}) {
-  exactKeys(data, GlobalCandidate.fields, "GlobalCandidate", GlobalCandidate.fields.filter((field) => !["schemaVersion", "candidateId"].includes(field)));
+  exactKeys(data, GlobalCandidate.fields, "GlobalCandidate", GlobalCandidate.fields.filter((field) => !["schemaVersion", "candidateId", "automationGeneration"].includes(field)));
   const firstSeenDay = utcDay(data.firstSeenDay, "firstSeenDay");
   const lastSeenDay = utcDay(data.lastSeenDay, "lastSeenDay");
   const createdAt = asTimestamp(data.createdAt);
@@ -999,7 +1254,15 @@ export function makeGlobalCandidate(data, options = {}) {
   const receiptType = asEnum(data.receiptType, RECEIPT_TYPES);
   const signatureHash = asSha256Hex(data.signatureHash);
   const targetBindingHash = asSha256Hex(data.targetBindingHash);
-  const candidateId = sha256(`self-evolve-global-candidate-v1\n${canonicalize({ claimType, receiptType, signatureHash, targetBindingHash })}`);
+  const automationGeneration = optionalAutomationGeneration(data.automationGeneration);
+  const candidateIdentity = {
+    claimType,
+    receiptType,
+    signatureHash,
+    targetBindingHash,
+    ...(automationGeneration === undefined ? {} : { automationGeneration }),
+  };
+  const candidateId = sha256(`self-evolve-global-candidate-v1\n${canonicalize(candidateIdentity)}`);
   if (data.candidateId !== undefined && asSha256Hex(data.candidateId) !== candidateId) fail("candidate-id-mismatch");
   const state = asEnum(data.state, GLOBAL_CANDIDATE_STATES);
   const eligibilityRoute = data.eligibilityRoute === null ? null : asEnum(data.eligibilityRoute, ["single-domain", "distributed"]);
@@ -1022,6 +1285,7 @@ export function makeGlobalCandidate(data, options = {}) {
     lastSeenDay,
     createdAt,
     updatedAt,
+    ...(automationGeneration === undefined ? {} : { automationGeneration }),
   });
   assertGlobalIdentitySafe(candidate, options);
   return candidate;
@@ -1428,7 +1692,7 @@ const GLOBAL_ATTEMPT_TRANSITIONS = deepFreeze({
 });
 
 export function makeGlobalSynthesisAttempt(data, options = {}) {
-  exactKeys(data, GlobalSynthesisAttempt.fields, "GlobalSynthesisAttempt", GlobalSynthesisAttempt.fields.filter((field) => field !== "schemaVersion"));
+  exactKeys(data, GlobalSynthesisAttempt.fields, "GlobalSynthesisAttempt", GlobalSynthesisAttempt.fields.filter((field) => !["schemaVersion", "automationGeneration"].includes(field)));
   const admittedAt = asTimestamp(data.admittedAt);
   const updatedAt = asTimestamp(data.updatedAt);
   if (updatedAt < admittedAt) fail("out-of-order", "attempt update precedes admission");
@@ -1441,6 +1705,7 @@ export function makeGlobalSynthesisAttempt(data, options = {}) {
     state: asEnum(data.state, Object.keys(GLOBAL_ATTEMPT_TRANSITIONS)),
     admittedAt,
     updatedAt,
+    ...(data.automationGeneration === undefined ? {} : { automationGeneration: optionalAutomationGeneration(data.automationGeneration) }),
   });
   assertGlobalIdentitySafe(attempt, options);
   return attempt;
@@ -1714,7 +1979,7 @@ export function makeV3PurgeOperation(data) {
   const recommendationId = data.recommendationId === null ? null : asSha256Hex(data.recommendationId);
   if ((scope === "global-recommendation") !== (recommendationId !== null)) fail("purge-scope-mismatch");
   const confirmation = data.confirmation === null ? null : asNonEmptyString(data.confirmation, { max: 128 });
-  if (scope === "all" && confirmation !== "PURGE ALL SELF-EVOLVE 0.3.0") fail("purge-confirmation-mismatch");
+  if (scope === "all" && confirmation !== "PURGE ALL SELF-EVOLVE 0.4.0") fail("purge-confirmation-mismatch");
   if (scope !== "all" && confirmation !== null) fail("purge-confirmation-mismatch");
   const requestedAt = asTimestamp(data.requestedAt);
   const updatedAt = asTimestamp(data.updatedAt);
@@ -1760,6 +2025,30 @@ export function transitionV3PurgeOperation(operation, nextState, now) {
   return makeV3PurgeOperation({ ...current, state, updatedAt });
 }
 
+// Unified contribution-authority predicate: the single source of truth for the
+// three consent bits that govern cross-repo contribution publication. Reused at
+// contribution creation (privacy guard) and at crash recovery so a revoked bit
+// terminalizes pending transactions consistently. durableObservations is the
+// durable-evidence root; without it the other two bits cannot authorize a
+// global contribution, so all three are required.
+export function evaluateContributionConsentAuthority(consent) {
+  const current = makeConsentState(consent);
+  if (!current.durableObservations) return deepFreeze({ ok: false, reason: "observation-consent-required" });
+  if (!current.sanitizedExcerpts) return deepFreeze({ ok: false, reason: "sanitized-excerpts-consent-required" });
+  if (!current.crossRepoAggregation) return deepFreeze({ ok: false, reason: "cross-repo-consent-required" });
+  return deepFreeze({ ok: true });
+}
+
+// Contribution-authority version stamp: a stable fingerprint of exactly the
+// three contribution-governing consent bits (no settings updatedAt, so a mode or
+// budget change cannot masquerade as a consent revocation). Stored on each
+// ContributionIntent at allocation and compared at recovery to detect that a
+// required bit was revoked after the transaction was allocated.
+export function evaluateContributionConsentVersion(consent) {
+  const current = makeConsentState(consent);
+  return sha256(`self-evolve-contribution-consent-v2\n${current.durableObservations}\n${current.sanitizedExcerpts}\n${current.crossRepoAggregation}`);
+}
+
 export function evaluateV3ConsentTransition(previous, next) {
   const before = makeConsentState(previous);
   const after = makeConsentState(next);
@@ -1799,6 +2088,7 @@ export function makeEpisodeCursor(data) {
     lastIdleAt: asTimestamp(data.lastIdleAt ?? 0),
     lastObservedMessageHash: data.lastObservedMessageHash === undefined || data.lastObservedMessageHash === null ? null : asSha256Hex(data.lastObservedMessageHash),
     leaseNonce: data.leaseNonce === undefined || data.leaseNonce === null ? null : nonceString(data.leaseNonce),
+    ...(data.automationGeneration === undefined ? {} : { automationGeneration: optionalAutomationGeneration(data.automationGeneration) }),
   });
 }
 
@@ -1878,7 +2168,7 @@ function structuredObservationFields(value) {
 }
 
 export function makeObservation(data) {
-  const optionalLegacyFields = new Set(["sessionLineageHash", "rootLineageHash", "originKind"]);
+  const optionalLegacyFields = new Set(["sessionLineageHash", "rootLineageHash", "originKind", "automationGeneration"]);
   exactKeys(data, Observation.fields, "Observation", Observation.fields.filter((field) => !optionalLegacyFields.has(field)));
   return deepFreeze({
     id: asSha256Hex(data.id),
@@ -1892,6 +2182,7 @@ export function makeObservation(data) {
     createdAt: asTimestamp(data.createdAt),
     injectionFlagged: asBoolean(data.injectionFlagged, "injectionFlagged"),
     redacted: asBoolean(data.redacted, "redacted"),
+    ...(data.automationGeneration === undefined ? {} : { automationGeneration: optionalAutomationGeneration(data.automationGeneration) }),
   });
 }
 

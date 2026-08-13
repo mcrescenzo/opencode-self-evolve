@@ -967,149 +967,25 @@ test("TUI never invokes promptAsync or appendPrompt", async () => {
   await h.dispose();
 });
 
-test("registered native settings command creates strict filesystem controls without bridge injection", async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-controls-"));
-  const worktree = path.join(root, "worktree");
-  const skillRoot = path.join(root, "skills");
-  const secondRoot = path.join(root, "other-skills");
-  fs.mkdirSync(worktree, { recursive: true });
-  fs.mkdirSync(skillRoot, { recursive: true });
-  fs.mkdirSync(secondRoot, { recursive: true });
-  const projectFingerprint = projectFingerprintFor("", worktree);
-  const now = Date.now();
-  publishControlState(root, {
-    schemaVersion: BRIDGE_SCHEMA_VERSION,
-    projectFingerprint,
-    actor: "self-evolve-integration",
-    issuedAt: now,
-    expiresAt: now + 60_000,
-    settingsUpdatedAt: now,
-    settingsVersion: "9".repeat(64),
-    stateRootIdentity: stateRootIdentity(root),
-    nonce: "native-control-nonce",
-    mode: "manual",
-    effectiveMode: "manual",
-    allowedSkillRoots: [skillRoot],
-    consent: { passiveCalls: false, durableObservations: false, sanitizedExcerpts: true, crossRepoAggregation: false },
-    repoExcluded: false,
-  });
-  const h = harness({ kv: enabledKv(), clock: now });
-  delete h.api.__testMailboxClient;
-  h.api.state.path = { state: path.join(root, "host-default"), worktree, directory: worktree };
-  t.after(async () => {
-    await h.dispose();
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-  await SelfEvolveTuiPlugin(h.api, { selfEvolve: { stateRoot: root, idleDebounceMs: 0, mailboxPollMs: 25, serverTimeoutMs: 1 } });
-  const command = h.keymapLayers.flatMap((layer) => layer.commands ?? []).find((item) => item.name === "self-evolve.settings");
-  assert.equal(command.namespace, "palette");
-  assert.equal("slashName" in command, false);
-  assert.equal("slashAliases" in command, false);
-
-  async function settingsDialog() {
-    command.run();
-    await flush();
-    return h.selects.findLast((item) => item.title === "Self-evolve durable settings");
-  }
-
-  for (const mode of ["manual", "auto"]) {
-    (await settingsDialog()).onSelect({ value: "mode" });
-    const modeDialog = h.selects.at(-1);
-    modeDialog.onSelect(modeDialog.options.find((item) => item.value === mode));
-    h.confirms.at(-1).onConfirm();
-  }
-
-  // v0.3 offers no unattended mode in the native settings flow.
-  (await settingsDialog()).onSelect({ value: "mode" });
-  const modeOptions = h.selects.at(-1).options.map((item) => item.value);
-  assert.deepEqual(modeOptions, ["manual", "auto"]);
-
-  (await settingsDialog()).onSelect({ value: "allowlist" });
-  h.prompts.at(-1).onConfirm(secondRoot);
-  assert.match(h.confirms.at(-1).title, /Elevated allowlist/u);
-  h.confirms.at(-1).onConfirm();
-
-  for (const key of ["passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation"]) {
-    (await settingsDialog()).onSelect({ value: `consent:${key}` });
-    if (key === "sanitizedExcerpts" || key === "crossRepoAggregation") assert.match(h.confirms.at(-1).message, /not a secrecy guarantee/u);
-    h.confirms.at(-1).onConfirm();
-  }
-  (await settingsDialog()).onSelect({ value: "repo-excluded" });
-  h.confirms.at(-1).onConfirm();
-  await new Promise((resolve) => setTimeout(resolve, 20));
-
-  const requestDir = path.join(root, "self-evolve", "bridge", projectFingerprint, "control-requests");
-  const requests = fs.readdirSync(requestDir).map((name) => JSON.parse(fs.readFileSync(path.join(requestDir, name), "utf8")));
-  assert.equal(requests.length, 8);
-  assert.equal(requests.filter((item) => item.action === "set-mode").length, 2);
-  assert.equal(requests.filter((item) => item.action === "set-consent").length, 4);
-  assert.equal(requests.filter((item) => item.action === "update-allowlist").length, 1);
-  assert.equal(requests.filter((item) => item.action === "set-repo-excluded").length, 1);
-  assert.ok(requests.every((item) => item.projectFingerprint === projectFingerprint && item.nonce === "native-control-nonce"));
-  assert.equal(h.promptAsync.calls, 0);
-  assert.equal(h.appendPrompt.calls, 0);
-  assert.equal(h.api.client.selfEvolve, undefined);
+test("production TUI registers the persistent control center and no legacy control mailbox", () => {
+  const source = fs.readFileSync(new URL("../self-evolve-tui.tsx", import.meta.url), "utf8");
+  assert.match(source, /Self-evolve control center/u);
+  assert.match(source, /submitOperation\("set-automatic-recommendations"/u);
+  assert.match(source, /submitOperation\("set-permission"/u);
+  assert.doesNotMatch(source, /self-evolve\.settings|submitControl|control-requests/u);
 });
 
-test("TUI fails closed when the server root projection disagrees", async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-root-mismatch-"));
-  const worktree = path.join(root, "worktree");
-  fs.mkdirSync(worktree, { recursive: true });
-  const projectFingerprint = projectFingerprintFor("", worktree);
-  const now = Date.now();
-  publishControlState(root, {
-    schemaVersion: BRIDGE_SCHEMA_VERSION,
-    projectFingerprint,
-    actor: "self-evolve-integration",
-    issuedAt: now,
-    expiresAt: now + 60_000,
-    settingsUpdatedAt: now,
-    settingsVersion: "7".repeat(64),
-    stateRootIdentity: stateRootIdentity(path.join(root, "different-root")),
-    nonce: "root-mismatch",
-    mode: "auto",
-    effectiveMode: "auto",
-    allowedSkillRoots: [],
-    consent: { passiveCalls: true, durableObservations: true, sanitizedExcerpts: false, crossRepoAggregation: false },
-    repoExcluded: false,
-  });
-  const h = harness({ kv: enabledKv(), clock: now });
-  delete h.api.__testMailboxClient;
-  h.api.state.path = { state: root, worktree, directory: worktree };
-  t.after(async () => { await h.dispose(); fs.rmSync(root, { recursive: true, force: true }); });
-  await SelfEvolveTuiPlugin(h.api, { selfEvolve: { idleDebounceMs: 0, mailboxPollMs: 25 } });
-  h.event("self-evolve.proposal");
-  await flush();
-  assert.equal(h.selects.length, 0);
-  assert.match(h.alerts.at(-1).message, /state-root-projection-mismatch/u);
+test("production TUI keeps root and projection failures in its mounted read-only surface", () => {
+  const source = fs.readFileSync(new URL("../self-evolve-tui.tsx", import.meta.url), "utf8");
+  assert.match(source, /Read-only stale context remains available/u);
+  assert.doesNotMatch(source, /DialogAlert|toast\(/u);
 });
 
-test("native cross-repository consent refuses enablement until excerpts are enabled", async () => {
-  const now = Date.now();
-  const state = {
-    schemaVersion: BRIDGE_SCHEMA_VERSION,
-    projectFingerprint: "c".repeat(64),
-    actor: "self-evolve-integration",
-    issuedAt: now,
-    expiresAt: now + 60_000,
-    settingsUpdatedAt: now,
-    settingsVersion: "8".repeat(64),
-    stateRootIdentity: stateRootIdentity("/state"),
-    nonce: "control-consent",
-    mode: "manual",
-    effectiveMode: "manual",
-    allowedSkillRoots: [],
-    consent: { passiveCalls: false, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false },
-    repoExcluded: false,
-  };
-  const h = harness({ kv: enabledKv(), clock: now, controlState: state });
-  await SelfEvolveTuiPlugin(h.api);
-  h.keymapLayers[0].commands[0].run();
-  await flush();
-  h.selects.findLast((item) => item.title === "Self-evolve durable settings").onSelect({ value: "consent:crossRepoAggregation" });
-  assert.match(h.alerts.at(-1).message, /Enable sanitized excerpts/u);
-  assert.equal(h.controls.length, 0);
-  await h.dispose();
+test("native permission changes use only the current strict operation envelope", () => {
+  const source = fs.readFileSync(new URL("../self-evolve-tui.tsx", import.meta.url), "utf8");
+  assert.match(source, /Consent disclosure/u);
+  assert.match(source, /submitOperation\("set-permission", \{ permission: key, enabled: true \}\)/u);
+  assert.doesNotMatch(source, /passiveCalls/u);
 });
 
 test("production TUI client resolves real state-root and worktree inputs without bridge injection", async (t) => {

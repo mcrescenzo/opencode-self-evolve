@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createPrivacyGuard } from "../self-evolve-privacy.js";
-import { makeEvidenceCluster, makeGlobalSettings, wrapRecord } from "../self-evolve-schemas.js";
+import { makeEvidenceCluster, wrapRecord } from "../self-evolve-schemas.js";
 import { hashContent, openStore } from "../self-evolve-store.js";
 
 const PROJECT = "a".repeat(64);
@@ -48,11 +48,6 @@ function runChild(root, input, faultPoint = "", storeOptions = {}) {
 
 function seed(root, incidentId = "process-incident", clusterId = CLUSTER) {
   const store = openStore(root, { projectFingerprint: PROJECT, now: () => NOW, staleLockMs: 1 });
-  assert.equal(store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: true, sanitizedExcerpts: true, crossRepoAggregation: true },
-    updatedAt: NOW,
-  })).ok, true);
   const privacy = createPrivacyGuard({ projectFingerprint: PROJECT, store, now: () => NOW });
   const capsule = privacy.createEvidenceCapsule({
     incidentId,

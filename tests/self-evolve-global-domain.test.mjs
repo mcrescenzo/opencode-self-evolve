@@ -26,6 +26,7 @@ function runDecisionChild(f, point, {
   readyPath = "none",
   releasePath = "none",
   storeOptions = {},
+  clockStart = NOW,
 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [
@@ -35,10 +36,11 @@ function runDecisionChild(f, point, {
       JSON.stringify(decision),
       action,
       point,
-      String(NOW),
+      String(clockStart),
       readyPath,
       releasePath,
       JSON.stringify(storeOptions),
+      JSON.stringify(f.policy),
     ], { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -52,7 +54,10 @@ function runDecisionChild(f, point, {
         return;
       }
       if (code !== 0) reject(new Error(`child-exit-${code}:${signal}:${stderr}`));
-      else resolve(JSON.parse(stdout));
+      else {
+        try { resolve(JSON.parse(stdout)); }
+        catch (error) { reject(new Error(`child-invalid-json:${error.message}:stdout=${stdout}:stderr=${stderr}`)); }
+      }
     });
   });
 }
@@ -108,6 +113,7 @@ function fixture(t, {
     faultInjection,
   });
   t.after(() => store.close());
+  const automationStamp = store.getAutomationState().stamp;
   const approvedRoot = schemas.makeApprovedGlobalRoot({
     canonicalPath: skillRoot,
     canUpdate: true,
@@ -122,18 +128,6 @@ function fixture(t, {
     selectedBy: "operator",
     updatedAt: NOW,
   });
-  assert.equal(store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    mode,
-    globalRootPolicy: policy,
-    consent: {
-      ...global.consent,
-      durableObservations: true,
-      sanitizedExcerpts: true,
-      crossRepoAggregation: true,
-    },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
   const catalog = inventory.buildGlobalSkillCatalog(policy);
   const candidateResolution = inventory.resolveGlobalSkillCandidate(
     targetKind === "new-global-skill" ? null : "durable-review",
@@ -170,6 +164,7 @@ function fixture(t, {
       createdAt: NOW,
       injectionFlagged: false,
       redacted: true,
+      automationGeneration: automationStamp.generation,
     });
     const cluster = schemas.makeEvidenceCluster({
       id: clusterId,
@@ -190,10 +185,11 @@ function fixture(t, {
       summary: "A deterministic global-domain failure repeated during verification.",
       createdAt: NOW,
       expiresAt: NOW + 30 * DAY,
+      automationGeneration: automationStamp.generation,
     });
-    assert.equal(store.appendRecord(schemas.wrapRecord("observation", observation, NOW)).ok, true);
-    assert.equal(store.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, NOW)).ok, true);
-    assert.equal(store.appendEvidenceCapsule(capsule).ok, true);
+    assert.equal(store.appendRecord(schemas.wrapRecord("observation", observation, NOW), { automationStamp }).ok, true);
+    assert.equal(store.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, NOW), { automationStamp }).ok, true);
+    assert.equal(store.appendEvidenceCapsule(capsule, { automationStamp }).ok, true);
     const published = store.publishContribution({
       claimType: "global-skill-candidate",
       receiptType: cluster.receiptType,
@@ -205,7 +201,7 @@ function fixture(t, {
       occurrenceCount: index === 0 ? 2 : 1,
       firstSeenAt: NOW,
       lastSeenAt: NOW,
-    });
+    }, { automationStamp });
     assert.equal(published.ok, true, published.reason);
     contributionIds.push(published.contribution.contributionId);
   }
@@ -224,6 +220,7 @@ function fixture(t, {
     lastSeenDay: "2026-08-10",
     createdAt: NOW,
     updatedAt: NOW,
+    automationGeneration: automationStamp.generation,
   });
   const support = schemas.makeGlobalSupportSet({
     candidateId: preliminary.candidateId,
@@ -251,6 +248,7 @@ function fixture(t, {
     lastSeenDay: "2026-08-10",
     evaluatedAt: NOW,
     expiresAt: NOW + 30 * DAY,
+    automationGeneration: automationStamp.generation,
   });
   const candidate = schemas.makeGlobalCandidate({ ...preliminary, supportSetHash: support.supportSetHash });
   const targetBinding = schemas.makeRecommendationTargetBinding({
@@ -299,6 +297,7 @@ function fixture(t, {
     store,
     inventory,
     now: () => ++clock,
+    getCatalog: () => inventory.buildGlobalSkillCatalog(policy),
     getSuppressors: () => ({ ...suppressors }),
     forbiddenIdentityValues,
     faultInjection,
@@ -344,9 +343,37 @@ function constrainedDomain(t, f, options, { clockStart = NOW } = {}) {
     store,
     inventory,
     now: () => ++clock,
+    getCatalog: () => inventory.buildGlobalSkillCatalog(f.policy),
     getSuppressors: () => ({ circuitBreakerOpen: false, emergencyStop: false }),
   });
   return { store, domain };
+}
+
+function transitionPermission(f, permission, enabled, transitionId) {
+  const current = f.store.getAutomationState();
+  assert.equal(current.ok, true, current.reason);
+  const result = f.store.transitionAutomation({
+    transitionId,
+    expectedGeneration: current.epoch.generation,
+    action: "set-permission",
+    permission,
+    enabled,
+  });
+  assert.equal(result.ok, true, result.reason);
+  return result;
+}
+
+function transitionEmergencyStop(f, enabled, transitionId) {
+  const current = f.store.getAutomationState();
+  assert.equal(current.ok, true, current.reason);
+  const result = f.store.transitionAutomation({
+    transitionId,
+    expectedGeneration: current.epoch.generation,
+    action: "set-emergency-stop",
+    enabled,
+  });
+  assert.equal(result.ok, true, result.reason);
+  return result;
 }
 
 function rejectDecision(f, nonce = "explicit-global-reject") {
@@ -841,11 +868,7 @@ test("stale decision bindings, revoked consent, support expiry, target drift, an
   });
   await t.test("consent", async (t) => {
     const f = fixture(t);
-    assert.equal(f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-      ...global,
-      consent: { ...global.consent, crossRepoAggregation: false },
-      updatedAt: global.updatedAt + 1,
-    })).ok, true);
+    transitionPermission(f, "crossRepoAggregation", false, "domain-revoke-consent");
     const result = await f.domain.decide({ action: "apply", decision: f.decision });
     assert.equal(result.reason, "global-apply-consent-required");
     assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
@@ -874,11 +897,7 @@ test("stale decision bindings, revoked consent, support expiry, target drift, an
   });
   await t.test("kill switch", async (t) => {
     const f = fixture(t);
-    assert.equal(f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-      ...global,
-      killSwitchActive: true,
-      updatedAt: global.updatedAt + 1,
-    })).ok, true);
+    transitionEmergencyStop(f, true, "domain-enable-emergency-stop");
     const result = await f.domain.decide({ action: "apply", decision: f.decision });
     assert.equal(result.reason, "kill-switch");
     assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
@@ -1351,25 +1370,10 @@ test("the final prepublication guard rejects path, authority, suppressor, and le
       return () => assert.equal(fs.readFileSync(outside, "utf8"), CURRENT);
     }],
     ["consent revocation", (f) => {
-      assert.equal(f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-        ...global,
-        consent: { ...global.consent, crossRepoAggregation: false },
-        updatedAt: global.updatedAt + 1,
-      })).ok, true);
-    }],
-    ["pause", (f) => {
-      assert.equal(f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-        ...global,
-        paused: true,
-        updatedAt: global.updatedAt + 1,
-      })).ok, true);
+      transitionPermission(f, "crossRepoAggregation", false, "guard-revoke-consent");
     }],
     ["kill switch", (f) => {
-      assert.equal(f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-        ...global,
-        killSwitchActive: true,
-        updatedAt: global.updatedAt + 1,
-      })).ok, true);
+      transitionEmergencyStop(f, true, "guard-enable-emergency-stop");
     }],
     ["circuit breaker", (f) => { f.setSuppressors({ circuitBreakerOpen: true }); }],
     ["emergency stop", (f) => { f.setSuppressors({ emergencyStop: true }); }],
@@ -1403,12 +1407,7 @@ test("consent revocation after prepublication proof rolls back and leaves no sta
   f = fixture(t, {
     faultInjection(point) {
       if (point !== "global-apply-after-temp-reproof") return;
-      const revoked = f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-        ...global,
-        consent: { ...global.consent, crossRepoAggregation: false },
-        updatedAt: global.updatedAt + 1,
-      }));
-      assert.equal(revoked.ok, true, revoked.reason);
+      transitionPermission(f, "crossRepoAggregation", false, "after-reproof-revoke-consent");
     },
   });
 
@@ -1423,24 +1422,12 @@ test("consent revocation after prepublication proof rolls back and leaves no sta
 
 test("revoked consent keeps a recommendation visible exportable and rejectable but not applicable", async (t) => {
   const f = fixture(t);
-  const revoked = f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: false, crossRepoAggregation: false },
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(revoked.ok, true, revoked.reason);
-  assert.equal(revoked.invalidatedGlobalRecommendations, 1);
-  const superseded = f.store.readGlobalRecommendations()[0];
-  assert.equal(superseded.state, "superseded");
-  const reenabled = f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: true, sanitizedExcerpts: true, crossRepoAggregation: true },
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(reenabled.ok, true, reenabled.reason);
+  transitionPermission(f, "crossRepoAggregation", false, "visible-revoke-consent");
+  const pending = f.store.readGlobalRecommendations()[0];
+  assert.equal(pending.state, "pending");
   const denied = await f.domain.decide({ action: "apply", decision: f.decision });
   assert.equal(denied.ok, false);
-  assert.match(denied.reason, /support|stale/u);
+  assert.equal(denied.reason, "global-apply-consent-required");
   const privacy = createPrivacyGuard({
     projectFingerprint: PROJECT,
     store: f.store,
@@ -1448,19 +1435,19 @@ test("revoked consent keeps a recommendation visible exportable and rejectable b
   });
   const archive = privacy.exportAll();
   assert.equal(archive.global.recommendations.some((item) => item.recommendationId === f.recommendation.recommendationId), true);
-  assert.equal(f.store.readGlobalRecommendations()[0].state, "superseded");
+  assert.equal(f.store.readGlobalRecommendations()[0].state, "pending");
   const rejected = f.store.rejectGlobalRecommendation({
     decision: schemas.makeGlobalDecision({
-      recommendationId: superseded.recommendationId,
-      supportSetHash: superseded.supportSetHash,
-      targetBindingHash: superseded.targetBinding.bindingHash,
-      targetHash: superseded.targetBinding.currentHash,
-      proposedContentHash: superseded.proposedContentHash,
-      decisionVersion: superseded.decisionVersion + 1,
+      recommendationId: pending.recommendationId,
+      supportSetHash: pending.supportSetHash,
+      targetBindingHash: pending.targetBinding.bindingHash,
+      targetHash: pending.targetBinding.currentHash,
+      proposedContentHash: pending.proposedContentHash,
+      decisionVersion: pending.decisionVersion + 1,
       actorRole: "operator",
       timestamp: NOW + 1,
       nonce: "reject-revoked-superseded",
-      priorState: "superseded",
+      priorState: "pending",
       newState: "rejected",
     }),
     nowMs: NOW + 1,
@@ -1473,12 +1460,7 @@ test("consent revocation preserves explicit Undo authority for an applied rollba
   const f = fixture(t);
   assert.equal((await f.domain.decide({ action: "apply", decision: f.decision })).ok, true);
   const applied = f.store.readGlobalRecommendations()[0];
-  const revoked = f.store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false },
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(revoked.ok, true, revoked.reason);
+  transitionPermission(f, "crossRepoAggregation", false, "undo-revoke-consent");
   assert.equal(f.store.readGlobalRecommendations()[0].state, "applied");
   const undo = schemas.makeGlobalDecision({
     recommendationId: applied.recommendationId,
@@ -2031,4 +2013,386 @@ test("a process killed inside every publication rollback converges to one termin
       assert.equal(first.length <= 1, true);
     });
   }
+});
+
+// H9-001: power-loss durability across the FULL decision journal. Each test
+// simulates SIGKILL after one `journal-*` stage is namespace-durable and proves
+// the two acceptance invariants: (1) no surviving target mutation lacks the
+// intent/snapshot/audit/rollback evidence required for recovery or Undo, and
+// (2) no durable journal overstates effects (a succeeded outcome implies the
+// target effect is durable; no outcome implies the recommendation is not
+// "applied"). The `journal-*` points fire immediately after each stage's
+// durable namespace commit (file fsync + parent-directory fsync), modeling the
+// strongest possible "loss after this stage" boundary.
+test("H9-001: loss after each journal/effect stage converges to one verified existing-skill Apply outcome", async (t) => {
+  const points = [
+    "journal-after-intent",
+    "journal-after-recommendation-cas",
+    "journal-after-decision-record",
+    "journal-after-intent-commit",
+    "journal-after-snapshot",
+    "journal-after-snapshot-intent",
+    "journal-after-intent-transition",
+    "journal-after-target-publication",
+    "journal-after-publication-commit",
+    "journal-after-outcome-recommendation-cas",
+    "journal-after-outcome-decision",
+    "journal-after-outcome-audit",
+    "journal-after-outcome-record",
+    "journal-after-outcome-intent",
+  ];
+  for (const point of points) {
+    await t.test(point, async (t) => {
+      const f = fixture(t);
+      await runDecisionChild(f, point, { expectSignal: "SIGKILL" });
+      f.setClock(NOW + 10 * 60 * 1000);
+
+      const recovered = await f.domain.recover();
+      if (recovered.length === 0) recovered.push(await f.domain.decide({ action: "apply", decision: f.decision }));
+
+      assert.equal(recovered.length, 1);
+      assert.equal(recovered[0].ok, true, `${point}: ${recovered[0].reason}`);
+      // Invariant 2: a succeeded outcome must imply a durable target effect.
+      assert.equal(fs.readFileSync(f.target, "utf8"), PROPOSED, `${point}: target must reflect the applied effect`);
+      assert.equal(f.store.readGlobalRecommendations()[0].state, "applied");
+      // Invariant 1: the surviving target carries its full evidence chain.
+      assert.equal(f.store.readGlobalDecisionOutcomes().length, 1);
+      assert.equal(f.store.readGlobalDecisionOutcomes()[0].state, "succeeded");
+      assert.equal(f.store.readGlobalSkillSnapshots().length, 1, `${point}: existing-skill snapshot evidence must survive`);
+      assert.equal(f.store.readGlobalAudits().filter((audit) => audit.kind === "apply").length, 1);
+      assert.equal(f.store.readGlobalApplyIntents()[0].state, "completed");
+      assert.deepEqual(fs.readdirSync(path.dirname(f.target)).filter((name) => name.includes("self-evolve-tmp")), []);
+    });
+  }
+});
+
+test("H9-001: loss after each new-skill Apply journal/effect stage converges with evidence", async (t) => {
+  // New-skill Apply has no snapshot and adds the temp-unlink boundary; the
+  // shared admission and outcome points are covered alongside the new-skill
+  // publication/temp-unlink/directory-creation boundaries.
+  const points = [
+    "journal-after-intent",
+    "journal-after-intent-commit",
+    "journal-after-intent-transition",
+    "journal-after-target-publication",
+    "journal-after-temp-unlink",
+    "journal-after-publication-commit",
+    "journal-after-outcome-record",
+    "journal-after-outcome-intent",
+  ];
+  for (const point of points) {
+    await t.test(point, async (t) => {
+      const f = fixture(t, { targetKind: "new-global-skill" });
+      await runDecisionChild(f, point, { expectSignal: "SIGKILL" });
+      f.setClock(NOW + 10 * 60 * 1000);
+      const recovered = await f.domain.recover();
+      // When the crash landed after the terminal journal stage the decision had
+      // already completed in the child; recovery has nothing to resume and the
+      // durable journal already carries the succeeded outcome.
+      if (recovered.length === 0) recovered.push(await f.domain.decide({ action: "apply", decision: f.decision }));
+      assert.equal(recovered[0].ok, true, `${point}: ${recovered[0].reason}`);
+      assert.equal(fs.readFileSync(f.target, "utf8"), PROPOSED);
+      assert.equal(f.store.readGlobalApplyIntents()[0].state, "completed");
+      assert.equal(f.store.readGlobalDecisionOutcomes().length, 1);
+      assert.equal(f.store.readGlobalDecisionOutcomes()[0].state, "succeeded");
+      assert.deepEqual(fs.readdirSync(f.skillRoot).filter((name) => name.startsWith(".self-evolve-owner-")), []);
+    });
+  }
+});
+
+test("H9-001: loss after each Undo journal/effect stage converges without an overclaiming journal", async (t) => {
+  for (const targetKind of ["existing-global-skill", "new-global-skill"]) {
+    await t.test(`${targetKind} Undo`, async (t) => {
+      const f = fixture(t, { targetKind });
+      assert.equal((await f.domain.decide({ action: "apply", decision: f.decision })).ok, true);
+      const applied = f.store.readGlobalRecommendations()[0];
+      const undoDecision = schemas.makeGlobalDecision({
+        recommendationId: applied.recommendationId,
+        supportSetHash: applied.supportSetHash,
+        targetBindingHash: applied.targetBinding.bindingHash,
+        targetHash: applied.proposedContentHash,
+        proposedContentHash: applied.proposedContentHash,
+        decisionVersion: applied.decisionVersion + 1,
+        actorRole: "operator",
+        timestamp: NOW,
+        nonce: `h9-undo-${targetKind}`,
+        priorState: "applied",
+        newState: "undo-approved",
+      });
+      // `journal-after-target-publication` for Undo is the moment the rolled
+      // back bytes (existing) or the target removal (new-skill) is durable.
+      await runDecisionChild(f, "journal-after-target-publication", { action: "undo", decision: undoDecision, expectSignal: "SIGKILL" });
+      f.setClock(NOW + 20 * 60 * 1000);
+      const [recovered] = await f.domain.recover();
+      assert.equal(recovered.ok, true, recovered.reason);
+      // Invariant 1 + 2 for Undo: a rolled-back recommendation must not leave a
+      // surviving applied target, and the outcome must record the rolled-back state.
+      assert.equal(f.store.readGlobalRecommendations()[0].state, "rolled-back");
+      assert.equal(fs.existsSync(f.target), targetKind === "existing-global-skill");
+      if (targetKind === "existing-global-skill") assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
+      assert.equal(f.store.readGlobalDecisionOutcomes().length, 2);
+      assert.equal(f.store.readGlobalApplyIntents().every((intent) => intent.state === "completed"), true);
+    });
+  }
+});
+
+test("H9-001: loss inside an Apply rollback leaves the durable journal consistent with the durable effect", async (t) => {
+  // A publication failure followed by loss inside the rollback reaches the
+  // `journal-after-rollback-effect` boundary on the existing-skill rename path:
+  // the rolled-back bytes are namespace-durable, so the later failed outcome
+  // must not claim a surviving applied effect. (The new-skill rollback unlink
+  // boundary is gated by a target-identity assert that is covered by the
+  // dedicated rollback-crash suite above.)
+  const targetKind = "existing-global-skill";
+  await t.test(targetKind, async (t) => {
+    const f = fixture(t, { targetKind });
+    const point = "throw:global-apply-after-publication+kill:journal-after-rollback-effect";
+    await runDecisionChild(f, point, { expectSignal: "SIGKILL" });
+    f.setClock(NOW + 20 * 60 * 1000);
+    await f.domain.recover();
+    f.setClock(NOW + 30 * 60 * 1000);
+    assert.deepEqual(await f.domain.recover(), [], "recovery must be idempotent after a durable rollback");
+    const outcomes = f.store.readGlobalDecisionOutcomes();
+    const finalOutcome = outcomes[outcomes.length - 1];
+    assert.equal(finalOutcome.state === "failed-closed" || finalOutcome.state === "succeeded", true);
+    // Invariant 2: a failed-closed outcome must not coexist with a surviving
+    // applied target; a succeeded outcome must.
+    if (finalOutcome.state === "failed-closed") {
+      assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
+    } else {
+      assert.equal(fs.readFileSync(f.target, "utf8"), PROPOSED);
+    }
+  });
+});
+
+test("H9-001: unsupported directory-fsync capability fail-closes Apply/Undo and authoritative writes while preserving reads", async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.domain.decide({ action: "apply", decision: f.decision })).ok, true);
+  f.store.close();
+
+  // Reopen the populated partition on a host whose directory-fsync path throws.
+  // The capability probe fails once at open and records the stable reason.
+  const unsupported = () => { throw Object.assign(new Error("EINVAL"), { code: "EINVAL" }); };
+  let clock = NOW + 1_000;
+  const readOnlyStore = openStore(path.join(f.root, "state"), {
+    projectFingerprint: PROJECT,
+    now: () => ++clock,
+    staleLockMs: 1,
+    filesystemSyncDirectory: unsupported,
+  });
+  t.after(() => readOnlyStore.close());
+  assert.equal(readOnlyStore.durableCapability.available, false);
+  assert.equal(readOnlyStore.durableCapability.reason, "directory-fsync-unavailable");
+
+  // Read-only analysis remains available: settings, recommendations, outcomes,
+  // and audits are all readable from the already-durable partition.
+  assert.equal(readOnlyStore.getSettings().global.mode, "manual");
+  assert.equal(readOnlyStore.readGlobalRecommendations().length, 1);
+  assert.equal(readOnlyStore.readGlobalRecommendations()[0].state, "applied");
+  assert.equal(readOnlyStore.readGlobalDecisionOutcomes().length, 1);
+  assert.equal(readOnlyStore.readGlobalAudits().some((audit) => audit.kind === "apply"), true);
+
+  // Authoritative store writes fail closed with the stable reason.
+  const writeResult = readOnlyStore.updateGlobalSettings((settings) => schemas.makeGlobalSettings({
+    ...settings,
+    updatedAt: settings.updatedAt + 1,
+  }));
+  assert.equal(writeResult.ok, false);
+  assert.equal(writeResult.reason, "directory-fsync-unavailable");
+
+  // The applier fail-closes Apply/Undo before any skill filesystem effect, with
+  // the same stable reason, so no surviving target mutation can outlive its
+  // journal evidence on the unsupported host.
+  const readOnlyDomain = createGlobalDecisionDomain({
+    store: readOnlyStore,
+    inventory,
+    now: () => ++clock,
+    getSuppressors: () => ({ circuitBreakerOpen: false, emergencyStop: false }),
+  });
+  const undoDecision = schemas.makeGlobalDecision({
+    recommendationId: f.recommendation.recommendationId,
+    supportSetHash: f.recommendation.supportSetHash,
+    targetBindingHash: f.recommendation.targetBinding.bindingHash,
+    targetHash: f.recommendation.proposedContentHash,
+    proposedContentHash: f.recommendation.proposedContentHash,
+    decisionVersion: f.recommendation.decisionVersion + 1,
+    actorRole: "operator",
+    timestamp: NOW,
+    nonce: "h9-unsupported-undo",
+    priorState: "applied",
+    newState: "undo-approved",
+  });
+  const undoResult = await readOnlyDomain.decide({ action: "undo", decision: undoDecision });
+  assert.equal(undoResult.ok, false);
+  assert.equal(undoResult.reason, "directory-fsync-unavailable");
+  // The applied target is untouched: the applier never reached the rename/unlink.
+  assert.equal(fs.readFileSync(f.target, "utf8"), PROPOSED);
+  // A fresh Apply attempt on the already-completed edge returns the persisted
+  // outcome without invoking any write path (read-only fast path).
+  const reapplied = await readOnlyDomain.decide({ action: "apply", decision: f.decision });
+  assert.equal(reapplied.ok, true);
+  assert.equal(reapplied.outcome.state, "succeeded");
+});
+
+// H10-001: immutable request/consumer deadlines carried into durable decision
+// admission. A request that expired after consumption but before admission
+// cannot drive a durable decision; the real deadline is compared without
+// clamping. The controlled clock crosses expiry in the window between lease
+// acquire (consume) and durable admission (begin decision).
+test("an expired request deadline is refused at durable admission without clamping (H10-001)", async (t) => {
+  for (const [label, deadlineOpt] of [
+    ["request deadline", { requestDeadline: NOW + 5 }],
+    ["consumer deadline", { consumerDeadline: NOW + 5 }],
+  ]) {
+    await t.test(label, async (t) => {
+      let armed = false;
+      const f = fixture(t, {
+        faultInjection(point) {
+          // Cross expiry between consume (lease acquire) and durable admission.
+          if (point === "global-decision-before-admission") {
+            f.setClock(NOW + 60_000);
+            armed = true;
+          }
+        },
+      });
+      const result = await f.domain.decide({ action: "apply", decision: f.decision, ...deadlineOpt });
+      assert.equal(armed, true);
+      assert.equal(result.ok, false);
+      assert.match(result.reason, /request-expired|consumer-claim-expired/u);
+      assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
+      assert.equal(f.store.readGlobalApplyIntents().length, 0);
+      assert.equal(f.store.readGlobalAudits().some((a) => a.kind === "apply"), false);
+      assert.equal(f.store.readGlobalRecommendations()[0].state, "pending");
+    });
+  }
+});
+
+test("valid request and consumer deadlines are admitted and apply once (H10-001 positive)", async (t) => {
+  const f = fixture(t);
+  const result = await f.domain.decide({
+    action: "apply",
+    decision: f.decision,
+    requestDeadline: NOW + 60 * 60 * 1000,
+    consumerDeadline: NOW + 60 * 60 * 1000,
+  });
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(fs.readFileSync(f.target, "utf8"), PROPOSED);
+  assert.equal(f.store.readGlobalDecisionOutcomes().length, 1);
+});
+
+test("a deadline that expires between consume and admission is caught only at admission (H10-001 window)", async (t) => {
+  let acquireSeen = false;
+  const f = fixture(t, {
+    faultInjection(point) {
+      if (point === "global-decision-after-intent") acquireSeen = true;
+      if (point === "global-decision-before-admission") f.setClock(NOW + 60_000);
+    },
+  });
+  // requestDeadline is valid at the lease-acquire (consume) timestamp but
+  // expired by the admission timestamp; only admission refuses.
+  const result = await f.domain.decide({
+    action: "apply",
+    decision: f.decision,
+    requestDeadline: NOW + 30_000,
+  });
+  assert.equal(acquireSeen, false);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "global-request-expired");
+  assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
+});
+
+// H9-002: a target lease that expires after final validation but before
+// mutation is renewed/fenced immediately adjacent to the filesystem effect. The
+// controlled clock crosses the lease TTL between reproof and the renewal fence,
+// proving NO late authority survives to the rename/link/unlink.
+test("a target lease expired between final proof and mutation is refused at the fence (H9-002)", async (t) => {
+  let reproofSeen = false;
+  const f = fixture(t, {
+    faultInjection(point) {
+      if (point === "global-apply-after-temp-reproof") {
+        reproofSeen = true;
+        // Advance past the target-write lease TTL (CLAIM_TTL_MS = 5 min).
+        f.setClock(NOW + 10 * 60 * 1000);
+      }
+    },
+  });
+  const result = await f.domain.decide({ action: "apply", decision: f.decision });
+  assert.equal(reproofSeen, true);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /global-target-lease-invalid/u);
+  assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
+  assert.equal(f.store.readGlobalAudits().some((a) => a.kind === "apply"), false);
+  assert.notEqual(f.store.readGlobalRecommendations()[0].state, "applied");
+});
+
+// H9-002 two-process: process A acquires the lease and passes final proof, then
+// its lease expires. Process B acquires the expired lease and settles. When A
+// resumes it must be rejected as a stale owner before any effect; only B mutates.
+test("a stale owner cannot mutate after a peer acquires the expired lease (H9-002 two-process)", async (t) => {
+  const f = fixture(t);
+  const readyPath = path.join(f.root, "A-ready");
+  const releasePath = path.join(f.root, "A-release");
+  // Process A: acquire lease, reach final reproof, and hold BEFORE the renewal
+  // fence and mutation.
+  const aChild = runDecisionChild(f, "hold-after-reproof", {
+    readyPath,
+    releasePath,
+  });
+  await waitForFile(readyPath);
+  // A is holding pre-mutation. Advance the test clock and run B with a clock
+  // past A's lease TTL so B may acquire the expired lease and settle.
+  f.setClock(NOW + 10 * 60 * 1000);
+  const bResult = await runDecisionChild(f, "none", {
+    decision: f.decision,
+    clockStart: NOW + 10 * 60 * 1000,
+  });
+  assert.equal(bResult.ok, true, bResult.reason);
+  assert.equal(fs.readFileSync(f.target, "utf8"), PROPOSED);
+  // Release A. A resumes and must fail closed at the renewal fence (B owns).
+  fs.writeFileSync(releasePath, "release");
+  const aResult = await aChild;
+  assert.equal(aResult.ok, false);
+  assert.match(aResult.reason, /lease|target/u);
+  // Only B mutated and settled; A produced no second mutation, audit, or outcome.
+  assert.equal(fs.readFileSync(f.target, "utf8"), PROPOSED);
+  assert.equal(f.store.readGlobalDecisionOutcomes().length, 1);
+  assert.equal(f.store.readGlobalDecisionOutcomes()[0].state, "succeeded");
+  assert.equal(f.store.readGlobalApplyIntents()[0].state, "completed");
+  assert.equal(f.store.readGlobalAudits().filter((a) => a.kind === "apply").length, 1);
+});
+
+test("lease renewal rotates the authorizing generation and rejects a non-owner (H9-002 renew contract)", async (t) => {
+  const f = fixture(t);
+  const leaseKeyHash = schemas.globalTargetLeaseKey(f.recommendation.targetBinding);
+  const acquired = f.store.acquireGlobalLease({ leaseKind: "target-write", leaseKeyHash, ttlMs: 60_000 });
+  assert.equal(acquired.ok, true, acquired.reason);
+  const renewed = f.store.renewGlobalLease({
+    leaseKeyHash,
+    ownerToken: acquired.lease.ownerToken,
+    nowMs: NOW + 1_000,
+    ttlMs: 60_000,
+  });
+  assert.equal(renewed.ok, true, renewed.reason);
+  assert.notEqual(renewed.lease.ownerToken, acquired.lease.ownerToken);
+  assert.equal(renewed.lease.leaseId, acquired.lease.leaseId);
+  assert.equal(renewed.lease.expiresAt, NOW + 1_000 + 60_000);
+  // The prior generation (old ownerToken) is no longer authoritative.
+  const stale = f.store.renewGlobalLease({
+    leaseKeyHash,
+    ownerToken: acquired.lease.ownerToken,
+    nowMs: NOW + 2_000,
+    ttlMs: 60_000,
+  });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.reason, "global-target-lease-invalid");
+  // A non-owner is likewise rejected before any effect.
+  const foreign = f.store.renewGlobalLease({
+    leaseKeyHash,
+    ownerToken: "not-the-owner",
+    nowMs: NOW + 3_000,
+    ttlMs: 60_000,
+  });
+  assert.equal(foreign.ok, false);
+  assert.equal(foreign.reason, "global-target-lease-invalid");
+  assert.equal(f.store.releaseGlobalLease({ leaseKeyHash, ownerToken: renewed.lease.ownerToken, nowMs: NOW + 4_000 }).ok, true);
 });

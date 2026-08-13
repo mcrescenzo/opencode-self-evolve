@@ -1,5 +1,5 @@
 # ADR-0001: Global-Only Autonomous Targets
 
-**Status:** Accepted for v0.3.
+**Status:** Superseded for existing-skill discovery by [ADR-0006](0006-host-authoritative-existing-skill-discovery.md); retained for explicit new-skill creation.
 
-Autonomous inventory and writes target only exact operator-approved global skill-collection roots. Existing skills require an update-capable approved root; new skills require the one explicit primary creation root and `must-not-exist` publication semantics. Project-local `.opencode/skills` remain outside autonomous target scope. This sacrifices repository-specific autonomous edits in exchange for one reusable global skill catalog, deterministic root authority, and no model-selected filesystem destination.
+In v0.3, autonomous inventory and writes targeted only exact operator-approved global skill-collection roots. v0.4 replaces the existing-skill half with host-authoritative global discovery, while new skills still require one explicit creation root and `must-not-exist` publication semantics. Project-local skills remain outside automatic target scope, and a model still cannot choose a filesystem destination.

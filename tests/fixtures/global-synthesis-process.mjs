@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import * as inventory from "../../self-evolve-inventory.js";
 import * as synthesis from "../../self-evolve-synthesis.js";
 import { openStore } from "../../self-evolve-store.js";
@@ -11,6 +11,8 @@ const explicitCrashPoint = mode.startsWith("crash:") ? mode.slice("crash:".lengt
 const store = openStore(root, {
   projectFingerprint,
   now: () => timestamp,
+  lockTimeoutMs: 10_000,
+  staleLockMs: 1,
   ...(explicitCrashPoint || ["crash-after-recommendation", "crash-after-candidate-recommended", "crash-after-candidate-no-change"].includes(mode) ? {
     faultInjection(point) {
       if (explicitCrashPoint) {
@@ -86,6 +88,7 @@ const result = await synthesis.runGlobalSynthesis({
   inventoryModule: inventory,
   options: {
     store,
+    automationStamp: store.getAutomationState().stamp,
     hiddenAgentRegistration: { assert: () => {} },
     suppressors: {
       bootValidated: true,
@@ -102,4 +105,4 @@ const result = await synthesis.runGlobalSynthesis({
   now: timestamp + 1,
 });
 store.close();
-process.stdout.write(JSON.stringify({ ok: result.ok, reason: result.reason ?? null }));
+writeFileSync(1, JSON.stringify({ ok: result.ok, reason: result.reason ?? null }));

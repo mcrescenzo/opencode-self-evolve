@@ -6,15 +6,13 @@ import test from "node:test";
 
 import SelfEvolvePlugin from "../self-evolve.js";
 import {
-  LEGACY_SELF_EVOLVE_AGENTS,
-  LEGACY_SELF_EVOLVE_SOURCE,
-  SELF_EVOLVE_ANALYZER_AGENT,
+  HISTORICAL_SELF_EVOLVE_AGENTS,
+  HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT,
   SELF_EVOLVE_CRITIC_AGENT,
   SELF_EVOLVE_SOURCE,
   SELF_EVOLVE_SYNTHESIZER_AGENT,
-  buildTranscript,
 } from "../self-evolve-core.js";
-import { recoverOrphanedAnalyzerSessions } from "../self-evolve-integration.js";
+import { recoverOrphanedHiddenSessions } from "../self-evolve-integration.js";
 import { CRITIC_AGENT_NAME, SYNTHESIS_AGENT_NAME } from "../self-evolve-synthesis.js";
 import { openStore } from "../self-evolve-store.js";
 import {
@@ -47,7 +45,7 @@ function memoryKv(entries = []) {
 test("canonical server, durable, synthesis, source, and TUI identities stay aligned", async () => {
   assert.equal(SELF_EVOLVE_MODULE_ID, MODULE_ID);
   assert.equal(SELF_EVOLVE_SOURCE, MODULE_ID);
-  assert.equal(SELF_EVOLVE_ANALYZER_AGENT, `${MODULE_ID}.analyzer`);
+  assert.equal(HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT, `${MODULE_ID}.analyzer`);
   assert.equal(SELF_EVOLVE_SYNTHESIZER_AGENT, `${MODULE_ID}.synthesizer`);
   assert.equal(SELF_EVOLVE_CRITIC_AGENT, `${MODULE_ID}.critic`);
   assert.equal(SYNTHESIS_AGENT_NAME, SELF_EVOLVE_SYNTHESIZER_AGENT);
@@ -70,18 +68,18 @@ test("canonical server, durable, synthesis, source, and TUI identities stay alig
   assert.match(source, /id:\s*TUI_IDENTITIES\.modeLayer/u);
   assert.doesNotMatch(source, /["']self-evolve(?:\.control-center|\.control-center\.route|-control-center)["']/u);
   assert.match(source, /submitDecision/u);
-  assert.match(source, /submitControl/u);
   assert.match(source, /submitOperation/u);
+  assert.doesNotMatch(source, /submitControl/u);
   assert.doesNotMatch(source, /appendRecord|updateSettings|api\.client\.selfEvolve|writeFile/u);
 
   const serverSource = readFileSync(new URL("../self-evolve.js", import.meta.url), "utf8");
   assert.match(serverSource, /import\("\.\/self-evolve-privacy\.js"\)/u);
   assert.doesNotMatch(serverSource, /from\s+["'](?:\.\/tui|@opentui\/)|import\(["'](?:\.\/tui|@opentui\/)/u);
 
-  const hooks = await SelfEvolvePlugin(pluginContext(), { durableAutonomy: false });
+  const hooks = await SelfEvolvePlugin(pluginContext());
   const cfg = { model: "fixture/model", agent: {} };
   await hooks.config(cfg);
-  for (const agentName of [SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
+  for (const agentName of [SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
     const agent = cfg.agent[agentName];
     assert.ok(agent);
     assert.equal(agent.mode, "primary");
@@ -92,23 +90,24 @@ test("canonical server, durable, synthesis, source, and TUI identities stay alig
     assert.equal(agent.permission.edit, "deny");
     assert.equal(agent.metadata, undefined, "agent registration uses only supported config fields");
   }
+  assert.equal(cfg.agent[HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT], undefined);
   assert.equal(typeof hooks["chat.params"], "function");
   await hooks.dispose();
 });
 
-test("all hidden agent registrations preserve foreign definitions and treat exact duplicates as idempotent", async () => {
-  const hooks = await SelfEvolvePlugin(pluginContext(), { durableAutonomy: false });
+test("current hidden agent registrations preserve foreign definitions and treat exact duplicates as idempotent", async () => {
+  const hooks = await SelfEvolvePlugin(pluginContext());
   const foreign = { description: "Anonymous co-install agent", prompt: "foreign", permission: { "*": "allow" } };
   const foreignFirst = {
     model: "fixture/model",
     agent: {
-      [SELF_EVOLVE_ANALYZER_AGENT]: foreign,
+      [HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT]: foreign,
       [SELF_EVOLVE_SYNTHESIZER_AGENT]: foreign,
       [SELF_EVOLVE_CRITIC_AGENT]: foreign,
     },
   };
   await hooks.config(foreignFirst);
-  for (const agentName of [SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
+  for (const agentName of [HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
     assert.equal(foreignFirst.agent[agentName], foreign);
   }
 
@@ -118,9 +117,9 @@ test("all hidden agent registrations preserve foreign definitions and treat exac
   await hooks.config(owned);
   for (const [agentName, definition] of first) assert.equal(owned.agent[agentName], definition);
 
-  owned.agent[SELF_EVOLVE_ANALYZER_AGENT] = foreign;
+  owned.agent[HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT] = foreign;
   await hooks.config(owned);
-  assert.equal(owned.agent[SELF_EVOLVE_ANALYZER_AGENT], foreign, "a later foreign definition is not reclaimed");
+  assert.equal(owned.agent[HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT], foreign, "the cleanup-only analyzer key is never claimed");
   await hooks.dispose();
 });
 
@@ -128,7 +127,8 @@ test("unsupported host agent config fails closed without replacing host state", 
   const cfg = { model: "fixture/model", agent: "unsupported-host-shape" };
   const registrations = SelfEvolvePlugin.__test.registerHiddenAgents(cfg);
   assert.equal(cfg.agent, "unsupported-host-shape");
-  for (const agentName of [SELF_EVOLVE_ANALYZER_AGENT, SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
+  assert.equal(registrations.size, 2);
+  for (const agentName of [SELF_EVOLVE_SYNTHESIZER_AGENT, SELF_EVOLVE_CRITIC_AGENT]) {
     assert.deepEqual(registrations.get(agentName), {
       registered: false,
       equivalent: false,
@@ -141,20 +141,17 @@ test("unsupported host agent config fails closed without replacing host state", 
   }
 });
 
-test("durable synthesis binding overrides caller registration bypasses for both provider roles", async () => {
+test("durable global synthesis binding overrides caller registration bypasses", async () => {
   const calls = [];
   const registration = { assert: () => {} };
   const module = SelfEvolvePlugin.__test.bindHiddenAgentRegistration({
-    async runSynthesis(args) { calls.push(["synthesis", args]); return "synthesis"; },
-    async runCritic(args) { calls.push(["critic", args]); return "critic"; },
+    async runGlobalSynthesis(args) { calls.push(args); return "global-synthesis"; },
   }, registration);
   const bypass = { assert: () => { throw new Error("must be replaced"); } };
 
-  assert.equal(await module.runSynthesis({ options: { marker: 1, hiddenAgentRegistration: bypass } }), "synthesis");
-  assert.equal(await module.runCritic({ options: { marker: 2, hiddenAgentRegistration: bypass } }), "critic");
-  assert.equal(calls[0][1].options.hiddenAgentRegistration, registration);
-  assert.equal(calls[1][1].options.hiddenAgentRegistration, registration);
-  assert.deepEqual(calls.map(([, args]) => args.options.marker), [1, 2]);
+  assert.equal(await module.runGlobalSynthesis({ options: { marker: 1, hiddenAgentRegistration: bypass } }), "global-synthesis");
+  assert.equal(calls[0].options.hiddenAgentRegistration, registration);
+  assert.equal(calls[0].options.marker, 1);
 });
 
 test("TUI surface ownership preserves foreign claims in both load orders and deduplicates package loads", () => {
@@ -212,41 +209,31 @@ test("KV migration is raw-valued, bounded, replay-safe, and never clobbers unrec
   assert.equal(foreign.writes.length, 0);
 });
 
-test("legacy hidden agents and source markers remain recognized for one release", async (t) => {
-  assert.equal(LEGACY_SELF_EVOLVE_SOURCE, "self-evolve-plugin");
-  assert.deepEqual(LEGACY_SELF_EVOLVE_AGENTS, {
+test("historical hidden session IDs remain bounded to cleanup and owner validation", async (t) => {
+  assert.deepEqual(HISTORICAL_SELF_EVOLVE_AGENTS, {
     analyzer: "self-evolve-analyzer",
     synthesizer: "self-evolve-synthesizer",
     critic: "self-evolve-critic",
   });
-  const transcript = buildTranscript([
-    { id: "canonical-agent", role: "assistant", agent: SELF_EVOLVE_ANALYZER_AGENT, text: "canonical agent" },
-    { id: "legacy-agent", role: "assistant", agent: LEGACY_SELF_EVOLVE_AGENTS.analyzer, text: "legacy agent" },
-    { id: "canonical-source", role: "assistant", parts: [{ type: "text", text: "canonical source", metadata: { source: SELF_EVOLVE_SOURCE } }] },
-    { id: "legacy-source", role: "assistant", parts: [{ type: "text", text: "legacy source", metadata: { source: LEGACY_SELF_EVOLVE_SOURCE } }] },
-    { id: "ordinary", role: "user", text: "visible" },
-  ]);
-  assert.equal(transcript.messageCount, 1);
-  assert.match(transcript.text, /visible/u);
-
   const sessions = [
     { id: "canonical", agent: SELF_EVOLVE_SYNTHESIZER_AGENT, state: "running" },
-    { id: "legacy", agent: LEGACY_SELF_EVOLVE_AGENTS.critic, state: "running" },
+    { id: "historical-analyzer", agent: HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT, state: "running" },
+    { id: "legacy", agent: HISTORICAL_SELF_EVOLVE_AGENTS.critic, state: "running" },
     { id: "foreign", agent: "anonymous-agent", state: "running" },
   ];
-  const outcomes = await recoverOrphanedAnalyzerSessions({ session: { list: async () => ({ data: sessions }) } }, "/workspace", {
+  const outcomes = await recoverOrphanedHiddenSessions({ session: { list: async () => ({ data: sessions }) } }, "/workspace", {
     store: { hostOwnerStatus: () => ({ classification: "unknown", reason: "fixture" }) },
     projectFingerprint: PROJECT,
     rootIdentity: "b".repeat(64),
   });
-  assert.deepEqual(outcomes.map((item) => item.id), ["canonical", "legacy"]);
+  assert.deepEqual(outcomes.map((item) => item.id), ["canonical", "historical-analyzer", "legacy"]);
 
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-identity-"));
   const store = openStore(root, { projectFingerprint: PROJECT, now: () => 100 });
   t.after(() => {
     try { store.close(); } finally { rmSync(root, { recursive: true, force: true }); }
   });
-  for (const [index, agent] of [SELF_EVOLVE_CRITIC_AGENT, LEGACY_SELF_EVOLVE_AGENTS.synthesizer].entries()) {
+  for (const [index, agent] of [SELF_EVOLVE_CRITIC_AGENT, HISTORICAL_SELF_EVOLVE_AGENTS.synthesizer].entries()) {
     const acquired = store.acquireHostOwner(`session-${index}`, {
       agent,
       projectFingerprint: PROJECT,

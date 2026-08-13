@@ -1,42 +1,34 @@
 import { createHash } from "node:crypto";
 import {
-  ConsentState,
-  Mode,
-  SCHEMA_VERSION,
+  V4_SCHEMA_VERSION,
   makeAuditEvent,
-  makeConsentState,
   makeDecision,
-  makeGlobalSettings,
-  makeRepoSettings,
-  resolveMode,
-  transitionMode,
   stripUndefined,
   wrapRecord,
 } from "./self-evolve-schemas.js";
 
 export const MIGRATION_NOTE = Object.freeze(
-  "v0.1.2 -> v0.2: status, pause, resume, scan, and help are unchanged; disable is deprecated and maps to pause; dismiss maps to reject (use snooze to defer); bare /self-evolve scans in legacy contexts and opens status/inbox in new contexts.",
+  "Self-evolve v0.4 uses Automatic recommendations On or Off. Manual/Auto modes, scan, repository modes, Pause/Resume/Disable, and passive consent were removed and are never reinterpreted. Use /self-evolve on, /self-evolve off, project include/exclude, or the retained permission controls.",
 );
 
-const MODES = new Set(Mode.values);
-const REPO_MODES = new Set([...MODES, "inherit"]);
 const EXPORT_SCOPES = new Set(["observations", "proposals", "global-recommendations", "project", "all"]);
 const PURGE_SCOPES = new Set(["observations", "project-evidence", "proposals", "global-recommendations", "project", "all"]);
 const CONSENT_KEYS = Object.freeze({
-  passive: "passiveCalls",
   observations: "durableObservations",
   excerpts: "sanitizedExcerpts",
   "cross-repo": "crossRepoAggregation",
 });
+const REMOVED_COMMANDS = new Set(["scan", "manual", "auto", "yolo", "repo", "pause", "resume", "disable"]);
 export const MAX_OBSERVATION_INSPECTION = 100;
 const DEFAULT_OBSERVATION_INSPECTION = 20;
 export const HEADLESS_APPROVAL_USAGE = "/self-evolve approve <proposal-id> --target-hash <sha256|must-not-exist> --proposed-content-hash <sha256> --decision-version <integer> --nonce <one-use-nonce>";
 const SHA256_RE = /^[a-f0-9]{64}$/u;
-const PURGE_ALL_CONFIRMATION = "PURGE ALL SELF-EVOLVE 0.3.0";
+const PURGE_ALL_CONFIRMATION = "PURGE ALL SELF-EVOLVE 0.4.0";
+const REINITIALIZE_CONFIRMATION = "REINITIALIZE SELF-EVOLVE 0.4.0";
+const RESET_BREAKER_CONFIRMATION = "RESET SELF-EVOLVE BREAKER 0.3.0";
 const NONCE_RE = /^[a-f0-9]{48}$/u;
 const MUST_NOT_EXIST = "must-not-exist";
 const DISCLOSURES = Object.freeze({
-  passiveCalls: "Disclosure: passive provider calls may occur at stable idle boundaries within configured budgets.",
   durableObservations: "Disclosure: bounded structured observations will be stored durably; complete transcripts and raw message bodies are never stored.",
   sanitizedExcerpts: "Disclosure: sanitized excerpts are heuristic redactions, not a secrecy guarantee, and have a short retention window.",
   crossRepoAggregation: "Disclosure: cross-repository aggregation uses only sanitized normalized evidence and excludes repository identifiers.",
@@ -89,28 +81,27 @@ function splitInput(input) {
   return { tokens };
 }
 
-export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
+export function parseSelfEvolveCommand(input) {
   const tokenized = splitInput(input);
   if (tokenized.error) return error(tokenized.error);
   const tokens = tokenized.tokens;
-  if (tokens.length === 0) return parsed(legacy ? "scan" : "default");
+  if (tokens.length === 0) return parsed("default");
   const [rawVerb, ...args] = tokens;
   const verb = rawVerb.toLowerCase();
   if (verb === "?") return args.length ? error("Help does not accept arguments.") : parsed("help");
-  if (["help", "scan", "status", "pause", "resume", "inbox", "budget", "health"].includes(verb)) {
+  if (["help", "status", "inbox", "budget", "health"].includes(verb)) {
     return args.length ? error(`/self-evolve ${verb} does not accept arguments.`) : parsed(verb);
   }
-  if (verb === "disable") {
-    return args.length ? error("/self-evolve disable does not accept arguments.") : parsed("pause", { deprecatedAlias: "disable" });
+  if (REMOVED_COMMANDS.has(verb)) {
+    return parsed("removed", { removedCommand: verb });
+  }
+  if (verb === "on" || verb === "off") {
+    return args.length
+      ? error(`/self-evolve ${verb} does not accept arguments.`)
+      : parsed("automatic-recommendations", { enabled: verb === "on" });
   }
   if (verb === "dismiss") {
     return args.length > 1 ? error("Usage: /self-evolve dismiss [proposal-id]") : parsed("dismiss", { proposalId: args[0] });
-  }
-  if (MODES.has(verb)) {
-    return args.length ? error(`Usage: /self-evolve ${verb}`) : parsed("mode", { mode: verb });
-  }
-  if (verb === "yolo") {
-    return error("Yolo was retired in v0.3. Project analysis is /self-evolve manual or /self-evolve auto, and every global skill write needs an explicit decision.");
   }
   if (["review", "reject", "undo"].includes(verb)) {
     if (verb === "review" && args.length <= 1) return parsed(verb, { proposalId: args[0] });
@@ -149,15 +140,12 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
   if (verb === "exclude" || verb === "include") {
     return args.length ? error(`/self-evolve ${verb} does not accept arguments.`) : parsed("repo-override", { excluded: verb === "exclude" });
   }
-  if (verb === "repo") {
-    if (args.length !== 1 || !REPO_MODES.has(args[0].toLowerCase())) return error("Usage: /self-evolve repo <manual|auto|inherit>");
-    return parsed("repo-mode", { mode: args[0].toLowerCase() });
-  }
   if (verb === "consent") {
     const key = CONSENT_KEYS[args[0]?.toLowerCase()];
     const value = args[1]?.toLowerCase();
     if (args.length !== 2 || !key || !["on", "off"].includes(value)) {
-      return error("Usage: /self-evolve consent <passive|observations|excerpts|cross-repo> <on|off>");
+      if (args[0]?.toLowerCase() === "passive") return parsed("removed", { removedCommand: "passive-consent" });
+      return error("Usage: /self-evolve consent <observations|excerpts|cross-repo> <on|off>");
     }
     return parsed("consent", { key, value: value === "on" });
   }
@@ -206,6 +194,16 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
       ? parsed("purge", { scope })
       : error(`Usage: /self-evolve purge <observations|project-evidence|proposals|global-recommendations|project> | purge global-recommendation <recommendation-id> | purge --all --confirm ${PURGE_ALL_CONFIRMATION}`);
   }
+  if (verb === "reinitialize") {
+    return args[0] === "--confirm" && args.slice(1).join(" ") === REINITIALIZE_CONFIRMATION
+      ? parsed("reinitialize", { confirmation: REINITIALIZE_CONFIRMATION })
+      : error(`Usage: /self-evolve reinitialize --confirm ${REINITIALIZE_CONFIRMATION}`);
+  }
+  if (verb === "reset-breaker") {
+    return args[0] === "--confirm" && args.slice(1).join(" ") === RESET_BREAKER_CONFIRMATION
+      ? parsed("reset-breaker", { confirmation: RESET_BREAKER_CONFIRMATION })
+      : error(`Usage: /self-evolve reset-breaker --confirm ${RESET_BREAKER_CONFIRMATION}`);
+  }
   if (verb === "kill-switch") {
     const enabled = args[0]?.toLowerCase();
     return args.length === 1 && ["on", "off"].includes(enabled)
@@ -218,20 +216,22 @@ export function parseSelfEvolveCommand(input, { legacy = false } = {}) {
 function helpText() {
   return [
     "Self-evolve commands:",
-    "/self-evolve - open status and the durable inbox (legacy: scan)",
-    "/self-evolve help | scan | status | pause | resume | inbox | budget | health",
-    "/self-evolve manual | auto",
+    "/self-evolve - show Automatic recommendations status and the durable inbox",
+    "/self-evolve help | status | inbox | budget | health",
+    "/self-evolve on | off",
     "/self-evolve review [id] | reject <id> | snooze <id> [duration] | undo <id>",
     HEADLESS_APPROVAL_USAGE,
     "The current approval tuple is shown by inbox and review; it contains hashes, version, and a one-use nonce, never proposal content.",
-    "/self-evolve exclude | include | repo <manual|auto|inherit>",
-    "/self-evolve consent <passive|observations|excerpts|cross-repo> <on|off>",
+    "/self-evolve exclude | include",
+    "/self-evolve consent <observations|excerpts|cross-repo> <on|off>",
     "/self-evolve allowlist list | allowlist <add|remove> <canonical-absolute-path> --confirm UPDATE ALLOWLIST",
     "/self-evolve inspect observations [N] | inspect eligibility [clusterId]",
     "/self-evolve export [observations|proposals|global-recommendations|project|all]",
     `/self-evolve purge <observations|project-evidence|proposals|global-recommendations|project> | purge global-recommendation <recommendation-id> | purge --all --confirm ${PURGE_ALL_CONFIRMATION}`,
+    `/self-evolve reinitialize --confirm ${REINITIALIZE_CONFIRMATION}`,
+    `/self-evolve reset-breaker --confirm ${RESET_BREAKER_CONFIRMATION}`,
     "/self-evolve kill-switch <on|off>",
-    "Legacy aliases: disable -> pause (deprecated); dismiss [id] -> reject when an id is supplied.",
+    "Compatibility alias: dismiss [id] rejects when an id is supplied.",
     MIGRATION_NOTE,
   ].join("\n");
 }
@@ -241,10 +241,6 @@ export function buildResponse(commandValue, outcome = {}) {
   if (outcome.error || outcome.ok === false) return `Self-evolve ${commandName} failed: ${outcome.error ?? outcome.reason ?? "unknown error"}. No files were applied.`;
   if (outcome.responseText) return outcome.responseText;
   if (commandName === "help") return helpText();
-  if (commandName === "mode" || commandName === "repo-mode") {
-    if (commandValue.requiresConfirmation && !commandValue.confirmed) return `${commandValue.confirmationPrompt}\nNo mode change or file application occurred.`;
-    return `Self-evolve mode preference changed to ${outcome.mode ?? commandValue.mode}. The next eligible lifecycle event observes the new analysis mode. No proposal was accepted and no files were applied.`;
-  }
   if (commandName === "approve") return `Proposal ${commandValue.proposalId} approval was processed by the durable server integration from the exact one-use tuple.`;
   if (commandName === "reject" || commandName === "dismiss") return `Proposal ${commandValue.proposalId} rejected. No files were applied.`;
   if (commandName === "undo") {
@@ -267,7 +263,7 @@ function durationMs(value) {
   return Number.isSafeInteger(result) && result > 0 ? result : null;
 }
 
-export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VERSION, hostVersion = "unknown", hostVersionSource = "global-health", now = () => Date.now() } = {}) {
+export function createCommandPolicy({ store, privacy, schemaVersion = V4_SCHEMA_VERSION, hostVersion = "unknown", hostVersionSource = "global-health", now = () => Date.now() } = {}) {
   if (!store || typeof store.getSettings !== "function") throw new TypeError("command-store-required");
   if (!privacy || typeof privacy.exportScope !== "function" || typeof privacy.purgeScope !== "function") throw new TypeError("command-privacy-required");
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
@@ -298,79 +294,62 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
   }
 
   function latestCircuitBreaker() {
-    return store.readRecords("circuit-breaker").at(-1)?.payload ?? null;
+    const stored = store.readRecords("circuit-breaker").at(-1)?.payload ?? null;
+    // H5-001: the durable root-global breaker epoch is the cross-process
+    // open/closed truth. If it is tripped, report the breaker as open so health
+    // and status reflect peer trip writes. A corrupt breaker epoch fails closed.
+    if (store.breakerEpochTripped?.() === true) {
+      return stored?.open === true
+        ? stored
+        : { open: true, openedAt: store.breakerEpochState?.()?.trippedAt ?? null, reason: store.breakerEpochReason?.() ?? "breaker-epoch-tripped", tripCount: Math.max(0, Number(stored?.tripCount ?? 0)) };
+    }
+    return stored;
   }
 
-  function getMode() {
-    const current = settingsResult();
-    return current.ok ? current.settings.global.mode : "manual";
+  function getAutomation() {
+    return store.getAutomationState?.() ?? { ok: false, enabled: false, reason: "automation-state-unavailable" };
   }
 
-  function getEffectiveMode({ projectFingerprint } = {}) {
-    const current = settingsResult();
-    if (!current.ok) return "manual";
-    const { global, repo } = current.settings;
-    const projectMismatch = projectFingerprint !== undefined && projectFingerprint !== repo.projectFingerprint;
-    const breaker = latestCircuitBreaker();
-    return resolveMode(global.mode, repo.mode, {
-      killSwitchActive: global.killSwitchActive,
-      paused: global.paused,
-      circuitBreakerOpen: breaker?.open === true,
-      processExcluded: repo.excluded || projectMismatch,
-      corrupt: false,
+  function transitionAutomation(action, enabled, permission = null) {
+    const current = getAutomation();
+    if (!current.ok) return { ok: false, error: current.reason ?? "automation-state-unavailable" };
+    const transitionId = `command:${action}:${current.epoch.generation}:${now()}`;
+    const result = store.transitionAutomation({
+      transitionId,
+      expectedGeneration: current.epoch.generation,
+      action,
+      ...(permission === null ? {} : { permission }),
+      enabled,
     });
+    return result.ok ? result : { ok: false, error: result.reason };
   }
 
-  function setMode(mode) {
-    // The command surface only configures the v0.3 project analysis modes; a
-    // legacy value is refused rather than silently narrowed.
-    if (!MODES.has(mode)) return { ok: false, error: "unsupported-analysis-mode" };
-    let transitioned;
-    const saved = store.updateSettings((current) => {
-      const global = current.global;
-      transitioned = transitionMode(global, current.repo, { scope: "global", mode }, now(), "self-evolve-command");
-      if (!transitioned.ok) throw new Error(transitioned.error);
-      return { global: transitioned.state.global };
-    });
-    if (!saved.ok) return { ok: false, error: saved.reason };
-    for (const event of transitioned.events) store.appendRecord(wrapRecord("audit-event", event, event.timestamp));
-    return { ok: true, mode: transitioned.state.global.mode, effectiveMode: transitioned.state.effectiveMode, auditEvent: transitioned.events[0] };
-  }
-
-  function setRepoMode(mode) {
-    let transitioned;
-    const saved = store.updateSettings((current) => {
-      transitioned = transitionMode(current.global, current.repo, { scope: "repo", mode }, now(), "self-evolve-command");
-      if (!transitioned.ok) throw new Error(transitioned.error);
-      return { repo: transitioned.state.repo };
-    });
-    if (!saved.ok) return { ok: false, error: saved.reason };
-    for (const event of transitioned.events) store.appendRecord(wrapRecord("audit-event", event, event.timestamp));
-    return { ok: true, mode: transitioned.state.repo.mode, effectiveMode: transitioned.state.effectiveMode, auditEvent: transitioned.events[0] };
+  function setAutomaticRecommendations(enabled) {
+    if (typeof enabled !== "boolean") return { ok: false, error: "invalid-automatic-recommendations-setting" };
+    return transitionAutomation("set-automatic-recommendations", enabled);
   }
 
   function getConsent() {
-    const current = settingsResult();
-    return current.ok ? current.settings.global.consent : makeConsentState();
+    const current = getAutomation();
+    return current.ok ? current.global.consent : {
+      durableObservations: false,
+      sanitizedExcerpts: false,
+      crossRepoAggregation: false,
+    };
   }
 
   function setConsent(key, value) {
-    if (!ConsentState.fields.includes(key) || typeof value !== "boolean") return { ok: false, error: "invalid-consent-setting" };
-    let wasEnabled;
-    let consent;
-    const saved = store.updateGlobalSettings((global) => {
-      if (key === "crossRepoAggregation" && value && !global.consent.sanitizedExcerpts) throw new Error("sanitized-excerpts-consent-required");
-      wasEnabled = global.consent[key];
-      consent = makeConsentState({
-        ...global.consent,
-        [key]: value,
-        ...(key === "sanitizedExcerpts" && !value ? { crossRepoAggregation: false } : {}),
-      });
-      return makeGlobalSettings({ ...global, consent, updatedAt: now() });
-    });
-    if (!saved.ok) return { ok: false, error: saved.reason };
-    const auditEvent = appendAudit("decision", { action: "consent", key, enabled: value });
-    return { ok: true, consent, disclosure: value && !wasEnabled ? DISCLOSURES[key] : undefined, auditEvent };
+    if (!Object.values(CONSENT_KEYS).includes(key) || typeof value !== "boolean") {
+      return { ok: false, error: "invalid-consent-setting" };
+    }
+    const wasEnabled = getConsent()[key] === true;
+    const result = transitionAutomation("set-permission", value, key);
+    if (!result.ok) return result;
+    return {
+      ...result,
+      consent: result.settings.consent,
+      disclosure: value && !wasEnabled ? DISCLOSURES[key] : undefined,
+    };
   }
 
   function latestAudit(action, proposalId) {
@@ -417,16 +396,17 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
 
   function getHealth() {
     const current = settingsResult();
-    if (!current.ok) {
+    const automation = getAutomation();
+    if (!current.ok || !automation.ok) {
       return {
         hostVersion,
         hostVersionSource,
         schemaVersion,
         circuitBreakerOpen: false,
         killSwitchActive: false,
-        mode: "manual",
-        repoMode: "inherit",
-        lastError: `Corrupt or unsupported settings: ${current.error}. Manual/no-write mode is active; only purge is permitted.`,
+        automaticRecommendationsEnabled: false,
+        projectExcluded: true,
+        lastError: `Corrupt or unsupported settings: ${current.error ?? automation.reason}. Automatic recommendations are Off; only read-only status and recovery are available.`,
       };
     }
     const breaker = latestCircuitBreaker();
@@ -435,19 +415,22 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
       hostVersionSource,
       schemaVersion,
       circuitBreakerOpen: breaker?.open === true,
-      killSwitchActive: current.settings.global.killSwitchActive,
-      mode: current.settings.global.mode,
-      repoMode: current.settings.repo.mode,
+      killSwitchActive: automation.global.killSwitchActive,
+      automaticRecommendationsEnabled: automation.enabled,
+      projectExcluded: automation.repo.excluded,
       ...(breaker?.reason ? { lastError: breaker.reason } : {}),
     };
   }
 
   function triggerKillSwitch(reason) {
-    const saved = store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, killSwitchActive: true, updatedAt: now() }));
-    if (!saved.ok) return { ok: false, error: saved.reason };
-    const global = saved.settings.global;
-    const auditEvent = appendAudit("kill-switch", { action: "on", reason: String(reason || "command"), storedMode: global.mode, effectiveMode: "manual" });
-    return { ok: true, auditEvent };
+    const result = transitionAutomation("set-emergency-stop", true);
+    if (!result.ok) return result;
+    const auditEvent = appendAudit("kill-switch", {
+      action: "on",
+      reason: String(reason || "command"),
+      automaticRecommendationsEnabled: result.settings.automaticRecommendationsEnabled,
+    });
+    return { ...result, auditEvent };
   }
 
   function decide(proposalId, newState, actor = "self-evolve-command") {
@@ -471,6 +454,11 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
 
   function execute(commandValue, { projectFingerprint } = {}) {
     const verb = commandValue?.verb;
+    if (verb === "removed") {
+      return {
+        responseText: `${commandValue.removedCommand} was removed in Self-evolve v0.4. ${MIGRATION_NOTE}`,
+      };
+    }
     if (store.isTerminal?.()) return { ok: false, terminal: true, responseText: "Self-evolve state was purged. Restart OpenCode to reinitialize durable self-evolve state." };
     const health = getHealth();
     if (health.lastError?.startsWith("Corrupt or unsupported") && verb !== "purge" && verb !== "health") {
@@ -479,33 +467,30 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     if (verb === "help") return { responseText: helpText() };
     if (verb === "default") {
       const inbox = getInbox();
-      return { responseText: `Self-evolve status: effective mode ${getEffectiveMode({ projectFingerprint })}.\nInbox: ${inbox.length} pending proposal(s).${inbox.length ? `\n${inbox.map(proposalLine).join("\n")}` : ""}` };
+      const automation = getAutomation();
+      return { responseText: `Automatic recommendations: ${automation.enabled ? "On" : "Off"}.\nInbox: ${inbox.length} pending proposal(s).${inbox.length ? `\n${inbox.map(proposalLine).join("\n")}` : ""}` };
     }
     if (verb === "status") {
       const current = settingsResult().settings;
-      const consent = current.global.consent;
+      const automation = getAutomation();
+      const consent = automation.global.consent;
       const roots = current.global.allowedSkillRoots;
-      return { responseText: `Self-evolve status: stored mode ${health.mode}; effective mode ${getEffectiveMode({ projectFingerprint })}; repo mode ${health.repoMode}; paused ${current.global.paused}; excluded ${current.repo.excluded}.\nConsent: passive ${consent.passiveCalls ? "on" : "off"}; observations ${consent.durableObservations ? "on" : "off"}; excerpts ${consent.sanitizedExcerpts ? "on" : "off"}; cross-repo ${consent.crossRepoAggregation ? "on" : "off"}.\nApproved skill folders (${roots.length}):${roots.length ? `\n${roots.map((root) => `- ${root}`).join("\n")}` : " none"}` };
+      return { responseText: `Automatic recommendations: ${automation.enabled ? "On" : "Off"}; project ${automation.repo.excluded ? "Excluded" : "Included"}; Emergency Stop ${automation.global.killSwitchActive ? "On" : "Off"}.\nPermissions: observations ${consent.durableObservations ? "on" : "off"}; excerpts ${consent.sanitizedExcerpts ? "on" : "off"}; cross-repo ${consent.crossRepoAggregation ? "on" : "off"}.\nCreation-policy suggestions (${roots.length}):${roots.length ? `\n${roots.map((root) => `- ${root}`).join("\n")}` : " none"}` };
     }
-    if (verb === "health") return { responseText: `Self-evolve health: host ${health.hostVersion}; source ${health.hostVersionSource ?? "global-health"}; schema ${health.schemaVersion}; mode ${health.mode}; repo mode ${health.repoMode}; circuit breaker ${health.circuitBreakerOpen ? "open" : "closed"}; kill switch ${health.killSwitchActive ? "on" : "off"}.${health.lastError ? ` Last error: ${health.lastError}` : ""}` };
-    if (verb === "mode") {
-      if (commandValue.requiresConfirmation && !commandValue.confirmed) return { responseText: buildResponse(commandValue) };
-      const result = setMode(commandValue.mode);
-      return { responseText: buildResponse(commandValue, result), ...(result.auditEvent ? { auditEvent: result.auditEvent } : {}) };
-    }
-    if (verb === "repo-mode") {
-      const result = setRepoMode(commandValue.mode);
-      return { responseText: buildResponse(commandValue, result), ...(result.auditEvent ? { auditEvent: result.auditEvent } : {}) };
-    }
-    if (verb === "pause" || verb === "resume") {
-      const paused = verb === "pause";
-      const saved = store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, paused, updatedAt: now() }));
-      const deprecation = commandValue.deprecatedAlias ? " Deprecated: /self-evolve disable now maps to pause." : "";
-      return { responseText: !saved.ok ? `Self-evolve ${verb} failed: ${saved.reason}.` : `Self-evolve ${paused ? "paused" : "resumed"}.${deprecation} No files were applied.` };
+    if (verb === "health") return { responseText: `Self-evolve health: host ${health.hostVersion}; source ${health.hostVersionSource ?? "global-health"}; schema ${health.schemaVersion}; Automatic recommendations ${health.automaticRecommendationsEnabled ? "On" : "Off"}; project ${health.projectExcluded ? "Excluded" : "Included"}; circuit breaker ${health.circuitBreakerOpen ? "open" : "closed"}; Emergency Stop ${health.killSwitchActive ? "On" : "Off"}.${health.lastError ? ` Last error: ${health.lastError}` : ""}` };
+    if (verb === "automatic-recommendations") {
+      const result = setAutomaticRecommendations(commandValue.enabled);
+      return {
+        responseText: result.ok
+          ? `Automatic recommendations ${commandValue.enabled ? "On" : "Off"}.${commandValue.enabled ? " Required data permissions are On." : " Future analysis is stopped; unfinished automatic work is superseded and will not be backfilled after re-enable; published recommendations and explicit actions remain available; retained data was not purged."}`
+          : `Automatic recommendations change failed: ${result.error}.`,
+        ...(result.auditEvent ? { auditEvent: result.auditEvent } : {}),
+      };
     }
     if (verb === "repo-override") {
-      const saved = store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, excluded: commandValue.excluded }));
-      return { responseText: !saved.ok ? `Repository override failed: ${saved.reason}.` : `Repository ${commandValue.excluded ? "excluded; autonomous work will be skipped" : "included"}. No files were applied.` };
+      const saved = store.setAutomationProjectExcluded?.(commandValue.excluded)
+        ?? { ok: false, reason: "automation-project-policy-unavailable" };
+      return { responseText: !saved.ok ? `Project participation change failed: ${saved.reason}.` : `Project ${commandValue.excluded ? "Excluded; automatic work will be skipped" : "Included"}. Automatic recommendations preference is unchanged. No files were applied.` };
     }
     if (verb === "consent") {
       const result = setConsent(commandValue.key, commandValue.value);
@@ -553,7 +538,6 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
       const auditEvent = appendAudit("decision", { action: "snooze", snoozedUntil, state: "pending" }, commandValue.proposalId);
       return { responseText: `Proposal ${commandValue.proposalId} remains pending and is snoozed until ${new Date(snoozedUntil).toISOString()}. No files were applied.`, ...(auditEvent ? { auditEvent } : {}) };
     }
-    if (verb === "scan") return { responseText: "A permitted self-evolve cycle was requested. This command result schedules no passive work and applies no files; the server pipeline performs the explicit cycle." };
     if (verb === "inspect") {
       if (commandValue.subject === "observations") {
         const archive = privacy.exportScope(projectFingerprint);
@@ -611,18 +595,26 @@ export function createCommandPolicy({ store, privacy, schemaVersion = SCHEMA_VER
     if (verb === "kill-switch") {
       if (commandValue.enabled) {
         const result = triggerKillSwitch("command");
-        return { responseText: result.ok ? `Kill switch enabled. Stored mode remains ${getMode()}; effective mode is manual. No files were applied.` : `Kill switch failed: ${result.error}.`, ...(result.auditEvent ? { auditEvent: result.auditEvent } : {}) };
+        return { responseText: result.ok ? "Kill switch enabled. Automatic recommendations preference is unchanged, but new automatic work and Apply are suppressed. No files were applied." : `Kill switch failed: ${result.error}.`, ...(result.auditEvent ? { auditEvent: result.auditEvent } : {}) };
       }
-      let snapshot;
-      const saved = store.updateGlobalSettings((global, current) => {
-        snapshot = current;
-        return makeGlobalSettings({ ...global, killSwitchActive: false, updatedAt: now() });
+      const cleared = transitionAutomation("set-emergency-stop", false);
+      const auditEvent = !cleared.ok ? null : appendAudit("kill-switch", {
+        action: "off",
+        automaticRecommendationsEnabled: cleared.settings.automaticRecommendationsEnabled,
       });
-      const auditEvent = !saved.ok ? null : appendAudit("kill-switch", { action: "off", storedMode: saved.settings.global.mode, effectiveMode: resolveMode(saved.settings.global.mode, snapshot.repo.mode, { paused: saved.settings.global.paused, processExcluded: snapshot.repo.excluded }) });
-      return { responseText: !saved.ok ? `Kill switch failed: ${saved.reason}.` : `Kill switch disabled. Stored mode remains ${getMode()}. No files were applied.`, ...(auditEvent ? { auditEvent } : {}) };
+      return { responseText: !cleared.ok ? `Kill switch failed: ${cleared.error}.` : "Kill switch disabled. Automatic recommendations preference is unchanged. No files were applied.", ...(auditEvent ? { auditEvent } : {}) };
     }
     return { responseText: "Unknown /self-evolve command. No files were applied." };
   }
 
-  return Object.freeze({ execute, getMode, setMode, getEffectiveMode, getConsent, setConsent, getInbox, getHealth, triggerKillSwitch });
+  return Object.freeze({
+    execute,
+    getAutomation,
+    setAutomaticRecommendations,
+    getConsent,
+    setConsent,
+    getInbox,
+    getHealth,
+    triggerKillSwitch,
+  });
 }

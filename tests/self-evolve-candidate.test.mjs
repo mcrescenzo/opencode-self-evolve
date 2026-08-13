@@ -66,12 +66,17 @@ function eligibilityFixture({ single = {}, distributed = {}, integrity = {}, tar
 }
 
 function enableContributionConsent(store) {
-  const result = store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: true, sanitizedExcerpts: true, crossRepoAggregation: true },
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(result.ok, true, result.reason);
+  const state = store.getAutomationState();
+  assert.equal(state.ok, true, state.reason);
+  assert.equal(state.enabled, true);
+  assert.equal(Object.values(state.global.consent).every(Boolean), true);
+  return state.stamp;
+}
+
+function materialize(store, input) {
+  const state = store.getAutomationState();
+  assert.equal(state.ok, true, state.reason);
+  return store.materializeGlobalCandidates({ ...input, automationStamp: state.stamp });
 }
 
 function setGlobalRootPolicy(store, rootPolicy) {
@@ -97,6 +102,7 @@ function seedStoredContribution(store, {
   clusterId = H("9"),
   capsuleId,
 }) {
+  const automationStamp = enableContributionConsent(store);
   const scopeFingerprint = H("7");
   const observation = schemas.makeObservation({
     id: hashSignature(JSON.stringify({ incidentId, signatureHash, project: store.projectFingerprint })),
@@ -116,6 +122,7 @@ function seedStoredContribution(store, {
     createdAt,
     injectionFlagged,
     redacted: true,
+    automationGeneration: automationStamp.generation,
   });
   const cluster = schemas.makeEvidenceCluster({
     id: clusterId,
@@ -128,8 +135,8 @@ function seedStoredContribution(store, {
     firstSeenAt: createdAt,
     lastSeenAt: createdAt,
   });
-  assert.equal(store.appendRecord(schemas.wrapRecord("observation", observation, createdAt)).ok, true);
-  assert.equal(store.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, createdAt)).ok, true);
+  assert.equal(store.appendRecord(schemas.wrapRecord("observation", observation, createdAt), { automationStamp }).ok, true);
+  assert.equal(store.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, createdAt), { automationStamp }).ok, true);
   const capsule = schemas.makeEvidenceCapsule({
     capsuleId,
     incidentId,
@@ -139,7 +146,7 @@ function seedStoredContribution(store, {
     createdAt,
     expiresAt: createdAt + 30 * DAY,
   });
-  assert.equal(store.appendEvidenceCapsule(capsule).ok, true);
+  assert.equal(store.appendEvidenceCapsule(capsule, { automationStamp }).ok, true);
   const published = store.publishContribution({
     claimType: "global-skill-candidate",
     receiptType: cluster.receiptType,
@@ -151,7 +158,7 @@ function seedStoredContribution(store, {
     occurrenceCount,
     firstSeenAt: createdAt,
     lastSeenAt: createdAt,
-  });
+  }, { automationStamp });
   assert.equal(published.ok, true, published.reason);
   return { observation, cluster, capsule, published };
 }
@@ -248,7 +255,7 @@ function globalRecommendationFixture(t, prefix, { firstStoreOptions = {} } = {})
   });
   const { rootPolicy, targetBinding } = targetFixture();
   setGlobalRootPolicy(second, rootPolicy);
-  const materialized = second.materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
+  const materialized = materialize(second, { targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
   assert.equal(materialized.ok, true, materialized.reason);
   const recommendation = seedGlobalRecommendation(
     root,
@@ -475,7 +482,7 @@ test("separate project partitions with one canonical source lineage converge on 
   });
   const { rootPolicy, targetBinding } = targetFixture();
   setGlobalRootPolicy(second, rootPolicy);
-  const result = second.materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
+  const result = materialize(second, { targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
   assert.equal(result.ok, true, result.reason);
   assert.equal(result.candidates.length, 1);
   assert.equal(result.candidates[0].state, "eligible");
@@ -504,7 +511,7 @@ test("distributed 2-domain/3-incident support counts clone lineage once and excl
   }));
   const { rootPolicy, targetBinding } = targetFixture();
   setGlobalRootPolicy(stores[3], rootPolicy);
-  const materialized = stores[3].materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
+  const materialized = materialize(stores[3], { targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
   assert.equal(materialized.ok, true, materialized.reason);
   assert.equal(materialized.candidates[0].eligibilityRoute, "distributed");
   assert.equal(materialized.candidates[0].independentDomainCount, 3, "two known domains plus one collapsed unknown domain");
@@ -536,7 +543,7 @@ for (const terminalState of ["rejected", "failed-closed"]) {
     });
     const { rootPolicy, targetBinding } = targetFixture();
     setGlobalRootPolicy(stores[2], rootPolicy);
-    const first = stores[2].materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
+    const first = materialize(stores[2], { targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
     const candidate = first.candidates[0];
     const toSynthesis = stores[2].transitionGlobalCandidate(candidate.candidateId, {
       state: "synthesis-pending",
@@ -563,7 +570,7 @@ for (const terminalState of ["rejected", "failed-closed"]) {
         eligibilityRoute: candidate.eligibilityRoute,
       }, NOW + 2).ok, true);
     }
-    const retry = stores[2].materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW + 4 });
+    const retry = materialize(stores[2], { targetBindings: [targetBinding], rootPolicy, nowMs: NOW + 4 });
     assert.equal(retry.candidates[0].state, terminalState);
     assert.equal(retry.candidates[0].supportSetHash, candidate.supportSetHash);
 
@@ -571,7 +578,7 @@ for (const terminalState of ["rejected", "failed-closed"]) {
       incidentId: `${terminalState}-3`, evidenceDomainId: lineage.domainId, rootLineageHash: H("6"), occurrenceCount: 1,
       capsuleId: "33333333-3333-4333-8333-333333333333",
     });
-    const changed = stores[2].materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW + 5 });
+    const changed = materialize(stores[2], { targetBindings: [targetBinding], rootPolicy, nowMs: NOW + 5 });
     assert.equal(changed.candidates[0].state, "eligible");
     assert.notEqual(changed.candidates[0].supportSetHash, candidate.supportSetHash);
   });
@@ -628,7 +635,7 @@ test("global candidate and support files enumerate identity-free summaries only"
   ];
   const { rootPolicy, targetBinding } = targetFixture();
   setGlobalRootPolicy(second, rootPolicy);
-  assert.equal(second.materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW }).ok, true);
+  assert.equal(materialize(second, { targetBindings: [targetBinding], rootPolicy, nowMs: NOW }).ok, true);
   const support = second.readGlobalSupportSets()[0];
   assert.deepEqual(support.contributionIds, seeded.map((item) => item.published.contribution.contributionId).sort());
   assert.equal(Object.hasOwn(second.readGlobalCandidates()[0], "contributionIds"), false);
@@ -655,7 +662,7 @@ test("global candidate and support files enumerate identity-free summaries only"
   }
 });
 
-test("support expiry recomputes only affected pending candidate authority", (t) => {
+test("support expiry removes affected pending authority without backfilling", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-candidate-expiry-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   let clock = NOW;
@@ -684,7 +691,7 @@ test("support expiry recomputes only affected pending candidate authority", (t) 
   });
   const { rootPolicy, targetBinding } = targetFixture();
   setGlobalRootPolicy(stores[1], rootPolicy);
-  const materialized = stores[1].materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: clock });
+  const materialized = materialize(stores[1], { targetBindings: [targetBinding], rootPolicy, nowMs: clock });
   assert.equal(materialized.candidates.length, 2);
   const retainedBefore = materialized.candidates.find((candidate) => candidate.signatureHash === H("a"));
   const expiring = materialized.candidates.find((candidate) => candidate.signatureHash === H("8"));
@@ -696,7 +703,7 @@ test("support expiry recomputes only affected pending candidate authority", (t) 
   assert.equal(stores[1].readGlobalSupportSets().some((support) => support.supportSetHash === expiring.supportSetHash), false);
 });
 
-test("project purge recomputes the affected candidate without rewriting unrelated pending authority", (t) => {
+test("project purge does not backfill affected or unrelated pending authority", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-candidate-purge-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const stores = [H("1"), H("2"), H("3"), H("4")].map((projectFingerprint, index) => openStore(root, {
@@ -719,7 +726,7 @@ test("project purge recomputes the affected candidate without rewriting unrelate
   }
   const { rootPolicy, targetBinding } = targetFixture();
   setGlobalRootPolicy(stores[3], rootPolicy);
-  const materialized = stores[3].materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
+  const materialized = materialize(stores[3], { targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
   assert.equal(materialized.ok, true, materialized.reason);
   assert.equal(materialized.candidates.length, 2);
   const affectedBefore = materialized.candidates.find((candidate) => candidate.signatureHash === H("a"));
@@ -727,9 +734,7 @@ test("project purge recomputes the affected candidate without rewriting unrelate
   assert.equal(stores[0].purge({ scope: "project" }).ok, true);
   const candidates = stores[3].readGlobalCandidates();
   const affectedAfter = candidates.find((candidate) => candidate.candidateId === affectedBefore.candidateId);
-  assert.ok(affectedAfter);
-  assert.equal(affectedAfter.state, "collecting");
-  assert.notEqual(affectedAfter.supportSetHash, affectedBefore.supportSetHash);
+  assert.equal(affectedAfter, undefined);
   assert.deepEqual(candidates.find((candidate) => candidate.candidateId === unrelatedBefore.candidateId), unrelatedBefore);
 });
 
@@ -758,7 +763,7 @@ test("project purge supersedes stale global Apply authority without removing ano
   });
   const { rootPolicy, targetBinding } = targetFixture();
   setGlobalRootPolicy(second, rootPolicy);
-  const materialized = second.materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
+  const materialized = materialize(second, { targetBindings: [targetBinding], rootPolicy, nowMs: NOW });
   assert.equal(materialized.ok, true, materialized.reason);
   const recommendation = seedGlobalRecommendation(
     root,
@@ -897,45 +902,6 @@ test("project purge recommendation invalidation recovers every durable crash bou
       assert.equal(recovered.readGlobalCandidates().find((item) => item.candidateId === recommendation.candidateId).state, "superseded");
       assert.equal(recovered.readGlobalDecisions().filter((item) => item.recommendationId === recommendation.recommendationId).length, 1);
       assert.equal(recovered.readGlobalAudits().filter((item) => item.recommendationId === recommendation.recommendationId).length, 1);
-      assert.equal(recovered.recoverGlobalLifecycle().recovered, 0);
-    });
-  }
-});
-
-test("consent revocation supersession recovers every lifecycle fault before clearing settings intent", async (t) => {
-  for (const faultPoint of [
-    "global-lifecycle-after-decision",
-    "global-lifecycle-after-recommendation",
-    "global-lifecycle-after-candidate",
-    "global-lifecycle-after-audit",
-  ]) {
-    await t.test(faultPoint, (t) => {
-      const f = globalRecommendationFixture(t, `consent-revoke-${faultPoint}`);
-      f.first.close();
-      const child = spawnSync(process.execPath, [
-        SETTINGS_CRASH_CHILD,
-        f.root,
-        H("1"),
-        faultPoint,
-        "revoke-excerpts",
-      ], { encoding: "utf8" });
-      assert.equal(child.signal, "SIGKILL", child.stderr);
-
-      const recovered = openStore(f.root, {
-        projectName: "recovered",
-        projectFingerprint: H("2"),
-        now: () => NOW + 1,
-        staleLockMs: 1,
-      });
-      t.after(() => recovered.close());
-      assert.equal(recovered.getSettings().global.consent.sanitizedExcerpts, false);
-      const recommendation = recovered.readGlobalRecommendations()
-        .find((item) => item.recommendationId === f.recommendation.recommendationId);
-      assert.equal(recommendation.state, "superseded");
-      assert.equal(recovered.readGlobalRecommendationContent(recommendation.recommendationId), null);
-      assert.equal(recovered.readGlobalCandidates().find((item) => item.candidateId === recommendation.candidateId).state, "superseded");
-      assert.equal(recovered.readGlobalDecisions().filter((item) => item.actorRole === "policy" && item.recommendationId === recommendation.recommendationId).length, 1);
-      assert.equal(recovered.readGlobalAudits().filter((item) => item.kind === "support-invalidated" && item.recommendationId === recommendation.recommendationId).length, 1);
       assert.equal(recovered.recoverGlobalLifecycle().recovered, 0);
     });
   }

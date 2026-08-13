@@ -50,6 +50,16 @@ function run(command, args, { cwd, env } = {}) {
   return assertSpawnSucceeded(result, command, args);
 }
 
+export function runDependencyAudit(repoRoot, { env } = {}) {
+  // The dependency audit is a mandatory publication gate. It runs the
+  // dependency-free `npm run audit:dependencies` script (Bun JSON audit plus
+  // owner-exception verification, including the no-future-reviewDate rule) and
+  // fails closed on any unresolved or malformed finding. It must precede every
+  // pack or publication-capable operation in this script and in
+  // `scripts/release-artifact.mjs`.
+  run("npm", ["run", "audit:dependencies"], { cwd: repoRoot, env: env ?? process.env });
+}
+
 function normalizePackagePath(value) {
   return String(value).replace(/^\.\//u, "").replaceAll("\\", "/").replace(/\/$/u, "");
 }
@@ -201,6 +211,7 @@ export function validatePackedArtifact({ repoRoot, packed, tarball, tempRoot, np
 export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? defaultRepoRoot } = {}) {
   const tempRoot = mkdtempSync(path.join(tmpdir(), "self-evolve-pack-"));
   try {
+    const npmEnv = { ...process.env, npm_config_cache: path.join(tempRoot, "npm-cache") };
     const packageJSON = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
     assertPublicFilesManifest(packageJSON);
     const source = readFileSync(path.join(repoRoot, TUI_SOURCE_FILE), "utf8");
@@ -209,7 +220,14 @@ export async function main({ repoRoot = process.env.SELF_EVOLVE_PACK_ROOT ?? def
     assertGeneratedTuiArtifact(generated);
     const rebuilt = compileTuiArtifact(path.join(tempRoot, GENERATED_TUI_FILE), { root: repoRoot });
     assertCurrentTuiArtifact(rebuilt, generated);
-    const npmEnv = { ...process.env, npm_config_cache: path.join(tempRoot, "npm-cache") };
+    // The dependency audit is a mandatory publication gate. It runs after the
+    // Node-only manifest/TUI structural checks (which must precede any `npm`
+    // invocation and which synthetic test fixtures may deliberately fail early)
+    // and immediately before any pack or publication-capable operation. It
+    // invokes the dependency-free `npm run audit:dependencies` (Bun JSON audit
+    // plus owner-exception verification, including the no-future-reviewDate
+    // rule) and fails closed on any unresolved or malformed finding.
+    runDependencyAudit(repoRoot, { env: npmEnv });
     const packed = parsePackResult(run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", tempRoot], { cwd: repoRoot, env: npmEnv }).stdout);
     const tarball = path.join(tempRoot, packed.filename);
     const { files } = validatePackedArtifact({ repoRoot, packed, tarball, tempRoot, npmEnv });

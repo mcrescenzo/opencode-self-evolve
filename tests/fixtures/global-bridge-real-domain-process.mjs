@@ -18,6 +18,17 @@ const store = openStore(stateRoot, {
     if (point === config.faultPoint) process.kill(process.pid, "SIGKILL");
   },
 });
+const hostCatalog = () => {
+  const policy = store.getSettings().global.globalRootPolicy;
+  const legacy = inventory.buildGlobalSkillCatalog(policy, { projectRoot: config.consumerProjectRoot });
+  return {
+    ok: legacy.ok,
+    records: legacy.records,
+    catalogGenerationHash: legacy.catalogGenerationHash,
+    sourceReceiptHash: inventory.hashSkillContent(`real-domain-host:${legacy.catalogGenerationHash}`),
+    diagnostics: legacy.blockers?.map((value) => value.code) ?? [],
+  };
+};
 const privacy = createPrivacyGuard({
   consent: store.getSettings().global.consent,
   projectFingerprint: config.consumerProjectFingerprint,
@@ -57,6 +68,7 @@ const integration = createIntegration({
   options: {
     stateRoot,
     hostSupported: true,
+    getHostGlobalSkillCatalog: hostCatalog,
     ctx: { directory: config.consumerProjectRoot },
     __testSetMailboxInterval: () => fakeTimer,
     __testClearMailboxInterval: () => {},

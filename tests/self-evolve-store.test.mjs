@@ -17,6 +17,7 @@ import {
   makeEpisodeCursor,
   makeEvidenceCapsule,
   makeEvidenceCluster,
+  makeGlobalContribution,
   makeGlobalSettings,
   makeInterventionEpoch,
   makeObservation,
@@ -143,6 +144,12 @@ function runSynthesisAdmissionChild(root, project, suffix, timestamp = 1_000) {
 function fixture(now = 1_000) {
   const root = ownedTempRoot("self-evolve-store-");
   return { root, store: openStore(root, { projectName: "fixture", projectFingerprint: PROJECT, now: () => now }) };
+}
+
+function automationStamp(store) {
+  const state = store.getAutomationState();
+  assert.equal(state.ok, true, state.reason);
+  return state.stamp;
 }
 
 function observation(createdAt = 1_000, id = H("1")) {
@@ -334,24 +341,22 @@ test("creates the store atomically and appends and reads records", () => {
 
 test("capsules deduplicate by local incident and never serialize under global state", () => {
   const { root, store } = fixture();
-  assert.equal(store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: true },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
-  const first = capsule();
-  assert.deepEqual(store.appendEvidenceCapsule(first), { ok: true, duplicate: false, capsule: first });
+  const stamp = automationStamp(store);
+  const firstResult = store.appendEvidenceCapsule(capsule(), { automationStamp: stamp });
+  assert.equal(firstResult.ok, true, firstResult.reason);
+  assert.equal(firstResult.duplicate, false);
+  const first = firstResult.capsule;
 
   const retry = capsule({
     capsuleId: "22222222-2222-4222-8222-222222222222",
     createdAt: 1_001,
     expiresAt: 1_001 + 30 * 86_400_000,
   });
-  assert.deepEqual(store.appendEvidenceCapsule(retry), { ok: true, duplicate: true, capsule: first });
+  assert.deepEqual(store.appendEvidenceCapsule(retry, { automationStamp: stamp }), { ok: true, duplicate: true, capsule: first });
   assert.deepEqual(store.appendEvidenceCapsule(capsule({
     capsuleId: "33333333-3333-4333-8333-333333333333",
     summary: "A conflicting retry attempted a different summary.",
-  })), { ok: false, reason: "capsule-incident-conflict" });
+  }), { automationStamp: stamp }), { ok: false, reason: "capsule-incident-conflict" });
   assert.deepEqual(store.readEvidenceCapsules({ includeExpired: true }), [first]);
 
   const capsulePath = path.join(root, "self-evolve", PROJECT, "evidence-capsules.jsonl");
@@ -365,39 +370,32 @@ test("capsules deduplicate by local incident and never serialize under global st
   store.close();
 });
 
-test("revocation transaction recovery deletes capsules in every project after a process kill", async () => {
+test("permission revocation deletes capsules in every project partition", () => {
   const root = ownedTempRoot("self-evolve-capsule-revocation-crash-");
   const projectB = H("b");
   const first = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
   const second = openStore(root, { projectFingerprint: projectB, now: () => 1_000 });
-  assert.equal(first.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: true },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  const stamp = automationStamp(first);
   const firstCapsule = capsule();
   const secondCapsule = capsule({
     capsuleId: "22222222-2222-4222-8222-222222222222",
     incidentId: "capsule-incident-2",
   });
-  assert.equal(first.appendEvidenceCapsule(firstCapsule).ok, true);
-  assert.equal(second.appendEvidenceCapsule(secondCapsule).ok, true);
-  first.close();
-  second.close();
-
-  await runKilledChild(SETTINGS_TRANSACTION_CRASH_CHILD, [
-    root,
-    PROJECT,
-    "settings-after-audit-write",
-    "revoke-excerpts",
-  ]);
+  assert.equal(first.appendEvidenceCapsule(firstCapsule, { automationStamp: stamp }).ok, true);
+  assert.equal(second.appendEvidenceCapsule(secondCapsule, { automationStamp: stamp }).ok, true);
   assert.equal(existsSync(path.join(root, "self-evolve", PROJECT, "evidence-capsules.jsonl")), true);
   assert.equal(existsSync(path.join(root, "self-evolve", projectB, "evidence-capsules.jsonl")), true);
-
-  const recovered = openStore(root, { projectFingerprint: PROJECT, now: () => 2_001, staleLockMs: 1 });
+  const revoked = first.transitionAutomation({
+    transitionId: "store-test-revoke-excerpts",
+    expectedGeneration: 1,
+    action: "set-permission",
+    permission: "sanitizedExcerpts",
+    enabled: false,
+  });
+  assert.equal(revoked.ok, true, revoked.reason);
   assert.equal(existsSync(path.join(root, "self-evolve", PROJECT, "evidence-capsules.jsonl")), false);
   assert.equal(existsSync(path.join(root, "self-evolve", projectB, "evidence-capsules.jsonl")), false);
-  assert.deepEqual(recovered.getEvidenceCapsuleSupport(firstCapsule.incidentId), {
+  assert.deepEqual(first.getEvidenceCapsuleSupport(firstCapsule.incidentId), {
     available: false,
     reason: "sanitized-excerpts-consent-required",
   });
@@ -409,7 +407,8 @@ test("revocation transaction recovery deletes capsules in every project after a 
     assert.doesNotMatch(globalText, new RegExp(item.capsuleId, "u"));
     assert.equal(globalText.includes(item.summary), false);
   }
-  recovered.close();
+  first.close();
+  second.close();
 });
 
 test("store open rejects symlinked root and durable ancestors without touching their targets", () => {
@@ -786,7 +785,8 @@ test("state-root-global leases are identity-free, short-lived, and released outs
     "schemaVersion", "leaseId", "leaseKind", "leaseKeyHash", "ownerToken",
     "state", "acquiredAt", "expiresAt", "releasedAt",
   ]);
-  assert.doesNotMatch(JSON.stringify(acquired.lease), new RegExp(`${PROJECT}|${H("b")}|${process.pid}`, "u"));
+  assert.doesNotMatch(JSON.stringify(acquired.lease), new RegExp(`${PROJECT}|${H("b")}`, "u"));
+  assert.equal("pid" in acquired.lease, false);
   assert.deepEqual(first.releaseGlobalLease({ leaseKeyHash: request.leaseKeyHash, ownerToken: "11111111-1111-4111-8111-111111111111" }), {
     ok: false,
     reason: "global-lease-owner-mismatch",
@@ -862,7 +862,7 @@ test("atomic store writes fsync their temporary descriptor before rename", () =>
 
   assert.equal(store.updateGlobalSettings((settings) => makeGlobalSettings({
     ...settings,
-    paused: true,
+    retentionDays: settings.retentionDays + 1,
     updatedAt: settings.updatedAt + 1,
   })).ok, true);
   assert.ok(syncCalls > 0, "transaction-intent and settings writes must be fsynced before rename");
@@ -995,11 +995,7 @@ test("retention removes capsules at their exact expiry and keeps fresh project-l
   const day = 86_400_000;
   const now = 40 * day;
   const { store } = fixture(now);
-  assert.equal(store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: true },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  const stamp = automationStamp(store);
   const expired = capsule({ createdAt: day, expiresAt: now });
   const fresh = capsule({
     capsuleId: "22222222-2222-4222-8222-222222222222",
@@ -1007,11 +1003,12 @@ test("retention removes capsules at their exact expiry and keeps fresh project-l
     createdAt: now - day,
     expiresAt: now + day,
   });
-  assert.equal(store.appendEvidenceCapsule(expired).ok, true);
-  assert.equal(store.appendEvidenceCapsule(fresh).ok, true);
+  assert.equal(store.appendEvidenceCapsule(expired, { automationStamp: stamp }).ok, true);
+  const freshResult = store.appendEvidenceCapsule(fresh, { automationStamp: stamp });
+  assert.equal(freshResult.ok, true, freshResult.reason);
 
   assert.equal(store.retain(now).capsules, 1);
-  assert.deepEqual(store.readEvidenceCapsules({ includeExpired: true }), [fresh]);
+  assert.deepEqual(store.readEvidenceCapsules({ includeExpired: true }), [freshResult.capsule]);
   store.close();
 });
 
@@ -1750,8 +1747,9 @@ const SETTINGS_TRANSACTION_POINTS = Object.freeze({
 
 function assertSettingsTransactionOutcome(store, scope, committed) {
   const settings = store.getSettings();
-  assert.equal(settings.global.mode, committed && scope !== "repo" ? "auto" : "manual");
-  assert.equal(settings.repo.mode, committed && scope !== "global" ? "auto" : "inherit");
+  assert.equal(settings.global.mode, "manual", "retired mode authority is never changed");
+  assert.equal(settings.global.retentionDays, committed && scope !== "repo" ? 31 : 30);
+  assert.equal(settings.repo.mode, "inherit", "retired repository mode authority is never changed");
   assert.equal(settings.repo.excluded, committed && scope !== "global");
   const audits = store.readRecords("audit-event").filter((record) => record.payload.kind === "mode-change");
   assert.equal(audits.length, committed ? 1 : 0);
@@ -1771,8 +1769,8 @@ for (const [scope, points] of Object.entries(SETTINGS_TRANSACTION_POINTS)) {
           if (current === point) throw new Error("injected-settings-failure");
         },
       });
-      const mutateGlobal = (global) => makeGlobalSettings({ ...global, mode: "auto", updatedAt: 2_000 });
-      const mutateRepo = (repo) => makeRepoSettings({ ...repo, mode: "auto", excluded: true });
+      const mutateGlobal = (global) => makeGlobalSettings({ ...global, retentionDays: 31, updatedAt: 2_000 });
+      const mutateRepo = (repo) => makeRepoSettings({ ...repo, excluded: true });
       const result = scope === "global"
         ? store.updateGlobalSettings(mutateGlobal)
         : scope === "repo"
@@ -1804,10 +1802,10 @@ for (const [scope, points] of Object.entries(SETTINGS_TRANSACTION_POINTS)) {
   }
 }
 
-test("global settings written by one project process are fresh in another project process", async () => {
+test("global retention written by one project process is fresh in another project process", async () => {
   const root = ownedTempRoot("self-evolve-store-global-");
-  assert.equal((await runChild(root, PROJECT, "set-global", "auto")).mode, "auto");
-  assert.deepEqual(await runChild(root, H("b"), "read-global"), { mode: "auto" });
+  assert.equal((await runChild(root, PROJECT, "set-global-retention", "45")).retentionDays, 45);
+  assert.deepEqual(await runChild(root, H("b"), "read-global-retention"), { retentionDays: 45 });
   assert.equal(existsSync(path.join(root, "self-evolve", PROJECT, "settings.json")), true);
   assert.equal(existsSync(path.join(root, "self-evolve", "global", "settings.json")), true);
 });
@@ -2000,33 +1998,33 @@ test("real child settings updaters preserve unrelated global and repository fiel
   initial.close();
 
   let results = await Promise.all([
-    runChild(root, PROJECT, "update-global-mode", "auto"),
-    runChild(root, PROJECT, "update-global-consent", "true"),
+    runChild(root, PROJECT, "update-global-retention", "45"),
+    runChild(root, PROJECT, "update-global-budget", "12"),
   ]);
   assert.equal(results.every((result) => result.ok), true);
   let reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 10 });
-  assert.equal(reopened.getSettings().global.mode, "auto");
-  assert.equal(reopened.getSettings().global.consent.sanitizedExcerpts, true);
+  assert.equal(reopened.getSettings().global.retentionDays, 45);
+  assert.equal(reopened.getSettings().global.budgets.synthesisPerDay, 12);
   reopened.close();
 
   results = await Promise.all([
-    runChild(root, PROJECT, "update-global-pause", "true"),
     runChild(root, PROJECT, "update-global-allowlist", allowlist),
+    runChild(root, PROJECT, "update-global-budget", "14"),
   ]);
   assert.equal(results.every((result) => result.ok), true);
   reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 20 });
-  assert.equal(reopened.getSettings().global.paused, true);
   assert.deepEqual(reopened.getSettings().global.allowedSkillRoots, [allowlist]);
+  assert.equal(reopened.getSettings().global.budgets.synthesisPerDay, 14);
   reopened.close();
 
   results = await Promise.all([
-    runChild(root, PROJECT, "update-repo-mode", "manual"),
     runChild(root, PROJECT, "update-repo-excluded", "true"),
+    runChild(root, PROJECT, "update-repo-budget", "32"),
   ]);
   assert.equal(results.every((result) => result.ok), true);
   reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 30 });
-  assert.equal(reopened.getSettings().repo.mode, "manual");
   assert.equal(reopened.getSettings().repo.excluded, true);
+  assert.equal(reopened.getSettings().repo.budgets.storageQuotaMiB, 32);
   reopened.close();
 });
 
@@ -2349,8 +2347,8 @@ test("already-open project stores re-read global settings on every get", () => {
   const first = openStore(root, { projectFingerprint: PROJECT, now: () => 1 });
   const second = openStore(root, { projectFingerprint: H("b"), now: () => 2 });
   const global = first.getSettings().global;
-  first.setGlobalSettings(makeGlobalSettings({ ...global, mode: "auto", updatedAt: 3 }));
-  assert.equal(second.getSettings().global.mode, "auto");
+  first.setGlobalSettings(makeGlobalSettings({ ...global, retentionDays: 45, updatedAt: 3 }));
+  assert.equal(second.getSettings().global.retentionDays, 45);
   first.close();
   second.close();
 });
@@ -2415,11 +2413,11 @@ test("0.2.0 and 0.2.1 partitions migrate explicitly without quarantine", () => {
   }
 });
 
-test("a representative v0.2 partition migrates settings to 0.3.0 without importing legacy global authority", () => {
+test("a representative v0.2 partition migrates into the v0.4 automation bundle without importing retired authority", () => {
   const root = ownedTempRoot("self-evolve-store-v02-migration-");
   const seed = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
   const current = seed.getSettings().global;
-  assert.equal(seed.setGlobalSettings(makeGlobalSettings({
+  const legacyGlobal = makeGlobalSettings({
     ...current,
     mode: "yolo",
     paused: true,
@@ -2429,7 +2427,7 @@ test("a representative v0.2 partition migrates settings to 0.3.0 without importi
     budgets: { ...current.budgets, synthesisPerDay: 7 },
     retentionDays: 14,
     updatedAt: 1_001,
-  })).mode, "auto");
+  });
   const legacyProposal = proposal();
   assert.equal(seed.appendRecord(wrapRecord("proposal", legacyProposal, 1_002)).ok, true);
   seed.close();
@@ -2437,11 +2435,11 @@ test("a representative v0.2 partition migrates settings to 0.3.0 without importi
   // Re-stamp the partition as a v0.2 generation the way a previous release left it.
   const base = path.join(root, "self-evolve");
   writeFileSync(path.join(base, "version.json"), '{"schemaVersion":"0.2.1"}\n', { mode: 0o600 });
-  for (const file of ["settings.json"]) {
-    const globalSettingsPath = path.join(base, "global", file);
-    const parsed = JSON.parse(readFileSync(globalSettingsPath, "utf8"));
-    writeFileSync(globalSettingsPath, `${JSON.stringify({ ...parsed, schemaVersion: "0.2.1", mode: "yolo" })}\n`, { mode: 0o600 });
-  }
+  const globalSettingsPath = path.join(base, "global", "settings.json");
+  writeFileSync(globalSettingsPath, `${JSON.stringify({ ...legacyGlobal, schemaVersion: "0.2.1", mode: "yolo" })}\n`, { mode: 0o600 });
+  rmSync(path.join(base, "global", "automation-settings.json"), { force: true });
+  rmSync(path.join(base, PROJECT, "automation-settings.json"), { force: true });
+  rmSync(path.join(root, ".self-evolve-automation-epoch.json"), { force: true });
   const recordsPath = path.join(base, PROJECT, "proposals.jsonl");
   const legacyRecords = readFileSync(recordsPath, "utf8").trim().split("\n")
     .map((line) => JSON.stringify({ ...JSON.parse(line), schemaVersion: "0.2.1" }))
@@ -2450,6 +2448,7 @@ test("a representative v0.2 partition migrates settings to 0.3.0 without importi
 
   const migrated = openStore(root, { projectFingerprint: PROJECT, now: () => 2_000 });
   const settings = migrated.getSettings();
+  const automation = migrated.getAutomationState();
 
   assert.equal(JSON.parse(readFileSync(path.join(base, "version.json"), "utf8")).schemaVersion, "0.3.0");
   assert.equal(settings.global.schemaVersion, SCHEMA_VERSION);
@@ -2466,6 +2465,17 @@ test("a representative v0.2 partition migrates settings to 0.3.0 without importi
   assert.equal(settings.global.budgets.synthesisPerDay, 7);
   assert.equal(settings.global.retentionDays, 14);
   assert.equal(settings.global.globalRootPolicy, null, "migration never invents an approved global root");
+  assert.equal(automation.ok, true, automation.reason);
+  assert.equal(automation.enabled, true, "every retired mode and pause combination converges to the On baseline");
+  assert.equal(automation.global.killSwitchActive, true, "Emergency Stop survives migration");
+  assert.equal("mode" in automation.global, false);
+  assert.equal("paused" in automation.global, false);
+  assert.equal("passiveCalls" in automation.global.consent, false);
+  assert.deepEqual(automation.global.consent, {
+    durableObservations: true,
+    sanitizedExcerpts: true,
+    crossRepoAggregation: true,
+  });
   const proposals = migrated.readRecords("proposal");
   assert.equal(proposals.length, 1);
   assert.equal(proposals[0].payload.id, legacyProposal.id);
@@ -2476,4 +2486,452 @@ test("a representative v0.2 partition migrates settings to 0.3.0 without importi
   assert.deepEqual(migrated.readGlobalDecisions(), []);
   assert.deepEqual(migrated.readContributions({ scope: "global", includeExpired: true }), []);
   migrated.close();
+});
+
+// The next five tests cover the v0.3 first-time global-settings reconciliation
+// contract (bead self-evolve-hscn.3): first-time migration must inspect EVERY
+// legacy partition, migrate only unanimous consent/authority values, and fail
+// closed to Manual+all-false consent with a durable, partition-safe conflict
+// record whenever any partition disagrees. The result is independent of the
+// lexical ordering of partition fingerprints, so a partition that happens to
+// sort first can no longer globalize its own broader consent.
+
+const CONFLICT_RECORD_PATH = ["self-evolve", "global", "migration-conflict.json"];
+const ALL_CONSENT_FALSE = { passiveCalls: false, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false };
+
+function writeLegacyCombinedPartition(root, fingerprint, globalOverrides = {}) {
+  const dir = path.join(root, "self-evolve", fingerprint);
+  mkdirSync(dir, { recursive: true });
+  const document = {
+    schemaVersion: SCHEMA_VERSION,
+    global: makeGlobalSettings({ createdAt: 100, updatedAt: 100, ...globalOverrides }),
+    repo: makeRepoSettings({ projectFingerprint: fingerprint }),
+  };
+  writeFileSync(path.join(dir, "settings.json"), JSON.stringify(document));
+  return dir;
+}
+
+function writeMalformedPartition(root, fingerprint, payload, { raw = false } = {}) {
+  const dir = path.join(root, "self-evolve", fingerprint);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "settings.json"), raw ? payload : JSON.stringify(payload));
+  return dir;
+}
+
+function readMigrationConflict(root) {
+  const conflictPath = path.join(root, ...CONFLICT_RECORD_PATH);
+  if (!existsSync(conflictPath)) return null;
+  return JSON.parse(readFileSync(conflictPath, "utf8"));
+}
+
+for (const [orderingLabel, broadFingerprint, narrowFingerprint] of [
+  ["broad-consent partition sorts first (lexically lower)", H("a"), H("b")],
+  ["broad-consent partition sorts second (lexically higher)", H("b"), H("c")],
+]) {
+  test(`first-time global migration fails closed for divergent legacy consent regardless of lexical order: ${orderingLabel}`, () => {
+    const root = ownedTempRoot("self-evolve-store-reconcile-divergent-");
+    const broadConsent = { passiveCalls: true, durableObservations: true, sanitizedExcerpts: true, crossRepoAggregation: true };
+    writeLegacyCombinedPartition(root, broadFingerprint, { mode: "auto", consent: broadConsent, allowedSkillRoots: ["/skills"] });
+    writeLegacyCombinedPartition(root, narrowFingerprint, { mode: "manual", consent: ALL_CONSENT_FALSE });
+
+    const triggerFingerprint = H("d");
+    const store = openStore(root, { projectFingerprint: triggerFingerprint, now: () => 5_000 });
+    const settings = store.getSettings().global;
+    store.close();
+
+    assert.equal(settings.mode, "manual", `${orderingLabel}: divergent mode must fail closed to manual`);
+    assert.equal(settings.paused, false, `${orderingLabel}: paused must default`);
+    assert.equal(settings.killSwitchActive, false, `${orderingLabel}: killSwitch must default`);
+    assert.deepEqual(settings.allowedSkillRoots, [], `${orderingLabel}: allowedSkillRoots must default to empty`);
+    assert.deepEqual(settings.consent, ALL_CONSENT_FALSE, `${orderingLabel}: every divergent consent bit must remain false`);
+
+    const conflict = readMigrationConflict(root);
+    assert.notEqual(conflict, null, `${orderingLabel}: a conflict record must be written`);
+    assert.equal(conflict.kind, "global-migration-conflict");
+    assert.equal(conflict.reason, "legacy-global-consent-conflict");
+    assert.equal(conflict.schemaVersion, SCHEMA_VERSION);
+    assert.equal(conflict.createdAt, 5_000, `${orderingLabel}: conflict records the migration timestamp`);
+    assert.deepEqual(conflict.partitionFingerprints, [broadFingerprint, narrowFingerprint], `${orderingLabel}: only the participating legacy partitions are listed, in sorted order`);
+    assert.ok(!conflict.partitionFingerprints.includes(triggerFingerprint), `${orderingLabel}: the migration-triggering partition is not a legacy participant`);
+    assert.ok(conflict.divergentFields.includes("mode"), `${orderingLabel}: divergent mode is named`);
+    assert.ok(conflict.divergentFields.includes("consent.passiveCalls"), `${orderingLabel}: divergent consent bit is named`);
+    assert.ok(conflict.divergentFields.includes("allowedSkillRoots"), `${orderingLabel}: divergent allowedSkillRoots is named`);
+    // No field values may leak into the conflict record beyond the public defaults.
+    for (const fingerprint of conflict.partitionFingerprints) {
+      assert.match(fingerprint, /^[a-f0-9]{64}$/u, "only 64-hex partition fingerprints are listed");
+    }
+    assert.equal(conflict.resolution.authorizesPublication, false, "conflict must never authorize publication");
+    assert.equal(conflict.resolution.selectsModel, false, "conflict must never select a model");
+    assert.equal(conflict.resolution.path, "operator-settings-control", "resolution names the trusted control path");
+    assert.deepEqual(conflict.appliedDefaults.consent, ALL_CONSENT_FALSE, "appliedDefaults documents the conservative consent fallback");
+    assert.equal(conflict.appliedDefaults.mode, "manual", "appliedDefaults documents the conservative mode fallback");
+  });
+}
+
+test("first-time global migration migrates unanimous non-default values across identical legacy partitions", () => {
+  const root = ownedTempRoot("self-evolve-store-reconcile-unanimous-");
+  const unanimous = {
+    mode: "auto",
+    paused: true,
+    killSwitchActive: true,
+    allowedSkillRoots: ["/skills"],
+    consent: { passiveCalls: true, durableObservations: true, sanitizedExcerpts: true, crossRepoAggregation: true },
+    retentionDays: 14,
+    budgets: {
+      passiveCallsPerHour: 5,
+      synthesisPerDay: 7,
+      tokensPerSynthesis: 4096,
+      concurrentObservationsPerProject: 2,
+      concurrentSynthesesGlobal: 1,
+      idleDebounceMs: 1500,
+      storageQuotaMiB: 8,
+      notificationsPerHour: 3,
+    },
+  };
+  writeLegacyCombinedPartition(root, H("a"), unanimous);
+  writeLegacyCombinedPartition(root, H("b"), unanimous);
+  writeLegacyCombinedPartition(root, H("c"), unanimous);
+
+  const store = openStore(root, { projectFingerprint: H("d"), now: () => 5_000 });
+  const settings = store.getSettings().global;
+  store.close();
+
+  assert.equal(settings.mode, "auto", "unanimous mode migrates");
+  assert.equal(settings.paused, true, "unanimous paused migrates");
+  assert.equal(settings.killSwitchActive, true, "unanimous killSwitch migrates");
+  assert.deepEqual(settings.allowedSkillRoots, ["/skills"], "unanimous allowedSkillRoots migrate");
+  assert.deepEqual(settings.consent, { passiveCalls: true, durableObservations: true, sanitizedExcerpts: true, crossRepoAggregation: true }, "unanimous consent bits migrate");
+  assert.equal(settings.budgets.synthesisPerDay, 7, "unanimous budgets migrate");
+  assert.equal(settings.budgets.passiveCallsPerHour, 5, "unanimous budgets migrate");
+  assert.equal(settings.retentionDays, 14, "unanimous retention migrates");
+  assert.equal(readMigrationConflict(root), null, "no conflict record is written when partitions agree");
+});
+
+test("first-time global migration skips malformed legacy partitions and reconciles the remaining valid ones", () => {
+  const root = ownedTempRoot("self-evolve-store-reconcile-malformed-");
+  // Pre-stamp a recognized state version so inspectPartitionVersion short-circuits
+  // and does not reject the whole state root; the per-partition reconciliation is
+  // what we are exercising here. (Without version.json present, the boot-time
+  // inspectUnversionedPartition safety gate would itself reject the malformed
+  // partitions before reconciliation ever runs.)
+  mkdirSync(path.join(root, "self-evolve"), { recursive: true });
+  writeFileSync(path.join(root, "self-evolve", "version.json"), JSON.stringify({ schemaVersion: SCHEMA_VERSION }));
+
+  const valid = { mode: "auto", consent: { passiveCalls: true, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false } };
+  writeLegacyCombinedPartition(root, H("a"), valid);
+  // Partition with unparseable JSON.
+  writeMalformedPartition(root, H("b"), "{not-json", { raw: true });
+  // Partition missing the repo section that readLegacyCombined requires.
+  writeMalformedPartition(root, H("c"), { schemaVersion: SCHEMA_VERSION, global: makeGlobalSettings(valid) });
+  // Partition whose global section fails makeGlobalSettings validation.
+  writeMalformedPartition(root, H("d"), {
+    schemaVersion: SCHEMA_VERSION,
+    global: { ...makeGlobalSettings(valid), mode: "not-a-real-mode" },
+    repo: makeRepoSettings({ projectFingerprint: H("d") }),
+  });
+  // Partition whose schemaVersion is unsupported.
+  writeMalformedPartition(root, H("e"), {
+    schemaVersion: "9.9.9",
+    global: makeGlobalSettings(valid),
+    repo: makeRepoSettings({ projectFingerprint: H("e") }),
+  });
+
+  const store = openStore(root, { projectFingerprint: H("f"), now: () => 5_000 });
+  const settings = store.getSettings().global;
+  store.close();
+
+  // Only partition "a" is valid; it is trivially unanimous with itself, so its
+  // values migrate cleanly and no conflict is recorded.
+  assert.equal(settings.mode, "auto", "the single valid partition's mode migrates");
+  assert.equal(settings.consent.passiveCalls, true, "the single valid partition's consent migrates");
+  assert.equal(readMigrationConflict(root), null, "no conflict when malformed partitions are simply skipped");
+});
+
+test("first-time global migration applies defaults when no legacy partition is present and writes no conflict", () => {
+  const root = ownedTempRoot("self-evolve-store-reconcile-absent-");
+
+  // No partition directories at all.
+  let store = openStore(root, { projectFingerprint: H("a"), now: () => 5_000 });
+  let settings = store.getSettings().global;
+  store.close();
+  assert.equal(settings.mode, "manual", "no legacy implies default manual mode");
+  assert.deepEqual(settings.consent, ALL_CONSENT_FALSE, "no legacy implies default all-false consent");
+  assert.equal(readMigrationConflict(root), null, "no conflict record without legacy partitions");
+
+  // Partition directory exists but has no settings.json (treated as absent).
+  mkdirSync(path.join(root, "self-evolve", H("b")), { recursive: true });
+  rmSync(path.join(root, "self-evolve", "global", "settings.json"), { force: true });
+  rmSync(path.join(root, "self-evolve", "global", "migration-conflict.json"), { force: true });
+  store = openStore(root, { projectFingerprint: H("c"), now: () => 6_000 });
+  settings = store.getSettings().global;
+  store.close();
+  assert.equal(settings.mode, "manual", "empty partition directory still implies default manual mode");
+  assert.deepEqual(settings.consent, ALL_CONSENT_FALSE, "empty partition directory still implies default all-false consent");
+  assert.equal(readMigrationConflict(root), null, "no conflict record when partitions have no settings");
+});
+
+test("first-time global migration reconciliation is idempotent across repeated restarts", () => {
+  const root = ownedTempRoot("self-evolve-store-reconcile-idempotent-");
+  writeLegacyCombinedPartition(root, H("a"), { mode: "auto", consent: { passiveCalls: true, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false } });
+  writeLegacyCombinedPartition(root, H("b"), { mode: "manual", consent: ALL_CONSENT_FALSE });
+
+  const triggerFingerprint = H("c");
+  const first = openStore(root, { projectFingerprint: triggerFingerprint, now: () => 5_000 });
+  const firstSettings = first.getSettings().global;
+  first.close();
+  const firstConflictRaw = readFileSync(path.join(root, ...CONFLICT_RECORD_PATH), "utf8");
+  const globalSettingsRaw = readFileSync(path.join(root, "self-evolve", "global", "settings.json"), "utf8");
+
+  // Repeated restarts must not re-run migration, re-write the conflict record,
+  // or alter the conservative settings.
+  for (const restartAt of [6_000, 7_000, 8_000]) {
+    const reopened = openStore(root, { projectFingerprint: triggerFingerprint, now: () => restartAt });
+    const restartSettings = reopened.getSettings().global;
+    reopened.close();
+    assert.deepEqual(restartSettings, firstSettings, `settings unchanged after restart at ${restartAt}`);
+    assert.equal(readFileSync(path.join(root, ...CONFLICT_RECORD_PATH), "utf8"), firstConflictRaw, `conflict record unchanged after restart at ${restartAt}`);
+    assert.equal(readFileSync(path.join(root, "self-evolve", "global", "settings.json"), "utf8"), globalSettingsRaw, `global settings file unchanged after restart at ${restartAt}`);
+  }
+
+  // A different project opening later also sees the already-reconciled state
+  // and does not re-trigger migration or duplicate the conflict record.
+  const otherProject = openStore(root, { projectFingerprint: H("d"), now: () => 9_000 });
+  const otherSettings = otherProject.getSettings().global;
+  otherProject.close();
+  assert.deepEqual(otherSettings, firstSettings, "later project inherits the reconciled global settings");
+  assert.equal(readFileSync(path.join(root, ...CONFLICT_RECORD_PATH), "utf8"), firstConflictRaw, "later project does not duplicate or rewrite the conflict record");
+});
+
+function writeGlobalContributionFile(root, contribution) {
+  const directory = path.join(root, "self-evolve", "global", "contributions", contribution.contributionId.slice(0, 2));
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const target = path.join(directory, `${contribution.contributionId}.json`);
+  writeFileSync(target, `${JSON.stringify(contribution)}\n`, { mode: 0o600 });
+  return target;
+}
+
+test("H3-001: a rehashed global contribution containing a raw project fingerprint is rejected before projection", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-h3-raw-"));
+  try {
+    const store = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+    const contributionId = randomUUID();
+    const clean = makeGlobalContribution({
+      schemaVersion: SCHEMA_VERSION,
+      contributionId,
+      claimType: "global-skill-candidate",
+      receiptType: "repeated-command",
+      signatureHash: H("e"),
+      occurrenceCount: 2,
+      firstSeenDay: "2024-01-01",
+      lastSeenDay: "2024-01-02",
+      createdAt: 1_000,
+      expiresAt: 2_000,
+    });
+    writeGlobalContributionFile(root, clean);
+    store.close();
+
+    // Tamper: replace signatureHash with the raw project fingerprint and
+    // re-serialize canonically. The record remains schema-valid (64-hex) but
+    // now carries a raw private identity.
+    const tampered = { ...clean, signatureHash: PROJECT };
+    writeGlobalContributionFile(root, tampered);
+
+    const reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+    const contributions = reopened.readContributions({ scope: "global", includeExpired: true });
+    reopened.close();
+    assert.deepEqual(contributions, [], "tampered contribution must not enter projection/recovery/export");
+    // The unsafe file was quarantined under a fixed reason code.
+    const quarantineDir = path.join(root, "self-evolve", "global", "quarantine");
+    const quarantineReasons = readdirSync(quarantineDir)
+      .filter((name) => name.endsWith(".reason.json"))
+      .map((name) => JSON.parse(readFileSync(path.join(quarantineDir, name), "utf8")).reason);
+    assert.ok(quarantineReasons.includes("global-record-identity-unsafe"), `quarantined with fixed reason: ${JSON.stringify(quarantineReasons)}`);
+    const activeJsonFiles = readdirSync(path.join(root, "self-evolve", "global", "contributions"), { recursive: true })
+      .filter((entry) => String(entry).endsWith(".json"));
+    assert.equal(activeJsonFiles.length, 0, "unsafe record removed from active tree");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("H3-001: a rehashed global contribution containing a derived identity hash is rejected before projection", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-h3-derived-"));
+  try {
+    const store = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+    const contributionId = randomUUID();
+    const clean = makeGlobalContribution({
+      schemaVersion: SCHEMA_VERSION,
+      contributionId,
+      claimType: "global-skill-candidate",
+      receiptType: "repeated-command",
+      signatureHash: H("e"),
+      occurrenceCount: 2,
+      firstSeenDay: "2024-01-01",
+      lastSeenDay: "2024-01-02",
+      createdAt: 1_000,
+      expiresAt: 2_000,
+    });
+    writeGlobalContributionFile(root, clean);
+    store.close();
+
+    // Tamper: embed a DERIVED identity (hash of the project fingerprint).
+    const tampered = { ...clean, signatureHash: hashContent(PROJECT) };
+    writeGlobalContributionFile(root, tampered);
+
+    const reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+    const contributions = reopened.readContributions({ scope: "global", includeExpired: true });
+    reopened.close();
+    assert.deepEqual(contributions, [], "derived-identity contribution must not enter projection");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("H3-001: a rehashed global contribution containing a provider token or absolute path is quarantined", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "self-evolve-h3-token-"));
+  try {
+    const store = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+    // A legitimate contribution (signatureHash is valid hex, no private material).
+    const contributionId = randomUUID();
+    const clean = makeGlobalContribution({
+      schemaVersion: SCHEMA_VERSION,
+      contributionId,
+      claimType: "global-skill-candidate",
+      receiptType: "repeated-command",
+      signatureHash: H("e"),
+      occurrenceCount: 1,
+      firstSeenDay: "2024-01-01",
+      lastSeenDay: "2024-01-01",
+      createdAt: 1_000,
+      expiresAt: 2_000,
+    });
+    writeGlobalContributionFile(root, clean);
+    store.close();
+
+    // Tamper: contributions have no free-text field, so validate the content
+    // scan through a record kind that DOES carry free text. Write a tampered
+    // global recommendation whose rationaleText embeds a token + absolute path.
+    const synthesizerModelId = "fixture/model";
+    const targetBinding = {
+      targetKind: "existing-global-skill",
+      rootId: H("r"),
+      logicalName: "privacy",
+      relativePath: "privacy/SKILL.md",
+      currentHash: H("c"),
+      catalogGenerationHash: H("g"),
+      rootSetHash: H("s"),
+      candidateBindingHash: H("b"),
+      bindingHash: H("z"),
+    };
+    const recommendation = {
+      schemaVersion: SCHEMA_VERSION,
+      recommendationId: H("1"),
+      candidateId: H("2"),
+      supportSetHash: H("3"),
+      candidateTargetBindingHash: H("b"),
+      targetBinding,
+      proposedContentHash: H("p"),
+      rationaleText: `Leaked bearer sk-canary1234567890abcdef and path /home/secret/canary in rationale.`,
+      synthesizedAt: 1_000,
+      synthesizerModelId,
+      criticScore: 0.9,
+      criticPassed: true,
+      validDeterministic: true,
+      state: "pending",
+      decisionVersion: 0,
+      burnedNonceHashes: [],
+    };
+    const recDir = path.join(root, "self-evolve", "global", "recommendations", recommendation.recommendationId.slice(0, 2));
+    mkdirSync(recDir, { recursive: true, mode: 0o700 });
+    writeFileSync(path.join(recDir, `${recommendation.recommendationId}.json`), `${JSON.stringify(recommendation)}\n`, { mode: 0o600 });
+
+    const reopened = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+    const recommendations = reopened.readGlobalRecommendations();
+    reopened.close();
+    assert.deepEqual(recommendations, [], "recommendation with token/path in rationale must not enter projection");
+    // The legitimate contribution survives (it has no private material).
+    const reopenedTwo = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+    assert.equal(reopenedTwo.readContributions({ scope: "global", includeExpired: true }).length, 1, "clean contribution survives");
+    reopenedTwo.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// H9-001: power-loss-durable decision journal. The store exposes the bound
+// durable capability and routes create-exclusive journal writes (global lease,
+// global decision/intent/snapshot/outcome/audit records, contributions) through
+// the shared durable primitive so every journal stage fails closed with the
+// stable reason on hosts that cannot fsync a directory descriptor.
+test("H9-001: durableCapability is exposed and reflects the directory-fsync probe at open", () => {
+  const root = ownedTempRoot("self-evolve-store-durable-capability-");
+  const store = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+  assert.equal(store.durableCapability.available, true);
+  assert.equal(store.durableCapability.reason, null);
+  assert.equal(store.acquireGlobalLease({ leaseKind: "candidate-synthesis", leaseKeyHash: H("9"), ttlMs: 1_000 }).ok, true);
+  store.close();
+
+  // Reopen on a host whose directory-fsync path throws. The capability probe
+  // fails once at open and records the stable reason; reads of the already-
+  // durable partition keep working while authoritative writes fail closed.
+  const unsupported = openStore(root, {
+    projectFingerprint: PROJECT,
+    now: () => 2_000,
+    filesystemSyncDirectory: () => { throw Object.assign(new Error("EINVAL"), { code: "EINVAL" }); },
+  });
+  assert.equal(unsupported.durableCapability.available, false);
+  assert.equal(unsupported.durableCapability.reason, "directory-fsync-unavailable");
+  // Read-only analysis remains available.
+  assert.equal(unsupported.getSettings().global.mode, "manual");
+  unsupported.close();
+});
+
+test("H9-001: create-exclusive journal writes route file fsync and parent-directory fsync through the durable primitive", () => {
+  const root = ownedTempRoot("self-evolve-store-journal-durable-");
+  let fileSyncs = 0;
+  let dirSyncs = 0;
+  const store = openStore(root, {
+    projectFingerprint: PROJECT,
+    now: () => 1_000,
+    filesystemSync: (descriptor) => { fileSyncs += 1; fsyncSync(descriptor); },
+    filesystemSyncDirectory: (directory) => { dirSyncs += 1; },
+  });
+  // acquireGlobalLease writes its lease file via exclusiveJsonWrite, which must
+  // now exercise BOTH the file-content fsync and the parent-directory fsync.
+  const beforeFile = fileSyncs;
+  const beforeDir = dirSyncs;
+  assert.equal(store.acquireGlobalLease({ leaseKind: "candidate-synthesis", leaseKeyHash: H("a"), ttlMs: 1_000 }).ok, true);
+  assert.ok(fileSyncs > beforeFile, "exclusiveJsonWrite must fsync the file content");
+  assert.ok(dirSyncs > beforeDir, "exclusiveJsonWrite must fsync the parent directory through the durable primitive");
+  store.close();
+});
+
+test("H9-001: create-exclusive journal writes fail closed with the stable reason when directory fsync is unavailable", () => {
+  const root = ownedTempRoot("self-evolve-store-journal-fail-closed-");
+  const setup = openStore(root, { projectFingerprint: PROJECT, now: () => 1_000 });
+  assert.equal(setup.acquireGlobalLease({ leaseKind: "candidate-synthesis", leaseKeyHash: H("b"), ttlMs: 1 }).ok, true);
+  setup.close();
+
+  const unsupported = openStore(root, {
+    projectFingerprint: PROJECT,
+    now: () => 2_000,
+    filesystemSyncDirectory: () => { throw Object.assign(new Error("EINVAL"), { code: "EINVAL" }); },
+  });
+  // A fresh global-lease key (no existing lease to read) reaches the
+  // exclusiveJsonWrite create path, which fail-closes via the durable
+  // primitive's capability assertion with the stable reason.
+  const result = unsupported.acquireGlobalLease({ leaseKind: "candidate-synthesis", leaseKeyHash: H("c"), ttlMs: 1_000 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "directory-fsync-unavailable");
+  // An atomicWrite-based authoritative write fails closed the same way.
+  const settings = unsupported.getSettings();
+  const settingsResult = unsupported.updateGlobalSettings((current) => makeGlobalSettings({
+    ...current,
+    updatedAt: current.updatedAt + 1,
+  }));
+  assert.equal(settingsResult.ok, false);
+  assert.equal(settingsResult.reason, "directory-fsync-unavailable");
+  // The pre-existing lease is still readable (read-only analysis preserved).
+  assert.equal(unsupported.getSettings().global.mode, settings.global.mode);
+  unsupported.close();
 });

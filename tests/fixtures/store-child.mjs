@@ -43,11 +43,11 @@ if (operation === "append") {
   result = store.appendRecord(wrapRecord("observation", observation, now));
 } else if (operation === "cas") {
   result = store.runCas("proposal", "proposal-1", "pending", (current) => ({ ...current, state: value, decisionVersion: 1 }));
-} else if (operation === "set-global") {
+} else if (operation === "set-global-retention") {
   const current = store.getSettings().global;
-  result = store.setGlobalSettings(makeGlobalSettings({ ...current, mode: value, updatedAt: now }));
-} else if (operation === "read-global") {
-  result = { mode: store.getSettings().global.mode };
+  result = store.setGlobalSettings(makeGlobalSettings({ ...current, retentionDays: Number(value), updatedAt: now }));
+} else if (operation === "read-global-retention") {
+  result = { retentionDays: store.getSettings().global.retentionDays };
 } else if (operation === "read-settings-result") {
   try {
     store.getSettings();
@@ -55,20 +55,27 @@ if (operation === "append") {
   } catch (error) {
     result = { ok: false, reason: error?.message ?? String(error) };
   }
-} else if (operation === "update-global-mode") {
-  result = store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, mode: value, updatedAt: global.updatedAt + 1 }));
-} else if (operation === "update-global-consent") {
+} else if (operation === "update-global-retention") {
+  result = store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, retentionDays: Number(value), updatedAt: global.updatedAt + 1 }));
+} else if (operation === "update-global-budget") {
   result = store.updateGlobalSettings((global) => makeGlobalSettings({
     ...global,
-    consent: { ...global.consent, sanitizedExcerpts: value === "true" },
+    budgets: { ...global.budgets, synthesisPerDay: Number(value) },
     updatedAt: global.updatedAt + 1,
   }));
-} else if (operation === "update-global-pause") {
-  result = store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, paused: value === "true", updatedAt: global.updatedAt + 1 }));
 } else if (operation === "update-global-allowlist") {
   result = store.updateGlobalSettings((global) => makeGlobalSettings({ ...global, allowedSkillRoots: [value], updatedAt: global.updatedAt + 1 }));
-} else if (operation === "update-repo-mode") {
-  result = store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, mode: value }));
+} else if (operation === "update-global-consent") {
+  const automation = store.getAutomationState();
+  result = automation.ok ? store.transitionAutomation({
+    transitionId: `child-sanitized-excerpts-${automation.epoch.generation}`,
+    expectedGeneration: automation.epoch.generation,
+    action: "set-permission",
+    permission: "sanitizedExcerpts",
+    enabled: value === "true",
+  }) : automation;
+} else if (operation === "update-repo-budget") {
+  result = store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, budgets: { ...repo.budgets, storageQuotaMiB: Number(value) } }));
 } else if (operation === "update-repo-excluded") {
   result = store.updateRepoSettings((repo) => makeRepoSettings({ ...repo, excluded: value === "true" }));
 } else if (operation === "retain") {

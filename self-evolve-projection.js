@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { scanForSecretCanaries, scanForUnsafeContent } from "./self-evolve-inventory.js";
-import { deepFreeze, resolveConfiguredProjectAnalysisMode } from "./self-evolve-schemas.js";
+import { deepFreeze } from "./self-evolve-schemas.js";
 import { effectiveTokensPerSynthesis } from "./self-evolve-synthesis.js";
 import {
   UI_ACTION_CAPABILITIES,
@@ -550,8 +550,8 @@ function detailRevision(proposalId, byKind) {
   return count;
 }
 
-function statusFrom(settings, health, breakerOpen, effectiveMode) {
-  const backgroundRestartRequired = health.passiveEventHookInstalled === false && effectiveMode !== "manual";
+function statusFrom(settings, health, breakerOpen) {
+  const backgroundRestartRequired = health.lifecycleEventHookInstalled === false;
   const state = health.state
     ?? (health.terminal ? "terminal"
       : health.corrupt ? "corrupt"
@@ -568,9 +568,7 @@ function statusFrom(settings, health, breakerOpen, effectiveMode) {
         : REASON_CODE_RE.test(String(health.reason ?? ""))
           ? String(health.reason)
           : state,
-    storedMode: settings.global.mode,
-    effectiveMode,
-    paused: settings.global.paused,
+    automaticRecommendationsEnabled: settings.global.automaticRecommendationsEnabled,
     killSwitchActive: settings.global.killSwitchActive || health.runtimeKillSwitch === true,
     repoExcluded: settings.repo.excluded,
     circuitBreakerOpen: breakerOpen,
@@ -595,9 +593,10 @@ function indexAllowedActions(operationGrants, expiresAt, statusState) {
     "export-data",
     "purge-all",
     "purge-scope",
+    "set-automatic-recommendations",
     "set-kill-switch",
-    "set-paused",
-    "set-repo-mode",
+    "set-permission",
+    "set-repo-excluded",
   ]) {
     const grant = operationGrants.get(`\n${action}`);
     if (grant) output.push(actionGrant(action, grant, expiresAt));
@@ -618,18 +617,19 @@ function cycleTriggerClass(value) {
 function cycleAuditValue(record) {
   const event = record?.payload;
   const details = event?.details;
-  const fields = [
+  const legacyFields = [
     "action", "outcome", "triggerClass", "mode", "observationCount",
     "eligibilityCount", "occurredAt", "reason",
   ];
+  const currentFields = legacyFields.filter((field) => field !== "mode");
+  const legacy = exactFieldSet(details, legacyFields);
   if (record?.kind !== "audit-event"
       || event?.kind !== "decision"
       || event.actor !== "self-evolve-integration"
-      || !exactFieldSet(details, fields)
+      || (!legacy && !exactFieldSet(details, currentFields))
       || details.action !== "cycle-outcome"
       || !CYCLE_OUTCOMES.has(details.outcome)
-      // A v0.2 partition can still hold `yolo` cycle-outcome audits; they stay readable history.
-      || !["manual", "auto", "yolo"].includes(details.mode)
+      || (legacy && !["manual", "auto", "yolo"].includes(details.mode))
       || !Number.isSafeInteger(details.observationCount)
       || details.observationCount < 0
       || !Number.isSafeInteger(details.eligibilityCount)
@@ -640,7 +640,6 @@ function cycleAuditValue(record) {
   return {
     outcome: details.outcome,
     triggerClass: cycleTriggerClass(details.triggerClass),
-    mode: details.mode,
     observationCount: details.observationCount,
     eligibilityCount: details.eligibilityCount,
     proposalId: sanitizeProposalId(event.proposalId),
@@ -738,23 +737,38 @@ function semanticActivity(records) {
     }
     if (record?.kind === "audit-event"
         && event?.kind === "mode-change"
-        && ["pause", "resume", "exclude", "include"].includes(event.details?.action)) {
-      const mapping = {
-        pause: ["paused", "Automatic work was paused.", "paused"],
-        resume: ["resumed", "Automatic work was resumed.", null],
-        exclude: ["project-excluded", "This project was excluded from automatic work.", "repository-excluded"],
-        include: ["project-included", "This project was included in automatic work.", null],
-      };
-      const [outcome, summary, reason] = mapping[event.details.action];
+        && event.details?.action === "automation-control"
+        && ["set-automatic-recommendations", "set-permission"].includes(event.details?.control)) {
+      const turnedOn = event.details.enabled === true;
       output.push({
         id: event.id,
         category: "system",
         audience: "default",
-        outcome,
-        summary,
+        outcome: turnedOn ? "automatic-recommendations-on" : "automatic-recommendations-off",
+        summary: turnedOn
+          ? "Automatic recommendations were turned on."
+          : "Automatic recommendations were turned off.",
         occurredAt: event.timestamp,
         proposalId: null,
-        reason,
+        reason: turnedOn ? null : "automatic-recommendations-off",
+      });
+      continue;
+    }
+    if (record?.kind === "audit-event"
+        && event?.kind === "mode-change"
+        && ["exclude", "include"].includes(event.details?.action)) {
+      const excluded = event.details.action === "exclude";
+      output.push({
+        id: event.id,
+        category: "system",
+        audience: "default",
+        outcome: excluded ? "project-excluded" : "project-included",
+        summary: excluded
+          ? "This project was excluded from automatic recommendations."
+          : "This project was included in automatic recommendations.",
+        occurredAt: event.timestamp,
+        proposalId: null,
+        reason: excluded ? "repository-excluded" : null,
       });
       continue;
     }
@@ -925,7 +939,7 @@ function rolloutSummary(records, health) {
   };
 }
 
-function dashboardBlockers(snapshot, health, breakerOpen, effectiveMode) {
+function dashboardBlockers(snapshot, health, breakerOpen, breakerEpoch) {
   const output = [];
   const add = (code, summary) => output.push({
     code,
@@ -934,13 +948,6 @@ function dashboardBlockers(snapshot, health, breakerOpen, effectiveMode) {
   });
   const globalSettings = snapshot.settings.global;
   const consent = globalSettings.consent;
-  const firstRun = effectiveMode === "manual"
-    && globalSettings.mode === "manual"
-    && globalSettings.createdAt === globalSettings.updatedAt
-    && consent.passiveCalls === false
-    && consent.durableObservations === false
-    && consent.sanitizedExcerpts === false
-    && consent.crossRepoAggregation === false;
   if (health.corrupt === true) add("corrupt-state", "Stored state could not be validated.");
   if (health.hostSupported === false) add("unsupported-host", "This OpenCode host version is not supported.");
   if (health.stateRootReady === false) add("state-root", "The official OpenCode state root is not validated.");
@@ -948,19 +955,30 @@ function dashboardBlockers(snapshot, health, breakerOpen, effectiveMode) {
   if (snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true) {
     add("emergency-stop", "Emergency stop disables automatic provider and write authority.");
   }
-  if (breakerOpen) add("circuit-breaker", "Repeated failures paused automatic work.");
-  if (snapshot.settings.global.paused) add("paused", "Automatic work is paused.");
-  if (snapshot.settings.repo.excluded) add("repository-excluded", "This project is excluded from automatic work.");
-  if (firstRun) add("first-run", "Automatic recommendations have not been set up yet.");
-  if (health.passiveEventHookInstalled === false && effectiveMode !== "manual") {
+  if (breakerOpen) {
+    // H5-001/H5-002: surface the durable root-global breaker epoch detail so the
+    // Activity/Errors blocker is actionable: shows the cross-process reason and
+    // the authenticated reset path.
+    const epochReason = breakerEpoch?.tripped && typeof breakerEpoch.reason === "string" && breakerEpoch.reason.length > 0
+      ? breakerEpoch.reason
+      : null;
+    add(
+      "circuit-breaker",
+      epochReason
+        ? `Automatic work paused after repeated failures (${epochReason}). Review failures in Activity, then reset with /self-evolve reset-breaker --confirm RESET SELF-EVOLVE BREAKER 0.3.0.`
+        : "Repeated failures paused automatic work. Review failures in Activity, then reset with /self-evolve reset-breaker --confirm RESET SELF-EVOLVE BREAKER 0.3.0.",
+    );
+  }
+  if (!globalSettings.automaticRecommendationsEnabled) {
+    add("automatic-recommendations-off", "Automatic recommendations are off.");
+  }
+  if (snapshot.settings.repo.excluded) add("repository-excluded", "This project is excluded from automatic recommendations.");
+  if (health.lifecycleEventHookInstalled === false) {
     add("restart-required", "Background analysis is awaiting an OpenCode restart before it can activate.");
   }
-  if (effectiveMode !== "manual") {
-    if (!snapshot.settings.global.consent.passiveCalls) add("passive-consent", "Background AI analysis is not allowed.");
-    if (!snapshot.settings.global.consent.durableObservations) add("observation-consent", "Saved structured patterns are not allowed.");
+  if (Object.values(consent).some((allowed) => allowed !== true)) {
+    add("observation-consent", "All three data permissions are required before automatic recommendations can run.");
   }
-  // v0.3 has no unattended apply mode, so the approved-skill-folder and
-  // automatic-rollout blockers that only ever fired for yolo are gone.
   const order = new Map(UI_DASHBOARD_BLOCKER_CODES.map((code, index) => [code, index]));
   return output
     .filter((item, index, values) => values.findIndex((candidate) => candidate.code === item.code) === index)
@@ -972,7 +990,6 @@ function dashboardAutomation({
   snapshot,
   health,
   breakerOpen,
-  effectiveMode,
   blockers,
   backoffUntil,
 }) {
@@ -982,17 +999,19 @@ function dashboardAutomation({
   else if (status.state === "corrupt" || status.state === "unavailable") state = "corrupt";
   else if (snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true) state = "emergency-stop";
   else if (breakerOpen) state = "circuit-breaker";
-  else if (snapshot.settings.global.paused) state = "paused";
   else if (snapshot.settings.repo.excluded) state = "excluded";
-  else if (effectiveMode === "manual") state = "on-demand";
+  else if (!snapshot.settings.global.automaticRecommendationsEnabled) {
+    state = "off";
+    reason = "automatic-recommendations-off";
+  }
   else if (blockers.length || status.state === "setup-required") state = "setup-required";
   else if ((health.inFlightCount ?? 0) > 0) state = "running";
   else if (backoffUntil > health.now) {
     state = "backoff";
     reason = "backoff";
-  } else if (snapshot.usage.passive.remaining === 0 || snapshot.usage.synthesis.remaining === 0) {
+  } else if (snapshot.usage.provider.remaining === 0 || snapshot.usage.synthesis.remaining === 0) {
     state = "budget";
-    reason = snapshot.usage.passive.remaining === 0
+    reason = snapshot.usage.provider.remaining === 0
       ? "passive-provider-budget-exhausted"
       : "synthesis-budget-exhausted";
   } else if (health.budgetStatus?.withinQuietPeriod === true) {
@@ -1008,8 +1027,8 @@ function buildDashboard(snapshot, {
   stateRootIdentity,
   now,
   status,
-  effectiveMode,
   breakerOpen,
+  breakerEpoch,
   health,
   supportedCapabilities,
   dashboardCapabilities,
@@ -1019,14 +1038,13 @@ function buildDashboard(snapshot, {
   dashboardVersion,
 }) {
   const records = snapshot.records ?? [];
-  const blockers = dashboardBlockers(snapshot, health, breakerOpen, effectiveMode);
+  const blockers = dashboardBlockers(snapshot, health, breakerOpen, breakerEpoch);
   const backoffUntil = latestBackoffUntil(records, now);
   const automation = dashboardAutomation({
     status,
     snapshot,
     health: { ...health, now },
     breakerOpen,
-    effectiveMode,
     blockers,
     backoffUntil,
   });
@@ -1045,13 +1063,14 @@ function buildDashboard(snapshot, {
   const nextEligibleAt = Math.max(
     0,
     backoffUntil,
-    snapshot.usage.passive.remaining === 0 ? snapshot.usage.passive.resetAt ?? 0 : 0,
+    snapshot.usage.provider.remaining === 0 ? snapshot.usage.provider.resetAt ?? 0 : 0,
     snapshot.usage.synthesis.remaining === 0 ? snapshot.usage.synthesis.resetAt ?? 0 : 0,
     Number.isSafeInteger(health.nextEligibleAt) ? health.nextEligibleAt : 0,
   ) || null;
   const globalSettingsVersion = sha256(JSON.stringify({
     global: snapshot.settings.global,
     repo: snapshot.settings.repo,
+    automationStamp: snapshot.settings.automationStamp,
   }));
   const globalRootPolicy = snapshot.settings.global.globalRootPolicy === null
     ? null
@@ -1085,20 +1104,21 @@ function buildDashboard(snapshot, {
       stage: inFlightCount > 0 ? (health.inFlightStage ?? "pipeline") : null,
       startedAt: inFlightStartedAt,
     },
-    lastCycle: lastCycleRecord,
+    lastCycle: dashboardVersion === 3 && lastCycleRecord !== null
+      ? Object.fromEntries(Object.entries(lastCycleRecord).filter(([key]) => key !== "mode"))
+      : lastCycleRecord,
     nextEligibleAt,
     usage: snapshot.usage,
     rollout: rolloutSummary(records, health),
     settings: {
-      globalMode: snapshot.settings.global.mode,
-      repositoryMode: snapshot.settings.repo.mode,
-      effectiveMode,
-      paused: snapshot.settings.global.paused,
+      automaticRecommendationsEnabled: snapshot.settings.global.automaticRecommendationsEnabled,
+      automationGeneration: snapshot.settings.automationStamp.generation,
       killSwitchActive: snapshot.settings.global.killSwitchActive || health.runtimeKillSwitch === true,
       repositoryExcluded: snapshot.settings.repo.excluded,
       consent: snapshot.settings.global.consent,
       approvedSkillFolderCount: snapshot.settings.global.allowedSkillRoots.length,
-      ...(dashboardVersion === 2 ? {
+      collectionSuggestions: [...snapshot.settings.global.allowedSkillRoots].sort(),
+      ...(dashboardVersion >= 2 ? {
         globalSettingsVersion,
         globalRootPolicy,
         globalRootPolicyConfirmation: globalRootPolicyConfirmation(globalSettingsVersion),
@@ -1118,9 +1138,8 @@ function buildDashboard(snapshot, {
       operationalDays: dashboardVersion === 1 ? 90 : snapshot.settings.global.retentionDays * 3,
     },
     supportedControls: Object.entries(UI_ACTION_CAPABILITIES)
-      .filter(([action, capability]) => action === "set-repo-mode"
-        ? dashboardCapabilities.includes("project-analysis-control-v1")
-        : supportedCapabilities.includes(capability) || dashboardCapabilities.includes(capability))
+      .filter(([, capability]) => supportedCapabilities.includes(capability)
+        || dashboardCapabilities.includes(capability))
       .map(([action]) => action)
       .sort(),
     activity: boundedActivity.included,
@@ -1186,12 +1205,28 @@ export function buildUiProjection(snapshot, {
     grouped.push(record);
     auditByProposal.set(proposalId, grouped);
   }
-  const breakerOpen = (byKind.get("circuit-breaker") ?? []).at(-1)?.payload?.open === true;
-  const effectiveMode = resolveConfiguredProjectAnalysisMode(
-    snapshot.settings.global.mode,
-    snapshot.settings.repo.mode,
-  );
-  const status = statusFrom(snapshot.settings, health, breakerOpen, effectiveMode);
+  const recordBreakerOpen = (byKind.get("circuit-breaker") ?? []).at(-1)?.payload?.open === true;
+  // H5-001: the durable root-global breaker epoch is the cross-process truth.
+  // Combine the record-derived state with the epoch health so the projection
+  // reflects peer trip/reset writes without restart.
+  const breakerEpochHealth = health?.breakerEpoch && typeof health.breakerEpoch === "object" ? health.breakerEpoch : null;
+  const breakerOpen = recordBreakerOpen || breakerEpochHealth?.tripped === true;
+  const breakerEpoch = breakerEpochHealth
+    ? {
+        tripped: breakerEpochHealth.tripped === true,
+        generation: Number.isSafeInteger(breakerEpochHealth.generation) ? breakerEpochHealth.generation : null,
+        trippedAt: Number.isSafeInteger(breakerEpochHealth.trippedAt) ? breakerEpochHealth.trippedAt : null,
+        reason: typeof breakerEpochHealth.reason === "string" ? breakerEpochHealth.reason : null,
+        resetAvailable: breakerEpochHealth.resetAvailable === true && breakerEpochHealth.tripped === true,
+      }
+    : null;
+  // Local proposal details are legacy read-only compatibility. The v0.4
+  // dashboard and operations expose only the binary automation preference.
+  // Retained local proposal details still call the v0.3 explicit-decision
+  // predicate. Fix that compatibility input to its actionable branch: the
+  // v0.4 automation preference never grants or suppresses explicit actions.
+  const legacyDetailMode = "auto";
+  const status = statusFrom(snapshot.settings, health, breakerOpen);
   const issuedAt = now;
   const expiresAt = now + UI_PROTOCOL_LIMITS.projectionTtlMs;
   const operationGrants = uiOperationGrants(auditRecords, {
@@ -1221,7 +1256,7 @@ export function buildUiProjection(snapshot, {
     const legacyGrant = matchingLegacyGrant(proposal, proposalAudits, now);
     const allowedActions = detailAllowedActions({
       proposal,
-      effectiveMode,
+      effectiveMode: legacyDetailMode,
       integrity,
       content,
       appliedAudit,
@@ -1252,7 +1287,7 @@ export function buildUiProjection(snapshot, {
           currentHash: proposal.skillTarget.currentHash,
           proposedContentHash: proposal.proposedContentHash,
         },
-        effectiveMode,
+        effectiveMode: legacyDetailMode,
         rationale,
         risk,
         criticScoreBasisPoints: Math.max(0, Math.min(10_000, Math.round(proposal.criticScore * 10_000))),
@@ -1348,8 +1383,8 @@ export function buildUiProjection(snapshot, {
     stateRootIdentity,
     now,
     status,
-    effectiveMode,
     breakerOpen,
+    breakerEpoch,
     health,
     supportedCapabilities,
     dashboardCapabilities: supportedDashboardCapabilities,
@@ -1360,11 +1395,6 @@ export function buildUiProjection(snapshot, {
   const dashboard = buildDashboard(snapshot, {
     ...dashboardOptions,
     dashboardVersion: UI_DASHBOARD_VERSION,
-  });
-  const dashboardV1 = buildDashboard(snapshot, {
-    ...dashboardOptions,
-    dashboardCapabilities: supportedDashboardCapabilities.filter((capability) => capability !== "project-analysis-control-v1"),
-    dashboardVersion: 1,
   });
   const requested = [...new Set(detailProposalIds)].slice(0, UI_PROTOCOL_LIMITS.residentDetails);
   const detailById = new Map(detailCandidates.map((candidate) => [candidate.proposal.id, candidate.detail]));
@@ -1393,7 +1423,6 @@ export function buildUiProjection(snapshot, {
     generation,
     index: footprint.index,
     dashboard,
-    dashboardV1,
     publicationDetails,
     details: footprint.details,
     unavailableDetailIds: unavailableDetailIds.sort(),
@@ -1433,17 +1462,28 @@ function globalTargetFresh(recommendation, target) {
     : target.exists === true && target.hash === expected;
 }
 
-function globalAvailableActions(recommendation, { contentValid, targetFresh, writeAuthorityReady }) {
+function globalAvailableActions(recommendation, { contentValid, targetFresh, actionAuthority }) {
+  const baseReason = (action) => actionAuthority[action].allowed ? null : actionAuthority[action].reason;
+  const reasons = {
+    apply: "action-state-mismatch",
+    reject: "action-state-mismatch",
+    undo: "action-state-mismatch",
+  };
   if (recommendation.state === "pending") {
-    return [
-      ...(writeAuthorityReady && contentValid && targetFresh
-        && recommendation.criticPassed && recommendation.validDeterministic ? ["apply"] : []),
-      "reject",
-    ];
+    reasons.apply = baseReason("apply")
+      ?? (!contentValid ? "recommendation-content-invalid" : null)
+      ?? (!targetFresh ? "target-not-fresh" : null)
+      ?? (!recommendation.criticPassed || !recommendation.validDeterministic ? "release-gates-failed" : null);
+    reasons.reject = baseReason("reject");
+  } else if (recommendation.state === "superseded") {
+    reasons.reject = baseReason("reject");
+  } else if (recommendation.state === "applied") {
+    reasons.undo = baseReason("undo") ?? (!targetFresh ? "target-not-fresh" : null);
   }
-  if (recommendation.state === "superseded") return ["reject"];
-  if (recommendation.state === "applied" && writeAuthorityReady && contentValid && targetFresh) return ["undo"];
-  return [];
+  return {
+    actions: ["apply", "reject", "undo"].filter((action) => reasons[action] === null),
+    reasons,
+  };
 }
 
 function globalProjectedDiff(recommendation, target, content, contentValid, targetFresh) {
@@ -1513,6 +1553,7 @@ export function buildGlobalRecommendationProjection(snapshotValue, {
   detailRecommendationIds,
   capabilities = GLOBAL_CAPABILITIES,
   writeAuthorityReady = true,
+  actionAuthority = null,
   nonceFactory = randomUUID,
 } = {}) {
   const snapshot = globalProjectionSnapshot(snapshotValue);
@@ -1520,6 +1561,16 @@ export function buildGlobalRecommendationProjection(snapshotValue, {
   if (!Number.isSafeInteger(now) || now < 0) throw new TypeError("invalid-global-projection-time");
   if (typeof nonceFactory !== "function") throw new TypeError("global-projection-nonce-factory-required");
   if (typeof writeAuthorityReady !== "boolean") throw new TypeError("invalid-global-write-authority-state");
+  const normalizedActionAuthority = actionAuthority ?? Object.fromEntries(["apply", "reject", "undo"].map((action) => [
+    action,
+    { allowed: writeAuthorityReady, reason: writeAuthorityReady ? null : "write-authority-unavailable" },
+  ]));
+  if (!normalizedActionAuthority || typeof normalizedActionAuthority !== "object"
+      || Object.keys(normalizedActionAuthority).sort().join(",") !== "apply,reject,undo"
+      || Object.entries(normalizedActionAuthority).some(([, value]) => !value || typeof value.allowed !== "boolean"
+        || (value.allowed ? value.reason !== null : typeof value.reason !== "string"))) {
+    throw new TypeError("invalid-global-action-authority-state");
+  }
   const supportedCapabilities = [...new Set(capabilities)].sort();
   const supportByHash = new Map(snapshot.supportSets.map((support) => [support.supportSetHash, support]));
   const candidateById = new Map(snapshot.candidates.map((candidate) => [candidate.candidateId, candidate]));
@@ -1556,11 +1607,12 @@ export function buildGlobalRecommendationProjection(snapshotValue, {
       && !containsPrivateMaterial(content);
     const target = targetReads.get(recommendation.recommendationId);
     const targetFresh = globalTargetFresh(recommendation, target);
-    const availableActions = globalAvailableActions(recommendation, {
+    const actionState = globalAvailableActions(recommendation, {
       contentValid,
       targetFresh,
-      writeAuthorityReady,
+      actionAuthority: normalizedActionAuthority,
     });
+    const availableActions = actionState.actions;
     const recommendationVersion = recommendation.decisionVersion + 1;
     const tier = candidate.eligibilityRoute === "distributed" ? "distributed" : "single-domain";
     const updatedAt = Math.max(
@@ -1616,6 +1668,7 @@ export function buildGlobalRecommendationProjection(snapshotValue, {
         { kind: "occurrences", count: candidate.occurrenceCount },
       ],
       availableActions,
+      actionReasons: actionState.reasons,
     };
     const detailValue = { ...detailBody, detailHash: hashGlobalProtocol("recommendation-detail", detailBody) };
     const detail = makeGlobalRecommendationDetail(detailValue, {

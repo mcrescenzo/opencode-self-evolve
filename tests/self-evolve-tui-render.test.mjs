@@ -24,18 +24,18 @@ test("compiled native control center renders reactively and retains exact deep-l
     assert.ok(smokeSource.includes(insertionPoint), "renderer smoke regression insertion point changed");
     writeFileSync(smoke, smokeSource.replace(insertionPoint, `
   const setupDeepLinkSnapshot = snapshot();
-  setupDeepLinkSnapshot.dashboard.settings.consent.passiveCalls = false;
-  setupDeepLinkSnapshot.controlState.consent.passiveCalls = false;
+  setupDeepLinkSnapshot.dashboard.settings.consent.durableObservations = false;
   const setupMountSnapshot = structuredClone(setupDeepLinkSnapshot);
-  setupMountSnapshot.controlState = null;
+  setupMountSnapshot.projection.effectiveIndexActions = setupMountSnapshot.projection.effectiveIndexActions
+    .filter((entry) => entry.action !== "set-permission");
   store.emit(setupMountSnapshot);
-  const lateHostFocusDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "passive-consent" });
+  const lateHostFocusDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "observation-consent" });
   try {
-    assert.equal(lateHostFocusDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-passiveCalls"), undefined,
-      "passive-consent control mounted before authority arrived");
+    assert.equal(lateHostFocusDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-durableObservations"), undefined,
+      "observation-consent control mounted before authority arrived");
     let hostClearedFocus = false;
     const clearMountedFocus = (current) => {
-      if (!hostClearedFocus && current?.id === "self-evolve-focus-local-consent-passiveCalls") {
+      if (!hostClearedFocus && current?.id === "self-evolve-focus-local-consent-durableObservations") {
         hostClearedFocus = true;
         current.blur();
       }
@@ -44,17 +44,17 @@ test("compiled native control center renders reactively and retains exact deep-l
     store.emit(setupDeepLinkSnapshot);
     await lateHostFocusDeepLink.flush();
     lateHostFocusDeepLink.renderer.off("focused_renderable", clearMountedFocus);
-    const exactTarget = lateHostFocusDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-passiveCalls");
+    const exactTarget = lateHostFocusDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-durableObservations");
     const routeRoot = lateHostFocusDeepLink.renderer.root.findDescendantById("mcrescenzo.self-evolve.control-center");
     assert.equal(hostClearedFocus, true, "late host focus clearing was not simulated");
-    assert.equal(exactTarget?.focused, true, "passive-consent deep link never acquired exact focus");
+    assert.equal(exactTarget?.focused, true, "observation-consent deep link never acquired exact focus");
     assert.ok(routeRoot, "control-center route root was not rendered");
     store.emit(structuredClone(setupDeepLinkSnapshot));
     await lateHostFocusDeepLink.flush();
-    const replacementTarget = lateHostFocusDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-passiveCalls");
+    const replacementTarget = lateHostFocusDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-durableObservations");
     assert.notEqual(replacementTarget, exactTarget, "reactive update did not replace the exact target instance");
     assert.equal(replacementTarget?.focused, true, "same-ID target replacement lost deep-link focus");
-    assert.match(lateHostFocusDeepLink.captureCharFrame(), /› Review consent for Background AI analysis/u);
+    assert.match(lateHostFocusDeepLink.captureCharFrame(), /› Review consent for Saved structured patterns/u);
     routeRoot.focus();
     await lateHostFocusDeepLink.flush();
     assert.equal(replacementTarget.focused, true, "repeated host route focus displaced the exact deep-link control");
@@ -63,11 +63,11 @@ test("compiled native control center renders reactively and retains exact deep-l
   }
 
   store.emit(setupMountSnapshot);
-  const abandonedDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "passive-consent" });
+  const abandonedDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "observation-consent" });
   try {
     let leftRouteDuringFocus = false;
     const leaveOnMountedFocus = (current) => {
-      if (!leftRouteDuringFocus && current?.id === "self-evolve-focus-local-consent-passiveCalls") {
+      if (!leftRouteDuringFocus && current?.id === "self-evolve-focus-local-consent-durableObservations") {
         leftRouteDuringFocus = true;
         host.api.route.current = { name: "session", params: { sessionID: "left-deep-link" } };
         current.blur();
@@ -77,7 +77,7 @@ test("compiled native control center renders reactively and retains exact deep-l
     store.emit(setupDeepLinkSnapshot);
     await abandonedDeepLink.flush();
     abandonedDeepLink.renderer.off("focused_renderable", leaveOnMountedFocus);
-    const abandonedTarget = abandonedDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-passiveCalls");
+    const abandonedTarget = abandonedDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-durableObservations");
     assert.equal(leftRouteDuringFocus, true, "route-guard deep link never acquired exact focus");
     assert.equal(abandonedTarget.focused, false, "deep-link focus returned after the route was left");
   } finally {
@@ -85,16 +85,16 @@ test("compiled native control center renders reactively and retains exact deep-l
   }
 
   store.emit(setupMountSnapshot);
-  const provisionalDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "passive-consent" });
+  const provisionalDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "observation-consent" });
   try {
-    const fallback = provisionalDeepLink.renderer.root.findDescendantById("self-evolve-focus-anchor-passive-consent");
+    const fallback = provisionalDeepLink.renderer.root.findDescendantById("self-evolve-focus-anchor-observation-consent");
     const userTarget = provisionalDeepLink.renderer.root.findDescendantById("self-evolve-focus-section-home");
     assert.equal(fallback?.focused, true, "provisional anchor did not receive fallback focus");
     assert.ok(userTarget, "user-navigation target was not rendered");
     userTarget.focus();
     store.emit(setupDeepLinkSnapshot);
     await provisionalDeepLink.flush();
-    const lateTarget = provisionalDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-passiveCalls");
+    const lateTarget = provisionalDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-durableObservations");
     assert.equal(userTarget.focused, true, "late exact mount stole focus after provisional user navigation");
     assert.equal(lateTarget?.focused, false, "late exact target remained focused after ownership cancellation");
   } finally {
@@ -103,10 +103,10 @@ test("compiled native control center renders reactively and retains exact deep-l
 
   for (const unavailableProperty of ["visible", "focusable"]) {
     store.emit(setupDeepLinkSnapshot);
-    const unavailableDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "passive-consent" });
+    const unavailableDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "observation-consent" });
     try {
-      const unavailableTarget = unavailableDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-passiveCalls");
-      const fallback = unavailableDeepLink.renderer.root.findDescendantById("self-evolve-focus-anchor-passive-consent");
+      const unavailableTarget = unavailableDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-durableObservations");
+      const fallback = unavailableDeepLink.renderer.root.findDescendantById("self-evolve-focus-anchor-observation-consent");
       const routeRoot = unavailableDeepLink.renderer.root.findDescendantById("mcrescenzo.self-evolve.control-center");
       assert.equal(unavailableTarget?.focused, true, unavailableProperty + " target did not start focused");
       assert.ok(routeRoot, "unavailable-target route root was not rendered");
@@ -121,9 +121,9 @@ test("compiled native control center renders reactively and retains exact deep-l
   }
 
   store.emit(setupDeepLinkSnapshot);
-  const geometryDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "passive-consent" });
+  const geometryDeepLink = await renderRoute(route, host.api, { section: "settings", settingsAnchor: "observation-consent" });
   try {
-    const geometryTarget = geometryDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-passiveCalls");
+    const geometryTarget = geometryDeepLink.renderer.root.findDescendantById("self-evolve-focus-local-consent-durableObservations");
     const routeRoot = geometryDeepLink.renderer.root.findDescendantById("mcrescenzo.self-evolve.control-center");
     let scrollbox = geometryTarget?.parent;
     while (scrollbox && typeof scrollbox.scrollChildIntoView !== "function") scrollbox = scrollbox.parent;
@@ -188,11 +188,11 @@ ${insertionPoint}`));
         activationParity: ["pointer", "enter", "space"],
         tabDirections: ["forward", "reverse"],
       },
-      sidebarModeCoverage: {
+      sidebarAutomationCoverage: {
         activationParity: ["pointer", "enter", "space"],
         cardAndControlFocus: "siblings",
-        manualToAuto: "inline-confirmation",
-        autoToManual: "immediate",
+        offToOn: "inline-confirmation",
+        onToOff: "immediate",
         unavailableAuthority: ["stale", "pending", "unsupported", "limited"],
       },
       escapeRestoration: "exact-prior-route-from-focused-descendant",
@@ -202,10 +202,10 @@ ${insertionPoint}`));
         projectSwitch: ["queue-bytes-preserved", "selection-preserved", "participation-replaced", "prepared-authority-cleared"],
         privacy: "identity-free-counts-only",
       },
-      deepLinkFocusCoverage: ["activity-errors", "settings-provider", "first-run-home"],
+      deepLinkFocusCoverage: ["activity-errors", "settings-provider", "first-run-settings"],
       reactiveLastCycle: true,
       identityResetCoverage: {
-        stateClasses: ["confirmation", "consent", "maintenance", "recommendation", "pending-route", "prior-route"],
+        stateClasses: ["confirmation", "maintenance", "recommendation", "pending-route", "prior-route"],
         transitions: ["project-selection-preserved", "project-authority-cleared", "state-root-reset"],
         freshReview: true,
       },

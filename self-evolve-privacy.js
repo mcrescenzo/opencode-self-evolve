@@ -4,14 +4,15 @@ import path from "node:path";
 import { isActiveProposalChainRecord, isActiveProposalState } from "./self-evolve-store.js";
 import { containsPrivateMaterial } from "./self-evolve-projection.js";
 import {
-  ConsentState,
+  V4ConsentState,
   Observation,
   errorReasonCode,
+  evaluateContributionConsentAuthority,
   makeAuditEvent,
-  makeConsentState,
   makeEvidenceCapsule,
   makeObservation,
   makeRepoSettings,
+  makeV4ConsentState,
   wrapRecord,
 } from "./self-evolve-schemas.js";
 
@@ -55,10 +56,21 @@ const REPO_NAME_KEY = /(?:project|repo(?:sitory)?|customer)(?:Name|Id|Identifier
 const UNIQUE_COMMAND_KEY = /(?:command|commandName|uniqueCommand|rawCommand)$/iu;
 const CAPSULE_SELF_REFERENCE_RE = /(?:\/self-evolve|\bself-evolve\b|proposal\s+from\s+self-evolve)/iu;
 const PRIVATE_NAME_CANARY_RE = /\b(?:customer|client|tenant|repository|repo|project|private)[-_:\s]+[a-z0-9][a-z0-9._-]{2,}\b/iu;
+const REMOTE_URL_GLOBAL = /\b(?:git|ssh|https?|ftp):\/\/[^\s"'<>]+|\bgit@[^\s@"':]+:[^\s"'<>]+/gu;
+const PRIVATE_NAME_GLOBAL = /\b(?:customer|client|tenant|repository|repo|project|private)[-_:\s]+[a-z0-9][a-z0-9._-]{2,}\b/giu;
 const CONTRIBUTION_INPUT_FIELDS = Object.freeze([
   "claimType", "receiptType", "signatureHash", "incidentId", "capsuleId", "clusterId",
   "evidenceDomainId", "occurrenceCount", "firstSeenAt", "lastSeenAt",
 ]);
+
+function normalizeAutomationConsent(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return makeV4ConsentState(Object.fromEntries(
+    V4ConsentState.fields
+      .filter((field) => source[field] !== undefined)
+      .map((field) => [field, source[field]]),
+  ));
+}
 
 function sha256(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -132,6 +144,52 @@ function issueScan(text, blockedNames = []) {
   return [...issues];
 }
 
+/**
+ * Centralized diagnostic-scrubbing predicate for a single string. Replaces
+ * provider tokens, private keys, remote URLs, absolute paths, private-name
+ * canaries, and control characters with fixed placeholders. Returns heuristic
+ * redaction only; "redacted" is not a secrecy guarantee. Used to keep scrubbed
+ * diagnostics ephemeral across audits, exports, and response text so raw host
+ * errors never echo tokens, paths, private names, or message contents.
+ */
+export function redactPrivateMaterial(text) {
+  if (typeof text !== "string") return text;
+  let redacted = text.replace(/```[\s\S]*?```/g, "<code>").replace(PRIVATE_KEY, "<private-key>");
+  for (const pattern of PROVIDER_TOKEN_PATTERNS) {
+    pattern.lastIndex = 0;
+    redacted = redacted.replace(pattern, "<token>");
+  }
+  redacted = redacted.replace(REMOTE_URL_GLOBAL, "<remote>");
+  redacted = redacted.replace(ABSOLUTE_PATH_GLOBAL, (match) => `${/^\s/u.test(match) ? match[0] : ""}<path>`);
+  redacted = redacted.replace(PRIVATE_NAME_GLOBAL, "<private-name>");
+  redacted = redacted.replace(CONTROL_GLOBAL, "");
+  return redacted;
+}
+
+const REDACT_SKIP_KEYS = new Set(["content"]);
+const REDACT_BLANK_KEYS = NEVER_STORED_KEY;
+
+/** Returns a structurally identical copy with every string value redacted. */
+export function redactRecordPrivateMaterial(record) {
+  const redact = (value, key) => {
+    if (typeof value === "string") {
+      // Message bodies, transcripts, and raw-text fields are blanked by field
+      // name: their contents are never appropriate for audits or exports even
+      // when no content pattern matches.
+      if (REDACT_BLANK_KEYS.test(key)) return null;
+      return redactPrivateMaterial(value);
+    }
+    if (Array.isArray(value)) return value.map((item) => redact(item, key));
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [childKey, child] of Object.entries(value)) out[childKey] = REDACT_SKIP_KEYS.has(childKey) ? child : redact(child, childKey);
+      return out;
+    }
+    return value;
+  };
+  return redact(record, "");
+}
+
 function expirationFor(record, retentionDays) {
   const createdAt = timestampFor(record);
   if (!Number.isSafeInteger(createdAt)) return null;
@@ -191,7 +249,10 @@ export function createPrivacyGuard({
   store,
   blockedNames = [],
 } = {}) {
-  const initialConsent = makeConsentState(consent ?? ConsentState.defaults);
+  const hasExplicitConsent = consent !== undefined;
+  // The caller may still pass the retained v0.3 settings view. Consume only
+  // the three v0.4 permission bits; retired passive-call consent has no role.
+  const initialConsent = normalizeAutomationConsent(consent ?? V4ConsentState.defaults);
   if (!FINGERPRINT.test(String(projectFingerprint))) throw new TypeError("invalid-project-fingerprint");
   if (!Number.isSafeInteger(retentionDays) || retentionDays < 1) throw new TypeError("invalid-retention");
   if (!Number.isFinite(storageQuotaMiB) || storageQuotaMiB < 0) throw new TypeError("invalid-storage-quota");
@@ -206,8 +267,16 @@ export function createPrivacyGuard({
   }
 
   function freshConsent() {
-    try { return makeConsentState(durableSettings().global.consent); }
-    catch { return makeConsentState(); }
+    if (hasExplicitConsent) return initialConsent;
+    try {
+      const automation = store?.getAutomationState?.();
+      if (automation) {
+        if (!automation.ok || !automation.enabled) throw new Error("automatic-recommendations-disabled");
+        return normalizeAutomationConsent(automation.global.consent);
+      }
+      return initialConsent;
+    }
+    catch { return makeV4ConsentState({ durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false }); }
   }
 
   function freshRetentionDays() {
@@ -266,11 +335,28 @@ export function createPrivacyGuard({
     }
   }
 
-  function scrubObservation(observation) {
+  function automationConsent(automationStamp) {
+    if (!automationStamp && hasExplicitConsent) return initialConsent;
+    const state = store?.getAutomationState?.();
+    if (!state) return initialConsent;
+    if (!state.ok || !state.enabled
+      || (automationStamp && !store.compareAutomationStamp?.(automationStamp))) {
+      return { durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false };
+    }
+    return state.global.consent;
+  }
+
+  function resolvedAutomationStamp(automationStamp) {
+    if (automationStamp) return automationStamp;
+    const state = store?.getAutomationState?.();
+    return state?.ok && state.enabled ? state.stamp : null;
+  }
+
+  function scrubObservation(observation, { automationStamp = null } = {}) {
     if (!observation || typeof observation !== "object" || Array.isArray(observation)) return { ok: false, reason: "invalid-observation" };
     if (!observation.projectFingerprint) return { ok: false, reason: "project-fingerprint-required" };
     if (observation.projectFingerprint !== projectFingerprint) return { ok: false, reason: "project-partition-mismatch" };
-    if (!freshConsent().durableObservations) return { ok: false, reason: "observation-consent-required" };
+    if (!automationConsent(automationStamp).durableObservations) return { ok: false, reason: "observation-consent-required" };
     return scrubObservationForProject(observation, projectFingerprint);
   }
 
@@ -284,16 +370,21 @@ export function createPrivacyGuard({
     }));
     return records.flatMap((record) => {
       if (record.kind === "proposal-content" && privateProposalIds.has(record.payload.proposalId)) return [];
-      if (record.kind !== "observation") return [record];
-      const result = scrubObservationForProject(record.payload, expectedProjectFingerprint);
-      if (!result.ok) throw new Error(`unsafe-observation:${result.reason}`);
-      return [{ ...record, payload: result.sanitized }];
+      if (record.kind === "observation") {
+        const result = scrubObservationForProject(record.payload, expectedProjectFingerprint);
+        if (!result.ok) throw new Error(`unsafe-observation:${result.reason}`);
+        return [{ ...record, payload: result.sanitized }];
+      }
+      // H6-002: redact every remaining record kind so raw host errors that
+      // reached an audit detail, decision reason, or rollback reason never
+      // surface tokens, paths, private names, or message contents in exports.
+      return [redactRecordPrivateMaterial(record)];
     });
   }
 
   /** Returns heuristic redaction only; "redacted" is not a secrecy guarantee. */
-  function scrubExcerpt({ text, maxLength = DEFAULT_EXCERPT_LENGTH } = {}) {
-    if (!freshConsent().sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
+  function scrubExcerpt({ text, maxLength = DEFAULT_EXCERPT_LENGTH } = {}, { automationStamp = null } = {}) {
+    if (!automationConsent(automationStamp).sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
     if (typeof text !== "string" || !Number.isSafeInteger(maxLength) || maxLength < 0) return { ok: false, reason: "invalid-excerpt" };
     let redacted = text.replace(/```[\s\S]*?```/g, "<code>").replace(PRIVATE_KEY, "<private-key>");
     for (const pattern of PROVIDER_TOKEN_PATTERNS) {
@@ -305,9 +396,10 @@ export function createPrivacyGuard({
     return { ok: true, redacted, hash: sha256(redacted), length: redacted.length };
   }
 
-  function createEvidenceCapsule(input) {
-    if (!freshConsent().durableObservations) return { ok: false, reason: "observation-consent-required" };
-    if (!freshConsent().sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
+  function createEvidenceCapsule(input, { automationStamp = null } = {}) {
+    const consent = automationConsent(automationStamp);
+    if (!consent.durableObservations) return { ok: false, reason: "observation-consent-required" };
+    if (!consent.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
     if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "invalid-capsule-input" };
     const allowed = ["incidentId", "receiptType", "targetLogicalName", "summary"];
     if (Object.keys(input).some((key) => !allowed.includes(key)) || allowed.some((key) => !(key in input))) {
@@ -328,14 +420,14 @@ export function createPrivacyGuard({
         createdAt,
         expiresAt: observationExpiresAt(createdAt, freshRetentionDays()),
       });
-      return requireStore(store).appendEvidenceCapsule(capsule);
+      return requireStore(store).appendEvidenceCapsule(capsule, { automationStamp: resolvedAutomationStamp(automationStamp) });
     } catch (error) {
       return { ok: false, reason: errorReasonCode(error, "capsule-rejected") };
     }
   }
 
-  function getEvidenceCapsuleSupport(incidentId) {
-    try { return requireStore(store).getEvidenceCapsuleSupport(incidentId, { nowMs: now() }); }
+  function getEvidenceCapsuleSupport(incidentId, { automationStamp = null } = {}) {
+    try { return requireStore(store).getEvidenceCapsuleSupport(incidentId, { nowMs: now(), automationStamp: resolvedAutomationStamp(automationStamp) }); }
     catch (error) { return { available: false, reason: errorReasonCode(error, "evidence-capsule-unavailable") }; }
   }
 
@@ -365,18 +457,18 @@ export function createPrivacyGuard({
     return { ok: true, sanitized: [...claims].sort(([a], [b]) => a.localeCompare(b)).map(([signature, occurrences]) => ({ signature, occurrences })) };
   }
 
-  function publishContribution(input) {
-    const consentNow = freshConsent();
-    if (!consentNow.durableObservations) return { ok: false, reason: "observation-consent-required" };
-    if (!consentNow.sanitizedExcerpts) return { ok: false, reason: "sanitized-excerpts-consent-required" };
-    if (!consentNow.crossRepoAggregation) return { ok: false, reason: "cross-repo-consent-required" };
+  function publishContribution(input, { automationStamp = null } = {}) {
+    // H6-001: the privacy guard reuses the unified three-bit contribution
+    // authority predicate so creation and recovery enforce the identical gate.
+    const authority = evaluateContributionConsentAuthority(automationConsent(automationStamp));
+    if (!authority.ok) return { ok: false, reason: authority.reason };
     if (!input || typeof input !== "object" || Array.isArray(input)) return { ok: false, reason: "invalid-contribution-input" };
     const keys = Object.keys(input);
     if (keys.some((key) => !CONTRIBUTION_INPUT_FIELDS.includes(key))
         || CONTRIBUTION_INPUT_FIELDS.some((key) => !(key in input))) {
       return { ok: false, reason: "invalid-contribution-input" };
     }
-    try { return requireStore(store).publishContribution(input); }
+    try { return requireStore(store).publishContribution(input, { automationStamp: resolvedAutomationStamp(automationStamp) }); }
     catch (error) { return { ok: false, reason: errorReasonCode(error, "privacy-failed") }; }
   }
 
@@ -492,7 +584,9 @@ export function createPrivacyGuard({
 
   function appendPrivacyAudit(action, details) {
     const timestamp = now();
-    const cleanDetails = { action, ...details };
+    // H6-002: scrub detail strings so raw host errors never persist private
+    // material (tokens, paths, private names, message contents) in audits.
+    const cleanDetails = redactRecordPrivateMaterial({ action, ...details });
     const payloadHash = sha256(JSON.stringify(cleanDetails));
     const event = makeAuditEvent({
       id: sha256(JSON.stringify({ timestamp, payloadHash, projectFingerprint, action })),

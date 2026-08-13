@@ -20,25 +20,23 @@ function dashboard(lastCycle = null) {
     lastCycle,
     nextEligibleAt: null,
     usage: {
-      passive: { used: 1, limit: 3, remaining: 2, resetAt: 2_000 },
+      provider: { used: 1, limit: 3, remaining: 2, resetAt: 2_000 },
       synthesis: { used: 1, limit: 2, remaining: 1, resetAt: 3_000 },
       storage: { usedBytes: 100, limitBytes: 1_000, remainingBytes: 900 },
     },
     rollout: null,
     settings: {
-      globalMode: "auto",
-      repositoryMode: "inherit",
-      effectiveMode: "auto",
-      paused: false,
+      automaticRecommendationsEnabled: true,
+      automationGeneration: 1,
       killSwitchActive: false,
       repositoryExcluded: false,
       consent: {
-        passiveCalls: true,
         durableObservations: true,
-        sanitizedExcerpts: false,
-        crossRepoAggregation: false,
+        sanitizedExcerpts: true,
+        crossRepoAggregation: true,
       },
       approvedSkillFolderCount: 0,
+      collectionSuggestions: [],
       globalSettingsVersion: "b".repeat(64),
       globalRootPolicy: null,
       globalRootPolicyConfirmation: "REPLACE GLOBAL ROOT POLICY bbbbbbbbbbbb",
@@ -50,8 +48,8 @@ function dashboard(lastCycle = null) {
       },
     },
     retention: { observationsDays: 30, operationalDays: 90 },
-    capabilities: ["control-repo-mode-v1", "decision-feedback-v1", "operation-global-root-policy-v1", "project-analysis-control-v1"],
-    supportedControls: ["replace-global-root-policy", "set-kill-switch", "set-paused", "set-repo-mode"],
+    capabilities: ["decision-feedback-v1", "operation-global-root-policy-v1", "project-participation-v1"],
+    supportedControls: ["replace-global-root-policy", "set-automatic-recommendations", "set-kill-switch", "set-permission", "set-repo-excluded"],
     activity: [],
     overflow: {
       activity: {
@@ -75,15 +73,7 @@ function snapshot(lastCycle = null, identity = "a") {
     acknowledgedOutcomes: [],
     dashboard: dashboardValue,
     dashboardError: null,
-    controlState: {
-      projectFingerprint: identity?.repeat(64),
-      stateRootIdentity: "f".repeat(64),
-      mode: "auto",
-      effectiveMode: "auto",
-      allowedSkillRoots: ["/skills/project-a"],
-      consent: dashboardValue.settings.consent,
-      repoExcluded: false,
-    },
+    controlState: null,
     tuiHealth: {
       projectFingerprint: identity?.repeat(64),
       stateRootIdentity: "f".repeat(64),
@@ -96,22 +86,24 @@ function snapshot(lastCycle = null, identity = "a") {
     runtime: {
       hostVersion: "1.18.3",
       hostVersionSource: "test",
-      pluginVersion: "0.2.0",
+      pluginVersion: "0.4.0",
       projectionVersion: 1,
-      dashboardVersion: 1,
+      dashboardVersion: 3,
       projectionMode: "native",
     },
     projection: {
       mode: "native",
       projectionVersion: 1,
-      operationProtocolVersion: 1,
-      capabilities: ["legacy-control-v1", "legacy-decision-v1"],
+      operationProtocolVersion: 2,
+      capabilities: ["automatic-recommendations-control-v1", "legacy-decision-v1"],
       dashboard: dashboardValue,
       dashboardError: null,
       index: {
         generation: "a".repeat(64),
         projectionVersion: 1,
-        capabilities: ["legacy-control-v1", "legacy-decision-v1"],
+        projectFingerprint: identity?.repeat(64),
+        stateRootIdentity: "f".repeat(64),
+        capabilities: ["automatic-recommendations-control-v1", "legacy-decision-v1"],
         allowedActions: [],
         budgets: {
           passiveCallsPerHour: 3,
@@ -124,9 +116,7 @@ function snapshot(lastCycle = null, identity = "a") {
         },
         status: {
           state: "ready",
-          storedMode: "auto",
-          effectiveMode: "auto",
-          paused: false,
+          automaticRecommendationsEnabled: true,
           killSwitchActive: false,
           repoExcluded: false,
           circuitBreakerOpen: false,
@@ -136,7 +126,9 @@ function snapshot(lastCycle = null, identity = "a") {
       },
       details: [],
       effectiveIndexActions: [
-        { action: "set-repo-mode" },
+        { action: "set-automatic-recommendations" },
+        { action: "set-permission" },
+        { action: "set-repo-excluded" },
         { action: "replace-global-root-policy" },
         { action: "export-data" },
         { action: "purge-scope" },
@@ -216,7 +208,7 @@ function globalRecommendationSnapshot(identity, {
     recommendationVersion: 1,
     supportSetHash,
     state,
-    target: { kind: "new-global-skill", label: "shared-global-review" },
+    target: { kind: "existing-global-skill", label: "shared-global-review" },
     support: { tier: "distributed", independentDomainCount: 2, independentIncidentCount: 3, occurrenceCount: 7 },
     dates: { firstSeenDay: "2026-08-01", lastSeenDay: "2026-08-11", synthesizedAt: 700, updatedAt: 900 },
     safety: { criticScoreBasisPoints: 9_750, criticPassed: true, validDeterministic: true },
@@ -248,8 +240,8 @@ function globalRecommendationSnapshot(identity, {
         support: { ...indexEntry.support, firstSeenDay: "2026-08-01", lastSeenDay: "2026-08-11" },
         safety: indexEntry.safety,
         generality: { passed: true, basis: "deterministic-generality-gate-v1" },
-        rationale: "Independent identity-free support warrants one bounded global skill.",
-        diff: { kind: "new-file", lines: ["+# Shared global review", "+Bounded reusable guidance."], overflow: { truncated: false } },
+        rationale: "Independent identity-free support warrants one bounded update to an existing global skill.",
+        diff: { kind: "existing-file", lines: ["+# Shared global review", "+Bounded reusable guidance."], overflow: { truncated: false } },
         evidenceSummary: [
           { kind: "independent-domains", count: 2 },
           { kind: "independent-incidents", count: 3 },
@@ -475,15 +467,11 @@ async function armAllProjectState(setup) {
   assert.match(setup.captureCharFrame(), /Confirm Apply Proposal/u);
 
   await clickLabel(setup, "Settings");
-  await clickLabel(setup, "Review consent for Sanitized evidence excerpts");
   await clickLabel(setup, "Everything");
   await clickLabel(setup, "Delete selected scope");
-  await typeInto(setup, "PURGE ALL SELF-EVOLVE 0.3.0", "PURGE ALL SELF-EVOLVE 0.3.0");
+  await typeInto(setup, "PURGE ALL SELF-EVOLVE 0.4.0", "PURGE ALL SELF-EVOLVE 0.4.0");
   const armed = setup.captureCharFrame();
-  for (const expected of [
-    "Consent disclosure",
-    "Delete permanently",
-  ]) assert.ok(armed.includes(expected), `armed Settings state omitted ${expected}\n${armed}`);
+  assert.ok(armed.includes("Delete permanently"), `armed Settings state omitted Delete permanently\n${armed}`);
 
   await clickLabel(setup, "Recommendations");
   const recommendation = setup.captureCharFrame();
@@ -510,7 +498,7 @@ async function assertGlobalIdentityReset(setup, host, store) {
     params: { section: "home" },
   });
   const reset = setup.captureCharFrame();
-  assert.match(reset, /Mode and scope/u);
+  assert.match(reset, /Automation and scope/u);
   assert.match(reset, /Esc returns to home/u);
   assert.doesNotMatch(reset, /Confirm Apply Proposal|A-only rejection reason|Consent disclosure|Delete permanently/u);
   assert.deepEqual(store.detailSelections.at(-1), []);
@@ -539,54 +527,58 @@ try {
   try {
     await sidebar.flush();
     const card = sidebar.renderer.root.findDescendantById("self-evolve-sidebar-card");
-    const manual = sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-manual");
-    const automatic = sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-auto");
-    assert.ok(card && manual && automatic, "sidebar card and project mode segments were not rendered");
-    assert.equal(card.findDescendantById?.("self-evolve-sidebar-mode-manual"), undefined,
-      "project mode control was nested inside the clickable card");
-    assert.equal(manual.focusable, true);
-    assert.equal(automatic.focusable, true, "selected Auto segment must remain independently focusable");
+    const off = sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-off");
+    const on = sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-on");
+    assert.ok(card && off && on, "sidebar card and binary automation segments were not rendered");
+    assert.equal(card.findDescendantById?.("self-evolve-sidebar-mode-off"), undefined,
+      "binary automation control was nested inside the clickable card");
+    assert.equal(off.focusable, true);
+    assert.equal(on.focusable, true, "selected On segment must remain independently focusable");
 
-    host.api.route.current = { name: "session", params: { sessionID: "sidebar-mode" } };
-    await clickLabel(sidebar, "On demand");
-    assert.deepEqual(store.controls.at(-1)?.payload, { mode: "manual" });
-    assert.deepEqual(host.api.route.current, { name: "session", params: { sessionID: "sidebar-mode" } },
-      "mode segment click bubbled into the sidebar card route action");
+    host.api.route.current = { name: "session", params: { sessionID: "sidebar-automation" } };
+    await clickLabel(sidebar, "Off");
+    assert.deepEqual(store.operations.at(-1), {
+      action: "set-automatic-recommendations",
+      payload: { enabled: false },
+      projectFingerprint: "a".repeat(64),
+    });
+    assert.deepEqual(host.api.route.current, { name: "session", params: { sessionID: "sidebar-automation" } },
+      "automation segment click bubbled into the sidebar card route action");
 
-    const manualSnapshot = snapshot();
-    manualSnapshot.dashboard.settings.repositoryMode = "manual";
-    manualSnapshot.dashboard.settings.effectiveMode = "manual";
-    manualSnapshot.projection.index.status.effectiveMode = "manual";
-    store.emit(manualSnapshot);
+    const offSnapshot = snapshot();
+    offSnapshot.dashboard.settings.automaticRecommendationsEnabled = false;
+    offSnapshot.dashboard.automation = { state: "off", reason: "automatic-recommendations-off" };
+    offSnapshot.projection.index.status.automaticRecommendationsEnabled = false;
+    store.emit(offSnapshot);
     await sidebar.flush();
-    const autoNode = sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-auto");
-    autoNode.focus();
-    assert.equal(autoNode.focused, true, "Auto segment did not expose a distinct focus target");
+    const onNode = sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-on");
+    onNode.focus();
+    assert.equal(onNode.focused, true, "On segment did not expose a distinct focus target");
     sidebar.mockInput.pressEnter();
     await sidebar.flush();
-    assert.match(sidebar.captureCharFrame(), /Confirm Auto/u);
-    const controlsBeforeConfirm = store.controls.length;
+    assert.match(sidebar.captureCharFrame(), /Confirm On/u);
+    const operationsBeforeConfirm = store.operations.length;
     sidebar.mockInput.pressEnter();
     await sidebar.flush();
-    assert.equal(store.controls.length, controlsBeforeConfirm + 1);
-    assert.deepEqual(store.controls.at(-1).payload, { mode: "auto" });
+    assert.equal(store.operations.length, operationsBeforeConfirm + 1);
+    assert.deepEqual(store.operations.at(-1).payload, { enabled: true });
 
-    store.emit(manualSnapshot);
+    store.emit(offSnapshot);
     await sidebar.flush();
     sidebar.renderer.root.findDescendantById("self-evolve-sidebar-card").focus();
     sidebar.mockInput.pressTab();
     await sidebar.flush();
-    assert.equal(sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-manual").focused, true,
-      "Tab did not include the selected sibling mode control");
+    assert.equal(sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-off").focused, true,
+      "Tab did not include the selected sibling Off control");
     sidebar.mockInput.pressTab();
     await sidebar.flush();
-    assert.equal(sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-auto").focused, true,
-      "Tab did not move between independently focusable sibling mode controls");
+    assert.equal(sidebar.renderer.root.findDescendantById("self-evolve-sidebar-mode-on").focused, true,
+      "Tab did not move between independently focusable binary controls");
     sidebar.mockInput.pressKey(" ");
     await sidebar.flush();
-    assert.match(sidebar.captureCharFrame(), /Confirm Auto/u, "Space did not mirror Enter confirmation");
+    assert.match(sidebar.captureCharFrame(), /Confirm On/u, "Space did not mirror Enter confirmation");
 
-    const unavailableModes = [
+    const unavailableAutomation = [
       ["stale", (value) => {
         value.phase = "error";
         value.stale = true;
@@ -594,11 +586,11 @@ try {
         value.projection.effectiveIndexActions = [];
       }],
       ["pending", (value) => {
-        value.pending = [{ action: "set-repo-mode", subject: "repository-mode" }];
+        value.pending = [{ action: "set-automatic-recommendations", subject: "automatic-recommendations" }];
       }],
       ["unsupported", (value) => {
         value.projection.effectiveIndexActions = value.projection.effectiveIndexActions
-          .filter((entry) => entry.action !== "set-repo-mode");
+          .filter((entry) => entry.action !== "set-automatic-recommendations");
       }],
       ["limited", (value) => {
         value.global = {
@@ -609,15 +601,15 @@ try {
         };
       }],
     ];
-    for (const [status, mutate] of unavailableModes) {
-      const unavailable = structuredClone(manualSnapshot);
+    for (const [status, mutate] of unavailableAutomation) {
+      const unavailable = structuredClone(offSnapshot);
       mutate(unavailable);
       store.emit(unavailable);
       await sidebar.flush();
-      const writesBeforeUnavailable = store.controls.length;
-      await clickLabel(sidebar, "Auto");
-      assert.equal(store.controls.length, writesBeforeUnavailable, `${status} sidebar mode control submitted a request`);
-      assert.match(sidebar.captureCharFrame(), new RegExp(`Project mode is read-only: ${status}`, "u"));
+      const writesBeforeUnavailable = store.operations.length;
+      await clickLabel(sidebar, "On");
+      assert.equal(store.operations.length, writesBeforeUnavailable, `${status} automation control submitted a request`);
+      assert.match(sidebar.captureCharFrame(), new RegExp(`Automatic recommendations are read-only:\\s+${status}`, "u"));
     }
     store.emit(snapshot());
     await sidebar.flush();
@@ -626,10 +618,10 @@ try {
   }
 
   const sections = [
-    [{ section: "home" }, "Mode and scope"],
+    [{ section: "home" }, "Automation and scope"],
     [{ section: "recommendations" }, "Nothing needs review"],
     [{ section: "activity", activityFilter: "all" }, "Diagnostics"],
-    [{ section: "settings" }, "Configured analysis"],
+    [{ section: "settings" }, "Automatic recommendations"],
   ];
   for (const [params, expected] of sections) {
     const setup = await renderRoute(route, host.api, params);
@@ -638,7 +630,7 @@ try {
       assert.match(frame, /Self-evolve/u);
       assert.ok(frame.includes(expected), `rendered ${params.section} without ${expected}\n${frame}`);
       if (params.section === "home") {
-        assert.match(frame, /Background analysis resets: 1970-01-01T00:00:02.000Z/u);
+        assert.match(frame, /Provider calls reset: 1970-01-01T00:00:02.000Z/u);
         assert.match(frame, /Recommendation synthesis resets: 1970-01-01T00:00:03.000Z/u);
       }
       renderedSections.push(params.section);
@@ -748,10 +740,9 @@ try {
   }
 
   const narrowOutcomeSnapshot = snapshot();
-  narrowOutcomeSnapshot.projection.effectiveIndexActions.push({ action: "set-paused" });
   narrowOutcomeSnapshot.responses = [
     {
-      requestId: "outcome-success", kind: "operation", action: "set-paused", subject: "project",
+      requestId: "outcome-success", kind: "operation", action: "set-automatic-recommendations", subject: "automatic-recommendations",
       submittedAt: 700, expiresAt: 900,
       response: { ok: true, status: "completed", processedAt: 800, reason: null },
     },
@@ -774,7 +765,6 @@ try {
   store.emit(narrowOutcomeSnapshot);
   const narrowOutcomes = await renderRoute(route, host.api, { section: "home" }, { width: 64, height: 20 });
   try {
-    await clickLabel(narrowOutcomes, "Pause");
     const primary = narrowOutcomes.captureCharFrame();
     assert.match(primary, /Ready/u);
     assert.match(primary, /No action required/u);
@@ -788,7 +778,7 @@ try {
     narrowOutcomes.mockInput.pressEnter();
     await narrowOutcomes.flush();
     for (const [index, expected] of [
-      [0, "set paused accepted by the server"],
+      [0, "set automatic recommendations accepted by the server"],
       [1, "bounded-long-rejection"],
       [2, "expired without a server response"],
       [3, "Purge all accepted"],
@@ -800,12 +790,6 @@ try {
       await narrowOutcomes.flush();
       assert.match(narrowOutcomes.captureCharFrame(), new RegExp(expected, "iu"));
     }
-    const feedback = narrowOutcomes.renderer.root.findDescendantById("self-evolve-focus-outcome-feedback");
-    assert.ok(feedback, "current feedback was not keyboard reachable");
-    scrollbox.scrollChildIntoView(feedback.id);
-    feedback.focus();
-    await narrowOutcomes.flush();
-    assert.match(narrowOutcomes.captureCharFrame(), /Request submitted/u);
   } finally {
     narrowOutcomes.renderer.destroy();
   }
@@ -880,7 +864,7 @@ try {
     recommendation: "stale-cross-project-recommendation",
   });
   try {
-    assert.match(invalidRoute.captureCharFrame(), /Mode and scope/u);
+    assert.match(invalidRoute.captureCharFrame(), /Automation and scope/u);
     await clickLabel(invalidRoute, "Recommendations");
     assert.match(invalidRoute.captureCharFrame(), /Nothing needs review/u,
       "invalid route leaked an applied recommendation filter into the Home fallback");
@@ -908,7 +892,7 @@ try {
       name: "mcrescenzo.self-evolve.control-center.route",
       params: { section: "home" },
     }, "local recommendation removal retained stale route params");
-    assert.match(localRemoval.captureCharFrame(), /Mode and scope/u);
+    assert.match(localRemoval.captureCharFrame(), /Automation and scope/u);
     assert.deepEqual(store.detailSelections.at(-1), [], "local recommendation removal retained detail selection");
     assert.equal(selectedRow.focused, false, "removed local recommendation retained focus");
   } finally {
@@ -947,7 +931,7 @@ try {
       name: "mcrescenzo.self-evolve.control-center.route",
       params: { section: "home" },
     }, "incompatible project switch retained a stale global recommendation route");
-    assert.match(incompatibleSwitch.captureCharFrame(), /Mode and scope/u);
+    assert.match(incompatibleSwitch.captureCharFrame(), /Automation and scope/u);
     assert.equal(selectedGlobalRow.focused, false, "incompatible project switch retained stale global focus");
   } finally {
     incompatibleSwitch.renderer.destroy();
@@ -967,20 +951,21 @@ try {
   firstRunSnapshot.dashboard.blockers = [{
     code: "first-run",
     summary: "Automatic recommendations have not been set up yet.",
-    destination: "home",
+    destination: "settings",
   }];
-  firstRunSnapshot.dashboard.settings.globalMode = "manual";
-  firstRunSnapshot.dashboard.settings.effectiveMode = "manual";
-  firstRunSnapshot.controlState.mode = "manual";
-  firstRunSnapshot.controlState.effectiveMode = "manual";
-  firstRunSnapshot.projection.index.status.storedMode = "manual";
-  firstRunSnapshot.projection.index.status.effectiveMode = "manual";
+  firstRunSnapshot.dashboard.settings.automaticRecommendationsEnabled = false;
+  firstRunSnapshot.projection.index.status.automaticRecommendationsEnabled = false;
   store.emit(firstRunSnapshot);
-  const firstRunDeepLink = await renderRoute(route, host.api, { section: "home" });
+  const firstRunDestination = firstRunSnapshot.dashboard.blockers[0];
+  assert.equal(firstRunDestination.destination, "settings");
+  const firstRunDeepLink = await renderRoute(route, host.api, {
+    section: "settings",
+    settingsAnchor: "automatic-recommendations",
+  });
   try {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await firstRunDeepLink.flush();
-    assert.match(firstRunDeepLink.captureCharFrame(), /› Turn on automatic recommendations/u);
+    assert.match(firstRunDeepLink.captureCharFrame(), /› Opened at automatic recommendations settings/u);
   } finally {
     firstRunDeepLink.renderer.destroy();
   }
@@ -990,8 +975,7 @@ try {
     assert.doesNotMatch(home.captureCharFrame(), /Last cycle/u);
     store.emit(snapshot({
       outcome: "valid-no-change",
-      triggerClass: "manual",
-      mode: "manual",
+      triggerClass: "automatic",
       observationCount: 4,
       eligibilityCount: 2,
       occurredAt: 2_000,
@@ -1020,7 +1004,7 @@ try {
   try {
     const detail = globalReview.captureCharFrame();
     for (const expected of [
-      "New global skill",
+      "Existing global skill",
       "shared global review",
       "distributed",
       "2 independent domains",
@@ -1151,7 +1135,7 @@ try {
   }
 
   const projectA = recommendationSnapshot("a");
-  projectA.responses = [{ action: "set-paused", response: { ok: true } }];
+  projectA.responses = [{ action: "set-automatic-recommendations", response: { ok: true } }];
   store.emit(projectA);
   host.api.route.current = { name: "session", params: { sessionID: "project-a" } };
   const openCommand = host.layers
@@ -1168,7 +1152,7 @@ try {
     projectOutcomes.focus();
     review.mockInput.pressEnter();
     await review.flush();
-    assert.match(review.captureCharFrame(), /set paused accepted by the server/u);
+    assert.match(review.captureCharFrame(), /set automatic recommendations accepted by the server/u);
     assert.match(review.captureCharFrame(), /Esc returns to session/u);
     assert.equal(store.decisions.length, 0);
 
@@ -1227,7 +1211,7 @@ try {
       submittedAt: 1_000,
       expiresAt: 2_000,
     }];
-    expired.projection.effectiveIndexActions = [{ action: "set-paused" }, { action: "set-kill-switch" }];
+    expired.projection.effectiveIndexActions = [{ action: "set-automatic-recommendations" }, { action: "set-kill-switch" }];
     store.emit(expired);
     await review.flush();
     const staleRecommendation = review.captureCharFrame();
@@ -1235,11 +1219,11 @@ try {
     assert.match(staleRecommendation, /Latest refresh failed: expired-projection/u);
     assert.match(staleRecommendation, /Request pending server validation/u);
     assert.match(staleRecommendation, /Retry/u);
-    assert.doesNotMatch(staleRecommendation, /Apply Proposal|Reject Proposal|Confirm Apply Proposal|Emergency stop|Pause/u);
+    assert.doesNotMatch(staleRecommendation, /Apply Proposal|Reject Proposal|Confirm Apply Proposal|Emergency stop|Turn Off/u);
 
     await clickLabel(review, "Settings");
     const staleSettings = review.captureCharFrame();
-    assert.match(staleSettings, /Configured analysis: Recommend automatically/u);
+    assert.match(staleSettings, /Automatic recommendations[\s\S]*On/u);
     assert.doesNotMatch(staleSettings, /Set global default|This project ✓|Export selected scope|Delete selected scope/u);
 
     const retried = withIdentity(recommendationSnapshot("e"), { stateRootIdentity: "d".repeat(64) });
@@ -1251,7 +1235,7 @@ try {
     const freshActions = review.captureCharFrame();
     assert.match(freshActions, /Reject Proposal/u);
     assert.match(freshActions, /Emergency stop/u);
-    assert.doesNotMatch(freshActions, /Apply Proposal|Read-only stale snapshot|Request pending server validation|Pause/u);
+    assert.doesNotMatch(freshActions, /Apply Proposal|Read-only stale snapshot|Request pending server validation|Turn Off/u);
 
     const isolated = withIdentity(pendingIsolationSnapshot("e"), { stateRootIdentity: "d".repeat(64) });
     store.emit(isolated);
@@ -1379,11 +1363,11 @@ process.stdout.write(`${JSON.stringify({
     activationParity: ["pointer", "enter", "space"],
     tabDirections: ["forward", "reverse"],
   },
-  sidebarModeCoverage: {
+  sidebarAutomationCoverage: {
     activationParity: ["pointer", "enter", "space"],
     cardAndControlFocus: "siblings",
-    manualToAuto: "inline-confirmation",
-    autoToManual: "immediate",
+    offToOn: "inline-confirmation",
+    onToOff: "immediate",
     unavailableAuthority: ["stale", "pending", "unsupported", "limited"],
   },
   escapeRestoration: "exact-prior-route-from-focused-descendant",
@@ -1393,10 +1377,10 @@ process.stdout.write(`${JSON.stringify({
     projectSwitch: ["queue-bytes-preserved", "selection-preserved", "participation-replaced", "prepared-authority-cleared"],
     privacy: "identity-free-counts-only",
   },
-  deepLinkFocusCoverage: ["activity-errors", "settings-provider", "first-run-home"],
+  deepLinkFocusCoverage: ["activity-errors", "settings-provider", "first-run-settings"],
   reactiveLastCycle: true,
   identityResetCoverage: {
-    stateClasses: ["confirmation", "consent", "maintenance", "recommendation", "pending-route", "prior-route"],
+    stateClasses: ["confirmation", "maintenance", "recommendation", "pending-route", "prior-route"],
     transitions: ["project-selection-preserved", "project-authority-cleared", "state-root-reset"],
     freshReview: true,
   },

@@ -25,6 +25,7 @@ import {
   resolveGlobalRecommendationTarget,
   validateProposalTarget,
 } from "./self-evolve-inventory.js";
+import { syncDirectoryFsync as syncDirectory } from "./self-evolve-durable.js";
 
 const ACTOR = "self-evolve-applier";
 const CLAIM_TTL_MS = 5 * 60 * 1000;
@@ -188,16 +189,6 @@ function verifiedNewSkillTemp(temporary, target, expectedHash) {
   } catch (error) {
     if (error?.code === "ENOENT") return false;
     throw error;
-  } finally {
-    if (descriptor !== undefined) fs.closeSync(descriptor);
-  }
-}
-
-function syncDirectory(directory) {
-  let descriptor;
-  try {
-    descriptor = fs.openSync(directory, fs.constants.O_RDONLY);
-    fs.fsyncSync(descriptor);
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
@@ -378,12 +369,13 @@ export function createGlobalDecisionDomain({
   inventory,
   now = () => Date.now(),
   getSuppressors,
+  getCatalog,
   forbiddenIdentityValues = [],
   projectSkillRoot = null,
   faultInjection,
 } = {}) {
   const requiredStoreMethods = [
-    "acquireGlobalLease", "acquireGlobalDecisionLease", "releaseGlobalLease", "getSettings", "readGlobalRecommendations", "readGlobalRecommendationContent",
+    "acquireGlobalLease", "acquireGlobalDecisionLease", "releaseGlobalLease", "renewGlobalLease", "getSettings", "readGlobalRecommendations", "readGlobalRecommendationContent",
     "readGlobalDecisionOutcomes", "readGlobalApplyIntents",
     "beginGlobalDecision", "revalidateGlobalDecisionIntent", "commitGlobalDecisionPublication", "writeGlobalSkillSnapshot", "advanceGlobalApplyIntent", "completeGlobalDecision",
     "failGlobalDecision", "readGlobalSkillSnapshots",
@@ -393,6 +385,7 @@ export function createGlobalDecisionDomain({
       || typeof inventory.validateProposalTarget !== "function") throw new TypeError("global-decision-inventory-required");
   if (typeof now !== "function") throw new TypeError("global-decision-clock-required");
   if (typeof getSuppressors !== "function") throw new TypeError("global-decision-suppressors-required");
+  if (getCatalog !== undefined && typeof getCatalog !== "function") throw new TypeError("global-decision-catalog-provider-invalid");
   if (!Array.isArray(forbiddenIdentityValues) || forbiddenIdentityValues.length > 20
       || forbiddenIdentityValues.some((value) => typeof value !== "string" || !value || value.length > 1024 || value.includes("\0"))) {
     throw new TypeError("invalid-global-identity-firewall-context");
@@ -403,8 +396,36 @@ export function createGlobalDecisionDomain({
     hashSkillContent(JSON.stringify(value)),
   ]))].sort();
 
+  function actionCatalog() {
+    const supplied = getCatalog?.();
+    if (supplied?.ok && supplied.policy && Array.isArray(supplied.records)) return supplied;
+    if (getCatalog !== undefined) {
+      throw new Error(supplied?.blockers?.[0]?.code ?? "host-global-skill-catalog-unavailable");
+    }
+    const policy = store.getSettings()?.global?.globalRootPolicy;
+    const fallback = policy ? inventory.buildGlobalSkillCatalog?.(policy, { projectSkillRoot }) : null;
+    if (!fallback?.ok || !fallback.policy) {
+      throw new Error(fallback?.blockers?.[0]?.code ?? "host-global-skill-catalog-unavailable");
+    }
+    return fallback;
+  }
+
   function injectFault(point, details = {}) {
     if (typeof faultInjection === "function") faultInjection(point, details);
+  }
+
+  // Power-loss durability gate. The store probes the host's directory-fsync
+  // capability once at open and exposes the stable result. Apply/Undo publish a
+  // surviving skill mutation (rename/link/unlink) whose journal evidence must be
+  // namespace-durable for recovery and Undo; on a host that cannot fsync a
+  // directory descriptor we fail closed BEFORE any skill filesystem effect or
+  // durable journal write, with the stable reason. Read-only recovery reads
+  // never reach this gate, so analysis remains available on unsupported hosts.
+  function assertDurableCapability() {
+    const capability = store.durableCapability;
+    if (capability && capability.available === false) {
+      throw new Error(capability.reason ?? "directory-fsync-unavailable");
+    }
   }
 
   function releaseTargetLease(leaseKeyHash, ownerToken) {
@@ -468,6 +489,9 @@ export function createGlobalDecisionDomain({
         fs.unlinkSync(target);
         syncDirectory(path.dirname(target));
         removeOwnedNewSkillDirectory(intent, target, canonicalRoot);
+        // The rolled-back target removal is namespace-durable; a failure
+        // recorded after this point must not claim a surviving applied effect.
+        injectFault("journal-after-rollback-effect", { intentId: intent.intentId, action: "unlink" });
         return { ok: true, rolledBackHash: MUST_NOT_EXIST };
       }
       const snapshot = store.readGlobalSkillSnapshots().find((item) => item.intentId === intent.intentId && item.snapshotId === intent.snapshotId);
@@ -484,6 +508,7 @@ export function createGlobalDecisionDomain({
         fs.rmSync(temporary, { force: true });
       }
       if (hashSkillContent(readBoundGlobalTarget(target, canonicalRoot)) !== intent.priorHash) throw new Error("global-rollback-readback-mismatch");
+      injectFault("journal-after-rollback-effect", { intentId: intent.intentId, action: "rename" });
       return { ok: true, rolledBackHash: intent.priorHash };
     } catch (error) {
       return { ok: false, reason: errorReason(error, "global-rollback-failed") };
@@ -523,6 +548,7 @@ export function createGlobalDecisionDomain({
         fs.rmSync(temporary, { force: true });
       }
       if (hashSkillContent(readBoundGlobalTarget(target, canonicalRoot)) !== intent.appliedHash) throw new Error("global-undo-rollback-readback-mismatch");
+      injectFault("journal-after-rollback-effect", { intentId: intent.intentId, action: intent.targetKind === "new-global-skill" ? "link" : "rename" });
       return { ok: true, rolledBackHash: intent.appliedHash };
     } catch (error) {
       return { ok: false, reason: errorReason(error, "global-undo-rollback-failed") };
@@ -530,8 +556,7 @@ export function createGlobalDecisionDomain({
   }
 
   function intentTarget(intent, recommendation) {
-    const settings = store.getSettings();
-    const policy = settings.global.globalRootPolicy;
+    const policy = actionCatalog().policy;
     if (!policy || policy.rootSetHash !== recommendation.targetBinding.rootSetHash) throw new Error("stale-root-set");
     const root = policy.roots.find((item) => item.rootId === intent.rootId);
     if (!root || fs.realpathSync(root.canonicalPath) !== root.canonicalPath || rejectSymlinked(root.canonicalPath)) {
@@ -707,14 +732,15 @@ export function createGlobalDecisionDomain({
     } else if (temporary || intent.temporaryName !== null) {
       throw new Error("global-temporary-file-invalid");
     }
-    const settings = store.getSettings();
+    const catalog = actionCatalog();
     const resolution = inventory.resolveGlobalRecommendationTarget(
       recommendation.targetBinding,
-      settings.global.globalRootPolicy,
+      catalog.policy,
       {
         action: intent.action,
         proposedContentHash: recommendation.proposedContentHash,
         projectSkillRoot,
+        catalog,
         ...(intent.action === "apply" && intent.targetKind === "new-global-skill" ? {
           preparedNewTarget: { temporaryName: intent.temporaryName, expectedHash: intent.appliedHash },
         } : {}),
@@ -747,6 +773,7 @@ export function createGlobalDecisionDomain({
       ownerToken: lease.ownerToken,
       nowMs: now(),
       suppressors: getSuppressors(),
+      rootPolicy: catalog.policy,
       forbiddenIdentityValues: identityFirewallValues,
     });
     if (!revalidated?.ok) throw new Error(revalidated?.reason ?? "global-decision-revalidation-failed");
@@ -857,7 +884,27 @@ export function createGlobalDecisionDomain({
       : { ok: false, reason: completed?.reason ?? "global-decision-completion-failed", recoveryRequired: true };
   }
 
-  async function decide({ action, decision } = {}) {
+  // Carry optional immutable request/consumer deadlines (H10-001) and validate
+  // them at durable admission. They originate from the consumed bridge request
+  // (`request.expiresAt`) and consumer claim (`consumer.expiresAt`) and are
+  // compared against the real admission timestamp without clamping. They are
+  // advisory admission inputs only: they are never persisted and do not appear
+  // in any intent, snapshot, outcome, or rollback record.
+  function normalizeDecisionDeadline(value) {
+    if (value === undefined || value === null) return undefined;
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid-global-decision-deadline");
+    return value;
+  }
+
+  async function decide({ action, decision, requestDeadline, consumerDeadline } = {}) {
+    let normalizedRequestDeadline;
+    let normalizedConsumerDeadline;
+    try {
+      normalizedRequestDeadline = normalizeDecisionDeadline(requestDeadline);
+      normalizedConsumerDeadline = normalizeDecisionDeadline(consumerDeadline);
+    } catch (error) {
+      return { ok: false, reason: errorReason(error, "invalid-global-decision") };
+    }
     let cleanDecision;
     try { cleanDecision = makeGlobalDecision(decision, { forbiddenIdentityValues: identityFirewallValues }); }
     catch (error) { return { ok: false, reason: errorReason(error, "invalid-global-decision") }; }
@@ -877,19 +924,31 @@ export function createGlobalDecisionDomain({
     if (existingOutcome && existingIntent && ["completed", "failed-closed"].includes(existingIntent.state)) {
       return persistedOutcomeResult(existingOutcome);
     }
+    // Fail closed before the first authoritative write or skill filesystem
+    // effect when the host cannot make journal evidence namespace-durable.
+    let capabilityReason;
+    try { assertDurableCapability(); }
+    catch (error) { capabilityReason = errorReasonCode(error, "directory-fsync-unavailable"); }
+    if (capabilityReason) return { ok: false, reason: capabilityReason };
+    let catalog;
+    try { catalog = actionCatalog(); }
+    catch (error) { return { ok: false, reason: errorReason(error, "host-global-skill-catalog-unavailable") }; }
     const acquired = store.acquireGlobalDecisionLease({
       action,
       decision: cleanDecision,
       nowMs: now(),
       ttlMs: CLAIM_TTL_MS,
       forbiddenIdentityValues: identityFirewallValues,
+      rootPolicy: catalog.policy,
+      requestDeadline: normalizedRequestDeadline,
+      consumerDeadline: normalizedConsumerDeadline,
     });
     if (!acquired?.ok) {
       return acquired?.reason === "global-lease-busy"
         ? { ok: false, reason: "global-lease-busy", deferred: true }
         : { ok: false, reason: acquired?.reason ?? "global-lease-acquire-failed" };
     }
-    const lease = acquired.lease;
+    let lease = acquired.lease;
     const recommendation = acquired.recommendation;
     const leaseKeyHash = lease.leaseKeyHash;
     let outcome;
@@ -909,10 +968,10 @@ export function createGlobalDecisionDomain({
     let publishedTargetIdentity = null;
     let operationDirectoryOwnership = null;
     let operationDirectoryOwnerIntent = null;
+    let appliedContentForUndo = null;
     const publication = { occurred: false, targetIdentity: null };
     await Promise.resolve();
     try {
-      const settings = store.getSettings();
       let persistedIntent = store.readGlobalApplyIntents().find((item) => item.intentId === intentId);
       if (existingOutcome && persistedIntent && !["completed", "failed-closed"].includes(persistedIntent.state)) {
         const reconciled = existingOutcome.state === "succeeded"
@@ -969,11 +1028,12 @@ export function createGlobalDecisionDomain({
       }
       const resolution = inventory.resolveGlobalRecommendationTarget(
         recommendation.targetBinding,
-        settings.global.globalRootPolicy,
+        catalog.policy,
         {
           action,
           proposedContentHash: recommendation.proposedContentHash,
           projectSkillRoot,
+          catalog,
           ...(persistedIntent?.action === "apply" && persistedIntent.targetKind === "new-global-skill"
             && persistedIntent.state === "temp-written" ? {
               preparedNewTarget: { temporaryName: persistedIntent.temporaryName, expectedHash: persistedIntent.appliedHash },
@@ -986,14 +1046,31 @@ export function createGlobalDecisionDomain({
         throw new Error("global-recommendation-content-unavailable");
       }
       if (action === "apply") validateFreshApply(resolution, recommendation, content);
+      // Durable decision admission fence (H10-001): re-compare the immutable
+      // request/consumer deadlines against the current clock immediately before
+      // the admission write. The store re-validates the same deadlines inside
+      // beginGlobalDecision; this fault-seamed check lets controlled-clock
+      // probes prove NO late authority survives between consumption and
+      // admission without clamping the admission timestamp.
+      injectFault("global-decision-before-admission", { intentId });
+      const admissionNow = now();
+      if (Number.isSafeInteger(normalizedRequestDeadline) && admissionNow >= normalizedRequestDeadline) {
+        throw new Error("global-request-expired");
+      }
+      if (Number.isSafeInteger(normalizedConsumerDeadline) && admissionNow >= normalizedConsumerDeadline) {
+        throw new Error("global-consumer-claim-expired");
+      }
       const admitted = store.beginGlobalDecision({
         action,
         decision: cleanDecision,
         leaseKeyHash,
         ownerToken: lease.ownerToken,
-        nowMs: now(),
+        nowMs: admissionNow,
         suppressors: getSuppressors(),
+        rootPolicy: catalog.policy,
         forbiddenIdentityValues: identityFirewallValues,
+        requestDeadline: normalizedRequestDeadline,
+        consumerDeadline: normalizedConsumerDeadline,
       });
       if (admitted.outcome) {
         outcome = persistedOutcomeResult(admitted.outcome);
@@ -1031,7 +1108,8 @@ export function createGlobalDecisionDomain({
         operationIntent = intent;
         assertSafeParent(target, canonicalRoot);
       } else {
-        if (hashSkillContent(readBoundGlobalTarget(target, canonicalRoot)) !== intent.appliedHash) {
+        appliedContentForUndo = readBoundGlobalTarget(target, canonicalRoot);
+        if (hashSkillContent(appliedContentForUndo) !== intent.appliedHash) {
           throw new Error("global-undo-target-hash-drift");
         }
         targetIdentity = captureBoundGlobalTargetIdentity(target, canonicalRoot);
@@ -1095,6 +1173,26 @@ export function createGlobalDecisionDomain({
       injectFault("global-apply-before-publication", { intentId: intent.intentId });
       revalidateBeforePublication({ intent, recommendation, lease, target, canonicalRoot, temporary, temporaryIdentity, targetIdentity, directoryOwnership: operationDirectoryOwnership });
       injectFault("global-apply-after-temp-reproof", { intentId: intent.intentId });
+      // Renewable generation-fenced target lease (H9-002). Immediately adjacent
+      // to every filesystem effect (rename/link/unlink) and to the durable
+      // publication commit, renew the lease so the authorizing generation
+      // (ownerToken) is fresh and a stale owner is rejected here, BEFORE the
+      // skill mutation. Renewal rotates the ownerToken; the renewed generation
+      // is then bound into the publication commit, readback, and settlement
+      // transitions below because every store call passes `lease.ownerToken`
+      // and the store revalidates it against the live lease. A peer that
+      // acquired the lease after this owner expired (or any non-owner) is
+      // observed by renewal and fails closed without touching the target.
+      injectFault("global-apply-before-lease-renew", { intentId: intent.intentId });
+      const renewed = store.renewGlobalLease({
+        leaseKeyHash: lease.leaseKeyHash,
+        ownerToken: lease.ownerToken,
+        nowMs: now(),
+        ttlMs: CLAIM_TTL_MS,
+      });
+      if (!renewed?.ok) throw new Error(renewed?.reason ?? "global-target-lease-renew-failed");
+      lease = renewed.lease;
+      injectFault("global-apply-after-lease-renew", { intentId: intent.intentId });
       if (action === "undo" && intent.targetKind === "new-global-skill") {
         assertOwnedNewSkillDirectory(operationDirectoryOwnership);
         assertBoundGlobalTargetIdentity(target, canonicalRoot, targetIdentity);
@@ -1112,12 +1210,18 @@ export function createGlobalDecisionDomain({
         publishedTargetIdentity = captureBoundGlobalTargetIdentity(target, canonicalRoot);
       }
       injectFault("global-apply-after-publication", { intentId: intent.intentId });
+      // The target mutation (rename/link/unlink) is now namespace-durable: the
+      // parent directory has been fsynced after the namespace mutation. This is
+      // the "effect durable" boundary; loss injected here models a crash after
+      // the skill effect is stable but before the journal records it.
+      injectFault("journal-after-target-publication", { intentId: intent.intentId, target });
       const publishedIntent = store.commitGlobalDecisionPublication({
         intentId: intent.intentId,
         leaseKeyHash: lease.leaseKeyHash,
         ownerToken: lease.ownerToken,
         nowMs: now(),
         suppressors: getSuppressors(),
+        rootPolicy: actionCatalog().policy,
         forbiddenIdentityValues: identityFirewallValues,
         publishedTemporaryName: action === "apply" && intent.targetKind === "new-global-skill" ? intent.temporaryName : null,
       });
@@ -1138,6 +1242,9 @@ export function createGlobalDecisionDomain({
         }
         injectFault("global-apply-after-temp-unlink", { intentId: intent.intentId });
         syncDirectory(path.dirname(target));
+        // The plugin-owned publication temporary has been durably removed; the
+        // new-skill target is now the sole nlink=1 hardlink owner.
+        injectFault("journal-after-temp-unlink", { intentId: intent.intentId });
         preserveTemporaryForRecovery = false;
         temporary = undefined;
         publishedTargetIdentity = captureBoundGlobalTargetIdentity(target, canonicalRoot);
@@ -1179,8 +1286,9 @@ export function createGlobalDecisionDomain({
       const reason = errorReason(error, "global-decision-failed");
       const intent = store.readGlobalApplyIntents?.().find((item) => item.intentId === intentId);
       if ((published || publication.occurred) && intent) {
-        const root = store.getSettings().global.globalRootPolicy?.roots.find((item) => item.rootId === intent.rootId);
-        const target = root ? path.join(root.canonicalPath, intent.relativePath) : null;
+        let root = operationRoot ? { canonicalPath: operationRoot } : null;
+        try { root ??= actionCatalog().policy.roots.find((item) => item.rootId === intent.rootId); } catch {}
+        const target = operationTarget ?? (root ? path.join(root.canonicalPath, intent.relativePath) : null);
         const rollback = target
           ? action === "apply"
             ? rollbackFailedApply(
@@ -1190,7 +1298,7 @@ export function createGlobalDecisionDomain({
               publishedTargetIdentity ?? publication.targetIdentity,
               { allowOwnedHashDrift: publication.occurred && !published },
             )
-            : rollbackFailedUndo(intent, target, root.canonicalPath, store.readGlobalRecommendationContent(intent.recommendationId), publishedTargetIdentity ?? publication.targetIdentity)
+            : rollbackFailedUndo(intent, target, root.canonicalPath, appliedContentForUndo, publishedTargetIdentity ?? publication.targetIdentity)
           : { ok: false, reason: "root-not-validated" };
         if (!rollback.ok) {
           outcome = { ok: false, reason: rollback.reason, recoveryRequired: true };
@@ -1280,6 +1388,20 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
   let tripCount = priorBreakers.at(-1)?.payload?.tripCount ?? 0;
   let closed = false;
 
+  // H5-001: FRESH durable breaker-epoch read at the effect boundary. The
+  // process-local `breakerOpen` flag is stale across processes; the durable
+  // root-global breaker epoch is the cross-process open/closed truth. Every
+  // applyProposal (the sole allowlisted skill writer / effect boundary) reads
+  // it freshly so a peer's trip suppresses this process's next effect without
+  // restart. A corrupt breaker epoch fails closed (tripped).
+  function durableBreakerTripped() {
+    try {
+      return store.breakerEpochTripped?.() === true;
+    } catch {
+      return true;
+    }
+  }
+
   function injectFault(point) {
     if (typeof faultInjection === "function") faultInjection(point);
   }
@@ -1340,6 +1462,14 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
       const timestamp = now();
       const breaker = makeCircuitBreaker({ open: true, openedAt: timestamp, reason, tripCount });
       store.appendRecord(wrapRecord("circuit-breaker", breaker, timestamp));
+    } catch {}
+    // H5-001: also write the durable root-global breaker epoch so peer processes
+    // sharing the state root see the open state at their next admission,
+    // provider, or effect boundary read. Idempotent within a generation; a
+    // capability-unavailable host is best-effort skipped (the per-trip audit
+    // record above still records the trip for this process).
+    try {
+      store.tripBreakerEpoch?.({ reason: String(reason || "applier-critical"), operationId: `applier-trip:${proposalId ?? "unknown"}` });
     } catch {}
   }
 
@@ -1449,7 +1579,10 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
 
   async function applyProposal({ proposal, decision, actor = ACTOR, mode, headless = false } = {}) {
     if (closed) return { ok: false, reason: "applier-closed" };
-    if (breakerOpen) return { ok: false, reason: "circuit-breaker-open", auditId: auditFailure(proposal ?? { id: "unknown", skillTarget: {} }, "circuit-breaker-open") };
+    // Effect boundary: freshly read the durable root-global breaker epoch (and
+    // the process-local flag) before any skill mutation. A peer process's trip
+    // suppresses this effect immediately.
+    if (breakerOpen || durableBreakerTripped()) return { ok: false, reason: "circuit-breaker-open", auditId: auditFailure(proposal ?? { id: "unknown", skillTarget: {} }, "circuit-breaker-open") };
     if (!proposal?.id || !proposal?.skillTarget) return { ok: false, reason: "invalid-proposal" };
 
     const inventoryRecords = typeof inventory?.discoverSkills === "function" && Array.isArray(inventory?.canonicalRoots)
@@ -1836,5 +1969,5 @@ export function createApplier({ store, inventory, privacy, now = () => Date.now(
     return store.getLeaseStatus?.(leaseKey(proposalId)) ?? { state: "absent", held: false, reclaimable: false, lease: null };
   }
 
-  return Object.freeze({ applyProposal, rollbackApplied, recoverPending, getApplyLeaseStatus, circuitBreakerOpen: () => breakerOpen, close });
+  return Object.freeze({ applyProposal, rollbackApplied, recoverPending, getApplyLeaseStatus, circuitBreakerOpen: () => breakerOpen || durableBreakerTripped(), close });
 }

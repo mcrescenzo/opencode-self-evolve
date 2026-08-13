@@ -72,6 +72,10 @@ function eligibility(records, thresholds = {}) {
 function pipelineFixture() {
   const records = [];
   const store = {
+    getAutomationState() {
+      return { ok: true, enabled: true, stamp: { generation: 1, permissionsHash: H("e") } };
+    },
+    compareAutomationStamp(stamp) { return stamp?.generation === 1; },
     appendRecord(envelope) { records.push(envelope); return { ok: true }; },
     readRecords(kind) { return records.filter((recordValue) => recordValue.kind === kind); },
   };
@@ -220,7 +224,7 @@ test("pipeline persists a consistent scheduler root and preserves explicit unres
     rootSessionID: "trusted-root",
     rootSessionIDHash: hashRootLineage("trusted-root"),
     originKind: "delegated",
-    options: { eligibility: { minIndependentIncidents: 1, minOccurrencesSum: 1, minDistinctSessions: 1 } },
+    options: { automationStamp: trusted.store.getAutomationState().stamp, eligibility: { minIndependentIncidents: 1, minOccurrencesSum: 1, minDistinctSessions: 1 } },
   });
   const trustedObservation = trusted.store.readRecords("observation")[0].payload;
   assert.equal(trustedObservation.rootLineageHash, hashRootLineage("trusted-root"));
@@ -236,7 +240,7 @@ test("pipeline persists a consistent scheduler root and preserves explicit unres
     mode: "auto",
     rootSessionIDHash: UNKNOWN_ROOT_LINEAGE_HASH,
     originKind: "unknown",
-    options: { eligibility: { minIndependentIncidents: 1, minOccurrencesSum: 1, minDistinctSessions: 1 } },
+    options: { automationStamp: unresolved.store.getAutomationState().stamp, eligibility: { minIndependentIncidents: 1, minOccurrencesSum: 1, minDistinctSessions: 1 } },
   });
   const unresolvedObservation = unresolved.store.readRecords("observation")[0].payload;
   assert.equal(unresolvedObservation.rootLineageHash, UNKNOWN_ROOT_LINEAGE_HASH);

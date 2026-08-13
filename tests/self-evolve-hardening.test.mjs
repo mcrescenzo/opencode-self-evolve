@@ -15,7 +15,6 @@ import { createPrivacyGuard } from "../self-evolve-privacy.js";
 import { createScheduler } from "../self-evolve-scheduler.js";
 import * as schemas from "../self-evolve-schemas.js";
 import { openStore, resolveProjectIdentity } from "../self-evolve-store.js";
-import * as synthesis from "../self-evolve-synthesis.js";
 import SelfEvolvePlugin from "../self-evolve.js";
 import { SelfEvolveTuiPlugin } from "../self-evolve-tui.js";
 
@@ -68,14 +67,13 @@ function skillFixture(t, label = "skill") {
   const roots = inventory.loadAllowlist({ globalSkillRoots: [skillRoot] }).canonicalRoots;
   const records = inventory.discoverSkills(roots);
   store = openStore(path.join(root, "state"), { projectName: "hardening", projectFingerprint: PROJECT_A, now: () => NOW });
-  assert.equal(store.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, durableObservations: true },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  const automation = store.getAutomationState();
+  assert.equal(automation.ok, true, automation.reason);
+  assert.equal(automation.enabled, true);
+  assert.equal(Object.values(automation.global.consent).every(Boolean), true);
   const privacy = createPrivacyGuard({ consent: {}, projectFingerprint: PROJECT_A, store, now: () => NOW });
   applier = createApplier({ store, inventory: { records, canonicalRoots: roots }, privacy, now: () => NOW });
-  return { root, skillRoot, target, roots, records, store, privacy, applier };
+  return { root, skillRoot, target, roots, records, store, privacy, applier, automationStamp: automation.stamp };
 }
 
 function proposal(f, overrides = {}) {
@@ -143,45 +141,6 @@ function observationPayload(overrides = {}) {
   });
 }
 
-function synthesisOutput(overrides = {}) {
-  const content = overrides.proposedContent ?? PROPOSED;
-  return {
-    action: "rewrite",
-    targetLogicalName: "hardening",
-    proposedContent: content,
-    proposedContentHash: H(content),
-    evidenceMapping: [{ claim: "Repeated checks need verification.", observationIds: [H("calibration-observation")] }],
-    expectedBehavior: "The skill verifies repeated checks.",
-    counterExamples: ["A one-off check does not qualify."],
-    overlap: [],
-    riskNotes: "Low risk.",
-    evaluationScenarios: ["The same check repeats."],
-    sizeDeltaBytes: Buffer.byteLength(content) - Buffer.byteLength(CURRENT),
-    approxTokenDelta: Math.ceil(Buffer.byteLength(content) / 4) - Math.ceil(Buffer.byteLength(CURRENT) / 4),
-    ...overrides,
-  };
-}
-
-function synthesisCluster(overrides = {}) {
-  return {
-    id: H("synthesis-cluster"),
-    receiptType: "repeated-command",
-    projectFingerprint: PROJECT_A,
-    scopeFingerprint: SCOPE,
-    incidentIds: ["one", "two", "three"],
-    occurrencesSum: 6,
-    firstSeenAt: NOW - 3,
-    lastSeenAt: NOW - 1,
-    observations: [{ id: H("calibration-observation"), createdAt: NOW - 1, injectionFlagged: false, redacted: true }],
-    eligibility: { clusterId: H("synthesis-cluster"), eligible: true },
-    ...overrides,
-  };
-}
-
-function synthesisTarget(f) {
-  return { ...f.records[0], currentContent: CURRENT };
-}
-
 function readTree(root) {
   const output = [];
   if (!fs.existsSync(root)) return output;
@@ -198,14 +157,14 @@ function waitFor(predicate, label) {
     let attempts = 0;
     const poll = () => {
       if (predicate()) return resolve();
-      if (++attempts > 100) return reject(new Error(`timed out waiting for ${label}`));
+      if (++attempts > 500) return reject(new Error(`timed out waiting for ${label}`));
       setTimeout(poll, 2);
     };
     poll();
   });
 }
 
-test("1 secret retention: extraction, privacy, synthesis, and durable files retain no seeded secret", (t) => {
+test("1 secret retention: extraction, privacy, and durable files retain no seeded secret", (t) => {
   const f = skillFixture(t, "secrets");
   const secrets = [
     `AKIA${"A".repeat(16)}`,
@@ -224,16 +183,10 @@ test("1 secret retention: extraction, privacy, synthesis, and durable files reta
   assert.ok(receipts.length > 0);
   assert.doesNotMatch(JSON.stringify(receipts), /AKIA|sk-|ghp_|PRIVATE KEY/u);
   const clean = f.privacy.scrubObservation(observationPayload());
-  assert.equal(clean.ok, true);
+  assert.equal(clean.ok, true, clean.reason);
   f.store.appendRecord(schemas.wrapRecord("observation", clean.observation, NOW));
   const cluster = schemas.makeEvidenceCluster({ id: H("secret-cluster"), receiptType: "repeated-command", projectFingerprint: PROJECT_A, incidentIds: ["one"], scopeFingerprint: SCOPE, occurrencesSum: 2, firstSeenAt: NOW, lastSeenAt: NOW });
   f.store.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, NOW));
-  for (const secret of secrets) {
-    const parsed = synthesis.parseSynthesizerOutput(synthesisOutput({ riskNotes: `risk ${secret}` }), {
-      cluster: synthesisCluster(), targetSkill: synthesisTarget(f), inventory: f.records, expectedCurrentHash: f.records[0].currentHash,
-    });
-    assert.equal(parsed.ok, false, secret);
-  }
   const serialized = readTree(path.join(f.root, "state")).map(([, content]) => content).join("\n");
   for (const secret of secrets) assert.equal(serialized.includes(secret), false, secret);
 });
@@ -424,28 +377,6 @@ test("11 bounded cost and concurrency: ten idle events stay under six calls and 
   assert.equal(scheduler.getCircuitBreaker().open, true);
 });
 
-test("12 hidden analyzer sessions are interrupted and deleted after success, failure, and timeout", async (t) => {
-  const f = skillFixture(t, "hidden-cleanup");
-  async function one(output, never = false) {
-    const cluster = synthesisCluster({ id: H(`hidden-${output}-${never}`) });
-    const calls = { abort: 0, delete: 0 };
-    const ctx = { directory: f.root, client: { session: {
-      create: async () => ({ data: { id: cluster.id } }),
-      prompt: async () => never ? await new Promise(() => {}) : { data: { info: { structured_output: output } } },
-      abort: async () => { calls.abort += 1; return { data: {} }; },
-      delete: async () => { calls.delete += 1; return { data: {} }; },
-    } } };
-    const result = await synthesis.runSynthesis({ ctx, cluster, targetSkill: synthesisTarget(f), inventory: f.records, privacy: { checkPartition: () => ({ ok: true }), isObservationEligible: () => true }, options: { store: f.store, currentContent: CURRENT, eligibility: { clusterId: cluster.id, eligible: true }, validateTarget: () => ({ ok: true }), timeoutMs: 5 }, now: NOW });
-    synthesis.resetSynthesisProcessStateForTests();
-    assert.equal(calls.abort, 1);
-    assert.equal(calls.delete, 1);
-    return result;
-  }
-  assert.equal((await one(synthesisOutput())).ok, true);
-  assert.equal((await one("bad-json")).ok, false);
-  assert.equal((await one(null, true)).ok, false);
-});
-
 test("13 rollback hash drift is refused, audited, and trips the circuit breaker", async (t) => {
   const f = skillFixture(t, "rollback-drift");
   const item = proposal(f);
@@ -457,10 +388,8 @@ test("13 rollback hash drift is refused, audited, and trips the circuit breaker"
   assert.equal(f.store.readRecords("audit-event").some((record) => record.payload.kind === "rollback" && record.payload.details.reason === "hash-drift"), true);
 });
 
-test("14 kill switch defeats an explicitly decided legacy yolo input between lease and rename", async (t) => {
+test("14 Emergency Stop defeats an explicitly decided apply between lease and rename", async (t) => {
   const f = skillFixture(t, "kill-race");
-  const current = f.store.getSettings();
-  f.store.setGlobalSettings(schemas.makeGlobalSettings({ ...current.global, mode: "yolo", allowedSkillRoots: [f.skillRoot], updatedAt: NOW }));
   let reads = 0;
   const wrappedStore = {
     snapshotRoot: f.store.snapshotRoot,
@@ -478,27 +407,15 @@ test("14 kill switch defeats an explicitly decided legacy yolo input between lea
   const applier = createApplier({ store: wrappedStore, inventory: { records: f.records, canonicalRoots: f.roots }, privacy: f.privacy, now: () => NOW });
   t.after(() => applier.close());
   const item = proposal(f);
-  const result = await applier.applyProposal({ proposal: item, decision: decision(item), mode: "yolo", headless: true });
+  const result = await applier.applyProposal({ proposal: item, decision: decision(item), mode: "auto", headless: true });
   assert.equal(result.reason, "kill-switch");
   assert.equal(fs.readFileSync(f.target, "utf8"), CURRENT);
   assert.deepEqual(fs.readdirSync(path.dirname(f.target)).filter((name) => name.includes("self-evolve-tmp")), []);
-  assert.equal(f.store.getSettings().global.mode, "auto", "a stored legacy yolo preference narrows to auto");
+  assert.equal(f.store.getAutomationState().enabled, true, "Emergency Stop does not rewrite the automatic-recommendations preference");
   assert.equal(f.store.readRecords("audit-event").some((record) => record.payload.kind === "kill-switch" && record.payload.details.state === "downgraded"), true);
 });
 
-test("15 provider and TUI hangs are bounded and fail closed without disabling manual commands", async (t) => {
-  const f = skillFixture(t, "hangs");
-  const cluster = synthesisCluster();
-  let aborts = 0;
-  let deletions = 0;
-  const started = Date.now();
-  const result = await synthesis.runSynthesis({ ctx: { directory: f.root, client: { session: { create: async () => ({ data: { id: "hung" } }), prompt: async () => await new Promise(() => {}), abort: async () => { aborts += 1; }, delete: async () => { deletions += 1; } } } }, cluster, targetSkill: synthesisTarget(f), inventory: f.records, privacy: { checkPartition: () => ({ ok: true }), isObservationEligible: () => true }, options: { store: f.store, currentContent: CURRENT, eligibility: cluster.eligibility, validateTarget: () => ({ ok: true }), timeoutMs: 5, cleanupTimeoutMs: 5 }, now: NOW });
-  synthesis.resetSynthesisProcessStateForTests();
-  assert.equal(result.ok, false);
-  assert.ok(Date.now() - started < 2_000);
-  assert.equal(aborts, 1);
-  assert.equal(deletions, 1);
-
+test("15 TUI mailbox hangs are bounded and fail closed", async (t) => {
   const controller = new AbortController();
   const alerts = [];
   const disposers = [];
@@ -531,10 +448,9 @@ test("15 provider and TUI hangs are bounded and fail closed without disabling ma
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.equal(alerts.length, 1);
-  assert.equal(createCommandPolicy({ store: f.store, privacy: f.privacy, now: () => NOW }).getMode(), "manual");
 });
 
-test("16 newer schema state falls back to manual, reports health, and blocks autonomous commands", (t) => {
+test("16 newer schema state reports unhealthy and fails Automatic recommendations closed", (t) => {
   const root = tempRoot(t, "newer-schema");
   const stateDir = path.join(root, "self-evolve", PROJECT_A);
   fs.mkdirSync(stateDir, { recursive: true });
@@ -545,10 +461,10 @@ test("16 newer schema state falls back to manual, reports health, and blocks aut
   t.after(() => {
     try { store.close(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
-  assert.equal(policy.getMode(), "manual");
-  assert.equal(policy.getEffectiveMode({ projectFingerprint: PROJECT_A }), "manual");
-  assert.match(policy.execute({ verb: "health" }, { projectFingerprint: PROJECT_A }).responseText, /Corrupt or unsupported/u);
-  assert.match(policy.execute({ verb: "mode", mode: "auto" }, { projectFingerprint: PROJECT_A }).responseText, /Manual\/no-write/u);
+  const health = policy.getHealth();
+  assert.equal(health.automaticRecommendationsEnabled, false);
+  assert.equal(health.projectExcluded, true);
+  assert.match(health.lastError, /Corrupt or unsupported/u);
 });
 
 test("17 durable entrypoint asynchronously aborts only active self-evolve orphan sessions without prompting", async (t) => {
@@ -562,9 +478,9 @@ test("17 durable entrypoint asynchronously aborts only active self-evolve orphan
     { id: "critic-terminal", agent: "self-evolve-critic", state: "completed" },
     { id: "ordinary-active", agent: "build", state: "running" },
   ];
-  // Only the three active hidden-analyzer sessions carry a dead self-evolve owner
-  // record; the terminal session and the unrelated agent are not candidates, and a
-  // foreign/unknown same-name session (no record) is never aborted.
+  // Only the three cleanup-recognized historical/current provider identities
+  // carry a dead self-evolve owner record. The terminal session and unrelated
+  // agent are not candidates, and an unknown same-name session is never aborted.
   seedActiveHostOwners(root, path.join(root, "state"), [
     { id: "analyzer-active", agent: "self-evolve-analyzer" },
     { id: "synth-active", agent: "self-evolve-synthesizer" },
@@ -626,7 +542,6 @@ function integrationThresholdHarness(t, successRate) {
   const pipeline = { createPipeline(deps) { return { async runEvolutionCycle(args) { const applied = await deps.applier.applyProposal({ proposal: item, mode: args.mode, headless: true }); return { result: applied.ok ? "applied" : "proposal-ready", proposal: item, responseText: "threshold" }; }, runApprovalFlow: async () => ({ result: "failed-closed" }), runRollbackFlow: async () => ({ result: "failed-closed" }) }; } };
   const scheduler = { createScheduler: () => ({ setMode() {}, getCircuitBreaker: () => ({ open: false }), handleEvent() {}, recordWorkResult() {}, dispose() {} }) };
   const runtime = createIntegration({ store, inventory: {}, privacy, schemas, observation: {}, synthesisModule: {}, applier: rawApplier, commands: { ...awaitableCommands }, pipeline, scheduler, now: () => NOW });
-  runtime.__testBridge.setMode("yolo", { confirmed: true, allowlist: [root] });
   t.after(() => {
     try { store.close(); } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -653,7 +568,7 @@ function seedRolloutHistory(store, observed, successes) {
   }
 }
 
-test("19 legacy yolo calibration never bypasses an explicit decision", async (t) => {
+test("19 rollout calibration never bypasses an explicit Apply decision", async (t) => {
   const low = integrationThresholdHarness(t, 15 / 20);
   assert.equal((await low.runtime.runEvolutionCycle({ projectFingerprint: PROJECT_A })).result, "proposal-ready");
   assert.equal(low.applies, 0);
@@ -662,7 +577,7 @@ test("19 legacy yolo calibration never bypasses an explicit decision", async (t)
   assert.equal(high.applies, 0);
 });
 
-test("20 a manual mode change during synthesis allows completion but prevents apply", async (t) => {
+test("20 turning Automatic recommendations Off during synthesis prevents automatic apply", async (t) => {
   const root = tempRoot(t, "mode-race");
   const store = openStore(root, { projectFingerprint: PROJECT_A, now: () => NOW });
   seedRolloutHistory(store, 20, 20);
@@ -675,50 +590,12 @@ test("20 a manual mode change during synthesis allows completion but prevents ap
   const pipeline = { createPipeline(deps) { return { async runEvolutionCycle(args) { await gate; const applied = await deps.applier.applyProposal({ proposal: item, mode: args.mode, headless: true }); return { result: applied.ok ? "applied" : "proposal-ready", proposal: item }; }, runApprovalFlow: async () => ({}), runRollbackFlow: async () => ({}) }; } };
   const scheduler = { createScheduler: () => ({ setMode() {}, getCircuitBreaker: () => ({ open: false }), handleEvent() {}, recordWorkResult() {}, dispose() {} }) };
   const runtime = createIntegration({ store, inventory: {}, privacy, schemas, observation: {}, synthesisModule: {}, applier: rawApplier, commands: awaitableCommands, pipeline, scheduler, now: () => NOW });
-  runtime.__testBridge.setMode("yolo", { confirmed: true, allowlist: [root] });
   const running = runtime.runEvolutionCycle({ projectFingerprint: PROJECT_A });
   await new Promise((resolve) => setImmediate(resolve));
-  runtime.__testBridge.setMode("manual");
+  assert.equal(runtime.__testBridge.setAutomaticRecommendations(false).ok, true);
   release();
   assert.equal((await running).result, "proposal-ready");
   assert.equal(applies, 0);
-  assert.equal(runtime.__testBridge.getMode().effectiveMode, "manual");
+  assert.equal(runtime.__testBridge.getAutomation().enabled, false);
   store.close();
-});
-
-// CALIBRATION: static, token-free corpus with known deterministic receipts.
-test("CALIBRATION: 20 offline syntheses meet yolo thresholds only at 18 valid results", (t) => {
-  const f = skillFixture(t, "calibration");
-  const corpus = Array.from({ length: 20 }, (_, index) => ({
-    incidentId: index < 2 ? "duplicate-incident" : `incident-${index}`,
-    privacyPass: true,
-    criticScore: index < 18 ? 0.9 : 0.2,
-    output: index === 18
-      ? synthesisOutput({ targetLogicalName: "wrong-scope" })
-      : index === 19
-        ? synthesisOutput({ riskNotes: `contains sk-${"x".repeat(24)}` })
-        : synthesisOutput(),
-  }));
-  const results = corpus.map((entry) => synthesis.parseSynthesizerOutput(entry.output, {
-    cluster: synthesisCluster(), targetSkill: synthesisTarget(f), inventory: f.records, expectedCurrentHash: f.records[0].currentHash,
-  }));
-  const uniqueIncidents = new Set(corpus.map((entry) => entry.incidentId)).size;
-  const duplicates = corpus.length - uniqueIncidents;
-  const duplicateCollapseRate = duplicates / corpus.length;
-  const privacyPasses = corpus.filter((entry) => entry.privacyPass).length;
-  const privacyPassRate = privacyPasses / corpus.length;
-  const scopeCorrect = results.filter((result) => result.ok).length;
-  const scopeCorrectnessRate = scopeCorrect / corpus.length;
-  const qualityScores = corpus.slice(0, 18).map((entry) => entry.criticScore);
-  const proposalQualityProxy = qualityScores.reduce((sum, score) => sum + score, 0) / qualityScores.length;
-  const synthesesObserved = corpus.length;
-  const successRate = results.filter((result, index) => result.ok && corpus[index].criticScore >= 0.75).length / synthesesObserved;
-  const calibration = { synthesesObserved, successes: successRate * synthesesObserved, successRate, duplicates, duplicateCollapseRate, privacyPasses, privacyPassRate, scopeCorrect, scopeCorrectnessRate, proposalQualityProxy };
-  assert.equal(synthesesObserved >= 10, true);
-  assert.equal(successRate >= 0.8, true);
-  assert.equal(successRate, 18 / 20);
-  assert.equal(privacyPassRate, 1);
-  assert.equal(scopeCorrectnessRate, 18 / 20);
-  assert.equal(duplicates, 1);
-  assert.ok(proposalQualityProxy >= 0.75);
 });

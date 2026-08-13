@@ -3,15 +3,11 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   BRIDGE_ACTOR,
-  createControlRequest,
   createDecisionRequest,
   pollDecisionResponse,
-  pollControlResponse,
   publishTuiHostHealth,
-  readControlState,
   readProjectInbox,
   revokeTuiHostHealth,
-  submitControlRequest,
   submitDecisionRequest,
 } from "./self-evolve-bridge.js";
 import { resolveProjectIdentity } from "./self-evolve-store.js";
@@ -32,7 +28,7 @@ const PROPOSAL_ACTION_LABELS = Object.freeze({
   "failed-closed": "Critical failed-closed record",
 });
 export const SELF_EVOLVE_MODULE_ID = "mcrescenzo.self-evolve";
-export const SELF_EVOLVE_PLUGIN_VERSION = "0.3.0";
+export const SELF_EVOLVE_PLUGIN_VERSION = "0.4.0";
 export const TUI_IDENTITIES = Object.freeze({
   command: `${SELF_EVOLVE_MODULE_ID}.control-center`,
   route: `${SELF_EVOLVE_MODULE_ID}.control-center.route`,
@@ -73,12 +69,6 @@ const MAX_SERVER_WAIT_MS = 5_000;
 const HOST_HEALTH_REFRESH_MS = 15_000;
 export const REVIEW_BOOKKEEPING_CAP = 256;
 export const REVIEW_BOOKKEEPING_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
-const CONSENT_LABELS = Object.freeze({
-  passiveCalls: "Passive provider calls",
-  durableObservations: "Durable observations",
-  sanitizedExcerpts: "Sanitized excerpts",
-  crossRepoAggregation: "Cross-repository aggregation",
-});
 
 function boundedJsonValue(value) {
   try {
@@ -576,6 +566,36 @@ export async function resolveTuiStateRoot(api, config = {}) {
   return (await resolveTuiStartupPath(api, config)).stateRoot;
 }
 
+// Fallible startup trust resolution shared by the legacy plugin and the native
+// orchestrator's inert Retry. Returns the resolved root/path/identity on
+// success, or a bounded failure descriptor (with phase, reason, and a
+// diagnostic string) so the native shell can render what failed without ever
+// holding projection, mailbox, or publication authority.
+export async function attemptTuiStartup(api, config = {}) {
+  let stateRoot;
+  let officialPath;
+  try {
+    ({ stateRoot, officialPath } = await resolveTuiStartupPath(api, config));
+    if (!stateRoot) throw new Error("state-root-unavailable");
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, phase: "state-root", reason, diagnostic: `State root unavailable: ${reason}` };
+  }
+  let identity;
+  try {
+    identity = resolveProjectIdentity({
+      projectFingerprint: config.projectFingerprint,
+      remoteUrl: config.remoteUrl,
+      worktreePath: nonEmptyPath(config.worktree) ?? nonEmptyPath(officialPath?.worktree) ?? nonEmptyPath(api.state?.path?.worktree),
+      directory: nonEmptyPath(officialPath?.directory) ?? nonEmptyPath(api.state?.path?.directory),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, phase: "identity", reason, diagnostic: `Project identity unresolved: ${reason}` };
+  }
+  return { ok: true, stateRoot, officialPath, identity };
+}
+
 /** @type {TuiPlugin} */
 export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const config = options?.selfEvolve ?? options ?? {};
@@ -589,25 +609,20 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
   const pollMs = Math.min(5_000, Math.max(25, Number.isFinite(config.mailboxPollMs) ? config.mailboxPollMs : 250));
   let stateRoot;
   let officialPath;
-  try {
-    ({ stateRoot, officialPath } = await resolveTuiStartupPath(api, config));
-    if (!stateRoot) throw new Error("state-root-unavailable");
-  } catch (error) {
-    console.warn(`self-evolve TUI disabled: ${error instanceof Error ? error.message : String(error)}`);
-    return;
-  }
   let identity;
-  try {
-    identity = resolveProjectIdentity({
-      projectFingerprint: config.projectFingerprint,
-      remoteUrl: config.remoteUrl,
-      worktreePath: nonEmptyPath(config.worktree) ?? nonEmptyPath(officialPath?.worktree) ?? nonEmptyPath(api.state?.path?.worktree),
-      directory: nonEmptyPath(officialPath?.directory) ?? nonEmptyPath(api.state?.path?.directory),
-    });
-  } catch (error) {
-    console.warn(`self-evolve TUI disabled: ${error instanceof Error ? error.message : String(error)}`);
+  const startup = await attemptTuiStartup(api, config);
+  if (!startup.ok) {
+    // Notify the native orchestrator so it can mount a zero-authority inert
+    // recovery shell (sidebar/route/keymap) instead of disappearing. The legacy
+    // plugin itself still returns: it holds no projection, mailbox, or host
+    // health authority on a trust failure.
+    if (typeof options?.__nativeStartupFailure === "function") {
+      try { options.__nativeStartupFailure(startup); } catch {}
+    }
+    console.warn(`self-evolve TUI disabled: ${startup.reason}`);
     return;
   }
+  ({ stateRoot, officialPath, identity } = startup);
   const projectFingerprint = identity.projectFingerprint;
   let projectStore;
   try {
@@ -763,21 +778,9 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     return;
   }
   const mailbox = options?.__testMailboxClient ?? api.__testMailboxClient ?? (stateRoot && projectFingerprint ? {
-    getInbox: () => {
-      const projection = readControlState(stateRoot, projectFingerprint, { now: nowFor(api) });
-      if (!projection) return [];
-      validateProjectedStateRoot(stateRoot, projection.stateRootIdentity);
-      return readProjectInbox(stateRoot, projectFingerprint, { now: nowFor(api) });
-    },
+    getInbox: () => readProjectInbox(stateRoot, projectFingerprint, { now: nowFor(api) }),
     submit: (request) => submitDecisionRequest(stateRoot, request),
     poll: (requestId) => pollDecisionResponse(stateRoot, projectFingerprint, requestId),
-    getControlState: () => {
-      const projection = readControlState(stateRoot, projectFingerprint, { now: nowFor(api) });
-      if (projection) validateProjectedStateRoot(stateRoot, projection.stateRootIdentity);
-      return projection;
-    },
-    submitControl: (request) => submitControlRequest(stateRoot, request),
-    pollControl: (requestId) => pollControlResponse(stateRoot, projectFingerprint, requestId),
   } : null);
   const idle = safeIdlePredicate(api, debounceMs);
   const testLimiter = testAutoReview ? notificationRateLimiter(api, testNotificationBudget) : null;
@@ -912,113 +915,6 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
     }
   }
 
-  async function getControlState() {
-    if (typeof mailbox?.getControlState !== "function") throw new Error("control-state-unavailable");
-    const state = await boundedMailboxCall(() => mailbox.getControlState());
-    if (!state) throw new Error("control-grant-unavailable");
-    return state;
-  }
-
-  async function submitControl(action, payload) {
-    try {
-      if (typeof mailbox?.submitControl !== "function" || typeof mailbox?.pollControl !== "function") throw new Error("control-mailbox-unavailable");
-      const controlState = await getControlState();
-      const request = createControlRequest({ controlState, action, payload, timestamp: nowFor(api) });
-      await mailbox.submitControl(request);
-      savePendingRequests([...pendingRequests(), { kind: "control", requestId: request.requestId, submittedAt: nowFor(api) }]);
-      const response = await pollResponse(request.requestId, serverTimeoutMs, "control");
-      if (!response) {
-        showAlert(api, { title: "Self-evolve control queued", message: "The server has not responded yet. The bounded request remains queued." });
-        return { ok: false, reason: "control-response-pending" };
-      }
-      savePendingRequests(pendingRequests().filter((item) => item.requestId !== request.requestId));
-      if (!response.ok) {
-        showAlert(api, { title: "Self-evolve control rejected", message: `${response.reason}. Reopen settings to refresh server state.` });
-        return { ok: false, reason: response.reason };
-      }
-      return { ok: true };
-    } catch (error) {
-      dialogError(api, error instanceof Error ? error.message : String(error));
-      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  function showModeFlow(state) {
-    // v0.3 project analysis is Manual or Auto only; no mode grants a write.
-    const options = ["manual", "auto"].map((mode) => ({
-      title: mode,
-      value: mode,
-      description: mode === "manual" ? "No passive work" : "Draft automatically; approve each write",
-    }));
-    const onSelect = (option) => {
-      showConfirm(api, {
-        title: `Set self-evolve mode to ${option.value}?`,
-        message: option.value === "auto" ? "Auto may make passive provider calls only when the separate consent controls permit it." : "Manual disables passive work.",
-        onConfirm: () => { void submitControl("set-mode", { mode: option.value }); },
-      });
-    };
-    showSelect(api, { title: `Self-evolve mode (current: ${state.mode})`, options, onSelect, skipFilter: true });
-  }
-
-  function showAllowlistFlow(state) {
-    showPrompt(api, {
-      title: "Edit canonical skill-root allowlist",
-      description: () => "This changes the approved project skill-root allowlist used by legacy explicit applies. Review every path before confirming.",
-      placeholder: "/canonical/skill/root (one per line)",
-      value: state.allowedSkillRoots.join("\n"),
-      onConfirm: (value) => {
-        try {
-          const allowlist = parseAllowlistInput(value);
-          const visible = allowlist.length ? allowlist.map((root) => `- ${root}`).join("\n") : "(empty)";
-          showConfirm(api, {
-            title: "Elevated allowlist confirmation",
-            message: `Replace the approved skill-root allowlist with exactly:\n${visible}`,
-            onConfirm: () => { void submitControl("update-allowlist", { allowlist, confirmation: "UPDATE ALLOWLIST" }); },
-          });
-        } catch (error) { dialogError(api, error instanceof Error ? error.message : String(error)); }
-      },
-    });
-  }
-
-  function showConsentFlow(state, key) {
-    const enabled = !state.consent[key];
-    if (key === "crossRepoAggregation" && enabled && !state.consent.sanitizedExcerpts) {
-      showAlert(api, { title: "Excerpt consent required", message: "Enable sanitized excerpts before cross-repository aggregation. Redaction reduces exposure; it does not guarantee secrecy." });
-      return;
-    }
-    const disclosure = key === "sanitizedExcerpts" || key === "crossRepoAggregation"
-      ? "Redaction reduces exposure but is not a secrecy guarantee. Review exports and retention policy accordingly."
-      : "This setting is independent and defaults to off.";
-    showConfirm(api, {
-      title: `${enabled ? "Enable" : "Disable"} ${CONSENT_LABELS[key]}?`,
-      message: disclosure,
-      onConfirm: () => { void submitControl("set-consent", { key, enabled }); },
-    });
-  }
-
-  async function openSettings() {
-    try {
-      const state = await getControlState();
-      const options = [
-        { title: "Mode", value: "mode", description: `${state.mode} (effective: ${state.effectiveMode})` },
-        { title: "Skill-root allowlist", value: "allowlist", description: `${state.allowedSkillRoots.length} root(s)` },
-        ...Object.entries(CONSENT_LABELS).map(([key, title]) => ({ title, value: `consent:${key}`, description: state.consent[key] ? "on" : "off" })),
-        { title: "Repository exclusion", value: "repo-excluded", description: state.repoExcluded ? "excluded" : "included" },
-      ];
-      const onSelect = (option) => {
-        if (option.value === "mode") showModeFlow(state);
-        else if (option.value === "allowlist") showAllowlistFlow(state);
-        else if (option.value === "repo-excluded") showConfirm(api, {
-          title: state.repoExcluded ? "Include this repository?" : "Exclude this repository?",
-          message: state.repoExcluded ? "Self-evolve may operate here subject to mode and consent." : "This repository will be excluded from self-evolve observation and application.",
-          onConfirm: () => { void submitControl("set-repo-excluded", { excluded: !state.repoExcluded }); },
-        });
-        else if (option.value.startsWith("consent:")) showConsentFlow(state, option.value.slice("consent:".length));
-      };
-      showSelect(api, { title: "Self-evolve durable settings", options, onSelect, skipFilter: true });
-    } catch (error) { dialogError(api, error instanceof Error ? error.message : String(error)); }
-  }
-
   function reviewBody(proposal) {
     const digest = formatProposalDigest(proposal, proposal.inventory);
     const preview = formatDiffOrNewSkillPreview(proposal, proposal.priorContent ?? proposal.currentContent);
@@ -1139,25 +1035,6 @@ export async function SelfEvolveTuiPlugin(api, options = {}, meta) {
       },
       onCancel: () => kv.set(FIRST_USE_KEY, false),
     });
-  }
-
-  const missingLegacySettingsCapabilities = [
-    ...(typeof api.keymap?.registerLayer === "function" ? [] : ["keymap.registerLayer"]),
-    ...(typeof api.ui?.DialogPrompt === "function" ? [] : ["ui.DialogPrompt"]),
-  ];
-  if (!terminalStopped && !nativeSurface && missingLegacySettingsCapabilities.length === 0) {
-    api.keymap.registerLayer({
-      mode: "base",
-      commands: [{
-        name: "self-evolve.settings",
-        title: "Self-evolve settings",
-        category: "Self-evolve",
-        namespace: "palette",
-        run: () => { void openSettings(); },
-      }],
-    });
-  } else if (!terminalStopped && !nativeSurface) {
-    console.warn(`self-evolve legacy settings command disabled: missing ${missingLegacySettingsCapabilities.join(", ")}; update external tui.json to load the package root (@mcrescenzo/opencode-self-evolve).`.slice(0, 240));
   }
 
   if (!terminalStopped && testAutoReview) {

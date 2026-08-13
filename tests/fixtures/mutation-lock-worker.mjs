@@ -2,7 +2,9 @@ import { existsSync, writeFileSync } from "node:fs";
 
 import { withStateMutationLock } from "../../self-evolve-lock.js";
 
-const [root, mode, observedPath, releasePath, enteredPath] = process.argv.slice(2);
+const [root, mode, observedPath, releasePath, enteredPath, staleMsArg, timeoutMsArg] = process.argv.slice(2);
+const staleLockMs = staleMsArg !== undefined ? Number(staleMsArg) : 10;
+const lockTimeoutMs = timeoutMsArg !== undefined ? Number(timeoutMsArg) : (mode === "recovery" ? 150 : 2_000);
 
 function waitFor(filePath) {
   while (!existsSync(filePath)) {
@@ -22,8 +24,8 @@ try {
       }
     }
   }, {
-    lockTimeoutMs: mode === "recovery" ? 150 : 2_000,
-    staleLockMs: 10,
+    lockTimeoutMs,
+    staleLockMs,
     onStaleOwnerObserved: mode === "recovery" ? () => {
       writeFileSync(observedPath, "observed\n", { flag: "wx" });
       waitFor(releasePath);

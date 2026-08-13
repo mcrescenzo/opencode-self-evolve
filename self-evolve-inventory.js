@@ -3,7 +3,11 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import {
   asPath,
+  canonicalize,
+  DEFAULT_CATALOG_LIMITS,
+  makeApprovedGlobalRoot,
   makeCandidateTargetBinding,
+  makeCatalogLimits,
   makeGlobalRootPolicy,
   makeRecommendationTargetBinding,
 } from "./self-evolve-schemas.js";
@@ -12,6 +16,19 @@ const MUST_NOT_EXIST = "must-not-exist";
 const MAX_EDIT_GROWTH = 8 * 1024;
 const MAX_NEW_FILE_BYTES = 24 * 1024;
 const MAX_FILE_BYTES = 64 * 1024;
+const MAX_HOST_RESPONSE_BYTES = 1024 * 1024;
+const MAX_HOST_SKILLS = 4096;
+const HOST_FETCH_TIMEOUT_MS = 5000;
+const HOST_PATH_FIELDS = Object.freeze(["home", "state", "config", "worktree", "directory"]);
+const HOST_SKILL_FIELDS = Object.freeze(["name", "description", "location", "content"]);
+const HOST_VERSION_RE = /^1\.18\.(?:[3-9]|[1-9][0-9]+)(?:[-+].*)?$/u;
+// O_NOFOLLOW refuses a symlink at the final path component. It is the kernel
+// boundary that supplements the path-level rejectSymlinked walk used during
+// catalog discovery: once we have a no-follow descriptor open, no symlink at
+// the file boundary can redirect the bounded read. Unsupported hosts fail
+// closed in acquireSkillContentProof so synthesis never falls back to a plain
+// path-based read where the proof bytes could diverge from the catalog hash.
+const NOFOLLOW = Number.isInteger(fs.constants.O_NOFOLLOW) ? fs.constants.O_NOFOLLOW : null;
 const GLOB_RE = /[*?[]/;
 const LOGICAL_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u;
@@ -52,6 +69,530 @@ const INJECTION_PATTERNS = [
 ];
 const rootScopes = new WeakMap();
 const inventoryScopes = new WeakMap();
+
+function exactProjection(value, fields, label, optional = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`invalid-${label}`);
+  const allowed = new Set(fields);
+  if (Object.keys(value).some((key) => !allowed.has(key))) throw new Error(`unexpected-${label}-field`);
+  for (const field of fields) {
+    if (!optional.includes(field) && !Object.hasOwn(value, field)) throw new Error(`missing-${label}-${field}`);
+  }
+}
+
+function boundedHostText(value, label, { optional = false, maxBytes = 256 * 1024 } = {}) {
+  if (optional && value === undefined) return undefined;
+  if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > maxBytes) {
+    throw new Error(`invalid-${label}`);
+  }
+  return value;
+}
+
+function canonicalHostPath(value, label) {
+  const source = boundedHostText(value, label, { maxBytes: 4096 });
+  if (!path.isAbsolute(source) || source.includes("\0")) throw new Error(`invalid-${label}`);
+  const normalized = path.normalize(source);
+  if (normalized !== source && normalized !== source.replace(/[\\/]+$/u, "")) throw new Error(`noncanonical-${label}`);
+  return normalized;
+}
+
+function hostOrigin(value) {
+  let url;
+  try { url = new URL(value); } catch { throw new Error("invalid-host-origin"); }
+  if (!["http:", "https:"].includes(url.protocol)
+    || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
+    throw new Error("invalid-host-origin");
+  }
+  return url;
+}
+
+async function boundedHostResponseText(response, label) {
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(declared)) throw new Error(`invalid-host-${label}-content-length`);
+    if (Number(declared) > MAX_HOST_RESPONSE_BYTES) throw new Error(`host-${label}-response-too-large`);
+  }
+  const chunks = [];
+  let bytes = 0;
+  if (response.body && typeof response.body.getReader === "function") {
+    const reader = response.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > MAX_HOST_RESPONSE_BYTES) {
+          try { await reader.cancel(); } catch {}
+          throw new Error(`host-${label}-response-too-large`);
+        }
+        chunks.push(Buffer.from(value));
+      }
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
+  } else {
+    const chunk = Buffer.from(await response.arrayBuffer());
+    bytes = chunk.length;
+    if (bytes > MAX_HOST_RESPONSE_BYTES) throw new Error(`host-${label}-response-too-large`);
+    chunks.push(chunk);
+  }
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, bytes)); }
+  catch { throw new Error(`invalid-host-${label}-utf8`); }
+}
+
+async function fetchHostProjection(origin, pathname, directory, fetchImpl, signal) {
+  const url = new URL(pathname, origin);
+  const response = await fetchImpl(url, {
+    redirect: "manual",
+    headers: { "x-opencode-directory": encodeURIComponent(directory) },
+    signal,
+  });
+  if (response.status !== 200 || response.type === "opaqueredirect" || response.headers.get("location")) {
+    throw new Error(`host-${pathname.slice(1)}-status-${response.status}`);
+  }
+  const source = await boundedHostResponseText(response, pathname.slice(1));
+  try { return JSON.parse(source); } catch { throw new Error(`invalid-host-${pathname.slice(1)}-json`); }
+}
+
+function hostPaths(value, requestedDirectory) {
+  exactProjection(value, HOST_PATH_FIELDS, "path-projection");
+  const result = Object.freeze(Object.fromEntries(HOST_PATH_FIELDS.map((field) => [field, canonicalHostPath(value[field], `path-${field}`)])));
+  if (result.directory !== requestedDirectory || result.worktree !== requestedDirectory) {
+    throw new Error("host-project-path-disagreement");
+  }
+  return result;
+}
+
+function configuredHostRoots(value, directory) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid-config-projection");
+  if (value.skills === undefined) return Object.freeze([]);
+  exactProjection(value.skills, ["paths", "urls"], "config-skills", ["paths", "urls"]);
+  if (value.skills.urls !== undefined && (!Array.isArray(value.skills.urls)
+    || value.skills.urls.length > 128
+    || value.skills.urls.some((item) => typeof item !== "string"))) {
+    throw new Error("invalid-config-skill-urls");
+  }
+  if (value.skills.paths === undefined) return Object.freeze([]);
+  if (!Array.isArray(value.skills.paths) || value.skills.paths.length > 128) throw new Error("invalid-config-skill-paths");
+  const roots = [];
+  for (let index = 0; index < value.skills.paths.length; index += 1) {
+    const source = boundedHostText(value.skills.paths[index], `config-skill-path-${index}`, { maxBytes: 4096 });
+    if (/^[a-z][a-z0-9+.-]*:/iu.test(source)) continue;
+    roots.push(path.normalize(path.isAbsolute(source) ? source : path.resolve(directory, source)));
+  }
+  return Object.freeze([...new Set(roots)]);
+}
+
+function hostSkills(value, label) {
+  if (!Array.isArray(value) || value.length > MAX_HOST_SKILLS) throw new Error(`invalid-${label}-skills`);
+  return Object.freeze(value.map((item, index) => {
+    exactProjection(item, HOST_SKILL_FIELDS, `${label}-skill`, ["description"]);
+    return Object.freeze({
+      name: boundedHostText(item.name, `${label}-skill-${index}-name`, { maxBytes: 1024 }),
+      ...(item.description === undefined ? {} : {
+        description: boundedHostText(item.description, `${label}-skill-${index}-description`, { maxBytes: 4096 }),
+      }),
+      location: boundedHostText(item.location, `${label}-skill-${index}-location`, { maxBytes: 4096 }),
+      content: boundedHostText(item.content, `${label}-skill-${index}-content`),
+    });
+  }));
+}
+
+function compareHostSkills(left, right) {
+  return compareCodepoints(left.name, right.name)
+    || compareCodepoints(left.location, right.location)
+    || compareCodepoints(left.description ?? "", right.description ?? "")
+    || compareCodepoints(left.content, right.content);
+}
+
+function safeHostOwnership(stat) {
+  if (typeof process.geteuid !== "function") return true;
+  if (stat.uid !== process.geteuid() || (stat.mode & 0o002) !== 0) return false;
+  if ((stat.mode & 0o020) === 0) return true;
+  return typeof process.getegid === "function" && stat.gid === process.getegid();
+}
+
+function safeHostFilesystemEntry(filePath) {
+  for (const candidate of [path.dirname(path.dirname(filePath)), path.dirname(filePath), filePath]) {
+    const stat = fs.lstatSync(candidate);
+    if (!safeHostOwnership(stat)) return false;
+  }
+  return true;
+}
+
+function safeHostRoot(rootPath) {
+  return safeHostOwnership(fs.lstatSync(rootPath));
+}
+
+function sourceReceiptHash(receipt) {
+  return hashSkillContent(`self-evolve-host-global-source-v1\n${JSON.stringify(receipt)}`);
+}
+
+function hostTargetBinding(record) {
+  const body = {
+    sourceReceiptHash: record.sourceReceiptHash,
+    sourceRootHash: record.sourceRootHash,
+    precedence: record.precedence,
+    logicalName: record.logicalName,
+    relativePath: record.relativePath,
+    currentHash: record.currentHash,
+    sizeBytes: record.sizeBytes,
+  };
+  return Object.freeze({ ...body, targetBindingHash: hashSkillContent(`self-evolve-host-global-target-v1\n${JSON.stringify(body)}`) });
+}
+
+function codeDiagnostic(code) {
+  return typeof code === "string" && /^[a-z][a-z0-9-]{0,127}$/u.test(code) ? code : "host-catalog-error";
+}
+
+function isSameOrContained(candidateAbsPath, canonicalRoot) {
+  return candidateAbsPath === canonicalRoot || isPathContained(candidateAbsPath, canonicalRoot);
+}
+
+export function buildHostGlobalSkillCatalog({
+  origin,
+  hostVersion,
+  paths: pathProjection,
+  globalConfig,
+  projectConfig,
+  globalSkills: globalSkillProjection,
+  projectSkills: projectSkillProjection,
+  requestedDirectory,
+  catalogLimits = null,
+} = {}) {
+  const diagnostics = [];
+  try {
+    const official = hostOrigin(origin);
+    if (typeof hostVersion !== "string" || !HOST_VERSION_RE.test(hostVersion)) throw new Error("unsupported-host-version");
+    const requested = canonicalHostPath(requestedDirectory, "requested-directory");
+    const paths = hostPaths(pathProjection, requested);
+    const limits = catalogLimits ? makeCatalogLimits(catalogLimits) : DEFAULT_CATALOG_LIMITS;
+    const configuredGlobal = configuredHostRoots(globalConfig, paths.config);
+    const configuredProject = configuredHostRoots(projectConfig, requested);
+    const globalSkills = Object.freeze([...hostSkills(globalSkillProjection, "global")].sort(compareHostSkills));
+    const projectSkills = Object.freeze([...hostSkills(projectSkillProjection, "project")].sort(compareHostSkills));
+    const rawRoots = [
+      { sourceKind: "opencode-config", canonicalRoot: path.join(paths.config, "skills") },
+      { sourceKind: "agents-global", canonicalRoot: path.join(paths.home, ".agents", "skills") },
+      { sourceKind: "claude-global", canonicalRoot: path.join(paths.home, ".claude", "skills") },
+      ...configuredGlobal.map((canonicalRoot) => ({ sourceKind: "configured-global", canonicalRoot })),
+    ];
+    const roots = [];
+    const seenRoots = new Set();
+    for (const root of rawRoots) {
+      const canonicalRoot = path.normalize(root.canonicalRoot);
+      if (seenRoots.has(canonicalRoot)) continue;
+      seenRoots.add(canonicalRoot);
+      roots.push(Object.freeze({
+        sourceKind: root.sourceKind,
+        canonicalRoot,
+        sourceRootHash: hashSkillContent(`self-evolve-host-root-v1\n${canonicalRoot}`),
+        precedence: roots.length,
+      }));
+    }
+    const rootByPath = new Map();
+    const invalidRoots = new Set();
+    for (const root of roots) {
+      if (isSameOrContained(root.canonicalRoot, paths.directory) || isSameOrContained(root.canonicalRoot, paths.worktree)) {
+        diagnostics.push("project-contained-source");
+        invalidRoots.add(root.canonicalRoot);
+        continue;
+      }
+      try {
+        if (fs.realpathSync(root.canonicalRoot) !== root.canonicalRoot
+          || rejectSymlinked(root.canonicalRoot)
+          || !fs.lstatSync(root.canonicalRoot).isDirectory()
+          || !safeHostRoot(root.canonicalRoot)) {
+          diagnostics.push("unsafe-global-root");
+          invalidRoots.add(root.canonicalRoot);
+          continue;
+        }
+      } catch (error) {
+        diagnostics.push(error?.code === "ENOENT" ? "missing-global-root" : "unsafe-global-root");
+        invalidRoots.add(root.canonicalRoot);
+        continue;
+      }
+      let entries;
+      try { entries = fs.readdirSync(root.canonicalRoot, { withFileTypes: true }); }
+      catch {
+        diagnostics.push("unreadable-global-root");
+        invalidRoots.add(root.canonicalRoot);
+        continue;
+      }
+      for (const entry of entries.sort((left, right) => compareCodepoints(left.name, right.name))) {
+        if (entry.isSymbolicLink()) {
+          diagnostics.push("symlinked-global-entry");
+          continue;
+        }
+        if (!entry.isDirectory()) continue;
+        const direct = path.join(root.canonicalRoot, entry.name, "SKILL.md");
+        if (fs.existsSync(direct)) continue;
+        const nested = findNestedSkill(path.join(root.canonicalRoot, entry.name), limits);
+        if (nested.found) {
+          diagnostics.push("nested-skill-collection-not-approved");
+          continue;
+        }
+        if (nested.depthExceeded) {
+          diagnostics.push("catalog-scan-depth-exceeded");
+        }
+      }
+      rootByPath.set(root.canonicalRoot, root);
+    }
+
+    const sourceReceipt = Object.freeze({
+      contract: "opencode-stable-1.18-host-skills-v1",
+      hostVersion,
+      hostOriginHash: hashSkillContent(official.origin),
+      hostPathIdentityHash: hashSkillContent(canonicalize(paths)),
+      globalConfigProjectionHash: hashSkillContent(canonicalize(globalConfig)),
+      projectConfigProjectionHash: hashSkillContent(canonicalize(projectConfig)),
+      globalSkillProjectionHash: hashSkillContent(canonicalize(globalSkills)),
+      projectSkillProjectionHash: hashSkillContent(canonicalize(projectSkills)),
+      projectConfiguredRootSetHash: hashSkillContent(JSON.stringify(configuredProject)),
+      roots: Object.freeze(roots.map(({ sourceKind, sourceRootHash, precedence }) => Object.freeze({ sourceKind, sourceRootHash, precedence }))),
+    });
+    const receiptHash = sourceReceiptHash(sourceReceipt);
+    const globalNameCounts = new Map();
+    const globalLocationCounts = new Map();
+    for (const item of globalSkills) {
+      globalNameCounts.set(item.name, (globalNameCounts.get(item.name) ?? 0) + 1);
+      globalLocationCounts.set(item.location, (globalLocationCounts.get(item.location) ?? 0) + 1);
+    }
+    const records = [];
+    let aggregateBytes = 0;
+    for (const item of globalSkills) {
+      if (globalNameCounts.get(item.name) !== 1 || globalLocationCounts.get(item.location) !== 1) {
+        diagnostics.push("ambiguous-global-skill");
+        continue;
+      }
+      if (!LOGICAL_NAME_RE.test(item.name)) {
+        diagnostics.push("invalid-global-skill-name");
+        continue;
+      }
+      if (item.location === "<built-in>" || /^[a-z][a-z0-9+.-]*:/iu.test(item.location)) {
+        diagnostics.push("non-local-source");
+        continue;
+      }
+      let skillPath;
+      try { skillPath = canonicalHostPath(item.location, "global-skill-location"); }
+      catch {
+        diagnostics.push("noncanonical-global-skill");
+        continue;
+      }
+      if (path.basename(skillPath) !== "SKILL.md" || path.basename(path.dirname(skillPath)) !== item.name) {
+        diagnostics.push("non-direct-global-skill");
+        continue;
+      }
+      if (isSameOrContained(skillPath, paths.directory) || isSameOrContained(skillPath, paths.worktree)) {
+        diagnostics.push("project-contained-source");
+        continue;
+      }
+      const canonicalRoot = path.dirname(path.dirname(skillPath));
+      const root = rootByPath.get(canonicalRoot);
+      if (!root) {
+        diagnostics.push(invalidRoots.has(canonicalRoot) ? "unsafe-global-source" : "unclassified-global-source");
+        continue;
+      }
+      const matchingProject = projectSkills.filter((candidate) => candidate.name === item.name
+        && candidate.location === item.location
+        && candidate.content === item.content);
+      if (matchingProject.length !== 1) {
+        diagnostics.push(matchingProject.length === 0 ? "project-shadowed-global-skill" : "ambiguous-project-skill");
+        continue;
+      }
+      let bytes;
+      try {
+        if (fs.realpathSync(skillPath) !== skillPath || rejectSymlinked(skillPath) || !safeHostFilesystemEntry(skillPath)) {
+          throw new Error("unsafe");
+        }
+        const stat = fs.lstatSync(skillPath);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("unsafe");
+        bytes = fs.readFileSync(skillPath);
+      } catch (error) {
+        diagnostics.push(error?.code === "ENOENT" ? "missing-global-skill" : "unsafe-global-skill");
+        continue;
+      }
+      if (records.length + 1 > limits.maxCatalogEntries) {
+        return Object.freeze({ ok: false, sourceReceipt, sourceReceiptHash: receiptHash, records: Object.freeze([]), catalogGenerationHash: null, diagnostics: Object.freeze(["catalog-entries-exceeded"]) });
+      }
+      if (bytes.length > limits.maxCatalogPerFileBytes) {
+        return Object.freeze({ ok: false, sourceReceipt, sourceReceiptHash: receiptHash, records: Object.freeze([]), catalogGenerationHash: null, diagnostics: Object.freeze(["catalog-per-file-bytes-exceeded"]) });
+      }
+      aggregateBytes += bytes.length;
+      if (aggregateBytes > limits.maxCatalogAggregateBytes) {
+        return Object.freeze({ ok: false, sourceReceipt, sourceReceiptHash: receiptHash, records: Object.freeze([]), catalogGenerationHash: null, diagnostics: Object.freeze(["catalog-aggregate-bytes-exceeded"]) });
+      }
+      const parsedSource = parseSkillFrontmatter(bytes.toString("utf8"));
+      const base = skillRecord(canonicalRoot, item.name, skillPath, bytes);
+      if (base.frontmatterErrors.length > 0) {
+        diagnostics.push("malformed-global-skill-frontmatter");
+        continue;
+      }
+      if (base.parsedFrontmatter.name !== item.name
+        || (item.description !== undefined && base.parsedFrontmatter.description !== item.description)) {
+        diagnostics.push("host-frontmatter-drift");
+        continue;
+      }
+      if (bytes.toString("utf8").slice(parsedSource.bodyStart) !== item.content) {
+        diagnostics.push("host-content-drift");
+        continue;
+      }
+      const binding = hostTargetBinding({
+        ...base,
+        sourceReceiptHash: receiptHash,
+        sourceRootHash: root.sourceRootHash,
+        precedence: root.precedence,
+      });
+      records.push(Object.freeze({
+        ...base,
+        parsedFrontmatter: Object.freeze({ ...base.parsedFrontmatter }),
+        frontmatterErrors: Object.freeze([...base.frontmatterErrors]),
+        sourceKind: root.sourceKind,
+        sourceReceiptHash: receiptHash,
+        sourceRootHash: root.sourceRootHash,
+        precedence: root.precedence,
+        targetBindingHash: binding.targetBindingHash,
+      }));
+    }
+    records.sort((left, right) => compareCodepoints(left.logicalName, right.logicalName)
+      || left.precedence - right.precedence
+      || compareCodepoints(left.absolutePath, right.absolutePath));
+    const duplicateAccepted = records.some((record, index) => index > 0 && records[index - 1].logicalName === record.logicalName);
+    if (duplicateAccepted) {
+      return Object.freeze({ ok: false, sourceReceipt, sourceReceiptHash: receiptHash, records: Object.freeze([]), catalogGenerationHash: null, diagnostics: Object.freeze(["ambiguous-global-skill"]) });
+    }
+    const catalogGenerationHash = hashSkillContent(`self-evolve-host-global-catalog-v1\n${JSON.stringify({
+      sourceReceiptHash: receiptHash,
+      records: records.map(({ logicalName, sourceRootHash, precedence, currentHash, targetBindingHash }) => ({
+        logicalName,
+        sourceRootHash,
+        precedence,
+        currentHash,
+        targetBindingHash,
+      })),
+    })}`);
+    return Object.freeze({
+      ok: true,
+      sourceReceipt,
+      sourceReceiptHash: receiptHash,
+      records: Object.freeze(records),
+      catalogGenerationHash,
+      diagnostics: Object.freeze([...new Set(diagnostics.map(codeDiagnostic))].sort()),
+    });
+  } catch (error) {
+    return Object.freeze({
+      ok: false,
+      sourceReceipt: null,
+      sourceReceiptHash: null,
+      records: Object.freeze([]),
+      catalogGenerationHash: null,
+      diagnostics: Object.freeze([codeDiagnostic(error instanceof Error ? error.message : "host-catalog-error")]),
+    });
+  }
+}
+
+export async function discoverHostGlobalSkills({
+  origin,
+  directory,
+  hostVersion,
+  fetchImpl = globalThis.fetch,
+  catalogLimits = null,
+} = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HOST_FETCH_TIMEOUT_MS);
+  try {
+    if (typeof fetchImpl !== "function") throw new Error("fetch-unavailable");
+    const official = hostOrigin(origin);
+    const requestedDirectory = canonicalHostPath(directory, "requested-directory");
+    const paths = hostPaths(await fetchHostProjection(official, "/path", requestedDirectory, fetchImpl, controller.signal), requestedDirectory);
+    const [globalConfig, projectConfig, globalSkills, projectSkills] = await Promise.all([
+      fetchHostProjection(official, "/config", paths.config, fetchImpl, controller.signal),
+      fetchHostProjection(official, "/config", requestedDirectory, fetchImpl, controller.signal),
+      fetchHostProjection(official, "/skill", paths.config, fetchImpl, controller.signal),
+      fetchHostProjection(official, "/skill", requestedDirectory, fetchImpl, controller.signal),
+    ]);
+    return buildHostGlobalSkillCatalog({
+      origin: official.origin,
+      hostVersion,
+      paths,
+      globalConfig,
+      projectConfig,
+      globalSkills,
+      projectSkills,
+      requestedDirectory,
+      catalogLimits,
+    });
+  } catch (error) {
+    const diagnostic = controller.signal.aborted
+      ? "host-request-timeout"
+      : error instanceof Error ? error.message : "host-catalog-error";
+    controller.abort();
+    return Object.freeze({
+      ok: false,
+      sourceReceipt: null,
+      sourceReceiptHash: null,
+      records: Object.freeze([]),
+      catalogGenerationHash: null,
+      diagnostics: Object.freeze([codeDiagnostic(diagnostic)]),
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function adaptHostGlobalSkillCatalog(hostCatalog, { updatedAt = 0 } = {}) {
+  if (!hostCatalog?.ok || !Array.isArray(hostCatalog.records)
+      || typeof hostCatalog.catalogGenerationHash !== "string") {
+    return {
+      ok: false,
+      policy: null,
+      projectSkillRoot: null,
+      canonicalRoots: [],
+      records: [],
+      catalogGenerationHash: null,
+      blockers: [{ code: hostCatalog?.diagnostics?.[0] ?? "host-global-skill-catalog-unavailable" }],
+    };
+  }
+  if (hostCatalog.records.length === 0) {
+    return {
+      ok: false,
+      policy: null,
+      projectSkillRoot: null,
+      canonicalRoots: [],
+      records: [],
+      catalogGenerationHash: null,
+      blockers: [{ code: "host-global-skill-catalog-empty" }],
+    };
+  }
+  const roots = [...new Set(hostCatalog.records.map((record) => record.canonicalRoot))]
+    .sort(compareCodepoints)
+    .map((canonicalPath) => makeApprovedGlobalRoot({ canonicalPath, canUpdate: true, canCreate: false }));
+  const policy = makeGlobalRootPolicy({
+    roots,
+    creationRootId: null,
+    selectedBy: "host",
+    updatedAt,
+  });
+  const rootIds = new Map(policy.roots.map((root) => [root.canonicalPath, root.rootId]));
+  const records = hostCatalog.records.map((record) => ({
+    ...record,
+    rootId: rootIds.get(record.canonicalRoot),
+    canUpdate: true,
+    canCreate: false,
+  }));
+  inventoryScopes.set(records, new Map(policy.roots.map((root) => [root.canonicalPath, "global"])));
+  return {
+    ok: true,
+    policy,
+    projectSkillRoot: null,
+    canonicalRoots: policy.roots.map((root) => root.canonicalPath),
+    records,
+    catalogGenerationHash: hostCatalog.catalogGenerationHash,
+    blockers: [],
+    hostAuthoritative: true,
+    sourceReceiptHash: hostCatalog.sourceReceiptHash,
+    diagnostics: hostCatalog.diagnostics,
+  };
+}
 
 function compareCodepoints(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -139,6 +680,124 @@ export function hashSkillContent(textOrBuffer) {
   return createHash("sha256").update(textOrBuffer).digest("hex");
 }
 
+const PROOF_HASH_RE = /^[a-f0-9]{64}$/u;
+
+// Bind the EXACT provider-bound SKILL.md bytes to the advertised catalog hash
+// despite concurrent replacement, rewrite, symlink, growth, or truncation.
+//
+// The catalog records (currentHash, sizeBytes) at discovery time. Between that
+// moment and provider dispatch the file can change. To close that TOCTOU window
+// we open the file through a NO-FOLLOW descriptor, validate containment,
+// identity, type, and size against both the recorded catalog proof and the
+// configured per-file limit, read the bounded bytes from the descriptor, hash
+// THOSE EXACT bytes, and return them as the single buffer the caller retains
+// through prompt construction. After this function returns, no path-based read
+// is permitted: the bytes are the proof.
+//
+// Returns { ok: true, bytes } where bytes is a Buffer whose sha256 hash equals
+// target.currentHash and whose length equals target.sizeBytes (when recorded).
+// Returns { ok: false, reason } on any mismatch; the caller must refuse
+// synthesis (no provider dispatch) for any non-ok outcome.
+export function acquireSkillContentProof(target, options = {}) {
+  if (NOFOLLOW === null) return { ok: false, reason: "skill-content-no-follow-unsupported" };
+  if (!target || typeof target !== "object") return { ok: false, reason: "skill-content-target-required" };
+  const absolutePath = target.absolutePath;
+  const canonicalRoot = target.canonicalRoot;
+  const currentHash = target.currentHash;
+  const sizeBytes = target.sizeBytes;
+  if (typeof absolutePath !== "string" || !absolutePath) return { ok: false, reason: "skill-content-target-path-required" };
+  if (typeof canonicalRoot !== "string" || !canonicalRoot) return { ok: false, reason: "skill-content-canonical-root-required" };
+  if (currentHash === MUST_NOT_EXIST) return { ok: false, reason: "skill-content-target-must-not-exist" };
+  if (typeof currentHash !== "string" || !PROOF_HASH_RE.test(currentHash)) return { ok: false, reason: "skill-content-target-hash-invalid" };
+  if (!isPathContained(absolutePath, canonicalRoot)) return { ok: false, reason: "skill-content-target-escapes-root" };
+
+  const limit = options.perFileBytesLimit ?? DEFAULT_CATALOG_LIMITS.maxCatalogPerFileBytes;
+  if (!Number.isSafeInteger(limit) || limit < 1) return { ok: false, reason: "skill-content-limit-invalid" };
+
+  // Revalidate the canonical root without storing extra state: the catalog
+  // records the canonical path, so any drift (replacement, relocation, or a
+  // newly-symlinked ancestor) is detected by re-deriving the realpath and
+  // re-running the segment-level symlink walk.
+  try {
+    if (fs.realpathSync(canonicalRoot) !== canonicalRoot || rejectSymlinked(canonicalRoot)) {
+      return { ok: false, reason: "skill-content-canonical-root-stale" };
+    }
+  } catch {
+    return { ok: false, reason: "skill-content-canonical-root-stale" };
+  }
+  if (rejectSymlinked(absolutePath)) return { ok: false, reason: "skill-content-path-symlinked" };
+
+  // Pre-open lstat for an inode/dev identity comparison against the descriptor
+  // we are about to open. If the file is replaced between lstat and open, the
+  // post-open fstat will disagree and we refuse before reading.
+  let before;
+  try {
+    before = fs.lstatSync(absolutePath);
+  } catch (error) {
+    return { ok: false, reason: error?.code === "ENOENT" ? "skill-content-target-missing" : "skill-content-target-unavailable" };
+  }
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    return { ok: false, reason: "skill-content-path-rejected" };
+  }
+  if (before.size > limit) return { ok: false, reason: "skill-content-size-exceeds-limit" };
+
+  let fd;
+  try {
+    fd = fs.openSync(absolutePath, fs.constants.O_RDONLY | NOFOLLOW);
+  } catch (error) {
+    return { ok: false, reason: error?.code === "ENOENT" ? "skill-content-target-missing" : "skill-content-path-rejected" };
+  }
+
+  try {
+    let opened;
+    try {
+      opened = fs.fstatSync(fd);
+    } catch {
+      return { ok: false, reason: "skill-content-fstat-failed" };
+    }
+    if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1) {
+      return { ok: false, reason: "skill-content-path-rejected" };
+    }
+    if (opened.dev !== before.dev || opened.ino !== before.ino) {
+      return { ok: false, reason: "skill-content-target-replaced" };
+    }
+    if (opened.size > limit) return { ok: false, reason: "skill-content-size-exceeds-limit" };
+
+    // Read bounded bytes from the descriptor only. The descriptor is the proof
+    // handle: even if the path is replaced now, the bytes we read come from the
+    // inode we just validated.
+    let bytes;
+    try {
+      bytes = fs.readFileSync(fd);
+    } catch {
+      return { ok: false, reason: "skill-content-read-failed" };
+    }
+    if (bytes.length > limit) return { ok: false, reason: "skill-content-size-exceeds-limit" };
+    if (Number.isSafeInteger(sizeBytes) && bytes.length !== sizeBytes) {
+      return { ok: false, reason: "skill-content-size-mismatch" };
+    }
+    if (hashSkillContent(bytes) !== currentHash) return { ok: false, reason: "skill-content-hash-mismatch" };
+
+    // Post-read lstat catches an in-window replacement: if the path now resolves
+    // to a different inode, the file we read may have been swapped even though
+    // the open descriptor still points at the original inode. The hash check
+    // already bound the bytes; this guard refuses to certify a swap.
+    let after;
+    try {
+      after = fs.lstatSync(absolutePath);
+    } catch {
+      return { ok: false, reason: "skill-content-target-replaced" };
+    }
+    if (after.dev !== opened.dev || after.ino !== opened.ino || after.nlink !== 1) {
+      return { ok: false, reason: "skill-content-target-replaced" };
+    }
+
+    return { ok: true, bytes };
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
 function parseScalar(raw) {
   const value = raw.trim();
   if (value.startsWith('"') && value.endsWith('"')) {
@@ -155,7 +814,7 @@ export function parseSkillFrontmatter(text) {
     return { ok: false, frontmatter: null, errors: ["frontmatter must start with ---"], bodyStart: 0 };
   }
   const firstBreak = source.indexOf("\n") + 1;
-  const closing = /^(?:---|\.\.\.)\s*\r?$/gmu;
+  const closing = /^(?:---|\.\.\.)[ \t]*\r?$/gmu;
   closing.lastIndex = firstBreak;
   const match = closing.exec(source);
   if (!match) return { ok: false, frontmatter: null, errors: ["frontmatter closing delimiter is missing"], bodyStart: 0 };
@@ -174,10 +833,11 @@ export function parseSkillFrontmatter(text) {
       errors.push(`duplicate frontmatter field: ${key}`);
       continue;
     }
-    if (raw === "|" || raw === ">") {
+    const block = /^([|>])[-+]?$/u.exec(raw);
+    if (block) {
       const parts = [];
       while (index + 1 < lines.length && /^\s+/.test(lines[index + 1])) parts.push(lines[++index].trim());
-      frontmatter[key] = raw === ">" ? parts.join(" ") : parts.join("\n");
+      frontmatter[key] = block[1] === ">" ? parts.join(" ") : parts.join("\n");
     } else {
       frontmatter[key] = parseScalar(raw);
     }
@@ -192,7 +852,7 @@ export function parseSkillFrontmatter(text) {
     if (frontmatter.description.includes("\0")) errors.push("frontmatter description contains NUL");
     if (CONTROL_RE.test(frontmatter.description)) errors.push("frontmatter description contains control characters");
     if (UNSAFE_SCHEME_RE.test(frontmatter.description)) errors.push("frontmatter description contains an unsafe link");
-    if (frontmatter.description.length > 300) errors.push("frontmatter description exceeds 300 characters");
+    if (Buffer.byteLength(frontmatter.description, "utf8") > 4096) errors.push("frontmatter description exceeds 4096 bytes");
   }
   const bodyBreak = source.indexOf("\n", match.index + match[0].length);
   const bodyStart = bodyBreak === -1 ? source.length : bodyBreak + 1;
@@ -218,9 +878,13 @@ function skillRecord(canonicalRoot, logicalName, absolutePath, bytes) {
   };
 }
 
-export function discoverSkills(canonicalRoots) {
+export function discoverSkills(canonicalRoots, options = {}) {
+  const limits = options.catalogLimits ? makeCatalogLimits(options.catalogLimits) : DEFAULT_CATALOG_LIMITS;
   const records = [];
-  for (const canonicalRoot of canonicalRoots) {
+  let aggregateBytes = 0;
+  let breach = null;
+
+  rootLoop: for (const canonicalRoot of canonicalRoots) {
     let entries;
     try {
       if (fs.realpathSync(canonicalRoot) !== canonicalRoot || rejectSymlinked(canonicalRoot)) continue;
@@ -231,13 +895,38 @@ export function discoverSkills(canonicalRoots) {
     for (const entry of entries.sort((a, b) => compareCodepoints(a.name, b.name))) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       const absolutePath = path.join(canonicalRoot, entry.name, "SKILL.md");
+      let consumed = false;
       try {
-        if (rejectSymlinked(absolutePath) || !fs.lstatSync(absolutePath).isFile()) continue;
-        const real = fs.realpathSync(absolutePath);
-        if (real !== absolutePath || !isPathContained(real, canonicalRoot)) continue;
-        records.push(skillRecord(canonicalRoot, entry.name, real, fs.readFileSync(real)));
+        if (!rejectSymlinked(absolutePath) && fs.lstatSync(absolutePath).isFile()) {
+          const real = fs.realpathSync(absolutePath);
+          if (real === absolutePath && isPathContained(real, canonicalRoot)) {
+            const bytes = fs.readFileSync(real);
+            if (records.length + 1 > limits.maxCatalogEntries) { breach = "catalog-entries-exceeded"; break rootLoop; }
+            if (bytes.length > limits.maxCatalogPerFileBytes) { breach = "catalog-per-file-bytes-exceeded"; break rootLoop; }
+            aggregateBytes += bytes.length;
+            if (aggregateBytes > limits.maxCatalogAggregateBytes) { breach = "catalog-aggregate-bytes-exceeded"; break rootLoop; }
+            records.push(skillRecord(canonicalRoot, entry.name, real, bytes));
+            consumed = true;
+          }
+        }
       } catch {}
+
+      if (!consumed && !breach) {
+        const nested = findNestedSkill(path.join(canonicalRoot, entry.name), limits);
+        if (nested.found) { breach = "nested-skill-collection-not-approved"; break rootLoop; }
+        if (nested.depthExceeded) { breach = "catalog-scan-depth-exceeded"; break rootLoop; }
+      }
     }
+  }
+
+  if (breach) {
+    records.length = 0;
+    Object.defineProperty(records, "catalogReceipt", {
+      value: { ok: false, code: breach },
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
   }
   inventoryScopes.set(records, rootScopes.get(canonicalRoots) ?? new Map(canonicalRoots.map((root) => [root, "unknown"])));
   return records;
@@ -257,6 +946,10 @@ function catalogBlocker(code, root, details = {}) {
     "nested-skill-collection-not-approved": `Approved root contains nested skill collection ${collectionName}; approve the exact collection root instead.`,
     "duplicate-global-skill-name": `Logical skill name ${logicalName} exists in more than one approved global root.`,
     "global-skill-record-invalid": `Direct global skill ${logicalName ?? details.entryName ?? "unknown"} is malformed, symlinked, or noncanonical.`,
+    "catalog-entries-exceeded": `Catalog entry count exceeds the configured limit (${details.limit ?? "unknown"}); reduce the collection or raise maxCatalogEntries.`,
+    "catalog-per-file-bytes-exceeded": `Catalog skill ${logicalName ?? details.entryName ?? "unknown"} is ${details.sizeBytes ?? "unknown"} bytes, exceeding the per-file limit (${details.limit ?? "unknown"} bytes).`,
+    "catalog-aggregate-bytes-exceeded": `Catalog aggregate content exceeds the configured limit (${details.limit ?? "unknown"} bytes); reduce the collection or raise maxCatalogAggregateBytes.`,
+    "catalog-scan-depth-exceeded": `Catalog nested-collection scan reached the depth limit (${details.limit ?? "unknown"}); flatten the collection or raise maxCatalogScanDepth.`,
   };
   return {
     code,
@@ -279,24 +972,51 @@ function globalCatalogGenerationHash(policy, records) {
   })}`);
 }
 
-function containsDirectSkill(collectionPath) {
-  let entries;
-  try { entries = fs.readdirSync(collectionPath, { withFileTypes: true }); } catch { return false; }
-  return entries.some((entry) => {
-    if (!entry.isDirectory() || entry.isSymbolicLink()) return false;
-    const skillPath = path.join(collectionPath, entry.name, "SKILL.md");
-    try {
-      return !rejectSymlinked(skillPath)
-        && fs.lstatSync(skillPath).isFile()
-        && fs.realpathSync(skillPath) === skillPath
-        && isPathContained(skillPath, collectionPath);
-    } catch {
-      return false;
+function findNestedSkill(collectionPath, limits) {
+  // Recursively scans inside a directory that is a direct child of an approved
+  // root but has no SKILL.md of its own. The detector's sole purpose is to emit
+  // a setup blocker when a nested skill collection shape is found at any
+  // supported depth. It never authorizes descendants.
+  //
+  // Symlinks are refused (skipped, never followed). Special files (block/char
+  // devices, FIFOs, sockets) are likewise refused: Dirent.isFile() and
+  // Dirent.isDirectory() both return false for them, so they fall through the
+  // file/directory branches and are ignored.
+  //
+  // Returns { found: string|null, depthExceeded: boolean }. found is the
+  // absolute path of the first nested SKILL.md discovered; depthExceeded is
+  // true when subdirectories remain beyond the scan-depth ceiling, meaning the
+  // scan cannot prove the absence of a deeper nested collection.
+  let depthExceeded = false;
+  function scan(directory, depth) {
+    if (depth > limits.maxCatalogScanDepth) {
+      depthExceeded = true;
+      return null;
     }
-  });
+    let entries;
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return null; }
+    for (const entry of entries.sort((left, right) => compareCodepoints(left.name, right.name))) {
+      if (entry.isSymbolicLink()) continue;
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isFile()) {
+        if (entry.name === "SKILL.md") return entryPath;
+        continue;
+      }
+      if (entry.isDirectory()) {
+        const nested = scan(entryPath, depth + 1);
+        if (nested) return nested;
+        continue;
+      }
+      // Special files (block/char devices, FIFOs, sockets) are refused.
+    }
+    return null;
+  }
+  const found = scan(collectionPath, 1);
+  return { found, depthExceeded };
 }
 
-export function buildGlobalSkillCatalog(rootPolicy, { projectRoot = null, projectSkillRoot = null } = {}) {
+export function buildGlobalSkillCatalog(rootPolicy, { projectRoot = null, projectSkillRoot = null, catalogLimits = null } = {}) {
+  const limits = catalogLimits ? makeCatalogLimits(catalogLimits) : DEFAULT_CATALOG_LIMITS;
   let excludedProjectSkillRoot = projectSkillRoot;
   if (excludedProjectSkillRoot === null && projectRoot !== null && projectRoot !== undefined) {
     try {
@@ -330,7 +1050,10 @@ export function buildGlobalSkillCatalog(rootPolicy, { projectRoot = null, projec
 
   const blockers = [];
   const records = [];
-  for (const root of policy.roots) {
+  let aggregateBytes = 0;
+  let limitBreached = false;
+
+  rootLoop: for (const root of policy.roots) {
     if (/\/\.opencode\/skills$/u.test(root.canonicalPath)
         || (excludedProjectSkillRoot !== null && root.canonicalPath === excludedProjectSkillRoot)) {
       blockers.push(catalogBlocker("project-skill-root-prohibited", root));
@@ -360,20 +1083,39 @@ export function buildGlobalSkillCatalog(rootPolicy, { projectRoot = null, projec
       if (!entry.isDirectory()) continue;
       const skillPath = path.join(root.canonicalPath, entry.name, "SKILL.md");
       let skillExists = false;
+      let recordAccepted = false;
       try {
         const stat = fs.lstatSync(skillPath);
         skillExists = true;
         if (!rejectSymlinked(skillPath) && stat.isFile()) {
           const real = fs.realpathSync(skillPath);
           if (real === skillPath && isPathContained(real, root.canonicalPath)) {
+            const fileBytes = fs.readFileSync(real);
+            if (fileBytes.length > limits.maxCatalogPerFileBytes) {
+              blockers.push(catalogBlocker("catalog-per-file-bytes-exceeded", root, { logicalName: entry.name, sizeBytes: fileBytes.length, limit: limits.maxCatalogPerFileBytes }));
+              limitBreached = true;
+              break rootLoop;
+            }
+            if (records.length + 1 > limits.maxCatalogEntries) {
+              blockers.push(catalogBlocker("catalog-entries-exceeded", root, { limit: limits.maxCatalogEntries }));
+              limitBreached = true;
+              break rootLoop;
+            }
+            aggregateBytes += fileBytes.length;
+            if (aggregateBytes > limits.maxCatalogAggregateBytes) {
+              blockers.push(catalogBlocker("catalog-aggregate-bytes-exceeded", root, { limit: limits.maxCatalogAggregateBytes }));
+              limitBreached = true;
+              break rootLoop;
+            }
             const record = {
-              ...skillRecord(root.canonicalPath, entry.name, real, fs.readFileSync(real)),
+              ...skillRecord(root.canonicalPath, entry.name, real, fileBytes),
               rootId: root.rootId,
               canUpdate: root.canUpdate,
               canCreate: root.canCreate,
             };
             if (LOGICAL_NAME_RE.test(entry.name) && validExistingTarget(record, entry.name)) {
               records.push(record);
+              recordAccepted = true;
               continue;
             }
           }
@@ -381,20 +1123,28 @@ export function buildGlobalSkillCatalog(rootPolicy, { projectRoot = null, projec
       } catch (error) {
         if (error?.code !== "ENOENT") skillExists = true;
       }
+      if (recordAccepted) continue;
       if (skillExists) {
         blockers.push(catalogBlocker("global-skill-record-invalid", root, { logicalName: entry.name }));
         continue;
       }
-      if (containsDirectSkill(path.join(root.canonicalPath, entry.name))) {
+      const nested = findNestedSkill(path.join(root.canonicalPath, entry.name), limits);
+      if (nested.found) {
         blockers.push(catalogBlocker("nested-skill-collection-not-approved", root, { collectionName: entry.name }));
+      } else if (nested.depthExceeded) {
+        blockers.push(catalogBlocker("catalog-scan-depth-exceeded", root, { collectionName: entry.name, limit: limits.maxCatalogScanDepth }));
+        limitBreached = true;
       }
     }
+    if (limitBreached) break rootLoop;
   }
 
-  const nameCounts = new Map();
-  for (const record of records) nameCounts.set(record.logicalName, (nameCounts.get(record.logicalName) ?? 0) + 1);
-  for (const [logicalName, count] of [...nameCounts].sort(([left], [right]) => compareCodepoints(left, right))) {
-    if (count > 1) blockers.push(catalogBlocker("duplicate-global-skill-name", null, { logicalName }));
+  if (!limitBreached) {
+    const nameCounts = new Map();
+    for (const record of records) nameCounts.set(record.logicalName, (nameCounts.get(record.logicalName) ?? 0) + 1);
+    for (const [logicalName, count] of [...nameCounts].sort(([left], [right]) => compareCodepoints(left, right))) {
+      if (count > 1) blockers.push(catalogBlocker("duplicate-global-skill-name", null, { logicalName }));
+    }
   }
 
   if (blockers.length) {
@@ -458,6 +1208,22 @@ function unresolvedGlobalTarget(reason) {
 function refreshGlobalSkillCatalog(catalog) {
   if (!catalog?.ok || !catalog.policy || typeof catalog.catalogGenerationHash !== "string") {
     return { ok: false, reason: catalog?.blockers?.[0]?.code ?? "global-skill-catalog-invalid", catalog: null };
+  }
+  if (catalog.hostAuthoritative === true) {
+    try {
+      for (const record of catalog.records) {
+        if (fs.realpathSync(record.canonicalRoot) !== record.canonicalRoot
+            || fs.realpathSync(record.absolutePath) !== record.absolutePath
+            || rejectSymlinked(record.absolutePath)
+            || !isPathContained(record.absolutePath, record.canonicalRoot)
+            || hashSkillContent(fs.readFileSync(record.absolutePath)) !== record.currentHash) {
+          throw new Error("global-skill-catalog-stale");
+        }
+      }
+      return { ok: true, reason: null, catalog };
+    } catch {
+      return { ok: false, reason: "global-skill-catalog-stale", catalog: null };
+    }
   }
   const refreshed = buildGlobalSkillCatalog(catalog.policy, { projectSkillRoot: catalog.projectSkillRoot ?? null });
   if (!refreshed.ok) return { ok: false, reason: refreshed.blockers[0]?.code ?? "global-skill-catalog-invalid", catalog: null };
@@ -584,6 +1350,7 @@ export function resolveGlobalRecommendationTarget(targetBinding, rootPolicy, {
   proposedContentHash,
   projectSkillRoot = null,
   preparedNewTarget = null,
+  catalog: providedCatalog = null,
 } = {}) {
   if (!["apply", "undo"].includes(action) || !/^[a-f0-9]{64}$/u.test(String(proposedContentHash))) {
     return unresolvedGlobalTarget("global-decision-target-input-invalid");
@@ -606,8 +1373,16 @@ export function resolveGlobalRecommendationTarget(targetBinding, rootPolicy, {
   } catch (error) {
     return unresolvedGlobalTarget(errorText(error).split(":", 1)[0] || "recommendation-target-binding-invalid");
   }
-  const catalog = buildGlobalSkillCatalog(policy, { projectSkillRoot });
-  if (!catalog.ok) return unresolvedGlobalTarget(catalog.blockers[0]?.code ?? "global-skill-catalog-invalid");
+  let catalog;
+  if (providedCatalog !== null) {
+    const refreshed = refreshGlobalSkillCatalog(providedCatalog);
+    if (!refreshed.ok) return unresolvedGlobalTarget(refreshed.reason);
+    catalog = refreshed.catalog;
+    if (catalog.policy.rootSetHash !== policy.rootSetHash) return unresolvedGlobalTarget("stale-root-set");
+  } else {
+    catalog = buildGlobalSkillCatalog(policy, { projectSkillRoot });
+    if (!catalog.ok) return unresolvedGlobalTarget(catalog.blockers[0]?.code ?? "global-skill-catalog-invalid");
+  }
   const root = policy.roots.find((item) => item.rootId === binding.rootId);
   if (!root) return unresolvedGlobalTarget("unapproved-global-root");
   const matches = catalog.records.filter((record) => record.logicalName === binding.logicalName);
@@ -690,7 +1465,8 @@ export function resolveGlobalRecommendationTarget(targetBinding, rootPolicy, {
   const baselineRecords = binding.targetKind === "new-global-skill"
     ? catalog.records.filter((record) => record !== matches[0])
     : catalog.records.map((record) => record === matches[0] ? { ...record, currentHash: binding.currentHash } : record);
-  if (globalCatalogGenerationHash(policy, baselineRecords) !== binding.catalogGenerationHash) {
+  if (catalog.hostAuthoritative !== true
+      && globalCatalogGenerationHash(policy, baselineRecords) !== binding.catalogGenerationHash) {
     return unresolvedGlobalTarget("global-skill-catalog-stale");
   }
   return { ok: true, reason: null, targetKind: binding.targetKind, binding, target: matches[0], catalog };

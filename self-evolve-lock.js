@@ -56,6 +56,17 @@ export function withStateMutationLock(rootDir, action, {
   const lockPath = path.join(root, ".self-evolve-mutation.lock");
   const deadline = Date.now() + lockTimeoutMs;
   const nonce = randomBytes(24).toString("hex");
+  const observations = new Map();
+  const deadForGrace = (key) => {
+    if (!key) return false;
+    const now = performance.now();
+    const first = observations.get(key);
+    if (first === undefined) {
+      observations.set(key, now);
+      return false;
+    }
+    return (now - first) >= staleLockMs;
+  };
   while (Date.now() <= deadline) {
     let descriptor;
     let createdThisIteration = false;
@@ -78,14 +89,20 @@ export function withStateMutationLock(rootDir, action, {
       if (error?.code !== "EEXIST") throw error;
     }
     let owner = null;
-    let age = 0;
+    let lockStat = null;
     try {
       owner = JSON.parse(readFileSync(lockPath, "utf8"));
-      age = Date.now() - lstatSync(lockPath).mtimeMs;
+      lockStat = lstatSync(lockPath);
     } catch {
-      try { age = Date.now() - lstatSync(lockPath).mtimeMs; } catch {}
+      try { lockStat = lstatSync(lockPath); } catch {}
     }
-    if (age >= staleLockMs && !processIsAlive(owner?.pid)) {
+    const wallAge = lockStat ? Date.now() - lockStat.mtimeMs : 0;
+    const ownerDead = !processIsAlive(owner?.pid);
+    const ownerKey = lockStat && owner?.nonce && Number.isSafeInteger(owner?.pid)
+      ? `lock:${lockStat.dev}:${lockStat.ino}:${owner.nonce}:${owner.pid}`
+      : null;
+    const ownerGraceElapsed = ownerDead ? deadForGrace(ownerKey) : false;
+    if (ownerDead && (wallAge >= staleLockMs || ownerGraceElapsed)) {
       if (typeof onStaleOwnerObserved === "function") onStaleOwnerObserved({ ...owner });
       const recoveryPath = `${lockPath}.stale.${process.pid}.${randomBytes(8).toString("hex")}`;
       const recoveryClaimPath = `${lockPath}.stale-recovery`;
@@ -113,8 +130,13 @@ export function withStateMutationLock(rootDir, action, {
             claimStat = lstatSync(recoveryClaimPath);
             claim = JSON.parse(readFileSync(recoveryClaimPath, "utf8"));
           } catch {}
-          const claimAge = claimStat ? Date.now() - claimStat.mtimeMs : 0;
-          if (claimStat && claimAge >= staleLockMs && !processIsAlive(claim?.pid)) {
+          const claimWallAge = claimStat ? Date.now() - claimStat.mtimeMs : 0;
+          const claimDead = !processIsAlive(claim?.pid);
+          const claimKey = claimStat && claim?.nonce && Number.isSafeInteger(claim?.pid)
+            ? `claim:${claimStat.dev}:${claimStat.ino}:${claim.nonce}:${claim.pid}`
+            : null;
+          const claimGraceElapsed = claimDead ? deadForGrace(claimKey) : false;
+          if (claimStat && claimDead && (claimWallAge >= staleLockMs || claimGraceElapsed)) {
             try {
               const currentClaimStat = lstatSync(recoveryClaimPath);
               if (currentClaimStat.dev === claimStat.dev && currentClaimStat.ino === claimStat.ino) {
@@ -131,14 +153,19 @@ export function withStateMutationLock(rootDir, action, {
         const candidate = lstatSync(recoveryPath);
         const current = lstatSync(lockPath);
         const currentOwner = JSON.parse(readFileSync(lockPath, "utf8"));
-        const currentAge = Date.now() - current.mtimeMs;
+        const currentWallAge = Date.now() - current.mtimeMs;
+        const currentDead = !processIsAlive(currentOwner.pid);
+        const currentKey = current && recovered?.nonce && Number.isSafeInteger(recovered?.pid)
+          ? `lock:${current.dev}:${current.ino}:${recovered.nonce}:${recovered.pid}`
+          : null;
+        const currentGraceElapsed = currentDead ? deadForGrace(currentKey) : false;
         if (
           candidate.dev === current.dev
           && candidate.ino === current.ino
           && currentOwner.nonce === recovered.nonce
           && currentOwner.pid === recovered.pid
-          && currentAge >= staleLockMs
-          && !processIsAlive(currentOwner.pid)
+          && (currentWallAge >= staleLockMs || currentGraceElapsed)
+          && currentDead
         ) unlinkSync(lockPath);
         continue;
       } catch (error) {

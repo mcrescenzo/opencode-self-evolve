@@ -184,6 +184,7 @@ function globalDetail(overrides = {}) {
     diff: { kind: "unified", lines: ["--- durable-review/SKILL.md", "+++ durable-review/SKILL.md"], overflow: { truncated: false, includedCount: 2, omittedCount: 0, omittedBytes: 0, reason: "none" } },
     evidenceSummary: [{ kind: "independent-incidents", count: 2 }, { kind: "occurrences", count: 3 }],
     availableActions: ["apply", "reject"],
+    actionReasons: { apply: null, reject: null, undo: "action-state-mismatch" },
     ...overrides,
   };
   return { ...body, detailHash: hashGlobalProtocol("recommendation-detail", body) };
@@ -365,15 +366,19 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
   const updated = setupStore.updateGlobalSettings((global) => schemas.makeGlobalSettings({
     ...global,
     globalRootPolicy: policy,
-    consent: {
-      ...global.consent,
-      durableObservations: true,
-      sanitizedExcerpts: true,
-      crossRepoAggregation: true,
-    },
     updatedAt: global.updatedAt + 1,
   }));
   assert.equal(updated.ok, true, updated.reason);
+  const initialAutomation = setupStore.getAutomationState();
+  assert.equal(initialAutomation.ok, true, initialAutomation.reason);
+  const enabled = setupStore.transitionAutomation({
+    transitionId: "global-bridge-fixture-enable",
+    expectedGeneration: initialAutomation.stamp.generation,
+    action: "set-automatic-recommendations",
+    enabled: true,
+  });
+  assert.equal(enabled.ok, true, enabled.reason);
+  const automationStamp = setupStore.getAutomationState().stamp;
   const catalog = inventory.buildGlobalSkillCatalog(policy);
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
@@ -388,6 +393,7 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
       summary: "Process verification failed repeatedly with a deterministic error.",
       createdAt: NOW,
       expiresAt: NOW + 30 * 24 * 60 * 60 * 1000,
+      automationGeneration: automationStamp.generation,
     });
     const observation = schemas.makeObservation({
       id: inventory.hashSkillContent(`process-observation:${index}`),
@@ -407,6 +413,7 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
       createdAt: NOW,
       injectionFlagged: false,
       redacted: true,
+      automationGeneration: automationStamp.generation,
     });
     const cluster = schemas.makeEvidenceCluster({
       id: clusterId,
@@ -419,9 +426,9 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
       firstSeenAt: NOW,
       lastSeenAt: NOW,
     });
-    assert.equal(setupStore.appendRecord(schemas.wrapRecord("observation", observation, NOW)).ok, true);
-    assert.equal(setupStore.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, NOW)).ok, true);
-    assert.equal(setupStore.appendEvidenceCapsule(capsule).ok, true);
+    assert.equal(setupStore.appendRecord(schemas.wrapRecord("observation", observation, NOW), { automationStamp }).ok, true);
+    assert.equal(setupStore.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, NOW), { automationStamp }).ok, true);
+    assert.equal(setupStore.appendEvidenceCapsule(capsule, { automationStamp }).ok, true);
     const published = setupStore.publishContribution({
       claimType: "global-skill-candidate",
       receiptType: cluster.receiptType,
@@ -433,7 +440,7 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
       occurrenceCount: 3,
       firstSeenAt: NOW,
       lastSeenAt: NOW,
-    });
+    }, { automationStamp });
     assert.equal(published.ok, true, published.reason);
     const secondIncidentId = `process-incident-${index}-second`;
     const secondClusterId = inventory.hashSkillContent(`process-cluster:${index}:second`);
@@ -454,9 +461,9 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
       id: secondClusterId,
       incidentIds: [secondIncidentId],
     });
-    assert.equal(setupStore.appendRecord(schemas.wrapRecord("observation", secondObservation, NOW)).ok, true);
-    assert.equal(setupStore.appendRecord(schemas.wrapRecord("evidence-cluster", secondCluster, NOW)).ok, true);
-    assert.equal(setupStore.appendEvidenceCapsule(secondCapsule).ok, true);
+    assert.equal(setupStore.appendRecord(schemas.wrapRecord("observation", secondObservation, NOW), { automationStamp }).ok, true);
+    assert.equal(setupStore.appendRecord(schemas.wrapRecord("evidence-cluster", secondCluster, NOW), { automationStamp }).ok, true);
+    assert.equal(setupStore.appendEvidenceCapsule(secondCapsule, { automationStamp }).ok, true);
     const secondPublished = setupStore.publishContribution({
       claimType: "global-skill-candidate",
       receiptType: secondCluster.receiptType,
@@ -468,7 +475,7 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
       occurrenceCount: 3,
       firstSeenAt: NOW,
       lastSeenAt: NOW,
-    });
+    }, { automationStamp });
     assert.equal(secondPublished.ok, true, secondPublished.reason);
     const resolution = inventory.resolveGlobalSkillCandidate(value.logicalName, catalog);
     const preliminary = schemas.makeGlobalCandidate({
@@ -486,6 +493,7 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
       lastSeenDay: "2026-08-11",
       createdAt: NOW,
       updatedAt: NOW,
+      automationGeneration: automationStamp.generation,
     });
     const support = schemas.makeGlobalSupportSet({
       candidateId: preliminary.candidateId,
@@ -504,6 +512,7 @@ function seedRealGlobalRecommendations(stateRoot, actingProjectFingerprint, root
       lastSeenDay: "2026-08-11",
       evaluatedAt: NOW,
       expiresAt: NOW + 30 * 24 * 60 * 60 * 1000,
+      automationGeneration: automationStamp.generation,
     });
     const candidate = schemas.makeGlobalCandidate({ ...preliminary, supportSetHash: support.supportSetHash });
     const targetBinding = schemas.makeRecommendationTargetBinding({

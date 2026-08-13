@@ -201,7 +201,7 @@ test("a process death after hard-link publication recovers the request and respo
   assert.equal(fs.statSync(responsePath).nlink, 1);
 });
 
-test("fresh TUI clients use authenticated controls and native project analysis operations", async (t) => {
+test("fresh TUI clients use only authenticated v0.4 automation operations", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-control-process-"));
   const skillRoot = path.join(root, "skills");
   const secondRoot = path.join(root, "other-skills");
@@ -213,28 +213,21 @@ test("fresh TUI clients use authenticated controls and native project analysis o
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  assert.equal((await controlClient(root, "mode", "manual")).response.ok, true);
-  assert.equal((await controlClient(root, "mode", "auto")).response.ok, true);
-  for (const key of ["passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation"]) {
-    assert.equal((await controlClient(root, "consent", `${key}=true`)).response.ok, true, key);
-  }
-  const yolo = await controlClient(root, "mode", "yolo", skillRoot);
-  assert.equal(yolo.response.ok, false, "a real v0.2 peer cannot enable yolo through the live bridge");
-  assert.equal(yolo.response.reason, "yolo-retired");
+  const turnedOff = await controlClient(root, "automatic", "false");
+  assert.equal(turnedOff.response.ok, true, turnedOff.response.reason);
+  assert.equal((await controlClient(root, "automatic", "true")).response.ok, true);
+  const revoked = await controlClient(root, "permission", "sanitizedExcerpts=false");
+  assert.equal(revoked.response.ok, true, revoked.response.reason);
+  assert.equal(revoked.next.dashboard.settings.automaticRecommendationsEnabled, false);
+  const restored = await controlClient(root, "permission", "sanitizedExcerpts=true");
+  assert.equal(restored.response.ok, true, restored.response.reason);
+  assert.equal(restored.next.dashboard.settings.automaticRecommendationsEnabled, false, "restoring permission never restarts automation");
+  assert.equal((await controlClient(root, "automatic", "true")).response.ok, true);
   assert.equal((await controlClient(root, "exclude", "true")).response.ok, true);
   assert.equal((await controlClient(root, "exclude", "false")).response.ok, true);
-  const repoAuto = await controlClient(root, "repo-mode", "auto");
-  assert.equal(repoAuto.response.ok, true, repoAuto.response.reason);
-  const repoInherit = await controlClient(root, "repo-mode", "inherit");
-  assert.equal(repoInherit.response.ok, true, repoInherit.response.reason);
   const allowlist = await controlClient(root, "allowlist", secondRoot);
   assert.equal(allowlist.response.ok, true, allowlist.response.reason);
-  assert.deepEqual(allowlist.next.allowedSkillRoots, [secondRoot]);
-
-  assert.equal((await controlClient(root, "consent", "crossRepoAggregation=false")).response.ok, true);
-  assert.equal((await controlClient(root, "consent", "sanitizedExcerpts=false")).response.ok, true);
-  assert.equal((await controlClient(root, "consent", "passiveCalls=false")).response.ok, true);
-  assert.equal((await controlClient(root, "consent", "durableObservations=false")).response.ok, true);
+  assert.deepEqual(allowlist.next.dashboard.settings.globalRootPolicy.roots.map((item) => item.canonicalPath), [secondRoot]);
 
   const replayPath = path.join(root, "control-replay.json");
   fs.writeFileSync(replayPath, JSON.stringify(allowlist.request), { mode: 0o600 });
@@ -242,48 +235,24 @@ test("fresh TUI clients use authenticated controls and native project analysis o
   assert.equal(replay.response.ok, false);
   assert.match(replay.response.reason, /replay|nonce/u);
 
-  const current = replay.next ?? allowlist.next;
-  const rawCases = [
-    { requestId: "raw-stale", settingsUpdatedAt: current.settingsUpdatedAt + 1 },
-    { requestId: "raw-cross", projectFingerprint: "f".repeat(64) },
-    { requestId: "raw-unknown", action: "run-command", payload: {} },
-    { requestId: "raw-malformed", action: "update-allowlist", payload: { allowlist: [skillRoot] } },
-  ];
-  for (const changes of rawCases) {
-    const rawPath = path.join(root, `${changes.requestId}.json`);
-    const raw = {
-      schemaVersion: current.schemaVersion,
-      requestId: changes.requestId,
-      projectFingerprint: PROJECT,
-      actor: "self-evolve-tui",
-      timestamp: Date.now(),
-      settingsUpdatedAt: current.settingsUpdatedAt,
-      settingsVersion: current.settingsVersion,
-      nonce: current.nonce,
-      action: "set-mode",
-      payload: { mode: "manual" },
-      ...changes,
-    };
-    fs.writeFileSync(rawPath, JSON.stringify(raw), { mode: 0o600 });
-    const rejected = await controlClient(root, "raw", "", rawPath);
-    assert.equal(rejected.response.ok, false, changes.requestId);
-  }
-
   await stopServer(server);
   const store = openStore(root, { projectFingerprint: PROJECT });
-  const settings = store.getSettings();
-  assert.equal(settings.global.mode, "auto", "the rejected yolo request left the prior auto mode intact");
-  assert.deepEqual(settings.global.allowedSkillRoots, [secondRoot]);
-  assert.deepEqual(settings.global.consent, { passiveCalls: false, durableObservations: false, sanitizedExcerpts: false, crossRepoAggregation: false });
-  assert.equal(settings.repo.excluded, false);
-  assert.equal(settings.repo.mode, "inherit");
+  const automation = store.getAutomationState();
+  assert.equal(automation.ok, true, automation.reason);
+  assert.equal(automation.enabled, true);
+  assert.deepEqual(automation.global.consent, {
+    durableObservations: true,
+    sanitizedExcerpts: true,
+    crossRepoAggregation: true,
+  });
+  assert.equal(automation.repo.excluded, false);
+  assert.deepEqual(automation.global.globalRootPolicy.roots.map((item) => item.canonicalPath), [secondRoot]);
   store.close();
 
   server = await startServer(root, skillRoot);
   const afterRestart = await controlClient(root, "exclude", "true");
-  assert.equal(afterRestart.state.mode, "auto");
-  assert.deepEqual(afterRestart.state.allowedSkillRoots, [secondRoot]);
   assert.equal(afterRestart.response.ok, true);
+  assert.equal(afterRestart.next.dashboard.settings.repositoryExcluded, true);
 });
 
 test("concurrent mailbox publishers cannot exceed the shared project file cap", async (t) => {
@@ -319,5 +288,5 @@ test("concurrent mailbox publishers cannot exceed the shared project file cap", 
   }
   assert.equal(fs.readdirSync(requestDir).length, 0);
   assert.ok(fs.readdirSync(responseDir).length > 0);
-  assert.equal(fs.existsSync(path.join(root, "self-evolve", "bridge", PROJECT, "control-state.json")), true);
+  assert.equal(fs.existsSync(path.join(root, "self-evolve", "bridge", PROJECT, "ui-projections", "index.json")), true);
 });

@@ -42,7 +42,7 @@ function runSynthesisChild(args, { expectSignal = null } = {}) {
       if (code !== 0) reject(new Error(`child-exit-${code}:${signal}:${stderr}`));
       else {
         try { resolve(JSON.parse(stdout)); }
-        catch (error) { reject(new Error(`invalid-child-output:${stdout}:${stderr}`, { cause: error })); }
+        catch (error) { reject(new Error(`invalid-child-output:code=${code}:signal=${signal}:${stdout}:${stderr}`, { cause: error })); }
       }
     });
   });
@@ -73,7 +73,11 @@ function seedContribution(store, {
   summary,
   targetLogicalName = "durable-review",
   capsuleExpiresAt = NOW + 30 * DAY,
+  automationStamp,
 }) {
+  const currentAutomation = store.getAutomationState();
+  assert.equal(currentAutomation.ok, true, currentAutomation.reason);
+  const effectiveAutomationStamp = automationStamp ?? currentAutomation.stamp;
   const signatureHash = H("repeated-config-failure");
   const scopeFingerprint = H("private-scope");
   const clusterId = H(`private-cluster:${incidentId}`);
@@ -95,6 +99,7 @@ function seedContribution(store, {
     createdAt: NOW,
     injectionFlagged: false,
     redacted: true,
+    automationGeneration: effectiveAutomationStamp.generation,
   });
   const cluster = schemas.makeEvidenceCluster({
     id: clusterId,
@@ -107,8 +112,8 @@ function seedContribution(store, {
     firstSeenAt: NOW,
     lastSeenAt: NOW,
   });
-  assert.equal(store.appendRecord(schemas.wrapRecord("observation", observation, NOW)).ok, true);
-  assert.equal(store.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, NOW)).ok, true);
+  assert.equal(store.appendRecord(schemas.wrapRecord("observation", observation, NOW), { automationStamp: effectiveAutomationStamp }).ok, true);
+  assert.equal(store.appendRecord(schemas.wrapRecord("evidence-cluster", cluster, NOW), { automationStamp: effectiveAutomationStamp }).ok, true);
   assert.equal(store.appendEvidenceCapsule(schemas.makeEvidenceCapsule({
     capsuleId,
     incidentId,
@@ -117,7 +122,7 @@ function seedContribution(store, {
     summary,
     createdAt: NOW,
     expiresAt: capsuleExpiresAt,
-  })).ok, true);
+  }), { automationStamp: effectiveAutomationStamp }).ok, true);
   const published = store.publishContribution({
     claimType: "global-skill-candidate",
     receiptType: "repeated-tool-error",
@@ -129,7 +134,7 @@ function seedContribution(store, {
     occurrenceCount,
     firstSeenAt: NOW,
     lastSeenAt: NOW,
-  });
+  }, { automationStamp: effectiveAutomationStamp });
   assert.equal(published.ok, true, published.reason);
   return { observation, cluster, contribution: published.contribution };
 }
@@ -224,8 +229,11 @@ function noPromptContext(calls) {
 }
 
 function globalOptions(store, overrides = {}) {
+  const automation = store.getAutomationState();
+  assert.equal(automation.ok, true, automation.reason);
   return {
     store,
+    automationStamp: automation.stamp,
     hiddenAgentRegistration: { assert: () => {} },
     suppressors: {
       bootValidated: true,
@@ -235,6 +243,17 @@ function globalOptions(store, overrides = {}) {
     },
     ...overrides,
   };
+}
+
+function transitionAutomation(store, request) {
+  const automation = store.getAutomationState();
+  assert.equal(automation.ok, true, automation.reason);
+  const result = store.transitionAutomation({
+    ...request,
+    expectedGeneration: automation.epoch.generation,
+  });
+  assert.equal(result.ok, true, result.reason);
+  return result;
 }
 
 function existingFixture(t, {
@@ -275,15 +294,15 @@ function existingFixture(t, {
     selectedBy: "operator",
     updatedAt: NOW,
   });
-  assert.equal(first.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+  const settingsResult = first.updateGlobalSettings((global) => schemas.makeGlobalSettings({
     ...global,
-    mode: "auto",
     globalRootPolicy: rootPolicy,
-    consent: { ...global.consent, sanitizedExcerpts: true, crossRepoAggregation: true },
     budgets: { ...global.budgets, synthesisPerDay },
     retentionDays,
     updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  }));
+  assert.equal(settingsResult.ok, true, settingsResult.reason);
+  const automationStamp = first.getAutomationState().stamp;
   const evidenceDomain = schemas.makeEvidenceDomain(deriveSourceLineage({ remoteUrl: "https://example.invalid/shared/source.git" }));
   const firstEvidence = seedContribution(first, {
     incidentId: "private-incident-a",
@@ -293,6 +312,7 @@ function existingFixture(t, {
     occurrenceCount: 2,
     summary: "Configuration validation failed repeatedly until the result was checked.",
     capsuleExpiresAt,
+    automationStamp,
   });
   const secondEvidence = seedContribution(second, {
     incidentId: "private-incident-b",
@@ -302,6 +322,7 @@ function existingFixture(t, {
     occurrenceCount: 1,
     summary: "A repeated configuration failure needed one verification step.",
     capsuleExpiresAt,
+    automationStamp,
   });
   const catalog = inventory.buildGlobalSkillCatalog(rootPolicy, { projectRoot: root });
   assert.equal(catalog.ok, true, JSON.stringify(catalog.blockers));
@@ -311,6 +332,7 @@ function existingFixture(t, {
     targetBindings: [resolution.binding],
     rootPolicy,
     nowMs: materializedAt,
+    automationStamp,
   });
   assert.equal(materialized.ok, true, materialized.reason);
   const candidate = materialized.candidates[0];
@@ -351,13 +373,13 @@ function newTargetFixture(t) {
     selectedBy: "operator",
     updatedAt: NOW,
   });
-  assert.equal(first.updateGlobalSettings((global) => schemas.makeGlobalSettings({
+  const settingsResult = first.updateGlobalSettings((global) => schemas.makeGlobalSettings({
     ...global,
-    mode: "auto",
     globalRootPolicy: rootPolicy,
-    consent: { ...global.consent, sanitizedExcerpts: true, crossRepoAggregation: true },
     updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  }));
+  assert.equal(settingsResult.ok, true, settingsResult.reason);
+  const automationStamp = first.getAutomationState().stamp;
   const evidenceDomain = schemas.makeEvidenceDomain(deriveSourceLineage({ remoteUrl: "https://example.invalid/shared/new-source.git" }));
   seedContribution(first, {
     incidentId: "private-new-incident-a",
@@ -367,6 +389,7 @@ function newTargetFixture(t) {
     occurrenceCount: 2,
     summary: "Repeated validation needed a reusable bounded review procedure.",
     targetLogicalName: null,
+    automationStamp,
   });
   seedContribution(second, {
     incidentId: "private-new-incident-b",
@@ -376,12 +399,18 @@ function newTargetFixture(t) {
     occurrenceCount: 1,
     summary: "A recurring validation gap needed one general verification step.",
     targetLogicalName: null,
+    automationStamp,
   });
   const catalog = inventory.buildGlobalSkillCatalog(rootPolicy, { projectRoot: root });
   const resolution = inventory.resolveGlobalSkillCandidate(null, catalog);
   assert.equal(resolution.ok, true, resolution.reason);
   assert.equal(resolution.binding.rootId, rootPolicy.creationRootId);
-  const materialized = second.materializeGlobalCandidates({ targetBindings: [resolution.binding], rootPolicy, nowMs: NOW });
+  const materialized = second.materializeGlobalCandidates({
+    targetBindings: [resolution.binding],
+    rootPolicy,
+    nowMs: NOW,
+    automationStamp,
+  });
   const candidate = materialized.candidates[0];
   assert.equal(candidate.state, "eligible");
   return { root, skillRoot, first, second, rootPolicy, catalog, candidate };
@@ -619,16 +648,13 @@ test("removing the primary creation root after candidate materialization fails b
     selectedBy: "operator",
     updatedAt: f.rootPolicy.updatedAt + 1,
   });
-  assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    globalRootPolicy: noCreationRoot,
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  const changedCatalog = inventory.buildGlobalSkillCatalog(noCreationRoot, { projectRoot: f.root });
+  assert.equal(changedCatalog.ok, true, JSON.stringify(changedCatalog.blockers));
   const calls = { create: 0, prompt: 0 };
   const result = await runGlobalSynthesis({
     ctx: noProviderContext(calls),
     candidate: f.candidate,
-    catalog: f.catalog,
+    catalog: changedCatalog,
     inventoryModule: inventory,
     options: globalOptions(f.second),
     now: NOW + 1,
@@ -665,35 +691,34 @@ test("fresh global preflight gates fail closed before provider creation", async 
   const cases = [
     ["invalid-model", (f) => ({ options: { model: "invalid-model" }, expected: "invalid-global-synthesis-model" })],
     ["budget-exhausted", () => ({ fixture: { synthesisPerDay: 0 }, expected: "synthesis-budget-exhausted" })],
-    ["consent-drift", (f) => {
-      assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-        ...global,
-        consent: { ...global.consent, sanitizedExcerpts: false, crossRepoAggregation: false },
-        updatedAt: global.updatedAt + 1,
-      })).ok, true);
-      return { expected: "global-synthesis-consent-required" };
+    ["permission-revoked", (f) => {
+      transitionAutomation(f.second, {
+        transitionId: "preflight-revoke-excerpts",
+        action: "set-permission",
+        permission: "sanitizedExcerpts",
+        enabled: false,
+      });
+      return { expected: "automatic-recommendations-disabled" };
     }],
-    ["paused", (f) => {
-      assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-        ...global, paused: true, updatedAt: global.updatedAt + 1,
-      })).ok, true);
-      return { expected: "paused" };
+    ["automatic-off", (f) => {
+      transitionAutomation(f.second, {
+        transitionId: "preflight-automatic-off",
+        action: "set-automatic-recommendations",
+        enabled: false,
+      });
+      return { expected: "automatic-recommendations-disabled" };
     }],
-    ["kill-switch", (f) => {
-      assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-        ...global, killSwitchActive: true, updatedAt: global.updatedAt + 1,
-      })).ok, true);
+    ["emergency-stop", (f) => {
+      transitionAutomation(f.second, {
+        transitionId: "preflight-emergency-stop",
+        action: "set-emergency-stop",
+        enabled: true,
+      });
       return { expected: "kill-switch" };
     }],
     ["runtime-suppressor", () => ({ options: { suppressors: {
       bootValidated: true, hostSupported: true, circuitBreakerOpen: true, processExcluded: false,
     } }, expected: "circuit-breaker" })],
-    ["root-policy-drift", (f) => {
-      assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-        ...global, globalRootPolicy: null, updatedAt: global.updatedAt + 1,
-      })).ok, true);
-      return { expected: "global-root-policy-required" };
-    }],
     ["target-content-drift", (f) => {
       fs.writeFileSync(f.skillPath, `${CURRENT}\nExternal drift.\n`);
       return { expected: "global-skill-catalog-stale" };
@@ -802,16 +827,19 @@ test("server-derived overlap rejects exact and near copies of another complete c
   }
 });
 
-test("consent, suppressor, target, and catalog drift after admission stop before provider dispatch", async (t) => {
+test("automation, target, and catalog drift after admission stop before provider dispatch", async (t) => {
   const cases = [
-    ["consent", (f) => f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-      ...global,
-      consent: { ...global.consent, sanitizedExcerpts: false, crossRepoAggregation: false },
-      updatedAt: global.updatedAt + 1,
-    })), /global-synthesis-consent-required/u],
-    ["paused", (f) => f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-      ...global, paused: true, updatedAt: global.updatedAt + 1,
-    })), /paused/u],
+    ["permission-revoked", (f) => transitionAutomation(f.second, {
+      transitionId: "post-admission-revoke-excerpts",
+      action: "set-permission",
+      permission: "sanitizedExcerpts",
+      enabled: false,
+    }), /stale-automation-generation/u],
+    ["automatic-off", (f) => transitionAutomation(f.second, {
+      transitionId: "post-admission-automatic-off",
+      action: "set-automatic-recommendations",
+      enabled: false,
+    }), /stale-automation-generation/u],
     ["target", (f) => {
       fs.writeFileSync(f.skillPath, `${CURRENT}\nDrift after admission.\n`);
       return { ok: true };
@@ -845,14 +873,17 @@ test("consent, suppressor, target, and catalog drift after admission stop before
       assert.equal(injected, true);
       assert.equal(result.ok, false);
       assert.match(result.reason, expected);
-      assert.deepEqual(calls, { create: 1, prompt: 0 });
+      assert.deepEqual(calls, {
+        create: ["permission-revoked", "automatic-off"].includes(name) ? 0 : 1,
+        prompt: 0,
+      });
       assert.deepEqual(f.second.readGlobalSynthesisAttempts().map((attempt) => attempt.state), ["failed-closed"]);
       assert.equal(f.second.readGlobalRecommendations().length, 0);
     });
   }
 });
 
-test("consent revoked while synthesizer session creation is paused suppresses its prompt", async (t) => {
+test("permission revoked while synthesizer session creation is pending suppresses its prompt", async (t) => {
   const f = existingFixture(t);
   const prompts = [];
   const gate = createGate(SYNTHESIS_AGENT_NAME);
@@ -865,64 +896,60 @@ test("consent revoked while synthesizer session creation is paused suppresses it
     now: NOW + 1,
   });
   await gate.started;
-  assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, sanitizedExcerpts: false, crossRepoAggregation: false },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  transitionAutomation(f.second, {
+    transitionId: "session-create-revoke-excerpts",
+    action: "set-permission",
+    permission: "sanitizedExcerpts",
+    enabled: false,
+  });
   gate.release();
   const result = await pending;
   assert.equal(result.ok, false);
-  assert.match(result.reason, /global-synthesis-consent-required/u);
+  assert.match(result.reason, /stale-automation-generation/u);
   assert.equal(prompts.length, 0);
   assert.equal(f.second.readGlobalRecommendations().length, 0);
 });
 
-test("passiveCalls-only revocation at the pre-prompt boundary suppresses passive work but not explicit work", async (t) => {
-  const passive = existingFixture(t);
-  assert.equal(passive.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, passiveCalls: true },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
+test("Automatic recommendations Off at the pre-prompt boundary suppresses provider work", async (t) => {
+  const automatic = existingFixture(t);
   const prompts = [];
   let reservations = 0;
   const gate = createGate(SYNTHESIS_AGENT_NAME);
   const pending = runGlobalSynthesis({
-    ctx: providerContext(passive.second, passive.candidate, prompts, {}, {}, { beforeCreateResolve: (agent) => gate.wait(agent) }),
-    candidate: passive.candidate,
-    catalog: passive.catalog,
+    ctx: providerContext(automatic.second, automatic.candidate, prompts, {}, {}, { beforeCreateResolve: (agent) => gate.wait(agent) }),
+    candidate: automatic.candidate,
+    catalog: automatic.catalog,
     inventoryModule: inventory,
-    options: globalOptions(passive.second, {
+    options: globalOptions(automatic.second, {
       reservePassiveProviderCalls() { reservations += 1; return { ok: true }; },
     }),
     now: NOW + 1,
   });
   await gate.started;
-  assert.equal(passive.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-    ...global,
-    consent: { ...global.consent, passiveCalls: false },
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
+  transitionAutomation(automatic.second, {
+    transitionId: "pre-prompt-automatic-off",
+    action: "set-automatic-recommendations",
+    enabled: false,
+  });
   gate.release();
   const blocked = await pending;
   assert.equal(blocked.ok, false);
-  assert.equal(blocked.reason, "passive-calls-consent-required");
+  assert.equal(blocked.reason, "stale-automation-generation");
   assert.equal(reservations, 0);
   assert.equal(prompts.length, 0);
 
-  const explicit = existingFixture(t);
-  const explicitPrompts = [];
+  const enabled = existingFixture(t);
+  const enabledPrompts = [];
   const allowed = await runGlobalSynthesis({
-    ctx: providerContext(explicit.second, explicit.candidate, explicitPrompts),
-    candidate: explicit.candidate,
-    catalog: explicit.catalog,
+    ctx: providerContext(enabled.second, enabled.candidate, enabledPrompts),
+    candidate: enabled.candidate,
+    catalog: enabled.catalog,
     inventoryModule: inventory,
-    options: globalOptions(explicit.second),
+    options: globalOptions(enabled.second),
     now: NOW + 1,
   });
   assert.equal(allowed.ok, true, allowed.reason);
-  assert.equal(explicitPrompts.length, 2);
+  assert.equal(enabledPrompts.length, 2);
 });
 
 test("synthesizer pre-prompt freshness suppresses catalog, capsule, support, suppressor, and lease drift", async (t) => {
@@ -993,17 +1020,18 @@ test("synthesizer pre-prompt freshness suppresses catalog, capsule, support, sup
   }
 });
 
-test("critic pre-prompt freshness suppresses consent, target, and lease drift", async (t) => {
+test("critic pre-prompt freshness suppresses automation, target, and lease drift", async (t) => {
   const cases = [
     {
-      name: "consent",
-      expected: /global-synthesis-consent-required/u,
+      name: "permission-revoked",
+      expected: /stale-automation-generation/u,
       mutate(f) {
-        assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-          ...global,
-          consent: { ...global.consent, sanitizedExcerpts: false, crossRepoAggregation: false },
-          updatedAt: global.updatedAt + 1,
-        })).ok, true);
+        transitionAutomation(f.second, {
+          transitionId: "critic-pre-prompt-revoke-excerpts",
+          action: "set-permission",
+          permission: "sanitizedExcerpts",
+          enabled: false,
+        });
       },
     },
     {
@@ -1168,11 +1196,6 @@ test("critic rejection and critic-call budget denial terminalize without a recom
 
   await t.test("critic provider budget", async (t) => {
     const f = existingFixture(t);
-    assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-      ...global,
-      consent: { ...global.consent, passiveCalls: true },
-      updatedAt: global.updatedAt + 1,
-    })).ok, true);
     const prompts = [];
     let reservations = 0;
     const result = await runGlobalSynthesis({
@@ -1197,7 +1220,7 @@ test("critic rejection and critic-call budget denial terminalize without a recom
   });
 });
 
-test("consent drift while the synthesizer runs blocks critic dispatch", async (t) => {
+test("automation permission drift while the synthesizer runs blocks critic dispatch", async (t) => {
   const f = existingFixture(t);
   const prompts = [];
   let revoked = false;
@@ -1210,18 +1233,19 @@ test("consent drift while the synthesizer runs blocks critic dispatch", async (t
       faultInjection(point) {
         if (point !== "global-synthesis-after-provider" || revoked) return;
         revoked = true;
-        assert.equal(f.second.updateGlobalSettings((global) => schemas.makeGlobalSettings({
-          ...global,
-          consent: { ...global.consent, sanitizedExcerpts: false, crossRepoAggregation: false },
-          updatedAt: global.updatedAt + 1,
-        })).ok, true);
+        transitionAutomation(f.second, {
+          transitionId: "after-provider-revoke-excerpts",
+          action: "set-permission",
+          permission: "sanitizedExcerpts",
+          enabled: false,
+        });
       },
     }),
     now: NOW + 1,
   });
   assert.equal(revoked, true);
   assert.equal(result.ok, false);
-  assert.match(result.reason, /global-synthesis-consent-required/u);
+  assert.match(result.reason, /stale-automation-generation/u);
   assert.equal(prompts.length, 1, "critic provider call is suppressed by the fresh consent read");
   assert.equal(f.second.readGlobalRecommendations().length, 0);
   assert.equal(f.second.readGlobalSynthesisAttempts()[0].state, "failed-closed");
@@ -1308,6 +1332,7 @@ test("the ephemeral packet keeps one capsule per domain, eight domains, 240-byte
     targetBindings: [resolution.binding],
     rootPolicy: f.rootPolicy,
     nowMs: NOW,
+    automationStamp: f.second.getAutomationState().stamp,
   });
   assert.equal(rematerialized.ok, true, rematerialized.reason);
   const candidate = rematerialized.candidates[0];
@@ -1336,10 +1361,16 @@ test("the ephemeral packet keeps one capsule per domain, eight domains, 240-byte
 test("recovery never replays a dispatched attempt and waits for the identity-free lease to expire", async (t) => {
   const f = existingFixture(t);
   const leaseKeyHash = globalSynthesisLeaseKey(f.candidate);
-  const acquired = f.second.acquireGlobalLease({ leaseKind: "candidate-synthesis", leaseKeyHash, ttlMs: 5 * 60 * 1000 });
+  const automationStamp = f.second.getAutomationState().stamp;
+  const acquired = f.second.acquireGlobalLease(
+    { leaseKind: "candidate-synthesis", leaseKeyHash, ttlMs: 5 * 60 * 1000 },
+    { automationStamp },
+  );
   assert.equal(acquired.ok, true, acquired.reason);
   const binding = {
     attemptId: "99999999-9999-4999-8999-999999999999",
+    automationStamp,
+    rootPolicy: f.rootPolicy,
     candidateId: f.candidate.candidateId,
     supportSetHash: f.candidate.supportSetHash,
     targetBindingHash: f.candidate.targetBindingHash,
@@ -1676,7 +1707,12 @@ test("concurrent processes cannot exceed the global synthesis day cap with disti
     assert.equal(resolution.ok, true, resolution.reason);
     return resolution.binding;
   });
-  const materialized = f.second.materializeGlobalCandidates({ targetBindings: bindings, rootPolicy: f.rootPolicy, nowMs: NOW });
+  const materialized = f.second.materializeGlobalCandidates({
+    targetBindings: bindings,
+    rootPolicy: f.rootPolicy,
+    nowMs: NOW,
+    automationStamp: f.second.getAutomationState().stamp,
+  });
   assert.equal(materialized.ok, true, materialized.reason);
   const eligible = materialized.candidates.filter((candidate) => candidate.state === "eligible");
   assert.equal(eligible.length, 2, JSON.stringify(materialized.candidates.map((candidate) => candidate.state)));
@@ -1704,4 +1740,43 @@ test("concurrent processes cannot exceed the global synthesis day cap with disti
   assert.deepEqual(retry, { ok: false, reason: "synthesis-budget-exhausted" });
   assert.equal(fs.readFileSync(markerPath, "utf8"), beforeRetry);
   assert.equal(f.second.readGlobalSynthesisAttempts().length, 1);
+});
+
+// H8-001: bind provider-bound synthesis bytes to catalog proof.
+//
+// The catalog generation hash check (`freshGlobalCatalog`) is the primary
+// defense against file drift in global synthesis. The proof acquisition added
+// in this bead is the secondary defense that closes the TOCTOU window BETWEEN
+// the catalog hash check inside `prePrompt` and the read of the file bytes
+// that become the provider-bound `<UNTRUSTED_CURRENT_SKILL_CONTENT>`. The
+// `global-synthesis-before-provider` fault point sits between those two
+// operations; mutating the skill file there exercises the proof boundary.
+test("global synthesis proof acquisition refuses provider dispatch when the SKILL.md drifts between catalog and provider", async (t) => {
+  const f = existingFixture(t);
+  const prompts = [];
+  let mutated = false;
+  const result = await runGlobalSynthesis({
+    ctx: providerContext(f.second, f.candidate, prompts),
+    candidate: f.candidate,
+    catalog: f.catalog,
+    inventoryModule: inventory,
+    options: globalOptions(f.second, {
+      faultInjection(point) {
+        if (point !== "global-synthesis-before-provider" || mutated) return;
+        mutated = true;
+        // Mutate the file AFTER freshGlobalCatalog has validated the catalog
+        // generation hash but BEFORE acquireSkillContentProof reads the bytes.
+        // The proof acquisition must catch the per-file hash drift and refuse
+        // to dispatch the synthesizer prompt.
+        fs.writeFileSync(f.skillPath, `${CURRENT}\nConcurrent drift between catalog and provider.\n`);
+      },
+    }),
+    now: NOW + 1,
+  });
+  assert.equal(mutated, true);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /skill-content-(?:hash-mismatch|size-mismatch|target-replaced)/u);
+  assert.equal(prompts.length, 0, "no provider dispatch on proof mismatch");
+  assert.equal(f.second.readGlobalRecommendations().length, 0);
+  assert.equal(f.second.readGlobalSynthesisAttempts()[0].state, "failed-closed");
 });

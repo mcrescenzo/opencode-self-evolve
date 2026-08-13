@@ -328,6 +328,7 @@ function uiProjectionPaths(paths, { create = false, generation } = {}) {
     index: path.join(root, "index.json"),
     dashboard: generationRoot ? path.join(generationRoot, "dashboard-v1.json") : null,
     dashboardV2: generationRoot ? path.join(generationRoot, "dashboard-v2.json") : null,
+    dashboardV3: generationRoot ? path.join(generationRoot, "dashboard-v3.json") : null,
   };
 }
 
@@ -1373,7 +1374,6 @@ function validateUiProjectionBundle({
   index: indexValue,
   details: detailValues,
   dashboard: dashboardValue,
-  dashboardV1: dashboardV1Value,
   offer: offerValue,
   projectFingerprint,
   stateRootIdentity,
@@ -1430,24 +1430,23 @@ function validateUiProjectionBundle({
     now,
   };
   const dashboards = new Map();
-  for (const [label, value] of [["dashboard", dashboardValue], ["dashboard-v1", dashboardV1Value]]) {
+  for (const [label, value] of [["dashboard", dashboardValue]]) {
     if (value === undefined || value === null) continue;
     const clean = makeUiDashboard(value, dashboardContext);
-    if (label === "dashboard-v1" && clean.dashboardVersion !== 1) {
-      throw new Error("ui-dashboard-v1-version-mismatch");
-    }
     if (dashboards.has(clean.dashboardVersion)) throw new Error("ui-dashboard-version-duplicate");
     dashboards.set(clean.dashboardVersion, clean);
   }
   const dashboardV1 = dashboards.get(1) ?? null;
   const dashboardV2 = dashboards.get(2) ?? null;
+  const dashboardV3 = dashboards.get(3) ?? null;
   return Object.freeze({
     offer,
     index,
     details: Object.freeze(details),
-    dashboard: dashboardV2 ?? dashboardV1,
+    dashboard: dashboardV3 ?? dashboardV2 ?? dashboardV1,
     dashboardV1,
     dashboardV2,
+    dashboardV3,
   });
 }
 
@@ -1493,7 +1492,6 @@ export function publishUiProjection(stateRoot, {
   index,
   details,
   dashboard,
-  dashboardV1,
   offer,
   now = Date.now(),
   __testFaultInjection,
@@ -1508,7 +1506,6 @@ export function publishUiProjection(stateRoot, {
     index,
     details,
     dashboard,
-    dashboardV1,
     offer,
     projectFingerprint,
     stateRootIdentity: expectedRootIdentity,
@@ -1522,11 +1519,8 @@ export function publishUiProjection(stateRoot, {
     let removed = cleanupUiProjectionTempsUnlocked(paths, projection.root);
     const offerSource = boundedJson(clean.offer, MAX_REQUEST_BYTES, "ui-protocol-offer");
     const indexSource = boundedJson(clean.index, UI_PROTOCOL_LIMITS.indexBytes, "ui-projection-index");
-    const dashboardV1Source = clean.dashboardV1
-      ? boundedJson(clean.dashboardV1, UI_PROTOCOL_LIMITS.dashboardBytes, "ui-dashboard-v1")
-      : null;
-    const dashboardV2Source = clean.dashboardV2
-      ? boundedJson(clean.dashboardV2, UI_PROTOCOL_LIMITS.dashboardBytes, "ui-dashboard-v2")
+    const dashboardV3Source = clean.dashboardV3
+      ? boundedJson(clean.dashboardV3, UI_PROTOCOL_LIMITS.dashboardBytes, "ui-dashboard-v3")
       : null;
     const detailSources = new Map(clean.details.map((detail) => [
       projectionDetailPath(projection, detail.proposalId),
@@ -1535,8 +1529,7 @@ export function publishUiProjection(stateRoot, {
     const planned = new Map([
       [projection.offer, offerSource],
       [projection.index, indexSource],
-      ...(dashboardV1Source ? [[projection.dashboard, dashboardV1Source]] : []),
-      ...(dashboardV2Source ? [[projection.dashboardV2, dashboardV2Source]] : []),
+      ...(dashboardV3Source ? [[projection.dashboardV3, dashboardV3Source]] : []),
       ...detailSources,
     ]);
     assertUiProjectionPublication(paths, planned);
@@ -1545,8 +1538,7 @@ export function publishUiProjection(stateRoot, {
     });
     for (const [filePath, source] of detailSources) writeProjectionFile(filePath, source);
     __testFaultInjection?.("ui-projection-after-details", { generation: clean.index.generation });
-    if (dashboardV1Source) writeProjectionFile(projection.dashboard, dashboardV1Source);
-    if (dashboardV2Source) writeProjectionFile(projection.dashboardV2, dashboardV2Source);
+    if (dashboardV3Source) writeProjectionFile(projection.dashboardV3, dashboardV3Source);
     __testFaultInjection?.("ui-projection-after-dashboard", { generation: clean.index.generation });
     fsyncDirectoryChain(paths, projection.details, __testAfterDirectoryChainFsync);
     writeProjectionFile(projection.offer, offerSource);
@@ -1559,8 +1551,9 @@ export function publishUiProjection(stateRoot, {
       index: clean.index,
       details: clean.details,
       dashboard: clean.dashboard,
-      dashboardV1: clean.dashboardV1,
-      dashboardV2: clean.dashboardV2,
+      dashboardV1: null,
+      dashboardV2: null,
+      dashboardV3: clean.dashboardV3,
       staleFilesRemoved: removed,
     });
   });
@@ -1634,7 +1627,11 @@ export function readUiProjection(stateRoot, projectFingerprint, {
   let dashboardError = null;
   let dashboardRead = null;
   let dashboardPath = null;
-  for (const [version, candidatePath] of [[2, generationPaths.dashboardV2], [1, generationPaths.dashboard]]) {
+  for (const [version, candidatePath] of [
+    [3, generationPaths.dashboardV3],
+    [2, generationPaths.dashboardV2],
+    [1, generationPaths.dashboard],
+  ]) {
     try {
       const candidateRead = secureProjectionRead(
         paths,
@@ -1661,7 +1658,7 @@ export function readUiProjection(stateRoot, projectFingerprint, {
       const code = errorReasonCode(error, "ui-dashboard-malformed");
       if (/owner|permissions|symlink|hardlink|replaced|path-rejected/u.test(code)) throw error;
       dashboardError = code || "ui-dashboard-malformed";
-      if (version === 2) break;
+      if (version === 3) break;
     }
   }
   const details = detailProposalIds.map((proposalId) => {
@@ -2555,7 +2552,19 @@ function globalActionAuthority({
     priorState: detail.priorState,
     action: grant.action,
   });
-  return Object.freeze({ grant, detail, health, consumerClaim });
+  // Carry the immutable request and consumer deadlines (H10-001) so the decision
+  // handler can forward them to durable Apply/Undo admission. The request
+  // deadline is the consumed GlobalActionRequest expiry; the consumer deadline
+  // is the mailbox consumer-claim expiry. Both are compared at admission without
+  // clamping. This is an additive carry-through: existing fields are unchanged.
+  return Object.freeze({
+    grant,
+    detail,
+    health,
+    consumerClaim,
+    requestDeadline: clean.expiresAt,
+    consumerDeadline: consumerClaim.expiresAt,
+  });
 }
 
 export async function consumeGlobalActionRequests({
@@ -3225,7 +3234,11 @@ function cleanupUiProjectionUnlocked(paths, projectFingerprint, now) {
     const generation = uiProjectionPaths(paths, { generation: index.generation });
     if (!generation) throw new Error("ui-projection-generation-unavailable");
     let removedDashboard = 0;
-    for (const [version, dashboardPath] of [[1, generation.dashboard], [2, generation.dashboardV2]]) {
+    for (const [version, dashboardPath] of [
+      [1, generation.dashboard],
+      [2, generation.dashboardV2],
+      [3, generation.dashboardV3],
+    ]) {
       const dashboardRead = secureProjectionRead(
         paths,
         dashboardPath,

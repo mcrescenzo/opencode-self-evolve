@@ -1,6 +1,6 @@
 # Self-Evolve Autonomy
 
-This glossary defines the durable v0.3 global-first language. The normative behavior and schema mapping are in `docs/autonomy-contract.md`.
+This glossary defines the durable v0.4 binary-automation language. The normative behavior and schema mapping are in `docs/autonomy-contract.md`.
 
 ## Language
 
@@ -8,25 +8,33 @@ This glossary defines the durable v0.3 global-first language. The normative beha
 The state-root directory that isolates one checkout or worktree's settings, observations, capsules, contribution intents, and contribution links.
 _Avoid_: repository state, global project
 
-**Project analysis mode**:
-The configured `manual` or `auto` policy for admitting passive analysis from one project partition. It does not grant skill-write authority.
-_Avoid_: global mode, repository mode, Yolo mode
+**Automatic recommendations**:
+The state-root-global operator preference that is exactly On or Off. On permits future eligible automatic evidence and recommendation work only when all required data permissions and operational gates pass; it never grants file-write authority.
+_Avoid_: Full Auto, Auto mode, global mode, project analysis mode, on demand
 
-**Project analysis override**:
-The project value `inherit`, `manual`, or `auto` that resolves against the installation's default project analysis mode.
-_Avoid_: repo mode, target mode
+**Automation epoch**:
+The root-global generation that advances exactly once for every accepted Automatic recommendations transition and every required-permission revocation. It fences automatic work without replacing the separate terminal-root or circuit-breaker epochs.
+_Avoid_: mode version, pause generation, root epoch
+
+**Required data permissions**:
+The inseparable automation bundle of durable observations, sanitized excerpts, and cross-project aggregation. Turning Automatic recommendations On enables all three; revoking any one turns automation Off, while restoring one never turns it back On.
+_Avoid_: passive consent, background-analysis consent
 
 **Operational suppressor**:
-A temporary fail-closed condition such as unvalidated boot, pause, kill switch, exclusion, corruption, unsupported host, or open circuit breaker. It suppresses passive analysis without changing the configured project analysis mode.
-_Avoid_: effective mode, forced Manual
+A fail-closed condition such as unvalidated boot, Emergency Stop, project exclusion, corruption, unsupported host, exhausted budget, quiet period, or an open circuit breaker. It can prevent automatic work without rewriting the Automatic recommendations preference.
+_Avoid_: effective mode, forced Off, pause
 
-**Approved global root**:
-An operator-selected canonical global skill-collection path with explicit update/create capabilities and a path-derived root ID. Autonomous targets never include a project-local skill root. See [ADR-0001](docs/adr/0001-global-only-autonomous-targets.md).
-_Avoid_: allowed skill path, repository skill root
+**Host-global skill source**:
+A local global skill collection identified by OpenCode's global-only path, configuration, and resolved-skill projections and accepted only when those projections agree. Project, remote, embedded, cache, ambiguous, or malformed sources are not host-global.
+_Avoid_: approved update root, inferred global folder, project skill path
 
-**Primary creation root**:
-The sole approved global root selected by the operator for new autonomous skill creation. A model may propose a validated logical skill name but cannot select or change this root.
-_Avoid_: default output folder, model-selected root
+**Host-global existing skill**:
+One uniquely resolved existing local skill from a Host-global skill source, bound to its canonical source, precedence, logical name, path, and current content generation. It needs no Self-Evolve root setup.
+_Avoid_: allowlisted existing skill, project target, cached skill
+
+**Explicit creation root**:
+The operator-selected canonical global skill collection used only to place a new skill. Host-global existing-skill discovery does not require it. See [ADR-0006](docs/adr/0006-host-authoritative-existing-skill-discovery.md).
+_Avoid_: approved update root, default output folder, model-selected root
 
 **Evidence domain**:
 A project-local independence identity derived from canonical source lineage when that lineage is known. It is never persisted in global records.
@@ -69,5 +77,5 @@ The live server integration that leases and processes a global action request. I
 _Avoid_: acting project runtime, source runtime
 
 **Explicit global write**:
-An Apply or Undo authorized by a fresh operator action bound to root, target, recommendation version, support set, content hashes, nonce, and expiry. Auto analysis never grants this authority. See [ADR-0004](docs/adr/0004-explicit-only-global-writes.md).
-_Avoid_: auto-apply, Yolo apply
+An Apply or Undo authorized by a fresh operator action bound to source/root, target, recommendation version, support set, content hashes, nonce, and expiry. Automatic recommendations never grants this authority. See [ADR-0004](docs/adr/0004-explicit-only-global-writes.md).
+_Avoid_: auto-apply, automatic write, Yolo apply

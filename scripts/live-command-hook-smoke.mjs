@@ -315,19 +315,26 @@ async function runDirectPluginChildProbe({ pluginPath, projectDir, baseEnv, conf
     }
     const stateLayoutCreated = existsSync(settingsPath);
     if (!stateLayoutCreated) throw new Error(`direct plugin child did not boot durable state at ${settingsPath}`);
-    const commandResult = await withTimeout(executeSessionCommand(baseUrl, sessionId, projectDir), "direct plugin child command");
-    const messages = await readSessionMessages(baseUrl, sessionId, projectDir);
     const expectedHealth = `Self-evolve health: host ${officialHealth.version}; source global-health`;
-    const commandResultTexts = (commandResult?.parts ?? [])
-      .map((part) => typeof part?.text === "string" ? part.text.slice(0, 500) : "")
-      .filter(Boolean);
-    const sessionMessageTexts = messages
-      .flatMap((message) => message?.parts ?? [])
-      .map((part) => typeof part?.text === "string" ? part.text.slice(0, 500) : "")
-      .filter(Boolean)
-      .slice(-10);
-    const commandHookExecuted = [...commandResultTexts, ...sessionMessageTexts]
-      .some((text) => text.includes(expectedHealth));
+    let commandResult;
+    let commandResultTexts = [];
+    let sessionMessageTexts = [];
+    let commandHookExecuted = false;
+    for (let attempt = 0; attempt < 100 && !commandHookExecuted; attempt += 1) {
+      commandResult = await withTimeout(executeSessionCommand(baseUrl, sessionId, projectDir), "direct plugin child command");
+      const messages = await readSessionMessages(baseUrl, sessionId, projectDir);
+      commandResultTexts = (commandResult?.parts ?? [])
+        .map((part) => typeof part?.text === "string" ? part.text.slice(0, 500) : "")
+        .filter(Boolean);
+      sessionMessageTexts = messages
+        .flatMap((message) => message?.parts ?? [])
+        .map((part) => typeof part?.text === "string" ? part.text.slice(0, 500) : "")
+        .filter(Boolean)
+        .slice(-10);
+      commandHookExecuted = [...commandResultTexts, ...sessionMessageTexts]
+        .some((text) => text.includes(expectedHealth));
+      if (!commandHookExecuted) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     report = {
       pid: child.pid,
       sessionId,
@@ -398,7 +405,8 @@ import { openStore, projectFingerprintFor } from ${JSON.stringify(pathToFileURL(
 import * as schemas from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-schemas.js")).href)};
 import * as commands from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-commands.js")).href)};
 import * as inventory from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-inventory.js")).href)};
-import { createControlRequest, pollControlResponse, readControlState, submitControlRequest } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-bridge.js")).href)};
+import { createUiOperationRequest, pollUiOperationResponse, readUiProjection, submitUiOperationRequest } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-bridge.js")).href)};
+import { UI_CAPABILITIES, UI_OPERATION_PROTOCOL_VERSION, UI_PROJECTION_VERSION } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "self-evolve-ui-protocol.js")).href)};
 
 let smokeStarted = false;
 
@@ -427,76 +435,27 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
     config: async (cfg) => {
       if (smokeStarted) return;
       smokeStarted = true;
-      const compatibilityHooks = await CompatibilitySelfEvolvePlugin(ctx, { durableAutonomy: false, now: () => 42_000 });
+      let retiredAnalyzerOptionRejected = false;
+      try {
+        await CompatibilitySelfEvolvePlugin(ctx, { durableAutonomy: false });
+      } catch (error) {
+        retiredAnalyzerOptionRejected = /durableAutonomy-option-retired-v04/.test(String(error?.message ?? error));
+      }
       cfg.model = cfg.model || "noop/noop";
       cfg.agent = cfg.agent || {};
-      await compatibilityHooks.config(cfg);
+      const registrationHooks = await SelfEvolvePlugin(ctx);
+      await registrationHooks.config(cfg);
+      const legacyAnalyzer = cfg.agent["mcrescenzo.self-evolve.analyzer"] ?? cfg.agent["self-evolve-analyzer"];
+      const synthesizer = cfg.agent["mcrescenzo.self-evolve.synthesizer"];
+      const critic = cfg.agent["mcrescenzo.self-evolve.critic"];
       setTimeout(() => { void (async () => {
       const runningHealthResponse = await fetch(new URL("/global/health", ctx.serverUrl), { redirect: "error" });
       const runningHealth = { data: await runningHealthResponse.json() };
-
       const sessionID = "live-smoke-session";
+      await waitForStartup(registrationHooks, "registration-startup");
       const output = { parts: [{ type: "text", text: "original" }] };
       const originalParts = output.parts;
-      const status = await runCommand(compatibilityHooks, output, sessionID, "status");
-      const pause = await runCommand(compatibilityHooks, output, sessionID, "pause");
-      const pausedStatus = await runCommand(compatibilityHooks, output, sessionID, "status");
-      const resume = await runCommand(compatibilityHooks, output, sessionID, "resume");
-      const finalStatus = await runCommand(compatibilityHooks, output, sessionID, "status");
-      const analyzer = cfg.agent["mcrescenzo.self-evolve.analyzer"] ?? cfg.agent["self-evolve-analyzer"];
-      const lifecycleCalls = { messages: [], create: [], prompt: [], abort: [], showToast: [], promptAsync: [] };
-      const lifecycleProposal = {
-        reason: "No-token smoke accepted proposal.",
-        proposal: {
-          title: "Add troubleshooting docs for smoke lifecycle",
-          summary: "The smoke transcript mentions troubleshooting docs, so a small repo-local note would help future validation.",
-          evidence: ["The no-token smoke transcript discusses troubleshooting docs and analyzer lifecycle validation."],
-          target: { path: "docs/troubleshooting.md", surface: "repo-local docs", symbol: "" },
-          placement: "repo-local",
-          risk: "low",
-          riskMitigation: "Keep the troubleshooting docs change small and advisory-only.",
-          confidence: 0.91,
-          suggestedAction: "Add troubleshooting docs guidance for the no-token analyzer lifecycle smoke.",
-        },
-      };
-      const lifecycleCtx = {
-        directory: ctx.directory,
-        client: {
-          tui: {
-            showToast: async (args) => {
-              lifecycleCalls.showToast.push(args);
-              return { data: {} };
-            },
-          },
-          session: {
-            messages: async (args) => {
-              lifecycleCalls.messages.push(args);
-              return { data: [{ id: "smoke-message", role: "user", parts: [{ type: "text", text: "Please check troubleshooting docs for analyzer lifecycle validation." }] }] };
-            },
-            create: async (args) => {
-              lifecycleCalls.create.push(args);
-              return { data: { id: "smoke-analyzer-session" } };
-            },
-            prompt: async (args) => {
-              lifecycleCalls.prompt.push(args);
-              return { data: { parts: [{ type: "text", text: JSON.stringify(lifecycleProposal) }] } };
-            },
-            promptAsync: async (args) => {
-              lifecycleCalls.promptAsync.push(args);
-              return { data: {} };
-            },
-            abort: async (args) => {
-              lifecycleCalls.abort.push(args);
-              return { data: {} };
-            },
-          },
-        },
-      };
-      const lifecycleHooks = await CompatibilitySelfEvolvePlugin(lifecycleCtx, { durableAutonomy: false, now: () => 43_000, deliveryTimeoutMs: 50, sdkTimeoutMs: 50, cleanupTimeoutMs: 50 });
-      await lifecycleHooks.config({ model: "noop/noop", agent: {} });
-      const lifecycleOutput = { parts: [{ type: "text", text: "original" }] };
-      const lifecycle = await runCommand(lifecycleHooks, lifecycleOutput, "lifecycle-session", "scan");
-      const analyzerLeakPattern = /Analyze this OpenCode session excerpt|Redacted transcript excerpt|JSON schema|\\{"proposal"|self-evolve-analyzer|mcrescenzo\.self-evolve\.analyzer/;
+      const status = await runCommand(registrationHooks, output, sessionID, "status");
 
       const durableFingerprint = projectFingerprintFor("", ctx.worktree || ctx.directory);
       const hostStateRoot = ${JSON.stringify(path.join(stateHome, "opencode-live-state"))};
@@ -535,7 +494,7 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
       await waitForStartup(durableAuto, "durable-auto-startup");
       const durableSkillRoot = path.join(ctx.directory, "durable-control-skills");
       mkdirSync(durableSkillRoot, { recursive: true });
-      // v0.3 retires yolo: the live host must refuse the command outright.
+      // v0.4 removes yolo: the live host must refuse the command outright.
       const durableYoloOutput = { parts: [] };
       await durableAuto["command.execute.before"]({ command: "self-evolve", sessionID: "durable-yolo", arguments: "yolo confirm --allowlist " + durableSkillRoot }, durableYoloOutput);
       await durableAuto.dispose();
@@ -557,7 +516,14 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
       writeFileSync(exactSkillPath, currentContent, "utf8");
       const exactStore = openStore(exactStateRoot, { projectFingerprint: durableFingerprint });
       const exactSettings = exactStore.getSettings();
-      exactStore.setGlobalSettings(schemas.makeGlobalSettings({ ...exactSettings.global, mode: "auto", allowedSkillRoots: [exactSkillRoot], updatedAt: Date.now() }));
+      const exactSettingsUpdate = exactStore.setGlobalSettings(schemas.makeGlobalSettings({
+        ...exactSettings.global,
+        allowedSkillRoots: [exactSkillRoot],
+        updatedAt: Date.now(),
+      }));
+      if (!exactSettingsUpdate?.allowedSkillRoots?.includes(exactSkillRoot)) {
+        throw new Error("live-allowlist-update-failed:" + (exactSettingsUpdate?.reason ?? "unknown"));
+      }
       const roots = inventory.loadAllowlist({ globalSkillRoots: [exactSkillRoot] }).canonicalRoots;
       const records = inventory.discoverSkills(roots);
       const target = records[0];
@@ -596,37 +562,55 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
       writeFileSync(staleBridgeFile, "{}", "utf8");
       const exactBoot = await exactIntegration.boot({ hostVersion: runningHealth.data.version });
       const mailboxCleanupExecuted = !existsSync(staleBridgeFile);
-      const controlState = readControlState(exactStateRoot, durableFingerprint);
-      const controlRequest = createControlRequest({ controlState, action: "set-consent", payload: { key: "durableObservations", enabled: true }, timestamp: Date.now(), requestId: "live-control" });
-      submitControlRequest(exactStateRoot, controlRequest);
+      const projection = readUiProjection(exactStateRoot, durableFingerprint, {
+        now: Date.now(),
+        clientOffer: {
+          projectionVersions: [UI_PROJECTION_VERSION],
+          operationProtocolVersions: [UI_OPERATION_PROTOCOL_VERSION],
+          capabilities: UI_CAPABILITIES,
+        },
+      });
+      const permissionGrant = projection.effectiveIndexActions.find((grant) => grant.action === "set-permission");
+      if (!permissionGrant) throw new Error("live-permission-grant-unavailable");
+      const operationRequest = createUiOperationRequest({
+        projection: projection.index,
+        grant: permissionGrant,
+        action: "set-permission",
+        payload: {
+          permission: "durableObservations",
+          enabled: true,
+          settingsVersion: projection.dashboard.settings.globalSettingsVersion,
+        },
+        timestamp: Date.now(),
+        requestId: "live-operation",
+      });
+      submitUiOperationRequest(exactStateRoot, operationRequest);
       await exactIntegration.processMailbox();
-      const controlResponse = pollControlResponse(exactStateRoot, durableFingerprint, controlRequest.requestId);
-      const controlPersisted = exactStore.getSettings().global.consent.durableObservations === true;
-      const staleControlFile = path.join(exactStateRoot, "self-evolve", "bridge", durableFingerprint, "control-responses", "stale-control.json");
-      writeFileSync(staleControlFile, "{}", "utf8");
-      const controlCleanup = await exactIntegration.runRetentionSweep();
+      const operationResponse = pollUiOperationResponse(exactStateRoot, operationRequest);
+      const permissionPersisted = exactStore.getAutomationState().global.consent.durableObservations === true;
+      const staleOperationFile = path.join(exactStateRoot, "self-evolve", "bridge", durableFingerprint, "operation-responses", "stale-operation.json");
+      writeFileSync(staleOperationFile, "{}", "utf8");
+      const operationCleanup = await exactIntegration.runRetentionSweep();
       const grant = exactStore.readRecords("audit-event").map((record) => record.payload).findLast((event) => event.details?.action === "headless-approval-nonce").details;
       const exactCommand = "/self-evolve approve " + exactProposal.id + " --target-hash " + grant.targetHash + " --proposed-content-hash " + grant.proposedContentHash + " --decision-version " + grant.decisionVersion + " --nonce " + grant.nonce;
       const exactApply = await exactIntegration.handleCommand(exactCommand);
       const exactReplay = await exactIntegration.handleCommand(exactCommand);
       await exactIntegration.shutdown();
       await durableManualRestart.dispose();
-      await compatibilityHooks.dispose();
+      await registrationHooks.dispose();
 
       const actualOpenCodeProcess = {
         serverTargetLoaded: typeof SelfEvolvePlugin === "function",
         tuiTargetLoaded: Boolean(SelfEvolveTuiModule?.id === "mcrescenzo.self-evolve" && typeof SelfEvolveTuiModule.tui === "function"),
-        durableIntegrationBooted: /Self-evolve status:/u.test(text(durableManualOutput)),
+        durableIntegrationBooted: /Automatic recommendations:/u.test(text(durableManualOutput)),
         runningVersionFromGlobalHealth: runningHealth?.data?.healthy === true && typeof runningHealth?.data?.version === "string",
         durableHealthReportsGlobalVersion: text(durableHealthOutput).includes("host " + runningHealth.data.version),
         globalStateLayoutCreated: existsSync(path.join(hostStateRoot, "self-evolve", "global", "settings.json")),
         projectStateLayoutCreated: existsSync(path.join(hostStateRoot, "self-evolve", durableFingerprint)),
         startupRetentionExecuted,
-        manualCommandRouted: /stored mode|effective mode/u.test(text(durableManualOutput)),
-        autoCommandRouted: /changed to auto/u.test(text(durableAutoOutput)),
-        yoloCommandRetired: /retired in v0\.3/u.test(text(durableYoloOutput)),
-        ordinaryDefaultDurableManual: /stored mode manual|effective mode manual/u.test(text(durableManualOutput)),
-        stableManualEventHookInstalled: typeof durableManual.event === "function" && typeof durableManualRestart.event === "function",
+        retiredModeCommandsRejected: /was removed in Self-evolve v0\.4/u.test(text(durableAutoOutput)) && /was removed in Self-evolve v0\.4/u.test(text(durableManualResetOutput)),
+        yoloCommandRetired: /was removed in Self-evolve v0\.4/u.test(text(durableYoloOutput)),
+        stableEventHookInstalled: typeof durableManual.event === "function" && typeof durableManualRestart.event === "function",
         autoPassiveHookRegistered: typeof durableAuto.event === "function",
         autoRestartPassiveHookRegistered: typeof durableYolo.event === "function",
         noWorkingSessionInjection: injectionCalls.promptAsync === 0 && injectionCalls.appendPrompt === 0,
@@ -643,9 +627,12 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
         mailboxLayoutCreated: existsSync(path.join(exactStateRoot, "self-evolve", "bridge", durableFingerprint, "requests")),
         mailboxPollingBooted: exactBoot.ok === true,
         mailboxCleanupExecuted,
-        controlStatePublished: controlState?.projectFingerprint === durableFingerprint && typeof controlState?.nonce === "string",
-        controlMailboxAccepted: controlResponse?.ok === true && controlPersisted,
-        controlCleanupExecuted: controlCleanup.ok === true && !existsSync(staleControlFile),
+        currentProjectionPublished: Boolean(
+          projection.index?.projectFingerprint === durableFingerprint
+          && projection.dashboard?.settings?.globalSettingsVersion,
+        ),
+        operationMailboxAccepted: operationResponse?.ok === true && permissionPersisted,
+        operationCleanupExecuted: operationCleanup.ok === true && !existsSync(staleOperationFile),
         mailboxDisposeCompleted: true,
       };
 
@@ -653,30 +640,37 @@ export default async function SelfEvolveLiveSmokePlugin(ctx) {
         ok: true,
         pluginLoadedInOpenCode: true,
         sessionID,
-        commands: { status, pause, pausedStatus, resume, finalStatus, lifecycle },
+        commands: { status },
         checks: {
-          analyzerRegistered: Boolean(analyzer?.hidden && analyzer?.permission?.edit === "deny" && analyzer?.permission?.bash === "deny"),
+          retiredAnalyzerOptionRejected,
+          legacyAnalyzerNotRegistered: legacyAnalyzer === undefined,
+          providerAgentsRegistered: Boolean(
+            synthesizer?.hidden && synthesizer?.permission?.edit === "deny" && synthesizer?.permission?.bash === "deny"
+            && critic?.hidden && critic?.permission?.edit === "deny" && critic?.permission?.bash === "deny"
+          ),
           tuiTargetImported: Boolean(SelfEvolveTuiModule?.id === "mcrescenzo.self-evolve" && typeof SelfEvolveTuiModule.tui === "function"),
-          statusText: /Self-evolve status: active/.test(status.text),
-          pauseText: /paused/i.test(pause.text),
-          pausedStatusText: /Self-evolve status: paused/.test(pausedStatus.text),
-          resumeText: /resumed/i.test(resume.text),
-          finalStatusText: /Self-evolve status: active/.test(finalStatus.text),
-          partsArrayPreserved: output.parts === originalParts && [status, pause, pausedStatus, resume, finalStatus].every((item) => item.samePartsArray),
-          noPassiveHooks: compatibilityHooks.event === undefined && compatibilityHooks["chat.message"] === undefined,
-          lifecycleMessagesRead: lifecycleCalls.messages.length === 1,
-          lifecycleAnalyzerCreated: lifecycleCalls.create.length === 1 && ["mcrescenzo.self-evolve.analyzer", "self-evolve-analyzer"].includes(lifecycleCalls.create[0].body?.agent),
-          lifecycleAnalyzerPrompted: lifecycleCalls.prompt.length === 1 && /Analyze this OpenCode session excerpt/.test(lifecycleCalls.prompt[0].body?.parts?.[0]?.text || ""),
-          lifecycleCleanup: lifecycleCalls.abort.length === 1,
-          lifecycleToast: lifecycleCalls.showToast.length === 1,
-          lifecycleNoPromptAsync: lifecycleCalls.promptAsync.length === 0,
-          lifecycleAcceptedOutput: /found proposal se-1/.test(lifecycle.text) && /Suggested action:/.test(lifecycle.text),
-          lifecycleNoAnalyzerLeak: !analyzerLeakPattern.test(lifecycle.text),
+          statusText: /Automatic recommendations:/u.test(status.text),
+          partsArrayPreserved: output.parts === originalParts && status.samePartsArray,
+          stableEventHookInstalled: typeof registrationHooks.event === "function",
+          noPassiveChatHook: registrationHooks["chat.message"] === undefined,
           ...actualOpenCodeProcess,
           ...inProcessFixture,
         },
         evidenceSplit: { actualOpenCodeProcess, inProcessFixture },
-        diagnostics: { serverUrlType: typeof ctx.serverUrl, serverUrlValue: String(ctx.serverUrl ?? ""), durableHealthText: text(durableHealthOutput) },
+        diagnostics: {
+          serverUrlType: typeof ctx.serverUrl,
+          serverUrlValue: String(ctx.serverUrl ?? ""),
+          durableHealthText: text(durableHealthOutput),
+          durableAutoText: text(durableAutoOutput),
+          durableYoloText: text(durableYoloOutput),
+          durableManualResetText: text(durableManualResetOutput),
+          exactApply: {
+            ok: exactApply?.ok,
+            reason: exactApply?.reason,
+            result: exactApply?.result,
+            responseText: exactApply?.responseText,
+          },
+        },
       };
       console.log(${JSON.stringify(SENTINEL)} + JSON.stringify(payload));
       })().catch((error) => console.log(${JSON.stringify(SENTINEL)} + JSON.stringify({ ok: false, error: String(error?.message ?? error), checks: {} }))); }, 0);
@@ -715,14 +709,14 @@ export default async function SelfEvolveRestartProbe(ctx) {
         const officialHealthResponse = await fetch(new URL("/global/health", ctx.serverUrl), { redirect: "error" });
         const officialHealth = await officialHealthResponse.json();
         let command = "";
-        if (phase === "seed-auto") command = "auto";
-        if (phase === "auto") {
+        if (phase === "seed-off") command = "off";
+        if (phase === "off") {
           const skillRoot = path.join(ctx.directory, "restart-probe-skills");
           mkdirSync(skillRoot, { recursive: true });
-          // The retired command must be refused without disturbing stored auto.
+          // The retired command must be refused without disturbing stored Off.
           command = "yolo confirm --allowlist " + skillRoot;
         }
-        if (phase === "retired-yolo") command = "manual";
+        if (phase === "retired-yolo") command = "on";
         const changed = command ? await run(command) : "";
         const serverStateRoot = (await ctx.client.path.get({ query: { directory: ctx.directory } })).data.state;
         const tuiStateRoot = initialStateRootSelection({ hostStateRoot: serverStateRoot, environment: {} }).stateRoot;
@@ -835,16 +829,16 @@ export default async function SelfEvolveRestartProbe(ctx) {
     const payload = await withTimeout(smokePayload, "self-evolve live command hook smoke");
     assertSmokePayload(payload);
     const restartPhases = [];
-    for (const phase of ["seed-auto", "auto", "retired-yolo", "manual"]) {
+    for (const phase of ["seed-off", "off", "retired-yolo", "on"]) {
       restartPhases.push(await runRestartProbe({ phase, probePlugin: restartProbePlugin, projectDir, baseEnv: env, configPath: restartProbeConfig }));
     }
-    const [seedAuto, autoRestart, retiredYolo, manualRestart] = restartPhases;
+    const [seedOff, offRestart, retiredYolo, onRestart] = restartPhases;
     const restartChecks = {
-      ordinaryDefaultDurableManual: seedAuto.passiveHook === true && /effective mode manual|stored mode manual/u.test(seedAuto.before),
-      persistedAutoFreshProcessHook: autoRestart.passiveHook === true && /effective mode auto|stored mode auto/u.test(autoRestart.before),
-      retiredYoloLeavesAutoIntact: retiredYolo.passiveHook === true && /effective mode auto|stored mode auto/u.test(retiredYolo.before)
-        && /retired in v0\.3/u.test(autoRestart.changed),
-      persistedManualFreshProcessStableHook: manualRestart.passiveHook === true && /effective mode manual|stored mode manual/u.test(manualRestart.before),
+      ordinaryDefaultIsOn: seedOff.passiveHook === true && /Automatic recommendations: On/u.test(seedOff.before),
+      persistedOffFreshProcessHook: offRestart.passiveHook === true && /Automatic recommendations: Off/u.test(offRestart.before),
+      retiredYoloLeavesOffIntact: retiredYolo.passiveHook === true && /Automatic recommendations: Off/u.test(retiredYolo.before)
+        && /was removed in Self-evolve v0\.4/u.test(offRestart.changed),
+      persistedOnFreshProcessStableHook: onRestart.passiveHook === true && /Automatic recommendations: On/u.test(onRestart.before),
       noPassiveChatHooks: restartPhases.every((item) => item.chatHookAbsent === true),
       serverTuiStateRootsMatch: restartPhases.every((item) => item.serverStateRoot === item.tuiStateRoot && item.serverStateRoot === path.join(stateHome, "opencode")),
       productionPluginReportsCliVersion: restartPhases.every((item) => item.officialHealth?.version === cliVersion && item.healthText.includes("host " + cliVersion) && item.healthText.includes("source global-health")),

@@ -11,7 +11,6 @@ import {
 import path from "node:path";
 import {
   BRIDGE_ACTOR,
-  BRIDGE_SCHEMA_VERSION,
   BRIDGE_TTL_MS,
   cleanupBridge,
   consumeGlobalActionRequests,
@@ -20,13 +19,12 @@ import {
   pendingRequestCounts,
   publishGlobalRecommendationProjection,
   publishProjectParticipationSidecars,
-  publishControlState,
   publishUiProjection,
   readGlobalRecommendationProjection,
 } from "./self-evolve-bridge.js";
 import {
-  LEGACY_SELF_EVOLVE_AGENTS,
-  SELF_EVOLVE_ANALYZER_AGENT,
+  HISTORICAL_SELF_EVOLVE_AGENTS,
+  HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT,
   SELF_EVOLVE_CRITIC_AGENT,
   SELF_EVOLVE_SYNTHESIZER_AGENT,
   isDurableLifecycleEvent,
@@ -39,6 +37,7 @@ import {
 import { createGlobalDecisionDomain } from "./self-evolve-applier.js";
 import { stateRootIdentity, validateStateRootBoundary } from "./self-evolve-state-root.js";
 import { errorReasonCode, latestByLogicalId } from "./self-evolve-schemas.js";
+import { ROOT_EPOCH_REINITIALIZE_CONFIRMATION } from "./self-evolve-epoch.js";
 import {
   UI_ACTION_CAPABILITIES,
   UI_CAPABILITIES,
@@ -62,11 +61,11 @@ const DEFAULT_ROLLOUT_GATES = Object.freeze({
   autoReviewRollout: true,
   yoloEnablementThreshold: Object.freeze({ minSynthesesObserved: 10, minSuccessRate: 0.8 }),
 });
-const HIDDEN_ANALYZER_AGENTS = new Set([
-  SELF_EVOLVE_ANALYZER_AGENT,
+const KNOWN_HIDDEN_SESSION_AGENTS = new Set([
+  HISTORICAL_SELF_EVOLVE_ANALYZER_AGENT,
   SELF_EVOLVE_SYNTHESIZER_AGENT,
   SELF_EVOLVE_CRITIC_AGENT,
-  ...Object.values(LEGACY_SELF_EVOLVE_AGENTS),
+  ...Object.values(HISTORICAL_SELF_EVOLVE_AGENTS),
 ]);
 const SESSION_ANCESTRY_MAX_DEPTH = 16;
 const SESSION_ANCESTRY_TIMEOUT_MS = 250;
@@ -94,7 +93,7 @@ function completionReason(result, fallback) {
   return result?.ok === true ? "accepted" : String(result?.reason ?? fallback).slice(0, 256);
 }
 
-function analyzerSessionState(session) {
+function hiddenSessionState(session) {
   return String(session?.state ?? session?.status?.type ?? session?.status ?? "").toLowerCase();
 }
 
@@ -102,7 +101,7 @@ function latestById(records) {
   return latestByLogicalId(records, { withPayload: true });
 }
 
-export async function recoverOrphanedAnalyzerSessions(client, directory, {
+export async function recoverOrphanedHiddenSessions(client, directory, {
   store,
   projectFingerprint,
   rootIdentity,
@@ -114,7 +113,7 @@ export async function recoverOrphanedAnalyzerSessions(client, directory, {
   const ctx = { client, directory };
   const candidates = (await listSessions(ctx, { timeoutMs, signal, label: "session-list" })).filter((session) => {
     const agent = session?.agent ?? session?.mode ?? session?.info?.agent;
-    return HIDDEN_ANALYZER_AGENTS.has(agent);
+    return KNOWN_HIDDEN_SESSION_AGENTS.has(agent);
   }).slice(0, maxSessions);
   const outcomes = [];
   for (const session of candidates) {
@@ -150,7 +149,7 @@ export async function recoverOrphanedAnalyzerSessions(client, directory, {
       continue;
     }
     try {
-      const state = analyzerSessionState(session);
+      const state = hiddenSessionState(session);
       if (!TERMINAL_SESSION_STATES.has(state)) {
         try { await cleanupSession(ctx, id, { timeoutMs, signal, label: "session-abort", optional: true }); }
         catch {}
@@ -240,10 +239,10 @@ function projectionTargetReader(inventoryModule) {
   };
 }
 
-function globalProjectionTargetReader(inventoryModule, store) {
+function globalProjectionTargetReader(inventoryModule, getCatalog) {
   const read = projectionTargetReader(inventoryModule);
   return (recommendation) => {
-    const policy = store.getSettings()?.global?.globalRootPolicy;
+    const policy = getCatalog()?.policy;
     const root = policy?.roots?.find((value) => value.rootId === recommendation?.targetBinding?.rootId);
     if (!root) throw new Error("global-projection-root-unavailable");
     return read({
@@ -304,15 +303,13 @@ export function createIntegration({
   let hostRecoveryController;
   let retentionTimer;
   let retentionTask;
-  let controlProjectionKey;
-  let controlProjection;
-  let controlProjectionRefreshAt = 0;
   let uiProjection;
   let uiProjectionDirty = true;
   let uiProjectionRefreshAt = 0;
   let globalProjection;
   let globalProjectionDirty = true;
   let globalProjectionRefreshAt = 0;
+  let activeHostGlobalCatalog = null;
   let sensitiveExportManager;
   let routingSettingsSnapshot;
   let routingSettingsRefreshAt = 0;
@@ -418,12 +415,46 @@ export function createIntegration({
     }
   }
 
+  function automationState() {
+    try {
+      const value = store.getAutomationState?.();
+      return value?.ok ? value : { ok: false, enabled: false, reason: value?.reason ?? "automation-state-unavailable" };
+    } catch (error) {
+      return { ok: false, enabled: false, reason: errorReasonCode(error, "automation-state-unavailable") };
+    }
+  }
+
   function hostOwnershipContext(projectFingerprint = settings()?.repo?.projectFingerprint) {
     return {
       projectFingerprint,
       rootIdentity: options.stateRoot ? stateRootIdentity(options.stateRoot) : store.rootIdentity,
       hostOwnerGeneration,
     };
+  }
+
+  // Refresh the durable root epoch truth and return a stable terminal reason if
+  // the root is terminal (whether by this process or by any peer sharing the
+  // state root). The epoch file lives outside the deletable subtree and is the
+  // cross-process terminal signal. Called at every admission, mailbox, boot,
+  // decision, and publication boundary so a peer's terminal write fails this
+  // process closed promptly.
+  function rootEpochTerminalReason() {
+    if (!options.stateRoot) return null;
+    if (typeof store.refreshRootEpoch !== "function") return null;
+    try {
+      const reason = store.refreshRootEpoch();
+      return reason ?? null;
+    } catch {
+      return "root-epoch-terminal";
+    }
+  }
+
+  // Combined terminal gate: the process-local flag (set when THIS process
+  // accepted purge-all) OR the durable epoch (set when ANY process sharing the
+  // state root accepted purge-all). Every authority boundary checks this.
+  function terminalGateReason() {
+    if (terminalPurge) return "restart-required-after-purge-all";
+    return rootEpochTerminalReason() ? "restart-required-after-purge-all" : null;
   }
 
   function exportManager() {
@@ -441,6 +472,12 @@ export function createIntegration({
 
   function circuitBreakerOpen() {
     try {
+      // H5-001: the durable root-global breaker epoch is the cross-process
+      // open/closed truth. Every admission, provider, and effect boundary
+      // routes through this function, so reading it here gives every boundary
+      // a fresh authoritative view of peer trip/reset writes. A corrupt breaker
+      // epoch fails closed (tripped).
+      if (store.breakerEpochTripped?.() === true) return true;
       const applierOpen = applier.circuitBreakerOpen?.();
       const schedulerBreaker = schedulerInstance?.getCircuitBreaker?.();
       if (applierOpen === true || schedulerBreaker?.open === true) return true;
@@ -451,14 +488,34 @@ export function createIntegration({
     }
   }
 
-  function modeOverrides(current, projectFingerprint) {
+  // H5-001/H5-002: bounded projection-facing view of the durable breaker epoch.
+  // Returns tripped/generation/reason/resetAvailable so the Activity/Errors UX
+  // can show actionable state. Fails closed (tripped) on any read error.
+  function safeBreakerEpochHealth() {
+    try {
+      const state = store.breakerEpochState?.();
+      if (!state || state.ok !== true) {
+        return { tripped: true, generation: null, trippedAt: null, reason: state?.reason ?? "breaker-epoch-unavailable", resetAvailable: false };
+      }
+      return {
+        tripped: state.tripped === true,
+        generation: state.generation ?? null,
+        trippedAt: state.trippedAt ?? null,
+        reason: state.trippedReason ?? null,
+        resetAvailable: state.tripped === true,
+      };
+    } catch {
+      return { tripped: true, generation: null, trippedAt: null, reason: "breaker-epoch-unavailable", resetAvailable: false };
+    }
+  }
+
+  function automaticWorkSuppressors(current, projectFingerprint) {
     const processExcluded = options.processExcluded === true
       || options.processExcluded?.has?.(projectFingerprint) === true
       || (typeof options.processExcluded === "function" && options.processExcluded(projectFingerprint) === true)
       || (projectFingerprint !== undefined && current?.repo?.projectFingerprint !== projectFingerprint);
     return {
       killSwitchActive: runtimeKillSwitch || current?.global?.killSwitchActive === true,
-      paused: current?.global?.paused === true,
       circuitBreakerOpen: circuitBreakerOpen(),
       processExcluded,
       repoOptOut: current?.repo?.excluded === true || options.repoOptOut === true,
@@ -467,40 +524,34 @@ export function createIntegration({
     };
   }
 
-  function resolveEffectiveMode(projectFingerprint, current = settings()) {
-    const mode = schemas.resolveMode(current?.global?.mode ?? "manual", current?.repo?.mode ?? "inherit", modeOverrides(current, projectFingerprint));
-    return schemas.Mode?.values?.includes(mode) ? mode : "manual";
-  }
-
-  function configuredProjectMode(current = settings()) {
-    try {
-      return schemas.resolveConfiguredProjectAnalysisMode(
-        current?.global?.mode ?? "manual",
-        current?.repo?.mode ?? "inherit",
-      );
-    } catch {
-      return "manual";
+  function getProjectOperationalState(projectFingerprint) {
+    const automation = automationState();
+    if (!automation.ok || !automation.enabled) {
+      return {
+        automaticRecommendationsEnabled: false,
+        automaticWorkAllowed: false,
+        reason: automation.reason ?? "automatic-recommendations-disabled",
+      };
     }
+    const targetFingerprint = projectFingerprint ?? automation.repo?.projectFingerprint;
+    const suppressors = automaticWorkSuppressors({ global: automation.global, repo: automation.repo }, targetFingerprint);
+    const reason = !bootValidated ? "boot-not-validated"
+      : suppressors.killSwitchActive ? "emergency-stop"
+        : suppressors.processExcluded || suppressors.repoOptOut ? "project-excluded"
+          : suppressors.corrupt ? "corrupt-state"
+            : suppressors.circuitBreakerOpen ? "circuit-breaker"
+              : !suppressors.hostSupported ? "host-unsupported"
+                : null;
+    return {
+      automaticRecommendationsEnabled: true,
+      automaticWorkAllowed: reason === null,
+      reason,
+    };
   }
 
-  function getProjectOperationalState(projectFingerprint, current = settings()) {
-    const configuredMode = configuredProjectMode(current);
-    const overrides = modeOverrides(current, projectFingerprint ?? current?.repo?.projectFingerprint);
-    return schemas.resolveProjectOperationalState({
-      configuredMode,
-      bootValidated,
-      paused: overrides.paused,
-      killSwitchActive: overrides.killSwitchActive,
-      excluded: overrides.processExcluded || overrides.repoOptOut,
-      corrupt: overrides.corrupt,
-      circuitBreakerOpen: overrides.circuitBreakerOpen,
-      hostSupported: overrides.hostSupported,
-    });
-  }
-
-  function backgroundRestartRequired(current = settings()) {
-    return options.passiveEventHookInstalled === false
-      && resolveEffectiveMode(current?.repo?.projectFingerprint, current) !== "manual";
+  function backgroundRestartRequired() {
+    const automation = automationState();
+    return options.passiveEventHookInstalled === false && automation.ok && automation.enabled;
   }
 
   function rolloutMetrics() {
@@ -572,10 +623,10 @@ export function createIntegration({
       approvedSkillFolderCount: savedRoots.length,
     }, undefined, "self-evolve-command");
     invalidateRoutingSettings();
-    syncSchedulerMode(settings()?.repo?.projectFingerprint, `command-allowlist-${command.action}`);
+    syncSchedulerAdmission(settings()?.repo?.projectFingerprint, `command-allowlist-${command.action}`);
     return {
       ok: true,
-      responseText: `Approved skill folders updated (${savedRoots.length}). No mode or consent setting changed.`,
+      responseText: `Creation-policy suggestions updated (${savedRoots.length}). Automatic recommendations and data permissions are unchanged.`,
     };
   }
 
@@ -587,16 +638,17 @@ export function createIntegration({
       && yoloThresholdMet();
   }
 
-  function evaluateAuthority({ proposal, decision, mode, headless = false }) {
+  function evaluateAuthority({ proposal, decision, headless = false }) {
     const current = settings();
-    const effectiveMode = resolveEffectiveMode(proposal?.projectFingerprint);
-    const requestedMode = mode === effectiveMode ? mode : effectiveMode;
     const exactApproval = decision?.proposalId === proposal?.id
       && decision?.targetHash === proposal?.skillTarget?.currentHash
       && decision?.proposedContentHash === proposal?.proposedContentHash
       && decision?.newState === "approved";
     return schemas.evaluateApplyAuthority({
-      mode: requestedMode,
+      // The retained project-proposal compatibility path still calls the v0.3
+      // predicate, whose `auto` input now means only "an explicit decision may
+      // be applied". Automatic recommendations On/Off is never consulted.
+      mode: "auto",
       decisionApproved: exactApproval,
       allowlisted: targetAllowlisted(proposal, current),
       releaseGatesPassed: releaseGatesPassed(proposal),
@@ -665,12 +717,16 @@ export function createIntegration({
 
   async function enqueueWork(workItem) {
     if (closed) return { ok: true, status: "cancelled", reason: "integration-closing" };
+    const automation = automationState();
+    if (!automation.ok || !automation.enabled) {
+      return { ok: true, status: "cancelled", result: "suppressed", reason: automation.reason ?? "automatic-recommendations-disabled" };
+    }
     const operational = getProjectOperationalState(workItem.projectFingerprint);
-    if (!operational.passiveAnalysisAllowed) {
+    if (!operational.automaticWorkAllowed) {
       return { ok: true, status: "cancelled", result: "suppressed", reason: operational.reason };
     }
     const key = `${workItem.sessionID}:${workItem.leaseNonce ?? workItem.epoch ?? now()}`;
-    const item = { ...workItem, key, mode: operational.configuredMode, stage: "pipeline", startedAt: now() };
+    const item = { ...workItem, key, stage: "pipeline", startedAt: now() };
     const controller = new AbortController();
     const promise = runEvolutionCycle({
       ...workItem,
@@ -678,6 +734,7 @@ export function createIntegration({
       trigger: workItem.trigger ?? "scheduler",
       options: {
         ...(workItem.options ?? {}),
+        automationStamp: automation.stamp,
         signal: controller.signal,
         reservePassiveProviderCalls: (count, context) => schedulerInstance.reservePassiveProviderCalls(count, {
           ...context,
@@ -685,12 +742,16 @@ export function createIntegration({
         }),
       },
     });
-    inFlight.set(key, { item, controller, promise });
+    inFlight.set(key, { item, controller, promise, kind: "passive" });
     try {
       const result = await promise;
-      return controller.signal.aborted
-        ? { ok: true, status: "cancelled", result: "cancelled", reason: "integration-shutdown" }
-        : result;
+      if (controller.signal.aborted) {
+        const abortReason = typeof controller.signal.reason === "string" && controller.signal.reason
+          ? controller.signal.reason
+          : "integration-shutdown";
+        return { ok: true, status: "cancelled", result: "cancelled", reason: abortReason };
+      }
+      return result;
     } finally {
       inFlight.delete(key);
     }
@@ -714,6 +775,7 @@ export function createIntegration({
       store,
       inventory,
       now,
+      getCatalog: () => activeHostGlobalCatalog,
       getSuppressors: () => ({
         circuitBreakerOpen: circuitBreakerOpen(),
         emergencyStop: runtimeKillSwitch,
@@ -755,11 +817,12 @@ export function createIntegration({
     }
   }
 
-  function syncSchedulerMode(projectFingerprint, reason = "settings-refresh", current) {
-    const operational = getProjectOperationalState(projectFingerprint, current);
-    const mode = operational.passiveAnalysisAllowed ? operational.configuredMode : "manual";
-    schedulerInstance.setMode?.(mode, reason);
-    return mode;
+  function syncSchedulerAdmission(projectFingerprint, reason = "settings-refresh") {
+    const operational = getProjectOperationalState(projectFingerprint);
+    // Scheduler setMode is a retained internal adapter until that module's
+    // admission flag is renamed; it is not settings or wire authority.
+    schedulerInstance.setMode?.(operational.automaticWorkAllowed ? "auto" : "manual", reason);
+    return operational.automaticWorkAllowed;
   }
 
   function currentProposal(proposalId) {
@@ -920,8 +983,12 @@ export function createIntegration({
       health: {
         runtimeKillSwitch,
         hostSupported: options.hostSupported !== false,
-        passiveEventHookInstalled: options.passiveEventHookInstalled !== false,
+        lifecycleEventHookInstalled: options.passiveEventHookInstalled !== false,
         corrupt,
+        // H5-001/H5-002: expose the durable root-global breaker epoch state so
+        // the projection/Activity-Errors UX is actionable across processes. The
+        // projection combines this with the record-derived breaker state.
+        breakerEpoch: safeBreakerEpochHealth(),
       },
     });
     let built = build(snapshot);
@@ -933,7 +1000,6 @@ export function createIntegration({
       index: built.index,
       details: built.publicationDetails,
       dashboard: built.dashboard,
-      dashboardV1: built.dashboardV1,
       now: timestamp,
     });
     uiProjectionDirty = false;
@@ -962,22 +1028,32 @@ export function createIntegration({
       return globalProjection;
     }
     let snapshot = store.readGlobalProjectionSnapshot();
-    const current = settings();
-    const writeAuthorityReady = bootValidated
-      && !corrupt
-      && options.hostSupported !== false
-      && current?.global?.paused !== true
-      && current?.global?.killSwitchActive !== true
-      && !runtimeKillSwitch
-      && !circuitBreakerOpen()
-      && current?.global?.consent?.durableObservations === true
-      && current?.global?.consent?.sanitizedExcerpts === true
-      && current?.global?.consent?.crossRepoAggregation === true;
+    const automation = automationState();
+    const baseReason = !bootValidated ? "boot-not-validated"
+      : corrupt ? "corrupt-state"
+        : options.hostSupported === false ? "host-unsupported"
+          : null;
+    const targetReason = baseReason ?? (!activeHostGlobalCatalog?.ok ? "host-global-skill-catalog-unavailable" : null);
+    const applyReason = targetReason
+      ?? (!automation.ok ? automation.reason ?? "automation-state-unavailable" : null)
+      ?? (automation.global?.killSwitchActive === true ? "kill-switch" : null)
+      ?? (runtimeKillSwitch ? "emergency-stop" : null)
+      ?? (circuitBreakerOpen() ? "circuit-breaker" : null)
+      ?? (!automation.global?.consent?.durableObservations
+        || !automation.global?.consent?.sanitizedExcerpts
+        || !automation.global?.consent?.crossRepoAggregation ? "global-apply-consent-required" : null);
+    const actionAuthority = {
+      apply: { allowed: applyReason === null, reason: applyReason },
+      reject: { allowed: baseReason === null, reason: baseReason },
+      // Undo is risk-reducing and therefore does not inherit automation,
+      // privacy, breaker, or Emergency Stop suppression.
+      undo: { allowed: targetReason === null, reason: targetReason },
+    };
     const built = buildGlobalRecommendationProjection(snapshot, {
       stateRootIdentity: store.rootIdentity,
       now: timestamp,
-      targetReader: globalProjectionTargetReader(inventory, store),
-      writeAuthorityReady,
+      targetReader: globalProjectionTargetReader(inventory, () => activeHostGlobalCatalog),
+      actionAuthority,
     });
     let existing = globalProjection;
     if (!existing) {
@@ -1020,22 +1096,13 @@ export function createIntegration({
     return sha256(JSON.stringify({ global: current.global, repo: current.repo }));
   }
 
-  function latestControlGrant() {
-    return (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
-      event.details?.action === "control-nonce");
-  }
-
-  function completedControlRequest(request) {
-    return (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
-      event.details?.action === "control-request-complete"
-      && event.details?.requestId === request.requestId);
-  }
-
-  function completedControlNonce(nonce) {
-    const nonceHash = sha256(nonce);
-    return (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
-      event.details?.action === "control-request-complete"
-      && event.details?.nonceHash === nonceHash);
+  function automationSettingsVersion(current) {
+    if (!current?.ok) return null;
+    return sha256(JSON.stringify({
+      global: current.global,
+      repo: current.repo,
+      automationStamp: current.stamp,
+    }));
   }
 
   function completedOperationRequest(request) {
@@ -1049,58 +1116,6 @@ export function createIntegration({
     return (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
       event.details?.action === "ui-operation-complete"
       && event.details?.nonceHash === nonceHash);
-  }
-
-  function issueControlGrant(current = settings()) {
-    if (!options.stateRoot) return null;
-    if (!current) return null;
-    const version = settingsVersion(current);
-    const timestamp = now();
-    let grant = latestControlGrant()?.details;
-    if (!grant
-      || grant.projectFingerprint !== current.repo.projectFingerprint
-      || grant.actor !== BRIDGE_ACTOR
-      || grant.settingsUpdatedAt !== current.global.updatedAt
-      || grant.settingsVersion !== version
-      || grant.expiresAt <= timestamp
-      || completedControlNonce(grant.nonce)) {
-      const nonce = randomBytes(24).toString("hex");
-      appendAudit("decision", {
-        action: "control-nonce",
-        projectFingerprint: current.repo.projectFingerprint,
-        actor: BRIDGE_ACTOR,
-        nonce,
-        settingsUpdatedAt: current.global.updatedAt,
-        settingsVersion: version,
-        expiresAt: timestamp + BRIDGE_TTL_MS,
-      });
-      grant = latestControlGrant()?.details;
-    }
-    if (!grant) return null;
-    const projection = {
-      // The control state is a bridge wire record: it carries the bridge
-      // protocol version, not the durable state generation.
-      schemaVersion: BRIDGE_SCHEMA_VERSION,
-      projectFingerprint: current.repo.projectFingerprint,
-      actor: "self-evolve-integration",
-      issuedAt: timestamp,
-      expiresAt: grant.expiresAt,
-      settingsUpdatedAt: current.global.updatedAt,
-      settingsVersion: version,
-      stateRootIdentity: stateRootIdentity(options.stateRoot),
-      nonce: grant.nonce,
-      mode: current.global.mode,
-      effectiveMode: resolveEffectiveMode(current.repo.projectFingerprint, current),
-      allowedSkillRoots: current.global.allowedSkillRoots,
-      consent: current.global.consent,
-      repoExcluded: current.repo.excluded,
-    };
-    const projectionKey = sha256(JSON.stringify({ ...projection, issuedAt: 0 }));
-    if (controlProjectionKey === projectionKey && controlProjection && timestamp < controlProjectionRefreshAt) return controlProjection;
-    controlProjection = publishControlState(options.stateRoot, projection);
-    controlProjectionKey = projectionKey;
-    controlProjectionRefreshAt = Math.min(grant.expiresAt, timestamp + 60_000);
-    return controlProjection;
   }
 
   function completedBridgeRequest(request) {
@@ -1273,17 +1288,6 @@ export function createIntegration({
       : { ok: false, reason: String(details.reason ?? "decision-rejected").slice(0, 256), recovered: true };
   }
 
-  function recoverControlCompletion(request, completion) {
-    const details = completion?.details;
-    if (details?.nonceHash !== sha256(request.nonce)
-      || details?.requestDigest !== mailboxRequestDigest("control", request)) {
-      return { ok: false, reason: "replayed-request" };
-    }
-    return details.accepted === true
-      ? { ok: true }
-      : { ok: false, reason: String(details.reason ?? "control-rejected").slice(0, 256) };
-  }
-
   function recoverOperationCompletion(request, completion) {
     const details = completion?.details;
     if (details?.nonceHash !== sha256(request.nonce)
@@ -1312,10 +1316,15 @@ export function createIntegration({
 
   function recoverOperationIntent(request, intent) {
     if (!validateOperationIntent(request, intent)) return { ok: false, reason: "replayed-request" };
-    const fresh = settings();
-    if (request.action === "set-paused" && fresh?.global?.paused === request.payload.paused) return { ok: true };
-    if (request.action === "set-kill-switch" && fresh?.global?.killSwitchActive === request.payload.enabled) return { ok: true };
-    if (request.action === "set-repo-mode" && fresh?.repo?.mode === request.payload.mode) return { ok: true };
+    const freshAutomation = automationState();
+    if (request.action === "set-automatic-recommendations"
+        && freshAutomation?.global?.automaticRecommendationsEnabled === request.payload.enabled) return { ok: true };
+    if (request.action === "set-permission"
+        && freshAutomation?.global?.consent?.[request.payload.permission] === request.payload.enabled) return { ok: true };
+    if (request.action === "set-kill-switch"
+        && freshAutomation?.global?.killSwitchActive === request.payload.enabled) return { ok: true };
+    if (request.action === "set-repo-excluded"
+        && freshAutomation?.repo?.excluded === request.payload.excluded) return { ok: true };
     if (request.action === "snooze-proposal") {
       const decisionNonce = sha256(`native-snooze:${request.requestId}:${request.operationHash}`);
       const snoozed = (store.readRecords?.("audit-event") ?? []).map((record) => record.payload).findLast((event) =>
@@ -1395,6 +1404,18 @@ export function createIntegration({
   }
 
   function scheduleTerminalPurge() {
+    // Write the terminal epoch durably FIRST so every peer process sharing this
+    // state root fails closed at its next mutation-lock acquisition or admission
+    // cycle. This runs via afterResponse AFTER the accepted-terminal response is
+    // recorded and published, and BEFORE authority stop and deletion — preserving
+    // the accepted-terminal ordering invariant (response first, then authority
+    // stop, then mailbox/subtree deletion). Idempotent: boot recovery re-enters
+    // here after a crash and a prior terminal epoch write is a no-op.
+    try {
+      store.markRootTerminal?.({ terminalOperationId: `terminal-purge:${now()}` });
+    } catch (error) {
+      lastError = errorReasonCode(error, "root-epoch-terminal-write-failed");
+    }
     stopAfterPurgeAll();
     terminalPurgeTask ??= new Promise((resolve) => {
       const timer = setTerminalPurgeTimeout(() => {
@@ -1459,8 +1480,66 @@ export function createIntegration({
   async function executeUiOperation(request) {
     const fresh = settings();
     if (!fresh) return { ok: false, reason: "corrupt-settings" };
+    const freshAutomation = automationState();
+    if (!freshAutomation.ok) return { ok: false, reason: freshAutomation.reason ?? "automation-state-unavailable" };
+    const freshAutomationVersion = automationSettingsVersion(freshAutomation);
+    const automationControlActions = new Set([
+      "set-automatic-recommendations",
+      "set-kill-switch",
+      "set-permission",
+      "set-repo-excluded",
+    ]);
+    if (automationControlActions.has(request.action)
+        && request.payload.settingsVersion !== freshAutomationVersion) {
+      return { ok: false, reason: "stale-settings-version" };
+    }
+    if (request.action === "set-automatic-recommendations") {
+      const result = store.transitionAutomation({
+        transitionId: request.requestId,
+        expectedGeneration: freshAutomation.epoch.generation,
+        action: "set-automatic-recommendations",
+        enabled: request.payload.enabled,
+      });
+      if (!result.ok) return { ok: false, reason: result.reason ?? "automatic-recommendations-update-failed" };
+      invalidateRoutingSettings();
+      if (!request.payload.enabled) downgradeInFlight("automatic-recommendations-off", { kinds: ["passive"] });
+      else syncSchedulerAdmission(freshAutomation.repo.projectFingerprint, "automatic-recommendations-on");
+      publish("self-evolve.settings", { action: request.action, enabled: request.payload.enabled });
+      return { ok: true };
+    }
+    if (request.action === "set-permission") {
+      const result = store.transitionAutomation({
+        transitionId: request.requestId,
+        expectedGeneration: freshAutomation.epoch.generation,
+        action: "set-permission",
+        permission: request.payload.permission,
+        enabled: request.payload.enabled,
+      });
+      if (!result.ok) return { ok: false, reason: result.reason ?? "permission-update-failed" };
+      invalidateRoutingSettings();
+      if (!request.payload.enabled) downgradeInFlight("permission-revoked", { kinds: ["passive"] });
+      publish("self-evolve.settings", {
+        action: request.action,
+        permission: request.payload.permission,
+        enabled: request.payload.enabled,
+      });
+      return { ok: true };
+    }
+    if (request.action === "set-repo-excluded") {
+      const result = store.setAutomationProjectExcluded?.(request.payload.excluded);
+      if (!result?.ok) return { ok: false, reason: result?.reason ?? "project-exclusion-update-failed" };
+      invalidateRoutingSettings();
+      if (request.payload.excluded) {
+        downgradeInFlight("project-excluded", {
+          kinds: ["passive"],
+          projectFingerprint: freshAutomation.repo.projectFingerprint,
+        });
+      } else syncSchedulerAdmission(freshAutomation.repo.projectFingerprint, "project-included");
+      publish("self-evolve.settings", { action: request.action, excluded: request.payload.excluded });
+      return { ok: true };
+    }
     if (request.action === "replace-global-root-policy") {
-      if (request.payload.settingsVersion !== settingsVersion(fresh)) return { ok: false, reason: "stale-settings-version" };
+      if (request.payload.settingsVersion !== freshAutomationVersion) return { ok: false, reason: "stale-settings-version" };
       if (typeof inventory?.buildGlobalSkillCatalog !== "function") {
         return { ok: false, reason: "global-root-validation-unavailable" };
       }
@@ -1491,9 +1570,13 @@ export function createIntegration({
         return { ok: false, reason: validated?.blockers?.[0]?.code ?? "invalid-global-root-policy" };
       }
       await options.__testAfterRootPolicyPrevalidation?.({ request, candidate });
+      const revalidatedAutomation = automationState();
+      if (!revalidatedAutomation.ok
+          || automationSettingsVersion(revalidatedAutomation) !== request.payload.settingsVersion) {
+        return { ok: false, reason: "stale-settings-version" };
+      }
       const transactionAudits = [];
       const saved = store.updateGlobalSettings((global, current) => {
-        if (settingsVersion(current) !== request.payload.settingsVersion) throw new Error("stale-settings-version");
         const revalidated = validatePolicy(candidate);
         if (!revalidated?.ok) throw new Error(revalidated?.blockers?.[0]?.code ?? "invalid-global-root-policy");
         const next = schemas.makeGlobalSettings({ ...global, globalRootPolicy: candidate, updatedAt: timestamp });
@@ -1514,60 +1597,9 @@ export function createIntegration({
       return { ok: true };
     }
     if (request.action === "set-kill-switch") {
-      if (request.payload.settingsVersion !== settingsVersion(fresh)) return { ok: false, reason: "stale-settings-version" };
       return request.payload.enabled
         ? triggerKillSwitch("native-control", request)
         : clearKillSwitch("native-control", request);
-    }
-    if (request.action === "set-paused") {
-      if (request.payload.settingsVersion !== settingsVersion(fresh)) return { ok: false, reason: "stale-settings-version" };
-      let projectFingerprint;
-      const transactionAudits = [];
-      const saved = store.updateGlobalSettings((global, current) => {
-        if (settingsVersion(current) !== request.payload.settingsVersion) throw new Error("stale-settings-version");
-        projectFingerprint = current.repo.projectFingerprint;
-        const next = schemas.makeGlobalSettings({ ...global, paused: request.payload.paused, updatedAt: now() });
-        const effectiveMode = schemas.resolveMode(next.mode, current.repo.mode, modeOverrides({ ...current, global: next }, projectFingerprint));
-        transactionAudits.push(makeAuditRecord("mode-change", {
-          action: request.payload.paused ? "pause" : "resume",
-          paused: request.payload.paused,
-          storedMode: next.mode,
-          effectiveMode,
-        }));
-        transactionAudits.push(operationCompletionRecord(request, { ok: true }));
-        return next;
-      }, { additionalAudits: transactionAudits });
-      if (!saved.ok) return { ok: false, reason: saved.reason ?? "pause-update-failed" };
-      invalidateRoutingSettings();
-      const effectiveMode = syncSchedulerMode(projectFingerprint, request.payload.paused ? "native-pause" : "native-resume");
-      if (request.payload.paused) setModeForDowngrade("native-pause");
-      publish("self-evolve.settings", { action: request.payload.paused ? "pause" : "resume", effectiveMode });
-      return { ok: true };
-    }
-    if (request.action === "set-repo-mode") {
-      if (request.payload.settingsVersion !== settingsVersion(fresh)) return { ok: false, reason: "stale-settings-version" };
-      let projectFingerprint;
-      const transactionAudits = [];
-      const saved = store.updateSettings((current) => {
-        if (settingsVersion(current) !== request.payload.settingsVersion) throw new Error("stale-settings-version");
-        projectFingerprint = current.repo.projectFingerprint;
-        const mode = schemas.asProjectAnalysisOverride(request.payload.mode);
-        const next = schemas.makeRepoSettings({ ...current.repo, mode });
-        transactionAudits.push(makeAuditRecord("mode-change", {
-          action: "project-analysis-mode",
-          scope: "repo",
-          requestedMode: mode,
-          configuredMode: schemas.resolveConfiguredProjectAnalysisMode(current.global.mode, mode),
-        }));
-        transactionAudits.push(operationCompletionRecord(request, { ok: true }));
-        return { repo: next };
-      }, { expectedGlobalUpdatedAt: fresh.global.updatedAt, additionalAudits: transactionAudits });
-      if (!saved.ok) return { ok: false, reason: saved.reason ?? "project-analysis-mode-update-failed" };
-      invalidateRoutingSettings();
-      const effectiveMode = syncSchedulerMode(projectFingerprint, "native-project-analysis-mode");
-      if (effectiveMode === "manual") setModeForDowngrade("native-project-analysis-mode");
-      publish("self-evolve.settings", { action: request.action, configuredMode: request.payload.mode, effectiveMode });
-      return { ok: true };
     }
     if (request.action === "snooze-proposal") {
       const proposal = currentProposal(request.payload.proposalId);
@@ -1636,6 +1668,11 @@ export function createIntegration({
       return result.ok ? { ok: true } : { ok: false, reason: result.reason ?? "purge-failed" };
     }
     if (request.action === "purge-all") {
+      // The terminal epoch is written durably in scheduleTerminalPurge
+      // (afterResponse) AFTER this response is recorded/published and BEFORE
+      // authority stop and deletion. This preserves accepted-terminal ordering
+      // (response first) while ensuring peers see the terminal epoch before the
+      // subtree is deleted. See scheduleTerminalPurge.
       return {
         ok: true,
         terminal: true,
@@ -1738,94 +1775,10 @@ export function createIntegration({
   }
 
   function validateMailboxControl(request) {
-    const completed = completedControlRequest(request);
-    if (completed) return recoverControlCompletion(request, completed);
-    if (completedControlNonce(request.nonce)) return { ok: false, reason: "replayed-control" };
-    const fresh = settings();
-    if (!fresh) return finishControlRequest(request, { ok: false, reason: "corrupt-settings" });
-    const grant = latestControlGrant()?.details;
-    const version = settingsVersion(fresh);
-    let result;
-    if (request.projectFingerprint !== fresh.repo.projectFingerprint) result = { ok: false, reason: "cross-project-request" };
-    else if (request.action === "set-repo-mode") result = { ok: false, reason: "legacy-project-analysis-control-disabled" };
-    else if (!grant
-      || grant.action !== "control-nonce"
-      || grant.projectFingerprint !== request.projectFingerprint
-      || grant.actor !== request.actor
-      || grant.nonce !== request.nonce
-      || grant.settingsUpdatedAt !== request.settingsUpdatedAt
-      || grant.settingsVersion !== request.settingsVersion
-      || grant.expiresAt <= now()) result = { ok: false, reason: "invalid-or-expired-nonce" };
-    else if (request.settingsUpdatedAt !== fresh.global.updatedAt || request.settingsVersion !== version) result = { ok: false, reason: "stale-settings-version" };
-    if (result) {
-      return finishControlRequest(request, result);
-    }
-
-    // A v0.2 peer can still encode `yolo`; v0.3 rejects it outright instead of
-    // silently narrowing an unattended-authority request to auto.
-    if (request.payload.mode === "yolo" && (request.action === "set-mode" || request.action === "set-repo-mode")) {
-      return finishControlRequest(request, { ok: false, reason: "yolo-retired" });
-    }
-
-    let transitionEvents = [];
-    const transactionAudits = [];
-    const successfulCompletion = controlCompletionRecord(request, { ok: true });
-    const saved = store.updateSettings((current) => {
-      transactionAudits.push(successfulCompletion);
-      if (current.global.updatedAt !== request.settingsUpdatedAt || settingsVersion(current) !== request.settingsVersion) throw new Error("stale-settings-version");
-      if (request.action === "set-mode") {
-        const transitioned = schemas.transitionMode(current.global, current.repo, {
-          scope: "global",
-          mode: request.payload.mode,
-          overrides: modeOverrides(current, current.repo.projectFingerprint),
-        }, now(), BRIDGE_ACTOR);
-        if (!transitioned.ok) throw new Error(transitioned.error);
-        transitionEvents = transitioned.events;
-        transactionAudits.push(...transitionEvents.map((event) => schemas.wrapRecord("audit-event", event, event.timestamp)));
-        return { global: transitioned.state.global };
-      }
-      if (request.action === "set-repo-mode") {
-        const transitioned = schemas.transitionMode(current.global, current.repo, {
-          scope: "repo",
-          mode: request.payload.mode,
-          overrides: modeOverrides(current, current.repo.projectFingerprint),
-        }, now(), BRIDGE_ACTOR);
-        if (!transitioned.ok) throw new Error(transitioned.error);
-        transitionEvents = transitioned.events;
-        transactionAudits.push(...transitionEvents.map((event) => schemas.wrapRecord("audit-event", event, event.timestamp)));
-        return { repo: transitioned.state.repo };
-      }
-      if (request.action === "set-consent") {
-        const consent = schemas.makeConsentState({
-          ...current.global.consent,
-          [request.payload.key]: request.payload.enabled,
-          ...(request.payload.key === "sanitizedExcerpts" && !request.payload.enabled
-            ? { crossRepoAggregation: false }
-            : {}),
-        });
-        if (consent.crossRepoAggregation && !consent.sanitizedExcerpts) throw new Error("sanitized-excerpts-consent-required");
-        return { global: schemas.makeGlobalSettings({ ...current.global, consent, updatedAt: now() }) };
-      }
-      if (request.action === "set-repo-excluded") {
-        return { repo: schemas.makeRepoSettings({ ...current.repo, excluded: request.payload.excluded }) };
-      }
-      if (request.action === "update-allowlist") {
-        if (request.payload.confirmation !== "UPDATE ALLOWLIST") throw new Error("allowlist-confirmation-required");
-        const validated = validateCanonicalAllowlist(request.payload.allowlist);
-        if (!validated.ok) throw new Error(validated.reason);
-        return { global: schemas.makeGlobalSettings({ ...current.global, allowedSkillRoots: request.payload.allowlist, updatedAt: now() }) };
-      }
-      throw new Error("unknown-control-action");
-    }, { expectedGlobalUpdatedAt: request.settingsUpdatedAt, additionalAudits: transactionAudits });
-    result = saved.ok ? { ok: true } : { ok: false, reason: saved.reason ?? "control-rejected" };
-    if (saved.ok) {
-      invalidateRoutingSettings();
-      uiProjectionDirty = true;
-      globalProjectionDirty = true;
-      const effectiveMode = syncSchedulerMode(request.projectFingerprint, `control-${request.action}`);
-      publish("self-evolve.settings", { action: request.action, effectiveMode });
-    }
-    return saved.ok && saved.changed ? result : finishControlRequest(request, result);
+    void request;
+    // v0.3 control mailboxes remain parseable so a mixed-version pair can
+    // explain the cutover, but v0.4 never grants or records their effects.
+    return { ok: false, reason: "retired-v04-control" };
   }
 
   async function validateMailboxDecision(request) {
@@ -1879,9 +1832,6 @@ export function createIntegration({
     const transitionAllowed = (request.priorState === "pending" && ["approved", "rejected", "pending"].includes(request.newState))
       || (request.priorState === "applied" && request.newState === "rolled-back");
     if (!transitionAllowed) return finishBridgeRequest(request, { ok: false, reason: "invalid-transition" });
-    if (request.newState === "approved" && resolveEffectiveMode(request.projectFingerprint) === "manual") {
-      return finishBridgeRequest(request, { ok: false, reason: "manual-advisory-only" });
-    }
     const result = await decide({
       proposalId: proposal.id,
       actor: request.actor,
@@ -1900,7 +1850,7 @@ export function createIntegration({
     return finishBridgeRequest(request, result);
   }
 
-  async function validateGlobalMailboxAction(requestValue) {
+  async function validateGlobalMailboxAction(requestValue, authority = {}) {
     if (!globalDecisionDomain || typeof store.readGlobalRecommendations !== "function") {
       return { ok: false, reason: "global-decision-domain-unavailable" };
     }
@@ -1943,7 +1893,17 @@ export function createIntegration({
     }
     const result = request.action === "reject"
       ? store.rejectGlobalRecommendation?.({ decision, nowMs: now() })
-      : await globalDecisionDomain.decide({ action: request.action, decision });
+      : await (async () => {
+          const projectRoot = options.projectRoot ?? options.worktree ?? ctx?.worktree ?? ctx?.directory;
+          const catalog = await currentHostGlobalCatalog(projectRoot);
+          if (!catalog?.ok) return { ok: false, reason: catalog?.blockers?.[0]?.code ?? "host-global-skill-catalog-unavailable" };
+          return globalDecisionDomain.decide({
+          action: request.action,
+          decision,
+          requestDeadline: authority.requestDeadline,
+          consumerDeadline: authority.consumerDeadline,
+          });
+        })();
     globalProjectionDirty = true;
     uiProjectionDirty = true;
     return result?.ok === true
@@ -2014,12 +1974,10 @@ export function createIntegration({
       const pending = options.stateRoot
         ? pendingRequestCounts(options.stateRoot, projectFingerprint)
         : { decisions: 0, controls: 0, operations: 0 };
-      const effective = resolveEffectiveMode(projectFingerprint, current);
-      // Manual mode still consumes controls and decisions. It only skips
-      // proactive decision-nonce work when no decision request is waiting.
-      if (pending.decisions > 0 || effective !== "manual") issueBridgeNonces();
-      let controlStateError;
-      try { issueControlGrant(current); } catch (error) { controlStateError = errorReasonCode(error, "unknown-error"); lastError = controlStateError; }
+      // Existing recommendations remain reviewable and actionable while
+      // Automatic recommendations is Off, so their one-use decision grants
+      // are independent of scheduler admission.
+      if (pending.decisions > 0 || actionableProposals().length > 0) issueBridgeNonces();
       const consumed = await consumeMailbox({
         stateRoot: options.stateRoot,
         projectFingerprint,
@@ -2030,9 +1988,6 @@ export function createIntegration({
         maxRequests: options.mailboxMaxRequests,
         __testAfterRequestHandled: options.__testAfterRequestHandled,
       });
-      if (consumed.controls?.length || consumed.processed?.length || consumed.operations?.length) {
-        try { issueControlGrant(); } catch (error) { controlStateError = errorReasonCode(error, "unknown-error"); lastError = controlStateError; }
-      }
       let uiProjectionError;
       try { refreshUiProjection(); } catch (error) { uiProjectionError = errorReasonCode(error, "unknown-error"); lastError = uiProjectionError; }
       let globalProjectionError;
@@ -2040,7 +1995,6 @@ export function createIntegration({
       return {
         ...consumed,
         globalActions,
-        ...(controlStateError ? { controlStateError } : {}),
         ...(uiProjectionError ? { uiProjectionError } : {}),
         ...(globalProjectionError ? { globalProjectionError } : {}),
       };
@@ -2051,7 +2005,8 @@ export function createIntegration({
   }
 
   async function processMailbox() {
-    if (!options.stateRoot || closed || terminalPurge) return { ok: false, reason: terminalPurge ? "restart-required-after-purge-all" : closed ? "integration-closed" : "mailbox-unavailable", processed: [] };
+    const gateReason = terminalGateReason();
+    if (!options.stateRoot || closed || gateReason) return { ok: false, reason: gateReason ?? (closed ? "integration-closed" : "mailbox-unavailable"), processed: [] };
     if (mailboxPolling) {
       mailboxPending = true;
       return mailboxTask;
@@ -2062,7 +2017,7 @@ export function createIntegration({
       do {
         mailboxPending = false;
         result = await runMailboxPass();
-      } while (mailboxPending && !closed && !terminalPurge);
+      } while (mailboxPending && !closed && !terminalGateReason());
       return result;
     })();
     try {
@@ -2155,13 +2110,52 @@ export function createIntegration({
     return changed;
   }
 
+  async function currentHostGlobalCatalog(projectRoot, cycleOptions = {}) {
+    let hostCatalog = cycleOptions.hostGlobalSkillCatalog ?? options.hostGlobalSkillCatalog ?? null;
+    const provider = cycleOptions.getHostGlobalSkillCatalog ?? options.getHostGlobalSkillCatalog;
+    if (typeof provider === "function") hostCatalog = await provider({ projectRoot, ctx, hostVersion });
+    if (!hostCatalog && typeof inventory?.discoverHostGlobalSkills === "function" && ctx?.serverUrl && projectRoot) {
+      hostCatalog = await inventory.discoverHostGlobalSkills({
+        origin: String(ctx.serverUrl),
+        directory: projectRoot,
+        hostVersion,
+      });
+    }
+    const adapted = typeof inventory?.adaptHostGlobalSkillCatalog === "function"
+      ? inventory.adaptHostGlobalSkillCatalog(hostCatalog, { updatedAt: now() })
+      : null;
+    activeHostGlobalCatalog = adapted?.ok ? adapted : null;
+    return adapted;
+  }
+
   async function runEvolutionCycle(args = {}) {
-    const mode = syncSchedulerMode(args.projectFingerprint, "cycle-refresh");
+    const automation = automationState();
+    if (!automation.ok || !automation.enabled) {
+      return {
+        result: "automatic-disabled",
+        cycleOutcome: "automatic-disabled",
+        cycleReason: automation.reason ?? "automatic-recommendations-disabled",
+        responseText: "Self-evolve Automatic recommendations are Off. No session data was read and no autonomous work was performed.",
+      };
+    }
+    const automaticWorkAllowed = syncSchedulerAdmission(args.projectFingerprint, "cycle-refresh");
+    if (!automaticWorkAllowed) return { result: "suppressed", reason: getProjectOperationalState(args.projectFingerprint).reason };
     const ownership = hostOwnershipContext(args.projectFingerprint ?? settings()?.repo?.projectFingerprint);
     const projectRoot = args.options?.projectRoot ?? options.worktree ?? ctx?.worktree ?? ctx?.directory;
+    const globalSkillCatalog = await currentHostGlobalCatalog(projectRoot, args.options);
     const cycleOptions = {
       ...(args.options ?? {}),
+      automationStamp: args.options?.automationStamp ?? automation.stamp,
       projectRoot,
+      globalSkillCatalog: globalSkillCatalog ?? {
+        ok: false,
+        policy: null,
+        records: [],
+        blockers: [{ code: "host-global-skill-catalog-unavailable" }],
+      },
+      ...(globalSkillCatalog?.ok ? {
+        globalRootPolicy: globalSkillCatalog.policy,
+      } : {}),
       remoteUrl: args.options?.remoteUrl ?? options.remoteUrl,
       rootSessionIDHash: args.rootSessionIDHash ?? args.options?.rootSessionIDHash,
       synthesis: { ...(args.options?.synthesis ?? {}), ...ownership },
@@ -2181,11 +2175,12 @@ export function createIntegration({
       rolloutGates,
       stopAfter: rolloutGates.passiveShadowObservation ? "correlate" : args.options?.stopAfter,
     };
-    const pipelineMode = rolloutGates.automaticSynthesisApplicationDisabled || (mode === "auto" && !rolloutGates.autoReviewRollout) ? "manual" : mode;
     let result;
     let failure = null;
     try {
-      result = await pipelineInstance.runEvolutionCycle({ ...args, ctx: args.ctx ?? ctx, mode: pipelineMode, options: cycleOptions });
+      // The legacy pipeline parameter is fixed to its explicit-review path;
+      // current automation authority comes exclusively from the v0.4 gate.
+      result = await pipelineInstance.runEvolutionCycle({ ...args, ctx: args.ctx ?? ctx, mode: "auto", options: cycleOptions });
       if (result?.result === "applied") {
         const finalized = currentProposal(result.proposal?.id) ? markApplied(result.proposal?.id) : { ok: true };
         result = !finalized?.ok
@@ -2221,31 +2216,33 @@ export function createIntegration({
         ? rawReason
         : outcome === "failed" ? "pipeline-failed" : null;
       const occurredAt = now();
-      appendAudit("decision", {
-        action: "cycle-outcome",
-        outcome,
-        triggerClass,
-        mode,
-        observationCount: Array.isArray(result?.observations) ? result.observations.length : 0,
-        eligibilityCount: Array.isArray(result?.eligibility)
-          ? result.eligibility.filter((item) => item?.eligible === true).length
-          : 0,
-        occurredAt,
-        reason,
-      }, result?.proposal?.id, "self-evolve-integration", occurredAt);
+      try {
+        appendAudit("decision", {
+          action: "cycle-outcome",
+          outcome,
+          triggerClass,
+          observationCount: Array.isArray(result?.observations) ? result.observations.length : 0,
+          eligibilityCount: Array.isArray(result?.eligibility)
+            ? result.eligibility.filter((item) => item?.eligible === true).length
+            : 0,
+          occurredAt,
+          reason,
+        }, result?.proposal?.id, "self-evolve-integration", occurredAt);
+      } catch {
+        // The root epoch may be terminal (purge-all accepted while this cycle
+        // was in-flight). The cycle-outcome audit is diagnostic and the subtree
+        // is being deleted, so swallowing is safe.
+      }
     }
   }
 
   async function runApprovalFlow(args = {}) {
     let proposal = currentProposal(args.proposalId);
-    const mode = resolveEffectiveMode(args.projectFingerprint ?? proposal?.projectFingerprint);
     if (!proposal) return { result: "failed-closed", responseText: `Proposal ${args.proposalId} was not found.` };
     let decision = (store.readRecords?.("decision") ?? []).map((record) => record.payload).findLast((item) => item.proposalId === proposal.id && item.newState === "approved");
-    const authority = evaluateAuthority({ proposal, decision, mode, headless: args.headless === true });
+    const authority = evaluateAuthority({ proposal, decision, headless: args.headless === true });
     if (!authority.allowed) return { result: "failed-closed", reason: authority.reason, responseText: `Proposal ${proposal.id} was not applied: ${authority.reason}.` };
-    // No mode self-approves a pending proposal in v0.3; the decision must
-    // already exist before this flow runs.
-    const result = await pipelineInstance.runApprovalFlow({ ...args, ctx: args.ctx ?? ctx, mode, projectFingerprint: args.projectFingerprint ?? proposal.projectFingerprint, headless: args.headless === true });
+    const result = await pipelineInstance.runApprovalFlow({ ...args, ctx: args.ctx ?? ctx, mode: "auto", projectFingerprint: args.projectFingerprint ?? proposal.projectFingerprint, headless: args.headless === true });
     if (result?.result === "applied") {
       const finalized = markApplied(proposal.id);
       if (!finalized?.ok) return { result: "failed-closed", reason: finalized?.reason ?? "applied-transition-failed", responseText: `Proposal ${proposal.id} was applied but final state recovery is required.` };
@@ -2262,17 +2259,20 @@ export function createIntegration({
 
   async function handleEvent(event) {
     if (closed) return { scheduled: false, reason: "integration-closing" };
-    if (terminalPurge) return { scheduled: false, reason: "restart-required-after-purge-all" };
+    if (terminalGateReason()) return { scheduled: false, reason: "restart-required-after-purge-all" };
     if (!isDurableLifecycleEvent(event)) return { scheduled: false, reason: "irrelevant-event" };
+    const automation = automationState();
+    if (!automation.ok || !automation.enabled) {
+      return { scheduled: false, reason: automation.reason ?? "automatic-recommendations-disabled" };
+    }
     const current = settings();
     const body = event?.event && typeof event.event === "object" ? event.event : event;
     const projectFingerprint = body?.properties?.projectFingerprint ?? current?.repo?.projectFingerprint;
     const operational = getProjectOperationalState(projectFingerprint, current);
-    const mode = operational.passiveAnalysisAllowed ? operational.configuredMode : "manual";
-    schedulerInstance.setMode?.(mode, "event-refresh");
-    if (!operational.passiveAnalysisAllowed) return {
+    schedulerInstance.setMode?.(operational.automaticWorkAllowed ? "auto" : "manual", "event-refresh");
+    if (!operational.automaticWorkAllowed) return {
       scheduled: false,
-      reason: operational.reason === "manual" ? "manual-mode" : operational.reason,
+      reason: operational.reason,
     };
     let lineage;
     try {
@@ -2285,7 +2285,7 @@ export function createIntegration({
     if (lineage.originKind === "delegated") return { scheduled: false, reason: "delegated-root" };
     if (lineage.originKind !== "user") return { scheduled: false, reason: "non-user-root" };
     await schedulerInstance.handleEvent(event, lineage);
-    return { scheduled: true, mode };
+    return { scheduled: true, automaticRecommendationsEnabled: true };
   }
 
   async function decide({ proposalId, decision, actor } = {}) {
@@ -2332,11 +2332,6 @@ export function createIntegration({
     const current = settings();
     const grant = latestHeadlessGrant(command.proposalId)?.details;
     if (!proposal || !current || !grant) return { ok: false, reason: "record-not-found", responseText: `Proposal ${command.proposalId} has no current headless approval grant.` };
-    const effectiveMode = resolveEffectiveMode(proposal.projectFingerprint);
-    if (effectiveMode !== "auto") {
-      const reason = effectiveMode === "manual" ? "manual-advisory-only" : "auto-mode-required";
-      return { ok: false, reason, responseText: `Proposal ${proposal.id} was not applied: ${reason}.` };
-    }
     const exact = proposal.projectFingerprint === current.repo.projectFingerprint
       && proposal.state === "pending"
       && proposal.skillTarget.currentHash === command.targetHash
@@ -2373,17 +2368,131 @@ export function createIntegration({
       : { ok: false, reason: applied.reason ?? "apply-failed", responseText: applied.responseText };
   }
 
+  // H5-002: Authenticated, audited root-global circuit-breaker reset. The sole
+  // recovery path from a tripped breaker epoch. Requires an exact operator-typed
+  // confirmation and a full authenticated commitment bound to the validated root
+  // identity, acting project, schema/protocol versions, and a one-use nonce.
+  // The store advances the breaker epoch generation and clears tripped so every
+  // peer process sharing the state root sees the healthy state at its next
+  // admission/provider/effect boundary read. Replay-safe (nonce burned,
+  // generation advanced; a replayed reset on a healthy breaker fails with a
+  // stable reason) and cannot be model-selected (exact confirmation +
+  // operator-typed command only). Also resets the scheduler-local breaker so
+  // this process resumes immediately.
+  function resetBreaker(command) {
+    let record;
+    try {
+      const projectFingerprint = command.projectFingerprint ?? settings()?.repo?.projectFingerprint;
+      const authentication = {
+        rootIdentityHash: options.stateRoot ? stateRootIdentity(options.stateRoot) : store.rootIdentity,
+        projectFingerprintHash: projectFingerprint ? sha256(projectFingerprint) : null,
+        schemaVersion: schemas?.SCHEMA_VERSION ?? null,
+        protocolVersion: "self-evolve-breaker-epoch-v1",
+        nonce: sha256(`breaker-reset:${now()}:${randomBytes(16).toString("hex")}`),
+        operatorAuthority: "operator",
+      };
+      record = store.resetBreakerEpoch?.({ confirmation: command.confirmation, authentication });
+    } catch (error) {
+      return {
+        ok: false,
+        reason: errorReasonCode(error, "breaker-reset-failed"),
+        responseText: `Circuit breaker reset failed: ${errorReasonCode(error, "breaker-reset-failed")}.`,
+      };
+    }
+    try {
+      appendAudit("decision", {
+        action: "breaker-epoch-reset",
+        generation: record?.generation ?? null,
+        tripped: false,
+        operatorAuthority: "operator",
+      }, undefined, "self-evolve-command");
+    } catch {}
+    // Clear the scheduler-local breaker so this process resumes immediately;
+    // peer processes see the cleared durable epoch at their next boundary read.
+    try { schedulerInstance?.resetCircuitBreaker?.("operator-root-reset"); } catch {}
+    uiProjectionDirty = true;
+    globalProjectionDirty = true;
+    return {
+      ok: true,
+      reset: true,
+      generation: record?.generation ?? null,
+      responseText: `Self-evolve circuit breaker reset to generation ${record?.generation ?? "unknown"}. Automatic work resumes at the next eligible boundary for every process sharing this state root.`,
+    };
+  }
+
+  function reinitializeFromTerminal(command) {
+    // The sole recovery path from a terminal root epoch. Requires an exact
+    // operator-typed confirmation and a full authenticated commitment bound to
+    // the validated root identity, acting project, schema/protocol versions,
+    // one-use nonce, and the default consent snapshot. The store writes the new
+    // epoch durably (incrementing the generation, clearing terminal); the
+    // operator then restarts to recreate the subtree and re-boot. Replay-safe
+    // (nonce burned, generation advanced) and cannot be model-selected (exact
+    // confirmation + operator-typed command only).
+    let record;
+    try {
+      const projectFingerprint = command.projectFingerprint ?? settings()?.repo?.projectFingerprint;
+      const authentication = {
+        rootIdentityHash: options.stateRoot ? stateRootIdentity(options.stateRoot) : store.rootIdentity,
+        projectFingerprintHash: projectFingerprint ? sha256(projectFingerprint) : null,
+        schemaVersion: schemas?.SCHEMA_VERSION ?? null,
+        protocolVersion: "self-evolve-root-epoch-v1",
+        nonce: sha256(`reinitialize:${now()}:${randomBytes(16).toString("hex")}`),
+        consentSnapshotHash: sha256(JSON.stringify(["reinitialize-default-consent", schemas?.SCHEMA_VERSION ?? null, "manual"])),
+        operatorAuthority: "operator",
+      };
+      record = store.reinitializeRoot?.({ confirmation: command.confirmation, authentication });
+    } catch (error) {
+      return {
+        ok: false,
+        reason: errorReasonCode(error, "reinitialize-failed"),
+        responseText: `Reinitialize failed: ${errorReasonCode(error, "reinitialize-failed")}.`,
+      };
+    }
+    // The audit is diagnostic; after a purge-all the subtree was deleted so the
+    // audit write may fail. The epoch was advanced successfully regardless.
+    try {
+      appendAudit("decision", {
+        action: "root-epoch-reinitialize",
+        generation: record?.generation ?? null,
+        terminal: false,
+        operatorAuthority: "operator",
+        restartRequired: true,
+      }, undefined, "self-evolve-command");
+    } catch {}
+    return {
+      ok: true,
+      reinitialized: true,
+      generation: record?.generation ?? null,
+      responseText: `Self-evolve root epoch reinitialized to generation ${record?.generation ?? "unknown"}. Restart OpenCode to complete reinitialization and recreate durable state.`,
+    };
+  }
+
   async function handleCommand(input, output) {
     if (closed) return { ok: false, reason: "integration-closed" };
-    if (terminalPurge) {
-      const result = { ok: false, terminal: true, responseText: "Self-evolve state was purged. Restart OpenCode to reinitialize durable self-evolve state." };
+    const raw = typeof input === "string" ? input : input?.command ?? input?.input ?? input;
+    const parsed = typeof raw === "object" && raw?.verb ? { ok: true, command: raw } : commands?.parseSelfEvolveCommand?.(raw) ?? { ok: false, error: "command-parser-unavailable" };
+    if (parsed.ok && parsed.command.verb === "removed") {
+      const result = commandPolicy.execute(parsed.command);
       if (output && typeof output === "object") output.responseText = result.responseText;
       return result;
     }
-    await processMailbox();
-    const raw = typeof input === "string" ? input : input?.command ?? input?.input ?? input;
-    const parsed = typeof raw === "object" && raw?.verb ? { ok: true, command: raw } : commands?.parseSelfEvolveCommand?.(raw) ?? { ok: false, error: "command-parser-unavailable" };
+    // Reinitialize is the sole recovery path from a terminal epoch and is the
+    // only command permitted through the terminal gate. It cannot be
+    // model-selected: it requires an exact operator-typed confirmation.
+    if (parsed.ok && parsed.command.verb === "reinitialize") {
+      const result = reinitializeFromTerminal(parsed.command);
+      if (output && typeof output === "object") output.responseText = result.responseText;
+      return result;
+    }
+    const gateReason = terminalGateReason();
+    if (gateReason) {
+      const result = { ok: false, terminal: true, reason: gateReason, responseText: "Self-evolve state was purged. Restart OpenCode and run /self-evolve reinitialize to reinitialize durable self-evolve state." };
+      if (output && typeof output === "object") output.responseText = result.responseText;
+      return result;
+    }
     if (!parsed.ok) return { ok: false, responseText: parsed.error };
+    await processMailbox();
     const command = parsed.command;
     let result;
     let afterResponse;
@@ -2398,24 +2507,12 @@ export function createIntegration({
         const state = command.verb === "undo" ? "rolled-back" : "rejected";
         result = await decide({ proposalId: proposal.id, decision: makeDecision(proposal, state, "self-evolve-command"), actor: "self-evolve-command" });
       }
-    } else if (command.verb === "scan") {
-      const scanArgs = { ...(typeof input === "object" ? input : {}), trigger: "manual-command" };
-      const episode = await schedulerInstance.runWithEpisodeLease({
-        projectFingerprint: scanArgs.projectFingerprint ?? settings()?.repo?.projectFingerprint,
-        sessionID: scanArgs.sessionID,
-      }, () => runEvolutionCycle(scanArgs));
-      result = episode.ok
-        ? episode.value
-        : {
-          result: episode.deferred ? "deferred" : "failed-closed",
-          deferred: episode.deferred === true,
-          reason: episode.reason,
-          responseText: episode.deferred
-            ? "Self-evolve deferred this scan because another scan for the same session is already running."
-            : `Self-evolve could not start this scan: ${episode.reason}.`,
-        };
     } else if (command.verb === "purge" && command.scope === "all") {
       try {
+        // The terminal epoch is written durably in scheduleTerminalPurge
+        // (afterResponse) after this acceptance audit is recorded and before
+        // authority stop and deletion. Acceptance audit first, then stop
+        // authority, then schedule the destructive sequence.
         appendAudit("purge", {
           action: "headless-purge-all-accepted",
           status: "accepted-terminal",
@@ -2439,6 +2536,10 @@ export function createIntegration({
           responseText: `Purge all was not accepted: ${errorReasonCode(error, "purge-all-acceptance-failed")}.`,
         };
       }
+    } else if (command.verb === "reinitialize") {
+      result = reinitializeFromTerminal(command);
+    } else if (command.verb === "reset-breaker") {
+      result = resetBreaker(command);
     } else if (command.verb === "kill-switch") {
       const switchResult = command.enabled
         ? triggerKillSwitch("command")
@@ -2447,8 +2548,8 @@ export function createIntegration({
         ...switchResult,
         responseText: switchResult.ok
           ? command.enabled
-            ? `Kill switch enabled. Stored mode remains ${switchResult.storedMode}; effective mode is manual. No files were applied.`
-            : `Kill switch disabled. Stored mode remains ${switchResult.storedMode}. No files were applied.`
+            ? "Kill switch enabled. Automatic recommendations preference is unchanged; new automatic work and Apply are suppressed. No files were applied."
+            : "Kill switch disabled. Automatic recommendations preference is unchanged. No files were applied."
           : `Kill switch failed: ${switchResult.reason ?? switchResult.error}.`,
       };
     } else {
@@ -2464,10 +2565,22 @@ export function createIntegration({
         invalidateRoutingSettings();
         uiProjectionDirty = true;
         globalProjectionDirty = true;
-        syncSchedulerMode(input?.projectFingerprint, `command-${command.verb}`);
+        const commandProjectFingerprint = input?.projectFingerprint ?? settings()?.repo?.projectFingerprint;
+        syncSchedulerAdmission(commandProjectFingerprint, `command-${command.verb}`);
+        if (command.verb === "automatic-recommendations" && !command.enabled) {
+          downgradeInFlight("automatic-recommendations-off", { kinds: ["passive"] });
+        } else if (command.verb === "consent" && !command.value) {
+          downgradeInFlight("permission-revoked", { kinds: ["passive"] });
+        } else if (command.verb === "repo-override" && command.excluded) {
+          downgradeInFlight("project-excluded", { kinds: ["passive"], projectFingerprint: commandProjectFingerprint });
+        }
       }
     }
     if (command.verb === "purge") sensitiveExportManager = undefined;
+    if (command.verb === "reset-breaker" && result.ok) {
+      invalidateRoutingSettings();
+      syncSchedulerAdmission(input?.projectFingerprint ?? settings()?.repo?.projectFingerprint, "command-reset-breaker");
+    }
     if (output && typeof output === "object") output.responseText = result.responseText;
     afterResponse?.();
     if (!terminalPurge) await processMailbox();
@@ -2488,37 +2601,9 @@ export function createIntegration({
     }
   }
 
-  function setMode(mode, opts = {}) {
-    if (terminalPurge) return { ok: false, reason: "restart-required-after-purge-all" };
-    let transitioned;
-    let projectFingerprint;
-    const saved = store.updateSettings((current) => {
-      if (mode === "yolo") throw new Error("yolo-retired");
-      const global = current.global;
-      const request = { scope: opts.scope === "repo" ? "repo" : "global", mode, overrides: modeOverrides(current, current.repo.projectFingerprint) };
-      transitioned = schemas.transitionMode(global, current.repo, request, now(), opts.actor ?? "self-evolve-integration");
-      if (!transitioned.ok) throw new Error(transitioned.error);
-      projectFingerprint = current.repo.projectFingerprint;
-      return request.scope === "repo" ? { repo: transitioned.state.repo } : { global: transitioned.state.global };
-    });
-    if (!saved.ok) return { ok: false, reason: saved.reason };
-    uiProjectionDirty = true;
-    invalidateRoutingSettings();
-    for (const event of transitioned.events) store.appendRecord(schemas.wrapRecord("audit-event", event, event.timestamp));
-    const effectiveMode = syncSchedulerMode(projectFingerprint, "mode-change");
-    if (effectiveMode === "manual") {
-      for (const record of inFlight.values()) {
-        const { item } = record;
-        schedulerInstance.cancelPending?.(item.sessionID);
-        schedulerInstance.recordWorkResult?.(item, { result: "downgrade", downgrade: true });
-      }
-    }
-    publish("self-evolve.settings", { action: "mode", mode, effectiveMode });
-    return { ok: true, mode, effectiveMode, auditEvent: transitioned.events[0] };
-  }
-
   function getHealth() {
     const current = settings();
+    const automation = automationState();
     const hostSessionRecovery = hostRecoveryReport ? {
       ok: hostRecoveryReport.ok,
       cancelled: hostRecoveryReport.cancelled,
@@ -2528,14 +2613,14 @@ export function createIntegration({
       ...(hostRecoveryReport.reason ? { reason: hostRecoveryReport.reason } : {}),
     } : null;
     return {
-      mode: resolveEffectiveMode(current?.repo?.projectFingerprint),
-      repoMode: current?.repo?.mode ?? "inherit",
+      automaticRecommendationsEnabled: automation.ok && automation.enabled,
+      projectExcluded: automation.ok ? automation.repo.excluded : true,
       circuitBreakerOpen: circuitBreakerOpen(),
-      killSwitchActive: runtimeKillSwitch || current?.global?.killSwitchActive === true,
+      killSwitchActive: runtimeKillSwitch || automation.global?.killSwitchActive === true,
       hostVersion,
       hostVersionSource,
-      schemaVersion: schemas.SCHEMA_VERSION,
-      passiveEventHookInstalled: options.passiveEventHookInstalled !== false,
+      schemaVersion: schemas.V4_SCHEMA_VERSION,
+      lifecycleEventHookInstalled: options.passiveEventHookInstalled !== false,
       backgroundRestartRequired: backgroundRestartRequired(current),
       ...(hostSessionRecovery ? { hostSessionRecovery } : {}),
       ...(lastError ? { lastError } : {}),
@@ -2558,7 +2643,7 @@ export function createIntegration({
       while (attempts <= retries && !signal.aborted) {
         attempts += 1;
         try {
-          outcomes = await recoverOrphanedAnalyzerSessions(ctx?.client, ctx?.directory, {
+          outcomes = await recoverOrphanedHiddenSessions(ctx?.client, ctx?.directory, {
             store,
             ...hostOwnershipContext(),
             now: now(),
@@ -2594,77 +2679,83 @@ export function createIntegration({
 
   function triggerKillSwitch(reason = "runtime", request) {
     if (terminalPurge) return { ok: false, reason: "restart-required-after-purge-all" };
-    let downgrade;
-    let storedMode;
-    const transactionAudits = [];
-    const saved = store.updateGlobalSettings((global, current) => {
-      storedMode = global.mode;
-      downgrade = schemas.downgradeOnKillSwitch({
-        storedMode,
-        effectiveMode: schemas.resolveMode(global.mode, current.repo.mode, modeOverrides(current, current.repo.projectFingerprint)),
-        yoloApplicationEnabled: false,
-        killSwitchActive: runtimeKillSwitch || global.killSwitchActive,
-        actor: "self-evolve-integration",
-        timestamp: now(),
-      });
-      if (!downgrade.ok) throw new Error(downgrade.error);
-      transactionAudits.push(makeAuditRecord("kill-switch", {
-        action: "on",
-        reason: String(reason).slice(0, 512),
-        storedMode,
-        priorEffectiveMode: downgrade.events[0]?.details?.priorEffectiveMode ?? "manual",
-        effectiveMode: "manual",
-      }));
-      if (request) transactionAudits.push(operationCompletionRecord(request, { ok: true }));
-      return schemas.makeGlobalSettings({ ...global, killSwitchActive: true, updatedAt: now() });
-    }, { additionalAudits: transactionAudits });
+    const current = automationState();
+    if (!current.ok) return { ok: false, reason: current.reason ?? "automation-state-unavailable" };
+    const saved = store.transitionAutomation({
+      transitionId: request?.requestId ?? `emergency-stop:on:${current.epoch.generation}:${now()}:${randomUUID()}`,
+      expectedGeneration: current.epoch.generation,
+      action: "set-emergency-stop",
+      enabled: true,
+    });
     if (!saved.ok) return { ok: false, reason: saved.reason };
     runtimeKillSwitch = true;
     invalidateRoutingSettings();
-    const auditEvent = saved.auditEvents?.find((event) => event.kind === "kill-switch")
-      ?? transactionAudits.find((record) => record.payload.kind === "kill-switch")?.payload;
+    const auditEvent = appendAudit("kill-switch", {
+      action: "on",
+      reason: String(reason).slice(0, 512),
+      automaticRecommendationsEnabled: saved.settings.automaticRecommendationsEnabled,
+    });
+    if (request) store.appendRecord(operationCompletionRecord(request, { ok: true }));
     setModeForDowngrade("kill-switch");
     publish("self-evolve.settings", { action: "kill-switch", enabled: true });
-    return { ok: true, storedMode, effectiveMode: "manual", auditEvent };
+    return { ok: true, automaticRecommendationsEnabled: saved.settings.automaticRecommendationsEnabled, auditEvent };
   }
 
-  function setModeForDowngrade(reason) {
-    schedulerInstance.setMode?.("manual", reason);
+  function abortInFlight(reason, { kinds = ["passive", "manual"], projectFingerprint = null } = {}) {
     for (const record of inFlight.values()) {
+      if (!kinds.includes(record.kind)) continue;
+      if (projectFingerprint && record.item.projectFingerprint !== projectFingerprint) continue;
+      record.controller.abort(reason);
+    }
+  }
+
+  // Abort matching in-flight controllers BEFORE cancellation/result bookkeeping.
+  // Scheduler bookkeeping (cancelPending/recordWorkResult) applies only to
+  // scheduler-admitted passive work; explicit-manual scans are tracked in the
+  // in-flight registry for global-safety aborts but are not scheduler-owned.
+  function downgradeInFlight(reason, { kinds = ["passive", "manual"], projectFingerprint = null } = {}) {
+    abortInFlight(reason, { kinds, projectFingerprint });
+    if (!kinds.includes("passive")) return;
+    for (const record of inFlight.values()) {
+      if (record.kind !== "passive") continue;
+      if (projectFingerprint && record.item.projectFingerprint !== projectFingerprint) continue;
       const { item } = record;
       schedulerInstance.cancelPending?.(item.sessionID);
       schedulerInstance.recordWorkResult?.(item, { result: "downgrade", downgrade: true });
     }
   }
 
+  function setModeForDowngrade(reason, opts = {}) {
+    schedulerInstance.setMode?.("manual", reason);
+    downgradeInFlight(reason, opts);
+  }
+
   function clearKillSwitch(reason = "runtime", request) {
     if (terminalPurge) return { ok: false, reason: "restart-required-after-purge-all" };
-    let projectFingerprint;
-    let effectiveMode;
-    const transactionAudits = [];
-    const saved = store.updateGlobalSettings((global, current) => {
-      projectFingerprint = current.repo.projectFingerprint;
-      const next = schemas.makeGlobalSettings({ ...global, killSwitchActive: false, updatedAt: now() });
-      effectiveMode = schemas.resolveMode(next.mode, current.repo.mode, {
-        ...modeOverrides({ ...current, global: next }, projectFingerprint),
-        killSwitchActive: false,
-      });
-      transactionAudits.push(makeAuditRecord("kill-switch", { action: "off", reason: String(reason), storedMode: next.mode, effectiveMode }));
-      if (request) transactionAudits.push(operationCompletionRecord(request, { ok: true }));
-      return next;
-    }, { additionalAudits: transactionAudits });
+    const current = automationState();
+    if (!current.ok) return { ok: false, reason: current.reason ?? "automation-state-unavailable" };
+    const saved = store.transitionAutomation({
+      transitionId: request?.requestId ?? `emergency-stop:off:${current.epoch.generation}:${now()}:${randomUUID()}`,
+      expectedGeneration: current.epoch.generation,
+      action: "set-emergency-stop",
+      enabled: false,
+    });
     if (!saved.ok) return { ok: false, reason: saved.reason };
     runtimeKillSwitch = false;
     invalidateRoutingSettings();
-    effectiveMode = syncSchedulerMode(projectFingerprint, "kill-switch-cleared");
-    const auditEvent = saved.auditEvents?.find((event) => event.kind === "kill-switch")
-      ?? transactionAudits.find((record) => record.payload.kind === "kill-switch")?.payload;
-    publish("self-evolve.settings", { action: "kill-switch", enabled: false, effectiveMode });
-    return { ok: true, storedMode: saved.settings.global.mode, effectiveMode, auditEvent };
+    syncSchedulerAdmission(settings()?.repo?.projectFingerprint, "kill-switch-cleared");
+    const auditEvent = appendAudit("kill-switch", {
+      action: "off",
+      reason: String(reason),
+      automaticRecommendationsEnabled: saved.settings.automaticRecommendationsEnabled,
+    });
+    if (request) store.appendRecord(operationCompletionRecord(request, { ok: true }));
+    publish("self-evolve.settings", { action: "kill-switch", enabled: false });
+    return { ok: true, automaticRecommendationsEnabled: saved.settings.automaticRecommendationsEnabled, auditEvent };
   }
 
   async function boot(args = {}) {
-    if (terminalPurge) return { ok: false, mode: "manual", reason: "restart-required-after-purge-all", health: { mode: "manual", lastError: "restart-required-after-purge-all" } };
+    if (terminalGateReason()) return { ok: false, automaticWorkAllowed: false, reason: "restart-required-after-purge-all", health: { automaticWorkAllowed: false, lastError: "restart-required-after-purge-all" } };
     ctx = args.ctx ?? ctx;
     hostVersion = String(args.hostVersion ?? hostVersion);
     hostVersionSource = args.hostVersionSource === "tui-app-version" ? "tui-app-version" : hostVersionSource;
@@ -2688,24 +2779,29 @@ export function createIntegration({
         if (terminalPurge) {
           return {
             ok: false,
-            mode: "manual",
+            automaticWorkAllowed: false,
             reason: "restart-required-after-purge-all",
-            health: { mode: "manual", lastError: "restart-required-after-purge-all" },
+            health: { automaticWorkAllowed: false, lastError: "restart-required-after-purge-all" },
           };
         }
         stopAfterPurgeAll();
+        // Ensure the terminal epoch is durable: if the crash happened before
+        // scheduleTerminalPurge wrote it, write it now so peers fail closed.
+        try { store.markRootTerminal?.({ terminalOperationId: `boot-recovery-terminal:${now()}` }); } catch {}
         await startWorkDrain();
         try { sensitiveExportManager?.purge(); } catch {}
         sensitiveExportManager = undefined;
         privacy.purgeScope({ scope: "all" });
         return {
           ok: false,
-          mode: "manual",
+          automaticWorkAllowed: false,
           reason: "restart-required-after-purge-all",
-          health: { mode: "manual", lastError: "restart-required-after-purge-all" },
+          health: { automaticWorkAllowed: false, lastError: "restart-required-after-purge-all" },
         };
       }
       settings();
+      const projectRoot = options.projectRoot ?? options.worktree ?? ctx?.worktree ?? ctx?.directory;
+      await currentHostGlobalCatalog(projectRoot);
       store.recoverDecisionTransaction?.();
       globalRejectionRecovery = recoverGlobalRejectionsForAuthority();
       const contributionRecovery = pipelineInstance.recoverContributionTransactions?.();
@@ -2748,37 +2844,50 @@ export function createIntegration({
           recovery.push({ ok: failed.ok, proposalId: proposal.id, action: "failed-closed", reason: resumed.reason ?? "apply-recovery-failed" });
         }
       }
-      if (args.recoverHostSessions !== false) hiddenSessionRecovery = await recoverOrphanedAnalyzerSessions(ctx?.client, ctx?.directory, {
+      if (args.recoverHostSessions !== false) hiddenSessionRecovery = await recoverOrphanedHiddenSessions(ctx?.client, ctx?.directory, {
         store,
         ...hostOwnershipContext(),
         now: now(),
       });
-      if (options.stateRoot) {
-        issueBridgeNonces();
-        issueControlGrant();
-        if (args.processMailbox !== false) await processMailbox();
-        startMailboxPolling();
-      }
-      startRetentionTimer();
-      appendAudit("decision", { action: "boot", hostVersion, hostVersionSource, schemaVersion: schemas.SCHEMA_VERSION, recovered: recovery.length, recoveredSyntheses: synthesisRecovery.length, abortedHiddenSessions: hiddenSessionRecovery.filter((item) => item.action === "deleted").length, hiddenSessionRecoveryFailures: hiddenSessionRecovery.filter((item) => !item.ok).length });
       recovery = recovery.map((item) => recoveredFailedClosed.has(item) ? { ...item, recoveredToFailedClosed: true } : item);
     } catch (error) {
       corrupt = true;
       lastError = errorReasonCode(error, "unknown-error");
     }
-    bootValidated = !corrupt;
-    if (bootValidated && options.stateRoot) {
-      try {
-        refreshGlobalRecommendationProjection({ force: true });
-        if (args.processMailbox !== false) await processMailbox();
-      } catch (error) {
-        lastError = errorReasonCode(error, "global-bridge-boot-failed");
-        globalProjection = undefined;
-        globalProjectionDirty = true;
+    // Calculate aggregate boot success ONCE across every mandatory recovery
+    // family. Both failure modes are covered: thrown errors set `corrupt`
+    // in the catch above, and non-throwing ok:false items fail the predicates.
+    const bootSucceeded = !corrupt
+      && recovery.every((item) => item.ok !== false || item.recoveredToFailedClosed === true)
+      && synthesisRecovery.every((item) => item.ok)
+      && globalDecisionRecovery.every((item) => item.ok !== false)
+      && globalRejectionRecovery.ok !== false
+      && hiddenSessionRecovery.every((item) => item.ok);
+    bootValidated = bootSucceeded;
+    // Activate runtime authority, timers, and the boot-success audit ONLY
+    // after aggregate success. On failure: no grants issued, no mailbox
+    // effects applied, no settings/decision changes, no target mutations,
+    // no polling started, no provider dispatch, and bootValidated stays false.
+    if (bootSucceeded) {
+      if (options.stateRoot) {
+        try {
+          refreshGlobalRecommendationProjection({ force: true });
+        } catch (error) {
+          lastError = errorReasonCode(error, "global-bridge-boot-failed");
+          globalProjection = undefined;
+          globalProjectionDirty = true;
+        }
+        issueBridgeNonces();
+        if (args.processMailbox !== false) {
+          try { await processMailbox(); } catch (error) { lastError = errorReasonCode(error, "unknown-error"); }
+        }
+        startMailboxPolling();
       }
+      startRetentionTimer();
+      appendAudit("decision", { action: "boot", hostVersion, hostVersionSource, schemaVersion: schemas.SCHEMA_VERSION, recovered: recovery.length, recoveredSyntheses: synthesisRecovery.length, abortedHiddenSessions: hiddenSessionRecovery.filter((item) => item.action === "deleted").length, hiddenSessionRecoveryFailures: hiddenSessionRecovery.filter((item) => !item.ok).length });
     }
-    const mode = syncSchedulerMode(settings()?.repo?.projectFingerprint, "boot");
-    return { ok: !corrupt && recovery.every((item) => item.ok !== false || item.recoveredToFailedClosed === true) && synthesisRecovery.every((item) => item.ok) && globalDecisionRecovery.every((item) => item.ok !== false) && globalRejectionRecovery.ok !== false && hiddenSessionRecovery.every((item) => item.ok), mode, recovered: recovery, synthesisRecovery, globalDecisionRecovery, globalRejectionRecovery, hiddenSessionRecovery, health: getHealth() };
+    const automaticWorkAllowed = syncSchedulerAdmission(settings()?.repo?.projectFingerprint, "boot");
+    return { ok: bootSucceeded, automaticWorkAllowed, recovered: recovery, synthesisRecovery, globalDecisionRecovery, globalRejectionRecovery, hiddenSessionRecovery, health: getHealth() };
   }
 
   function startWorkDrain() {
@@ -2875,9 +2984,10 @@ export function createIntegration({
       return handleCommand({ command: value, projectFingerprint });
     },
     getHealth,
-    getMode: () => ({ storedMode: settings()?.global?.mode ?? "manual", effectiveMode: resolveEffectiveMode(settings()?.repo?.projectFingerprint) }),
-    setMode,
-    getConsent: () => commandPolicy.getConsent?.() ?? settings()?.global?.consent,
+    getAutomation: () => automationState(),
+    setAutomaticRecommendations: (enabled) => commandPolicy.setAutomaticRecommendations?.(enabled)
+      ?? { ok: false, reason: "automation-policy-unavailable" },
+    getConsent: () => commandPolicy.getConsent?.() ?? automationState()?.global?.consent,
     setConsent: (key, value) => commandPolicy.setConsent?.(key, value) ?? { ok: false, reason: "consent-policy-unavailable" },
   });
 
@@ -2891,7 +3001,6 @@ export function createIntegration({
     decide,
     processMailbox,
     issueBridgeNonces,
-    issueControlGrant,
     refreshUiProjection,
     runRetentionSweep,
     __testBridge: testBridge,
@@ -2901,6 +3010,6 @@ export function createIntegration({
     triggerKillSwitch,
     clearKillSwitch,
     getRetentionState: () => ({ scheduled: retentionTimer !== undefined, inFlight: retentionTask !== undefined }),
-    getInFlightWork: () => [...inFlight.values()].map((record) => ({ ...record.item })),
+    getInFlightWork: () => [...inFlight.values()].map((record) => ({ ...record.item, kind: record.kind })),
   });
 }

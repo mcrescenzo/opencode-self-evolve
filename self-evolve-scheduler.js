@@ -15,6 +15,7 @@ import {
   wrapRecord,
 } from "./self-evolve-schemas.js";
 import { hashSessionLineage, resolveRootLineage } from "./self-evolve-observation.js";
+import { BREAKER_EPOCH_RESET_CONFIRMATION } from "./self-evolve-epoch.js";
 
 const ACTOR = "self-evolve-scheduler";
 const DEFAULT_LEASE_TTL_MS = 10 * 60 * 1000;
@@ -83,6 +84,15 @@ function safeSettings(store) {
   }
 }
 
+function safeAutomation(store) {
+  try {
+    const state = store.getAutomationState?.();
+    return state?.ok ? state : null;
+  } catch {
+    return null;
+  }
+}
+
 function latestCursor(store, sessionIDHash) {
   const records = store.readRecords?.("episode-cursor") ?? [];
   return records.filter((record) => record?.payload?.sessionIDHash === sessionIDHash).at(-1)?.payload
@@ -145,7 +155,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   if (typeof now !== "function") throw new TypeError("now-must-be-function");
   if (typeof log !== "function") throw new TypeError("log-must-be-function");
 
-  const initialSettings = safeSettings(store);
+  const initialSettings = safeAutomation(store) ?? safeSettings(store);
   const budgetOverrides = Object.fromEntries(Object.entries(budgets).filter(([key]) => key in DEFAULT_BUDGETS));
   const configured = {
     ...DEFAULT_BUDGETS,
@@ -186,21 +196,33 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
 
   function latestBreaker() {
     try {
-      return store.readRecords?.("circuit-breaker").at(-1)?.payload
-        ?? makeCircuitBreaker({ open: false, tripCount: 0 });
+      const stored = store.readRecords?.("circuit-breaker").at(-1)?.payload;
+      // H5-001: the durable root-global breaker epoch is the cross-process
+      // open/closed truth. If it is tripped, the breaker is open regardless of
+      // this process's stale view of the per-trip audit records. A corrupt
+      // breaker epoch fails closed (tripped).
+      if (store.breakerEpochTripped?.() === true) {
+        return stored?.open === true
+          ? stored
+          : makeCircuitBreaker({ open: true, tripCount: Math.max(0, Number(stored?.tripCount ?? 0)) });
+      }
+      return stored ?? makeCircuitBreaker({ open: false, tripCount: 0 });
     } catch {
-      return makeCircuitBreaker({ open: false, tripCount: 0 });
+      return makeCircuitBreaker({ open: true, tripCount: 0 });
     }
   }
 
-  function append(kind, payload, timestamp) {
-    const result = store.appendRecord?.(wrapRecord(kind, payload, timestamp));
+  function append(kind, payload, timestamp, automationStamp = null) {
+    const result = store.appendRecord?.(wrapRecord(kind, payload, timestamp), { automationStamp });
     if (!result?.ok) throw new Error(result?.reason ?? `${kind}-write-failed`);
   }
 
-  function audit(action, details = {}, timestamp = now(), kind = "decision") {
+  function audit(action, details = {}, timestamp = now(), kind = "decision", automationStamp = null) {
     const clean = { action, ...details };
     try {
+      const automation = safeAutomation(store);
+      if (typeof store.getAutomationState === "function" && !automation?.enabled) return;
+      const authoritativeStamp = automationStamp ?? automation?.stamp ?? null;
       const payloadHash = hash(JSON.stringify(clean));
       append("audit-event", makeAuditEvent({
         id: hash(`${timestamp}:${randomUUID()}:${payloadHash}`),
@@ -209,7 +231,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
         timestamp,
         payloadHash,
         details: clean,
-      }), timestamp);
+      }), timestamp, authoritativeStamp);
     } catch (error) {
       log({ level: "warn", action, error: String(error?.message ?? error) });
     }
@@ -275,10 +297,20 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     let lease;
     let result;
     try {
-      lease = store.acquireLease(PASSIVE_BUDGET_LEASE_KEY, { ttlMs: PASSIVE_BUDGET_LEASE_TTL_MS, actor: ACTOR });
+      const automation = safeAutomation(store);
+      if (!automation?.enabled) return { ok: false, reason: "automatic-recommendations-disabled" };
+      if (context.automationStamp && !store.compareAutomationStamp?.(context.automationStamp)) {
+        return { ok: false, reason: "stale-automation-generation" };
+      }
+      const automationStamp = context.automationStamp ?? automation.stamp;
+      lease = store.acquireLease(PASSIVE_BUDGET_LEASE_KEY, {
+        ttlMs: PASSIVE_BUDGET_LEASE_TTL_MS,
+        actor: ACTOR,
+        automationStamp,
+      });
       if (!lease?.ok) return { ok: false, reason: lease?.reason === "lease-busy" ? "passive-provider-budget-reservation-busy" : String(lease?.reason ?? "passive-provider-budget-lease-failed") };
 
-      const freshSettings = safeSettings(store);
+      const freshSettings = safeAutomation(store);
       if (!freshSettings) return { ok: false, reason: "passive-provider-budget-settings-unavailable" };
       const limit = currentBudgets(freshSettings).passiveCallsPerHour;
       const events = store.readRecords?.("audit-event")?.map((record) => record?.payload).filter((event) => event?.actor === ACTOR) ?? [];
@@ -306,7 +338,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
           timestamp,
           payloadHash,
           details: clean,
-        }), timestamp);
+        }), timestamp, automationStamp);
       }
       const persisted = (store.readRecords?.("audit-event") ?? []).filter((record) =>
         record?.payload?.actor === ACTOR
@@ -348,9 +380,11 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       return { ok: false, reason: "invalid-episode-lease-request" };
     }
     const key = leaseKey(projectFingerprint, sessionID);
+    const automation = safeAutomation(store);
+    if (!automation?.enabled) return { ok: false, reason: "automatic-recommendations-disabled" };
     let lease;
     try {
-      lease = store.acquireLease(key, { ttlMs: leaseTtlMs, actor: ACTOR });
+      lease = store.acquireLease(key, { ttlMs: leaseTtlMs, actor: ACTOR, automationStamp: automation.stamp });
     } catch (error) {
       return { ok: false, reason: String(error?.message ?? error) };
     }
@@ -373,9 +407,11 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     if (!accepting || disposed) return;
     const timestamp = now();
     cleanupStaleSessions(timestamp);
-    const settings = safeSettings(store);
-    cachedMode = effectiveMode(settings);
-    if (cachedMode === "manual" || breaker.open) return;
+    const automation = safeAutomation(store);
+    if (!automation?.enabled || breaker.open
+        || automation.global.killSwitchActive || automation.repo.excluded) return;
+    const settings = automation;
+    cachedMode = "auto";
     if (timestamp - state.touchedAt > STALE_SESSION_MS) {
       sessions.delete(state.sessionID);
       audit("late-session-cleanup", { sessionIDHash: hashSessionLineage(state.sessionID) }, timestamp);
@@ -405,7 +441,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     const projectFingerprint = settings?.repo?.projectFingerprint;
     if (!projectFingerprint) return;
     const consent = settings.global.consent;
-    if (!consent?.passiveCalls || !consent?.durableObservations) {
+    if (!consent?.durableObservations || !consent?.sanitizedExcerpts || !consent?.crossRepoAggregation) {
       audit("schedule-suppressed", {
         sessionIDHash: hashSessionLineage(state.sessionID),
         reason: "consent-missing",
@@ -422,7 +458,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     const key = leaseKey(projectFingerprint, state.sessionID);
     let lease;
     try {
-      lease = store.acquireLease(key, { ttlMs: leaseTtlMs, actor: ACTOR });
+      lease = store.acquireLease(key, { ttlMs: leaseTtlMs, actor: ACTOR, automationStamp: automation.stamp });
     } catch (error) {
       audit("scheduler-failure", { sessionIDHash, reason: String(error?.message ?? error).slice(0, 400) }, timestamp);
       return;
@@ -455,6 +491,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
         ...(state.canonicalRootSessionID ? { rootSessionID: state.canonicalRootSessionID } : {}),
         rootSessionIDHash: state.rootLineageHash ?? UNKNOWN_ROOT_LINEAGE_HASH,
         originKind: state.originKind ?? "unknown",
+        automationStamp: automation.stamp,
       });
       inFlight.set(state.sessionID, workItem);
     } catch (error) {
@@ -485,8 +522,9 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     const event = eventBody(input);
     const status = statusType(event);
     if (!status && event?.type !== "session.compacted") return;
-    cachedMode = effectiveMode(safeSettings(store));
-    if (cachedMode === "manual") return;
+    const automation = safeAutomation(store);
+    if (!automation?.enabled || automation.global.killSwitchActive || automation.repo.excluded) return;
+    cachedMode = "auto";
     const sessionID = eventSessionID(event);
     if (!sessionID) return;
     const timestamp = now();
@@ -558,6 +596,12 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
   function tripCircuitBreaker(reason) {
     breaker = trip(breaker, String(reason || "scheduler-failure"), now());
     try { append("circuit-breaker", breaker, now()); } catch (error) { log({ level: "warn", action: "persist-circuit-breaker", error: String(error?.message ?? error) }); }
+    // H5-001: also write the durable root-global breaker epoch so peer processes
+    // see the open state at their next boundary read. Idempotent within a
+    // generation; best-effort on capability-unavailable hosts.
+    try {
+      store.tripBreakerEpoch?.({ reason: String(reason || "scheduler-failure"), operationId: `scheduler-trip:${now()}` });
+    } catch (error) { log({ level: "warn", action: "persist-breaker-epoch-trip", error: String(error?.message ?? error) }); }
     for (const state of sessions.values()) clearTimer(state);
     cachedMode = "manual";
     return breaker;
@@ -567,6 +611,22 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     breaker = reset(breaker);
     try { append("circuit-breaker", breaker, now()); } catch (error) { log({ level: "warn", action: "persist-circuit-breaker-reset", error: String(error?.message ?? error) }); }
     audit("circuit-breaker-reset", { reason: String(reason) }, now());
+    // H5-001: the durable root-global breaker epoch is the cross-process truth.
+    // A scheduler-local reset only clears this process's in-memory breaker; the
+    // durable epoch requires the authenticated root-global reset operation
+    // (integration resetBreaker / /self-evolve reset-breaker). Attempt a durable
+    // reset only when the epoch is currently tripped; otherwise this is a local
+    // no-op for peers. Best-effort: capability-unavailable hosts keep the local
+    // reset so this process resumes, and the operator can retry the durable
+    // reset from a capable process.
+    try {
+      if (store.breakerEpochTripped?.() === true) {
+        store.resetBreakerEpoch?.({
+          confirmation: BREAKER_EPOCH_RESET_CONFIRMATION,
+          authentication: { operatorAuthority: "operator" },
+        });
+      }
+    } catch (error) { log({ level: "warn", action: "persist-breaker-epoch-reset", error: String(error?.message ?? error) }); }
     cachedMode = effectiveMode();
     return breaker;
   }
@@ -651,6 +711,122 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     return { ok: true };
   }
 
+  // H7-001: Independent candidate-drain trigger. This is callable without a
+  // session idle event or new source observation. It checks budgets, breaker,
+  // and consent, acquires a cross-process drain lease, and enqueues a drain
+  // work item that the integration layer processes through the normal
+  // work-promise plumbing. The drain work item carries no sessionID cursor,
+  // signaling that the pipeline should skip observation and proceed directly
+  // to draining eligible candidates.
+  function triggerCandidateDrain({ projectFingerprint, scopeFingerprint } = {}) {
+    if (!accepting || disposed) return { ok: false, reason: "scheduler-not-accepting" };
+    const timestamp = now();
+    const automation = safeAutomation(store);
+    if (!automation?.enabled) return { ok: false, reason: "automatic-recommendations-disabled" };
+    const settings = automation;
+    cachedMode = "auto";
+    if (breaker.open) return { ok: false, reason: "circuit-breaker-open" };
+    const resolvedProject = projectFingerprint ?? settings?.repo?.projectFingerprint;
+    if (!resolvedProject) return { ok: false, reason: "project-fingerprint-required" };
+    const budget = runBudgetCheck(timestamp, settings);
+    if (budget.withinQuietPeriod || budget.passiveCallsRemainingThisHour === 0 || budget.synthesesRemainingToday === 0) {
+      audit("drain-suppressed", {
+        projectFingerprint: resolvedProject,
+        reason: budget.withinQuietPeriod ? "quiet-period" : "budget-exhausted",
+      }, timestamp);
+      return { ok: false, reason: budget.withinQuietPeriod ? "quiet-period" : "budget-exhausted" };
+    }
+    const consent = settings.global.consent;
+    if (!consent?.durableObservations || !consent?.sanitizedExcerpts || !consent?.crossRepoAggregation) {
+      audit("drain-suppressed", { projectFingerprint: resolvedProject, reason: "consent-missing" }, timestamp);
+      return { ok: false, reason: "consent-missing" };
+    }
+    const leaseKey = `drain_${hash(`${resolvedProject}`)}`;
+    let lease;
+    try {
+      lease = store.acquireLease(leaseKey, { ttlMs: leaseTtlMs, actor: ACTOR, automationStamp: automation.stamp });
+    } catch (error) {
+      audit("drain-failure", { projectFingerprint: resolvedProject, reason: String(error?.message ?? error).slice(0, 400) }, timestamp);
+      return { ok: false, reason: "drain-lease-failed" };
+    }
+    if (!lease?.ok) {
+      audit(lease?.reason === "lease-busy" ? "drain-lease-busy" : "drain-lease-failed", {
+        projectFingerprint: resolvedProject,
+        reason: String(lease?.reason ?? "unknown"),
+      }, timestamp, "lease");
+      return { ok: false, reason: lease?.reason === "lease-busy" ? "drain-lease-busy" : "drain-lease-failed" };
+    }
+    heldLeases.set(leaseKey, lease.nonce);
+    const drainId = hash(`drain-work-v1:${resolvedProject}:${timestamp}:${randomUUID()}`);
+    const workItem = Object.freeze({
+      drain: true,
+      drainId,
+      sessionID: `drain:${drainId.slice(0, 16)}`,
+      projectFingerprint: resolvedProject,
+      scopeFingerprint: scopeFingerprint ?? resolvedProject,
+      leaseNonce: lease.nonce,
+      _leaseKey: leaseKey,
+      scheduledAt: timestamp,
+      trigger: cachedMode,
+      epoch: 0,
+      cursor: makeEpisodeCursor({ sessionIDHash: hashSessionLineage(drainId) }),
+      rootSessionIDHash: UNKNOWN_ROOT_LINEAGE_HASH,
+      originKind: "unknown",
+      automationStamp: automation.stamp,
+    });
+    const budgetSnapshot = Object.freeze({
+      synthesesRemainingToday: budget.synthesesRemainingToday,
+      passiveCallsRemainingThisHour: budget.passiveCallsRemainingThisHour,
+    });
+    const workPromise = Promise.resolve()
+      .then(() => enqueueWork(workItem))
+      .then(
+        (result) => recordDrainWorkResult(workItem, budgetSnapshot, result),
+        (error) => recordDrainWorkResult(workItem, budgetSnapshot, { ok: false, error: String(error?.message ?? error) }),
+      )
+      .catch((error) => {
+        log({ level: "warn", action: "settle-drain-work", error: String(error?.message ?? error) });
+      });
+    workPromises.add(workPromise);
+    void workPromise.finally(() => workPromises.delete(workPromise));
+    audit("drain-admitted", {
+      projectFingerprint: resolvedProject,
+      drainId,
+      synthesesRemainingToday: budgetSnapshot.synthesesRemainingToday,
+      passiveCallsRemainingThisHour: budgetSnapshot.passiveCallsRemainingThisHour,
+    }, timestamp);
+    return { ok: true, drainId };
+  }
+
+  function recordDrainWorkResult(workItem, budgetSnapshot, result = {}) {
+    const key = workItem?._leaseKey;
+    const nonce = workItem?.leaseNonce;
+    if (key && nonce && heldLeases.get(key) === nonce) {
+      try { store.releaseLease(key, nonce); heldLeases.delete(key); }
+      catch (error) { log({ level: "warn", action: "release-drain-lease", error: String(error?.message ?? error) }); }
+    }
+    const timestamp = now();
+    if (normalizeResultFailure(result)) {
+      audit("drain-failure", {
+        projectFingerprint: workItem?.projectFingerprint,
+        drainId: workItem?.drainId,
+        reason: String(result?.reason ?? result?.error ?? "unknown").slice(0, 400),
+        synthesesRemainingToday: budgetSnapshot.synthesesRemainingToday,
+        passiveCallsRemainingThisHour: budgetSnapshot.passiveCallsRemainingThisHour,
+      }, timestamp);
+    } else {
+      audit("drain-settled", {
+        projectFingerprint: workItem?.projectFingerprint,
+        drainId: workItem?.drainId,
+        drained: Array.isArray(result?.drained) ? result.drained.length : 0,
+        result: String(result?.result ?? "ok").slice(0, 128),
+        synthesesRemainingToday: budgetSnapshot.synthesesRemainingToday,
+        passiveCallsRemainingThisHour: budgetSnapshot.passiveCallsRemainingThisHour,
+      }, timestamp);
+    }
+    return { accepted: true, stale: false };
+  }
+
   function dispose() {
     if (disposed) return;
     stopAdmission();
@@ -682,6 +858,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     resetCircuitBreaker,
     setMode,
     recordWorkResult,
+    triggerCandidateDrain,
     stopAdmission,
     drain,
     dispose,

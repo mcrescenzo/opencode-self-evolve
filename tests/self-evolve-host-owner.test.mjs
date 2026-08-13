@@ -4,9 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { recoverOrphanedAnalyzerSessions } from "../self-evolve-integration.js";
-import { hashSkillContent } from "../self-evolve-inventory.js";
-import { runSynthesis } from "../self-evolve-synthesis.js";
+import { recoverOrphanedHiddenSessions } from "../self-evolve-integration.js";
 import { hashContent, HOST_OWNER_TTL_MS, openStore } from "../self-evolve-store.js";
 
 const NOW = 2_100_000_000_000;
@@ -90,7 +88,6 @@ test("dead matching owner is abortable while live and reused pids defer", (t) =>
   assert.equal(status(f.store, "dead-session").classification, "live-owner");
   assert.equal(status(f.store, "dead-session", { now: NOW + HOST_OWNER_TTL_MS + 1 }).classification, "live-owner");
 });
-
 test("unknown and foreign same-name sessions remain non-abortable", (t) => {
   const f = fixture(t);
   assert.equal(status(f.store, "unknown-session").classification, "unknown");
@@ -126,8 +123,8 @@ test("recovery interrupts and deletes a dead owner once while deferring live, un
   const deletions = [];
   const client = recoveryClient(sessions, aborts, deletions);
 
-  const first = await recoverOrphanedAnalyzerSessions(client, "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
-  const second = await recoverOrphanedAnalyzerSessions(client, "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
+  const first = await recoverOrphanedHiddenSessions(client, "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
+  const second = await recoverOrphanedHiddenSessions(client, "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
 
   assert.deepEqual(aborts, ["dead-session"]);
   assert.deepEqual(deletions, ["dead-session"]);
@@ -139,7 +136,7 @@ test("recovery interrupts and deletes a dead owner once while deferring live, un
   f.setAlive(true);
   const liveAborts = [];
   const liveDeletions = [];
-  const live = await recoverOrphanedAnalyzerSessions(recoveryClient([
+  const live = await recoverOrphanedHiddenSessions(recoveryClient([
     { id: "live-session", agent: "self-evolve-synthesizer", state: "running" },
   ], liveAborts, liveDeletions), "/workspace", { store: f.store, projectFingerprint: PROJECT, rootIdentity: f.store.rootIdentity, now: NOW });
   assert.deepEqual(liveAborts, []);
@@ -190,57 +187,4 @@ test("expired host owners are reclaimed only after their process is dead", (t) =
   f.setAlive(false);
   assert.deepEqual(f.store.cleanupExpiredHostOwners({ now: NOW + 2 }), { hostOwners: 1, quarantinedHostOwners: 0 });
   assert.equal(status(f.store, "expired-session", { now: NOW + 2 }).classification, "unknown");
-});
-
-test("hidden-session terminal finally removes ownership after a pre-prompt crash", async (t) => {
-  const f = fixture(t);
-  const currentContent = "---\nname: owner-test\ndescription: Tests owner cleanup.\n---\n\n# Owner Test\n";
-  const currentHash = hashSkillContent(currentContent);
-  const cluster = {
-    id: "e".repeat(64),
-    receiptType: "repeated-command",
-    projectFingerprint: PROJECT,
-    scopeFingerprint: "f".repeat(64),
-    incidentIds: ["one", "two", "three"],
-    occurrencesSum: 3,
-    firstSeenAt: NOW - 2,
-    lastSeenAt: NOW - 1,
-    observations: [{ id: "1".repeat(64), createdAt: NOW - 1, receiptIds: ["2".repeat(64)], structuredFields: { receiptType: "repeated-command" }, redacted: true, injectionFlagged: false }],
-    eligibility: { clusterId: "e".repeat(64), eligible: true },
-  };
-  const target = { canonicalRoot: "/skills", relativePath: "owner-test/SKILL.md", logicalName: "owner-test", currentHash, currentContent };
-  let prompts = 0;
-  let aborts = 0;
-  let deletions = 0;
-  const ctx = { directory: "/workspace", client: { session: {
-    async create() { return { data: { id: "prompt-failure-session" } }; },
-    async prompt() { prompts += 1; return { data: {} }; },
-    async abort() { aborts += 1; return { data: {} }; },
-    async delete() { deletions += 1; return { data: {} }; },
-  } } };
-
-  const result = await runSynthesis({
-    ctx,
-    cluster,
-    targetSkill: target,
-    inventory: [target],
-    privacy: { checkPartition: () => ({ ok: true }), isObservationEligible: () => true },
-    options: {
-      store: f.store,
-      currentContent,
-      eligibility: cluster.eligibility,
-      validateTarget: () => ({ ok: true }),
-      projectFingerprint: PROJECT,
-      rootIdentity: f.store.rootIdentity,
-      hostOwnerGeneration: 9,
-      faultInjection(point) { if (point === "hidden-session-after-owner-acquire") throw new Error("simulated-pre-prompt-crash"); },
-    },
-    now: NOW,
-  });
-
-  assert.equal(result.ok, false);
-  assert.equal(prompts, 0);
-  assert.ok(aborts >= 1);
-  assert.equal(deletions, 1);
-  assert.equal(status(f.store, "prompt-failure-session").classification, "unknown");
 });

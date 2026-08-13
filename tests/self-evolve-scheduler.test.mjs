@@ -68,8 +68,26 @@ function fixture(t, options = {}) {
     },
     repo: { projectFingerprint: PROJECT, mode: "inherit", excluded: false, budgets: {} },
   };
+  const automation = options.automation ?? {
+    ok: true,
+    enabled: options.automaticEnabled ?? true,
+    stamp: { generation: 1, permissionsHash: H("c") },
+    global: {
+      automaticRecommendationsEnabled: options.automaticEnabled ?? true,
+      killSwitchActive: false,
+      consent: { durableObservations: true, sanitizedExcerpts: true, crossRepoAggregation: true },
+      budgets: settings.global.budgets,
+    },
+    repo: { projectFingerprint: PROJECT, excluded: false, budgets: settings.repo.budgets },
+  };
   const store = {
     getSettings() { calls.settingsReads += 1; return settings; },
+    getAutomationState() {
+      calls.settingsReads += 1;
+      const permissionsGranted = Object.values(automation.global.consent).every(Boolean);
+      return { ...automation, enabled: automation.enabled && permissionsGranted };
+    },
+    compareAutomationStamp(stamp) { return stamp?.generation === automation.stamp.generation; },
     readRecords: (kind) => records.get(kind) ?? [],
     appendRecord(envelope) {
       calls.append.push(envelope);
@@ -111,7 +129,7 @@ function fixture(t, options = {}) {
     }),
     log: (entry) => calls.logs.push(entry),
   });
-  return { root, clock, records, leases, calls, settings, store, work, scheduler };
+  return { root, clock, records, leases, calls, settings, automation, store, work, scheduler };
 }
 
 function actions(records, action) {
@@ -309,8 +327,8 @@ test("two schedulers contend on one cross-process lease", async (t) => {
   second.scheduler.dispose();
 });
 
-test("manual mode returns without scheduling or durable writes", async (t) => {
-  const { scheduler, work, calls } = fixture(t, { mode: "manual" });
+test("Automatic recommendations Off returns without scheduling or durable writes", async (t) => {
+  const { scheduler, work, calls } = fixture(t, { automaticEnabled: false });
   await scheduler.handleEvent(idle("manual"));
   await wait(15);
   assert.equal(work.length, 0);
@@ -319,34 +337,37 @@ test("manual mode returns without scheduling or durable writes", async (t) => {
   scheduler.dispose();
 });
 
-test("fresh Manual and pause changes override an earlier scheduler mode observation", async (t) => {
+test("fresh Off, Emergency Stop, and project exclusion suppress an earlier scheduler observation", async (t) => {
   for (const suppress of [
-    (settings) => { settings.repo.mode = "manual"; },
-    (settings) => { settings.global.paused = true; },
+    (automation) => { automation.enabled = false; },
+    (automation) => { automation.global.killSwitchActive = true; },
+    (automation) => { automation.repo.excluded = true; },
   ]) {
-    await t.test(suppress.toString().includes("paused") ? "pause" : "manual", async (t) => {
-      const { scheduler, settings, work, calls } = fixture(t, { budgets: { idleDebounceMs: 20 } });
+    const label = suppress.toString().includes("killSwitch") ? "emergency-stop"
+      : suppress.toString().includes("excluded") ? "project-excluded" : "automatic-off";
+    await t.test(label, async (t) => {
+      const { scheduler, automation, work, calls } = fixture(t, { budgets: { idleDebounceMs: 20 } });
       scheduler.setMode("auto", "integration-observed-auto");
+      const appendsBefore = calls.append.length;
       await scheduler.handleEvent(idle("fresh-suppressor"));
-      suppress(settings);
+      suppress(automation);
       await wait(35);
       assert.equal(work.length, 0);
       assert.equal(calls.acquire.length, 0);
-      assert.equal(calls.append.length, 0);
+      assert.equal(calls.append.length, appendsBefore);
       scheduler.dispose();
     });
   }
 });
 
-test("missing background consent is durably visible as a scheduling suppression", async (t) => {
-  const { scheduler, settings, work, records } = fixture(t);
-  settings.global.consent.passiveCalls = false;
+test("required permission revocation suppresses scheduling", async (t) => {
+  const { scheduler, automation, work, records } = fixture(t);
+  automation.global.consent.sanitizedExcerpts = false;
   await scheduler.handleEvent(idle("missing-consent", { projectFingerprint: PROJECT }));
   await wait(15);
   assert.equal(work.length, 0);
   const suppressed = actions(records, "schedule-suppressed");
-  assert.equal(suppressed.length, 1);
-  assert.equal(suppressed[0].payload.details.reason, "consent-missing");
+  assert.equal(suppressed.length, 0);
   scheduler.dispose();
 });
 
@@ -657,20 +678,19 @@ test("handleEvent returns within 50ms even when debounce is immediate", async (t
   scheduler.dispose();
 });
 
-test("mode downgrade cancels pending work but does not cancel in-flight work", async (t) => {
-  const { scheduler, settings, work, records } = fixture(t);
+test("stopping admission cancels pending work but does not cancel in-flight work", async (t) => {
+  const { scheduler, work, records } = fixture(t);
   await scheduler.handleEvent(idle("downgrade"));
   await waitFor(() => work.length === 1, "in-flight work");
   await scheduler.handleEvent(idle("downgrade"));
-  settings.repo.mode = "manual";
-  scheduler.setMode("manual", "operator-downgrade");
+  scheduler.stopAdmission("automatic-off");
   await wait(15);
   assert.equal(work.length, 1);
   assert.deepEqual(scheduler.recordWorkResult(work[0], { ok: true }), { accepted: true, stale: false });
   await scheduler.handleEvent(idle("downgrade"));
   await wait(15);
   assert.equal(work.length, 1);
-  assert.equal(actions(records, "mode-downgrade").length, 1);
+  assert.equal(actions(records, "mode-downgrade").length, 0);
   scheduler.dispose();
 });
 
@@ -693,5 +713,150 @@ test("autonomous scheduler failure leaves a mocked manual command path usable", 
   assert.equal(work.length, 0);
   assert.equal(manual.ok, true);
   assert.match(manual.responseText, /manual scan completed/);
+  scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain admits and settles a drain work item", async (t) => {
+  // The scheduler's triggerCandidateDrain must be independently invokable
+  // without a session idle event. It checks budgets/breaker/consent, acquires
+  // a drain lease, and enqueues a drain work item that settles through the
+  // normal work-promise plumbing.
+  const work = [];
+  const { scheduler, records } = fixture(t, {
+    enqueueWork(item) {
+      work.push(item);
+      return Promise.resolve({ ok: true, result: "no-eligible", drained: [] });
+    },
+  });
+
+  const result = scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  assert.equal(result.ok, true);
+  assert.ok(result.drainId);
+
+  await scheduler.drain();
+
+  assert.equal(work.length, 1);
+  assert.equal(work[0].drain, true);
+  assert.equal(work[0].projectFingerprint, PROJECT);
+  assert.equal(actions(records, "drain-admitted").length, 1);
+  assert.equal(actions(records, "drain-settled").length, 1);
+  assert.equal(actions(records, "drain-settled")[0].payload.details.drained, 0);
+  scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain records drained count on successful settlement", async (t) => {
+  const work = [];
+  const { scheduler, records } = fixture(t, {
+    enqueueWork(item) {
+      work.push(item);
+      return Promise.resolve({
+        ok: true,
+        result: "recommendation-ready",
+        drained: [{ candidateId: "c1" }, { candidateId: "c2" }],
+      });
+    },
+  });
+
+  const result = scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  assert.equal(result.ok, true);
+  await scheduler.drain();
+
+  const settled = actions(records, "drain-settled");
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0].payload.details.drained, 2);
+  assert.equal(settled[0].payload.details.result, "recommendation-ready");
+  scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain is suppressed by quiet hours", async (t) => {
+  const clock = { value: new Date(2026, 6, 22, 12, 0, 0).getTime() };
+  const { scheduler, records } = fixture(t, {
+    clock,
+    budgets: { quietHours: [{ from: "11:00", to: "13:00" }] },
+  });
+  const result = scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "quiet-period");
+  assert.equal(actions(records, "drain-suppressed").length, 1);
+  assert.equal(actions(records, "drain-suppressed")[0].payload.details.reason, "quiet-period");
+  scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain is suppressed by Automatic recommendations Off", async (t) => {
+  const { scheduler, records } = fixture(t, { automaticEnabled: false });
+  const result = scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "automatic-recommendations-disabled");
+  assert.equal(actions(records, "drain-suppressed").length, 0);
+  scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain is suppressed by open circuit breaker", async (t) => {
+  const { scheduler, records } = fixture(t);
+  scheduler.tripCircuitBreaker("test");
+  const result = scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  assert.equal(result.ok, false);
+  // Tripping the breaker also sets cachedMode to manual, so either reason is valid.
+  assert.ok(["circuit-breaker-open", "scheduler-mode-manual"].includes(result.reason),
+    `expected circuit-breaker-open or scheduler-mode-manual, got ${result.reason}`);
+  scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain is suppressed by missing consent", async (t) => {
+  const { scheduler, automation, records } = fixture(t);
+  automation.global.consent.crossRepoAggregation = false;
+  const result = scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "automatic-recommendations-disabled");
+  assert.equal(actions(records, "drain-suppressed").length, 0);
+  scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain serializes via cross-process drain lease", async (t) => {
+  const clock = { value: 20_000 };
+  const leases = new Map();
+  const records = new Map();
+  const first = fixture(t, { clock, leases, records, process: "one" });
+  const second = fixture(t, { clock, leases, records, process: "two" });
+
+  const resultA = first.scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  const resultB = second.scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+
+  assert.equal(resultA.ok + resultB.ok, 1, "exactly one drain admission wins the lease");
+  const drainEvents = actions(records, "drain-admitted").length + actions(records, "drain-lease-busy").length;
+  assert.equal(drainEvents, 2, "one admission and one lease-busy audit");
+  first.scheduler.dispose();
+  second.scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain settles a failed drain as drain-failure", async (t) => {
+  const { scheduler, records } = fixture(t, {
+    enqueueWork: () => Promise.resolve({ ok: false, reason: "synthesis-failed-in-drain" }),
+  });
+
+  const result = scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  assert.equal(result.ok, true);
+  await scheduler.drain();
+
+  const failures = actions(records, "drain-failure");
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].payload.details.reason, /synthesis-failed-in-drain/);
+  scheduler.dispose();
+});
+
+test("H7-001 triggerCandidateDrain without projectFingerprint uses the configured project", async (t) => {
+  const work = [];
+  const { scheduler } = fixture(t, {
+    enqueueWork(item) {
+      work.push(item);
+      return Promise.resolve({ ok: true, result: "no-eligible", drained: [] });
+    },
+  });
+
+  const result = scheduler.triggerCandidateDrain();
+  assert.equal(result.ok, true);
+  await scheduler.drain();
+  assert.equal(work.length, 1);
+  assert.equal(work[0].projectFingerprint, PROJECT);
   scheduler.dispose();
 });

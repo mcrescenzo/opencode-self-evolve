@@ -3,7 +3,10 @@ import { extractTargetLogicalNames, partIsExcludedFromEvidence } from "./self-ev
 import { latestByLogicalId } from "./self-evolve-schemas.js";
 
 const DEFAULT_MESSAGE_LIMIT = 120;
-const CONTENT_CHUNK_SIZE = 400;
+const DEFAULT_DRAIN_MAX_PER_PASS = 4;
+const DEFAULT_DRAIN_MIN_PASSIVE_PER_SYNTHESIS = 2;
+const DRAIN_LEASE_KEY = "self-evolve-candidate-drain";
+const DRAIN_LEASE_TTL_MS = 5 * 60 * 1000;
 
 export function resolveClusterTargetName(cluster) {
   const counts = new Map();
@@ -51,7 +54,7 @@ function selfEvolveOutput(message) {
     || (Array.isArray(parts) && parts.some((part) => part?.metadata?.source === "self-evolve-plugin"));
 }
 
-function metadataMessages(messages, privacy) {
+function metadataMessages(messages, privacy, automationStamp = null) {
   return messages.flatMap((message) => {
     if (partIsExcludedFromEvidence(message)) return [];
     const parts = messageParts(message);
@@ -60,7 +63,7 @@ function metadataMessages(messages, privacy) {
     const role = messageRole(message);
     const text = messageText(message, evidenceParts).trim();
     const command = role === "user" ? text.match(/^\s*(\/[A-Za-z0-9][A-Za-z0-9_-]*)\b/u)?.[1] : null;
-    const excerpt = text && privacy?.scrubExcerpt ? privacy.scrubExcerpt({ text }) : null;
+    const excerpt = text && privacy?.scrubExcerpt ? privacy.scrubExcerpt({ text }, { automationStamp }) : null;
     const contentScan = text && privacy?.scanForForbiddenContent ? privacy.scanForForbiddenContent(text) : null;
     const targetNames = extractTargetLogicalNames([{ parts: evidenceParts ?? [] }]);
     const base = {
@@ -130,15 +133,14 @@ function signatureForCluster(cluster, item, hashSignature) {
   return null;
 }
 
-function proposalText(proposal, mode) {
-  const readiness = mode === "manual" ? "pending manual review" : "ready for explicit approval";
+function proposalText(proposal) {
   return [
-    `Self-evolve proposal ${proposal.id} is ${readiness}.`,
+    `Self-evolve proposal ${proposal.id} is ready for explicit approval.`,
     `Target: ${proposal.skillTarget.relativePath}`,
     `Rationale: ${proposal.rationaleText}`,
     `Review: /self-evolve review ${proposal.id}`,
-    mode === "manual" ? "Manual mode is advisory and cannot approve or apply." : "Use /self-evolve inbox or review to obtain the current exact approval tuple.",
-    "No files were applied by this scan.",
+    "Use /self-evolve inbox or review to obtain the current exact approval tuple.",
+    "No files were applied while creating this recommendation.",
   ].join("\n");
 }
 
@@ -191,13 +193,16 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
   const pendingSynthesisLeaseCleanups = new Map();
   const globalCatalogs = new WeakMap();
 
-  function append(kind, payload, timestamp = now()) {
-    const saved = store.appendRecord(schemas.wrapRecord(kind, payload, timestamp));
+  function append(kind, payload, timestamp = now(), automationStamp = null) {
+    const saved = store.appendRecord(
+      schemas.wrapRecord(kind, payload, timestamp),
+      { automationStamp },
+    );
     if (!saved?.ok) throw new Error(saved?.reason ?? `${kind}-write-failed`);
     return saved;
   }
 
-  function appendAudit(action, subjectId, details = {}, { synthesisFinalization = false } = {}) {
+  function appendAudit(action, subjectId, details = {}, { synthesisFinalization = false, automationStamp = null } = {}) {
     const timestamp = now();
     const clean = { action, subjectId: String(subjectId), ...details };
     const payloadHash = observation.hashSignature(JSON.stringify(clean));
@@ -212,13 +217,13 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     const envelope = schemas.wrapRecord("audit-event", event, timestamp);
     const saved = synthesisFinalization && typeof store.appendSynthesisFinalizationAudit === "function"
       ? store.appendSynthesisFinalizationAudit(envelope)
-      : store.appendRecord(envelope);
+      : store.appendRecord(envelope, { automationStamp });
     if (!saved?.ok) throw new Error(saved?.reason ?? "audit-event-write-failed");
     return event;
   }
 
-  function appendDiagnosticAudit(action, subjectId, details = {}) {
-    try { return appendAudit(action, subjectId, details); }
+  function appendDiagnosticAudit(action, subjectId, details = {}, automationStamp = null) {
+    try { return appendAudit(action, subjectId, details, { automationStamp }); }
     catch { return null; }
   }
 
@@ -427,7 +432,29 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
   }
 
   function inventoryFor(options) {
-    if (Array.isArray(options.inventoryRecords)) return options.inventoryRecords;
+    if (options.globalSkillCatalog?.ok && Array.isArray(options.globalSkillCatalog.records)) {
+      globalCatalogs.set(options.globalSkillCatalog.records, options.globalSkillCatalog);
+      return options.globalSkillCatalog.records;
+    }
+    // Integration always supplies the host discovery result, including a
+    // failed result. Do not silently fall back to the retired persisted root
+    // policy when the authoritative host projection is unavailable.
+    if (Object.prototype.hasOwnProperty.call(options, "globalSkillCatalog")) {
+      const records = [];
+      globalCatalogs.set(records, options.globalSkillCatalog ?? {
+        ok: false,
+        policy: null,
+        blockers: [{ code: "host-global-skill-catalog-unavailable" }],
+      });
+      return records;
+    }
+    if (Array.isArray(options.inventoryRecords)) {
+      const policy = options.globalRootPolicy ?? store.getAutomationState?.().global?.globalRootPolicy
+        ?? store.getSettings?.().global.globalRootPolicy ?? null;
+      const catalog = inventory.buildGlobalSkillCatalog?.(policy, { projectRoot: options.projectRoot }) ?? null;
+      if (catalog?.ok) globalCatalogs.set(options.inventoryRecords, { ...catalog, records: options.inventoryRecords });
+      return options.inventoryRecords;
+    }
     const policy = options.globalRootPolicy ?? store.getSettings?.().global.globalRootPolicy ?? null;
     const catalog = inventory.buildGlobalSkillCatalog?.(policy, { projectRoot: options.projectRoot }) ?? {
       ok: false,
@@ -437,39 +464,6 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     const records = catalog.ok ? catalog.records : [];
     globalCatalogs.set(records, catalog);
     return records;
-  }
-
-  function targetFor(records, options, targetLogicalName) {
-    if (targetLogicalName === null && options.targetSkill) {
-      return { ok: true, reason: null, target: options.targetSkill, inventory: records };
-    }
-    if (targetLogicalName === null && options.targetRelativePath) {
-      const target = records.find((item) => item.relativePath === options.targetRelativePath) ?? null;
-      return target
-        ? { ok: true, reason: null, target, inventory: records }
-        : { ok: false, reason: "test-target-override-unresolved", target: null, inventory: null };
-    }
-    const catalog = globalCatalogs.get(records);
-    if (catalog) {
-      if (!catalog.ok) {
-        return { ok: false, reason: catalog.blockers?.[0]?.code ?? "global-skill-catalog-invalid", target: null, inventory: null };
-      }
-      const resolved = inventory.resolveGlobalSkillCandidate?.(targetLogicalName, catalog)
-        ?? { ok: false, reason: "global-target-resolver-unavailable", target: null, catalog: null };
-      if (!resolved.ok) return { ok: false, reason: resolved.reason, target: null, inventory: null };
-      if (resolved.targetKind === "new-global-skill") {
-        return {
-          ok: false,
-          reason: "new-global-skill-synthesis-not-yet-integrated",
-          target: null,
-          inventory: null,
-          candidateBinding: resolved.binding,
-        };
-      }
-      return { ok: true, reason: null, target: resolved.target, inventory: resolved.catalog.records, candidateBinding: resolved.binding };
-    }
-    return inventory.resolveSkillTarget?.(targetLogicalName, records)
-      ?? { ok: false, reason: "target-resolver-unavailable", target: null, inventory: null };
   }
 
   function materializeGlobalCandidates(clusters, options) {
@@ -488,54 +482,265 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
       targetBindings: [...bindings.values()],
       rootPolicy: catalog.policy,
       nowMs: now(),
+      automationStamp: options.automationStamp,
     });
     if (!result?.ok) throw new Error(`global-candidate-materialization-failed:${result?.reason ?? "unknown"}`);
     return { ...result, catalog };
   }
 
-  function captureSynthesisContent(ctx, captured) {
-    const session = ctx?.client?.session;
-    const prompt = session?.prompt;
-    if (typeof prompt !== "function") return ctx;
-    const capturedPrompt = async (...args) => {
-      const result = await prompt.call(session, ...args);
-      const output = result?.data?.info?.structured_output ?? result?.data?.structured_output ?? result?.info?.structured_output ?? result?.structured_output;
-      if (typeof output?.proposedContent === "string") {
-        captured.set(inventory.hashSkillContent(output.proposedContent), output.proposedContent);
-      }
-      return result;
-    };
-    return {
-      ...ctx,
-      client: {
-        ...ctx.client,
-        session: new Proxy(session, {
-          get(target, property) {
-            if (property === "prompt") return capturedPrompt;
-            return Reflect.get(target, property, target);
-          },
-        }),
-      },
-    };
+  function readEligibleGlobalCandidates(automationGeneration = null) {
+    if (typeof store.readGlobalCandidates !== "function") return [];
+    try {
+      return store.readGlobalCandidates()
+        .filter((candidate) => candidate?.state === "eligible"
+          && (automationGeneration === null || candidate.automationGeneration === automationGeneration))
+        .sort((left, right) => left.candidateId.localeCompare(right.candidateId));
+    } catch {
+      return [];
+    }
   }
 
-  function persistProposalContent(proposal, content, faultInjection) {
-    if (typeof content !== "string" || inventory.hashSkillContent?.(content) !== proposal.proposedContentHash) {
-      throw new Error("proposal-content-unavailable");
-    }
-    const encoded = Buffer.from(content, "utf8").toString("base64");
-    const chunks = encoded.match(new RegExp(`.{1,${CONTENT_CHUNK_SIZE}}`, "gu")) ?? [""];
-    chunks.forEach((chunk, index) => {
-      append("proposal-content", schemas.makeProposalContent({
-        proposalId: proposal.id,
-        contentHash: proposal.proposedContentHash,
-        contentEncoding: "base64",
-        chunkIndex: index,
-        chunkCount: chunks.length,
-        content: chunk,
-      }));
-      faultInjection?.("pipeline-after-content-chunk", { proposal, chunkIndex: index, chunkCount: chunks.length });
+  function nextEligibleGlobalCandidate(materialization) {
+    const fromMaterialization = materialization?.candidates
+      ?.filter((candidate) => candidate?.state === "eligible")
+      .sort((left, right) => left.candidateId.localeCompare(right.candidateId))[0] ?? null;
+    if (fromMaterialization) return { candidate: fromMaterialization, catalog: materialization.catalog ?? null };
+    return null;
+  }
+
+  function isBudgetExhaustedReason(reason) {
+    const value = String(reason ?? "").toLowerCase();
+    return value.includes("passive-provider-budget")
+      || value.includes("synthesis-budget")
+      || value.includes("daily-synthesis")
+      || value.includes("quota");
+  }
+
+  async function runOneGlobalCandidate({ ctx, candidate, catalog, options, timestamp, sessionIDHash }) {
+    assertWorkActive(options.signal);
+    const result = await synthesis.runGlobalSynthesis({
+      ctx,
+      candidate,
+      catalog: catalog ?? undefined,
+      inventoryModule: inventory,
+      options: {
+        store,
+        ...(options.synthesis ?? {}),
+        signal: options.signal,
+        reservePassiveProviderCalls: typeof options.reservePassiveProviderCalls === "function"
+          ? (count, context) => options.reservePassiveProviderCalls(count, {
+              ...context,
+              automationStamp: options.automationStamp,
+            })
+          : undefined,
+        automationStamp: options.automationStamp,
+        faultInjection: options.faultInjection,
+        suppressors: options.globalSynthesisSuppressors ?? {
+          bootValidated: true,
+          hostSupported: true,
+          circuitBreakerOpen: applier.circuitBreakerOpen?.() === true,
+          processExcluded: false,
+        },
+        getSuppressors: options.getGlobalSynthesisSuppressors,
+      },
+      now,
     });
+    return result;
+  }
+
+  function buildDrainSummary({ drained, headline, observations, capsules, capsuleSupport, eligibility, auditEvents, cycleReason }) {
+    if (headline?.kind === "recommendation-ready") {
+      return {
+        result: "recommendation-ready",
+        cycleOutcome: "recommendation-created",
+        recommendation: headline.recommendation,
+        drained,
+        observations,
+        capsules,
+        capsuleSupport,
+        eligibility,
+        auditEvents,
+        responseText: `Self-evolve created global recommendation ${headline.recommendation.recommendationId} for explicit review. No files were applied.`,
+      };
+    }
+    if (headline?.kind === "no-change") {
+      return {
+        result: "no-eligible",
+        cycleOutcome: "valid-no-change",
+        cycleReason: cycleReason ?? "valid-no-change",
+        drained,
+        observations,
+        capsules,
+        capsuleSupport,
+        eligibility,
+        auditEvents,
+        responseText: "Self-evolve completed bounded global synthesis without a safe change. No files were applied.",
+      };
+    }
+    const allBudgetExhausted = drained.length > 0 && drained.every((item) => !item.result?.ok && isBudgetExhaustedReason(item.result?.reason));
+    if (allBudgetExhausted) {
+      return {
+        result: "deferred",
+        cycleOutcome: "deferred",
+        cycleReason: "budget-deferred",
+        drained,
+        observations,
+        capsules,
+        capsuleSupport,
+        eligibility,
+        auditEvents,
+        responseText: "Self-evolve deferred remaining eligible candidates because the configured synthesis budget was exhausted. Pending candidates retain durable continuations for a later drain pass.",
+      };
+    }
+    if (drained.length > 0) {
+      const failedReasons = drained
+        .map((item) => item.result?.reason)
+        .filter((reason) => !isBudgetExhaustedReason(reason))
+        .slice(0, 1);
+      const reason = failedReasons[0] ?? drained[0].result?.reason ?? "global-synthesis-failed";
+      return {
+        result: "failed-closed",
+        cycleOutcome: "failed-closed",
+        cycleReason: "drain-failure",
+        reason,
+        drained,
+        observations,
+        capsules,
+        capsuleSupport,
+        eligibility,
+        auditEvents,
+        responseText: `Self-evolve global synthesis failed closed: ${reason}. No files were applied.`,
+      };
+    }
+    return null;
+  }
+
+  async function drainEligibleGlobalCandidates({
+    ctx, options, auditStart, sessionIDHash, mode,
+    observations = [], capsules = [], capsuleSupport = [], eligibility = [],
+    seededMaterialization = null,
+  }) {
+    if (typeof synthesis.runGlobalSynthesis !== "function") return null;
+    if (options.signal?.aborted) return null;
+    if (applier.circuitBreakerOpen?.()) {
+      appendDiagnosticAudit("pipeline-drain-breaker-open", "drain", { drainedCount: 0 }, options.automationStamp);
+      return null;
+    }
+    const maxPerPass = Math.max(1, Number.isSafeInteger(options.maxCandidatesPerPass)
+      ? options.maxCandidatesPerPass : DEFAULT_DRAIN_MAX_PER_PASS);
+    const drainBudget = options.drainBudget ?? {};
+    let synthesesRemaining = Math.min(
+      maxPerPass,
+      Number.isSafeInteger(drainBudget.synthesesRemaining) ? drainBudget.synthesesRemaining : maxPerPass,
+    );
+    const minPassivePerSynthesis = Number.isSafeInteger(drainBudget.minPassivePerSynthesis)
+      ? Math.max(0, drainBudget.minPassivePerSynthesis)
+      : DEFAULT_DRAIN_MIN_PASSIVE_PER_SYNTHESIS;
+    let passiveCallsRemaining = Number.isSafeInteger(drainBudget.passiveCallsRemaining)
+      ? drainBudget.passiveCallsRemaining : Infinity;
+    const eligibleSeen = new Set();
+    const drained = [];
+    let headline = null;
+    let budgetDeferred = false;
+    let lease = null;
+    try {
+      // Acquire a cross-process drain lease so two processes do not run
+      // competing drains against the same global candidate store. This is
+      // best-effort: if the store lacks lease support, the drain still runs
+      // because per-candidate synthesis leases enforce exact-once safety.
+      if (typeof store.acquireLease === "function") {
+        try {
+          lease = store.acquireLease(DRAIN_LEASE_KEY, {
+            ttlMs: DRAIN_LEASE_TTL_MS,
+            actor: "self-evolve-pipeline-drain",
+            automationStamp: options.automationStamp,
+          });
+        } catch { lease = null; }
+        if (lease && !lease.ok) {
+          appendDiagnosticAudit("pipeline-drain-lease-busy", "drain", { reason: String(lease.reason ?? "lease-busy") }, options.automationStamp);
+          return null;
+        }
+      }
+      while (synthesesRemaining > 0 && passiveCallsRemaining >= minPassivePerSynthesis) {
+        assertWorkActive(options.signal);
+        if (applier.circuitBreakerOpen?.()) {
+          appendDiagnosticAudit("pipeline-drain-breaker-open", "drain", { drainedCount: drained.length }, options.automationStamp);
+          break;
+        }
+        // H7-001 fairness: stable order by candidateId. After each synthesis,
+        // the processed candidate transitions out of "eligible" (to
+        // "recommended", "no-change", or "failed-closed"), so the next
+        // iteration picks the next eligible candidate. Re-reading from the
+        // store avoids stale state across the synthesis mutation.
+        let candidateEntry = seededMaterialization && drained.length === 0
+          ? nextEligibleGlobalCandidate(seededMaterialization)
+          : null;
+        if (!candidateEntry) {
+          const freshEligible = readEligibleGlobalCandidates(options.automationStamp?.generation ?? null);
+          const next = freshEligible.find((item) => !eligibleSeen.has(item.candidateId));
+          if (!next) break;
+          candidateEntry = { candidate: next, catalog: seededMaterialization?.catalog ?? null };
+        }
+        const { candidate, catalog } = candidateEntry;
+        if (eligibleSeen.has(candidate.candidateId)) break;
+        eligibleSeen.add(candidate.candidateId);
+
+        options.faultInjection?.("pipeline-drain-before-synthesis", { sessionIDHash, candidate, drainedCount: drained.length });
+        options.faultInjection?.("pipeline-boundary-synthesis", { sessionIDHash, globalCandidate: candidate });
+        assertWorkActive(options.signal);
+
+        const globalResult = await runOneGlobalCandidate({ ctx, candidate, catalog, options, timestamp: now(), sessionIDHash });
+        options.faultInjection?.("pipeline-boundary-publication", { sessionIDHash, globalResult });
+        assertWorkActive(options.signal);
+
+        synthesesRemaining -= 1;
+        drained.push({ candidateId: candidate.candidateId, result: globalResult });
+
+        if (globalResult?.ok && globalResult.recommendation && !headline) {
+          headline = { kind: "recommendation-ready", recommendation: globalResult.recommendation };
+        } else if (globalResult?.ok && globalResult.noChange && !headline) {
+          headline = { kind: "no-change" };
+        }
+
+        // H7-001 bounded: stop immediately when the configured budget is
+        // exhausted. Pending eligible candidates retain durable
+        // continuations (the candidate record itself) for a later pass.
+        if (!globalResult?.ok && isBudgetExhaustedReason(globalResult?.reason)) {
+          budgetDeferred = true;
+          appendDiagnosticAudit("pipeline-drain-budget-deferred", "drain", {
+            candidateId: candidate.candidateId,
+            reason: String(globalResult.reason).slice(0, 160),
+            drainedCount: drained.length,
+            synthesesRemaining,
+          }, options.automationStamp);
+          break;
+        }
+      }
+    } finally {
+      if (lease?.ok && typeof store.releaseLease === "function") {
+        try { store.releaseLease(DRAIN_LEASE_KEY, lease.nonce); } catch {}
+      }
+    }
+
+    const auditEvents = auditSince(store, auditStart);
+    const summary = buildDrainSummary({
+      drained, headline, observations, capsules, capsuleSupport, eligibility, auditEvents,
+      cycleReason: budgetDeferred ? "budget-deferred" : undefined,
+    });
+    if (summary) {
+      appendDiagnosticAudit("pipeline-drain-settled", "drain", {
+        drainedCount: drained.length,
+        result: summary.result,
+        budgetDeferred,
+        ...(headline?.recommendation ? { recommendationId: headline.recommendation.recommendationId } : {}),
+      }, options.automationStamp);
+      return summary;
+    }
+    // No candidates were drained (empty queue) and no headline: signal the
+    // caller that no drain happened so it can return the global-only
+    // not-eligible result.
+    appendDiagnosticAudit("pipeline-drain-empty", "drain", { drainedCount: 0 }, options.automationStamp);
+    return null;
   }
 
   function readProposalContent(proposal) {
@@ -570,137 +775,6 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     const committed = store.commitDecision(decision);
     if (!committed?.ok) throw new Error(committed?.reason ?? "proposal-failed-closed-write-failed");
     return committed.proposal;
-  }
-
-  async function finalizeSynthesisCandidate({ synthesisCtx, cluster, targetSkill, targetInventory, options, timestamp, captured }) {
-    let synthesized;
-    try {
-      assertWorkActive(options.signal);
-      synthesized = await synthesis.runSynthesis({
-        ctx: synthesisCtx,
-        cluster,
-        targetSkill,
-        inventory: targetInventory,
-        privacy,
-        options: {
-          store,
-          currentContent: options.currentContent ?? targetSkill.currentContent ?? "",
-          eligibility: cluster.eligibility,
-          faultInjection: options.faultInjection,
-          ...(options.synthesis ?? {}),
-          signal: options.signal,
-          rootSessionIDHash: options.rootSessionIDHash,
-          reservePassiveProviderCalls: options.reservePassiveProviderCalls,
-        },
-        now: timestamp,
-      });
-      if (!synthesized?.attempt) {
-        appendDiagnosticAudit("pipeline-synthesis-failure", cluster.id, {
-          reason: synthesized?.reason ?? (synthesized?.noChange ? "no-change" : "unknown"),
-        });
-        return { status: synthesized?.noChange ? "no-change" : "failed", reason: synthesized?.reason };
-      }
-      if (!synthesized.ok || !synthesized.proposal) {
-        const status = synthesized.noChange ? "no-change" : "failed";
-        if (synthesized.proposal) failProposalClosed(synthesized.proposal, synthesized.reason ?? "synthesis-failed");
-        persistSynthesisOutcome(synthesized, status, synthesized.reason, options.faultInjection);
-        appendDiagnosticAudit("pipeline-synthesis-failure", cluster.id, {
-          reason: synthesized.reason ?? (synthesized.noChange ? "no-change" : "unknown"),
-        });
-        return { status, reason: synthesized.reason };
-      }
-
-      const cleanProposal = schemas.makeProposal(synthesized.proposal);
-      if (!currentProposal(store, cleanProposal.id)) append("proposal", cleanProposal, timestamp);
-      const refreshedRecords = inventoryFor(options);
-      const refreshedResolution = targetFor(refreshedRecords, options, cluster.resolvedTargetLogicalName ?? null);
-      const refreshedTarget = refreshedResolution.target;
-      if (!refreshedResolution.ok
-          || refreshedTarget.canonicalRoot !== cleanProposal.skillTarget.canonicalRoot
-          || refreshedTarget.relativePath !== cleanProposal.skillTarget.relativePath
-          || refreshedTarget.currentHash !== cleanProposal.skillTarget.currentHash) {
-        const reason = "target-changed-after-synthesis";
-        failProposalClosed(cleanProposal, reason);
-        persistSynthesisOutcome(synthesized, "failed", reason, options.faultInjection);
-        appendDiagnosticAudit("pipeline-post-synthesis-target-failure", cleanProposal.id, {
-          reason,
-          resolutionReason: refreshedResolution.reason ?? "target-binding-mismatch",
-        });
-        return { status: "failed", reason };
-      }
-
-      const criticized = await synthesis.runCritic({
-        ctx: synthesisCtx,
-        proposal: cleanProposal,
-        criticInput: synthesized.criticInput,
-        cluster,
-        inventory: refreshedResolution.inventory,
-        options: {
-          store,
-          attemptLease: synthesized.lease,
-          ...(options.critic ?? {}),
-          signal: options.signal,
-          reservePassiveProviderCalls: options.reservePassiveProviderCalls,
-        },
-        now: timestamp,
-      });
-      options.faultInjection?.("pipeline-after-critic-transaction", { synthesized, criticized });
-      if (!criticized?.ok || !criticized.proposal?.criticPassed) {
-        const reason = criticized?.reason ?? "critic-rejected";
-        failProposalClosed(criticized?.proposal ?? cleanProposal, reason);
-        const status = criticized?.criticResult ? "critic-rejected" : "failed";
-        persistSynthesisOutcome(synthesized, status, reason, options.faultInjection);
-        appendDiagnosticAudit("pipeline-critic-failure", cleanProposal.id, { reason });
-        return { status, reason };
-      }
-
-      const proposal = criticized.proposal;
-      const content = synthesized.criticInput?.proposedContent ?? captured.get(proposal.proposedContentHash);
-      try {
-        assertWorkActive(options.signal);
-        persistProposalContent(proposal, content, options.faultInjection);
-        options.faultInjection?.("pipeline-after-content-chunks", { proposal });
-      } catch (error) {
-        const reason = String(error?.message ?? error) === "proposal-content-unavailable"
-          ? "proposal-content-unavailable"
-          : "proposal-content-persistence-failed";
-        failProposalClosed(proposal, reason);
-        persistSynthesisOutcome(synthesized, "failed", reason, options.faultInjection);
-        appendDiagnosticAudit("pipeline-proposal-content-failure", proposal.id, { reason });
-        return { status: "failed", reason };
-      }
-      persistSynthesisOutcome(synthesized, "accepted", undefined, options.faultInjection);
-      return { status: "accepted", proposal, content };
-    } catch (error) {
-      if (!synthesized?.attempt) throw error;
-      const reason = String(error?.message ?? error);
-      let outcome = synthesisOutcomeFor(synthesized.attempt);
-      let proposal = currentProposal(store, synthesized.attempt.proposalId);
-      if (outcome?.success && outcome.status === "accepted") {
-        const content = proposal ? readProposalContent(proposal) : null;
-        if (!proposal || proposal.criticPassed !== true || proposal.validDeterministic !== true
-            || !["pending", "approved", "applied"].includes(proposal.state) || content === null) {
-          throw new Error("successful-synthesis-state-incomplete", { cause: error });
-        }
-        return { status: "accepted", proposal, content };
-      }
-      if (outcome?.success && outcome.status === "no-change") return { status: "no-change" };
-      if (proposal && ["critic-pending", "pending", "approved", "applied"].includes(proposal.state)) {
-        try { proposal = failProposalClosed(proposal, reason); } catch {}
-      }
-      if (!outcome) outcome = persistSynthesisOutcome(synthesized, "failed", reason, options.faultInjection);
-      appendDiagnosticAudit("pipeline-synthesis-finalization-failure", synthesized.attempt.proposalId, { reason });
-      return { status: outcome?.status ?? "failed", reason, proposal };
-    } finally {
-      if (synthesized?.attempt) {
-        const cleanup = releaseTerminalLease(synthesized.attempt, synthesized.lease);
-        if (!cleanup?.ok && cleanup?.cleanupWarningPersisted !== true) {
-          appendDiagnosticAudit("pipeline-synthesis-cleanup-unresolved", synthesized.attempt.outcomeId, {
-            reason: String(cleanup?.reason ?? "synthesis-cleanup-unresolved").slice(0, 128),
-          });
-        }
-      }
-    }
   }
 
   function recoverSynthesisAttempts() {
@@ -771,6 +845,31 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
   }
 
   async function runEvolutionCycle({ ctx, sessionID, projectFingerprint, scopeFingerprint, trigger, mode, rootSessionID, rootSessionIDHash, originKind, options = {} }) {
+    const automation = store.getAutomationState?.();
+    if (!automation?.ok || !automation.enabled) {
+      return {
+        result: "automatic-disabled",
+        cycleOutcome: "automatic-disabled",
+        cycleReason: automation?.reason ?? "automatic-recommendations-disabled",
+        observations: [],
+        capsules: [],
+        capsuleSupport: [],
+        eligibility: [],
+        auditEvents: [],
+        responseText: "Self-evolve Automatic recommendations are Off. No session data was read and no autonomous work was performed.",
+      };
+    }
+    if (options.automationStamp && !store.compareAutomationStamp?.(options.automationStamp)) {
+      return {
+        result: "failed-closed",
+        cycleOutcome: "failed-closed",
+        cycleReason: "stale-automation-generation",
+        observations: [], capsules: [], capsuleSupport: [], eligibility: [], auditEvents: [],
+        responseText: "Self-evolve rejected stale automatic work. No files were applied.",
+      };
+    }
+    const automationStamp = options.automationStamp ?? automation.stamp;
+    options = { ...options, automationStamp };
     const auditStart = store.readRecords("audit-event").length;
     const observations = [];
     const capsules = [];
@@ -778,7 +877,6 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     let eligibility = [];
     try {
       assertWorkActive(options.signal);
-      retryTerminalLeaseCleanups();
       const sessionIDHash = observation.hashSessionLineage(sessionID);
       const lineage = episodeLineage({ sessionID, projectFingerprint, rootSessionID, rootSessionIDHash, originKind, trigger, options, schemas, observation });
       const cursorRecord = latestCursor(store, sessionIDHash);
@@ -789,11 +887,43 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         signal: options.signal,
         label: "Self-evolve durable session.messages",
       });
+      options.faultInjection?.("pipeline-boundary-message-read", { sessionIDHash, messages });
       assertWorkActive(options.signal);
       const messageHashes = messages.map((message) => observation.hashMessageCursor(message));
       const lastObservedMessageHash = messageHashes.at(-1) ?? null;
+      if ((cursor.automationGeneration ?? 1) !== automationStamp.generation) {
+        const timestamp = now();
+        const baseline = schemas.makeEpisodeCursor({
+          sessionIDHash,
+          lastIdleAt: timestamp,
+          lastObservedMessageHash,
+          leaseNonce: null,
+          automationGeneration: automationStamp.generation,
+        });
+        if (cursorRecord) {
+          const updated = store.runCas(
+            "episode-cursor",
+            cursor.sessionIDHash,
+            cursor.lastObservedMessageHash,
+            () => baseline,
+            (payload) => payload?.lastObservedMessageHash,
+            { automationStamp },
+          );
+          if (!updated?.ok) throw new Error(updated?.reason ?? "cursor-baseline-cas-failed");
+        } else {
+          append("episode-cursor", baseline, timestamp, automationStamp);
+        }
+        return {
+          result: "automatic-baselined",
+          cycleOutcome: "automatic-baselined",
+          cycleReason: "future-evidence-only",
+          observations, capsules, capsuleSupport, eligibility,
+          auditEvents: auditSince(store, auditStart),
+          responseText: "Self-evolve established a future-only Automatic baseline. Existing session history was not converted into evidence.",
+        };
+      }
       if (cursorRecord && messages.length === 0) {
-        appendAudit("message-window-empty", sessionIDHash, { sessionIDHash, preservedMessageHash: cursor.lastObservedMessageHash });
+        appendAudit("message-window-empty", sessionIDHash, { sessionIDHash, preservedMessageHash: cursor.lastObservedMessageHash }, { automationStamp });
         return {
           result: "no-eligible",
           cycleOutcome: "no-observations",
@@ -808,6 +938,28 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
       }
       if (cursorRecord && cursor.lastObservedMessageHash === lastObservedMessageHash) {
         const proposal = pendingProposal(store, projectFingerprint);
+        // H7-001: An unchanged cursor must not block draining eligible global
+        // candidates that retain durable continuations from a prior observation.
+        // The drain is bounded, budget-aware, and respects pause/kill/breaker.
+        if (typeof synthesis.runGlobalSynthesis === "function") {
+          const drainResult = await drainEligibleGlobalCandidates({
+            ctx, options, auditStart, sessionIDHash, mode,
+            observations, capsules, capsuleSupport, eligibility,
+            seededMaterialization: null,
+          });
+          if (drainResult) {
+            const proposalSuffix = proposal ? ` ${proposalText(proposal)}` : "";
+            if (drainResult.result === "recommendation-ready") {
+              return drainResult;
+            }
+            if (drainResult.drained?.length > 0) {
+              return {
+                ...drainResult,
+                responseText: `${drainResult.responseText}${proposalSuffix}`,
+              };
+            }
+          }
+        }
         return {
           result: proposal ? "proposal-pending" : "no-eligible",
           cycleOutcome: "cursor-unchanged",
@@ -819,14 +971,20 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
           eligibility,
           auditEvents: auditSince(store, auditStart),
           responseText: proposal
-            ? `${proposalText(proposal, mode)}\nThis cursor was already processed; no duplicate observations or synthesis were created.`
+            ? `${proposalText(proposal)}\nThis cursor was already processed; no duplicate observations or synthesis were created.`
             : "Self-evolve skipped this scan because this session message cursor was already processed. No files were applied.",
         };
       }
 
       const priorIndex = cursor.lastObservedMessageHash === null ? -1 : messageHashes.lastIndexOf(cursor.lastObservedMessageHash);
       const timestamp = now();
-      const nextCursor = schemas.makeEpisodeCursor({ sessionIDHash, lastIdleAt: timestamp, lastObservedMessageHash, leaseNonce: null });
+      const nextCursor = schemas.makeEpisodeCursor({
+        sessionIDHash,
+        lastIdleAt: timestamp,
+        lastObservedMessageHash,
+        leaseNonce: null,
+        automationGeneration: automationStamp.generation,
+      });
       const advanceCursor = () => {
         if (cursorRecord) {
           const updated = store.runCas(
@@ -835,15 +993,16 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
             cursor.lastObservedMessageHash,
             () => nextCursor,
             (payload) => payload?.lastObservedMessageHash,
+            { automationStamp },
           );
           if (!updated?.ok) throw new Error(updated?.reason ?? "cursor-cas-failed");
         } else {
-          append("episode-cursor", nextCursor, timestamp);
+          append("episode-cursor", nextCursor, timestamp, automationStamp);
         }
       };
       if (cursor.lastObservedMessageHash !== null && priorIndex < 0) {
         advanceCursor();
-        appendAudit("message-cursor-gap", sessionIDHash, { sessionIDHash, priorMessageHash: cursor.lastObservedMessageHash, lastObservedMessageHash });
+        appendAudit("message-cursor-gap", sessionIDHash, { sessionIDHash, priorMessageHash: cursor.lastObservedMessageHash, lastObservedMessageHash }, { automationStamp });
         return {
           result: "no-eligible",
           cycleOutcome: "no-observations",
@@ -863,13 +1022,15 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         scopeFingerprint,
         startedAt: timestamp,
         endedAt: timestamp,
-        messages: metadataMessages(unseenMessages, privacy),
+        messages: metadataMessages(unseenMessages, privacy, automationStamp),
       };
       const receipts = observation.extractReceipts(episode, { projectFingerprint, scopeFingerprint, now: timestamp });
+      options.faultInjection?.("pipeline-boundary-observation-write", { sessionIDHash, receipts });
+      assertWorkActive(options.signal);
       const injectionFlagged = episode.messages.some((message) => message.injectionFlagged === true);
       for (const receipt of receipts) {
-        append("receipt", receipt, timestamp);
-        const incidentId = observation.hashSignature(`self-evolve-incident-v1\n${sessionIDHash}\n${cursor.lastObservedMessageHash ?? "start"}\n${lastObservedMessageHash ?? "empty"}\n${receipt.signatureHash}`);
+        append("receipt", receipt, timestamp, automationStamp);
+        const incidentId = observation.hashSignature(`self-evolve-incident-v2\n${automationStamp.generation}\n${sessionIDHash}\n${cursor.lastObservedMessageHash ?? "start"}\n${lastObservedMessageHash ?? "empty"}\n${receipt.signatureHash}`);
         const candidate = schemas.makeObservation({
           id: observation.hashSignature(JSON.stringify({ incidentId, receipt: receipt.signatureHash })),
           projectFingerprint,
@@ -882,10 +1043,11 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
           createdAt: timestamp,
           injectionFlagged,
           redacted: true,
+          automationGeneration: automationStamp.generation,
         });
-        const scrubbed = privacy.scrubObservation(candidate);
+        const scrubbed = privacy.scrubObservation(candidate, { automationStamp });
         if (!scrubbed?.ok) throw new Error(`observation-rejected:${scrubbed?.reason ?? "unknown"}`);
-        append("observation", scrubbed.sanitized ?? scrubbed.observation ?? scrubbed, timestamp);
+        append("observation", scrubbed.sanitized ?? scrubbed.observation ?? scrubbed, timestamp, automationStamp);
         observations.push(scrubbed.sanitized ?? scrubbed.observation ?? scrubbed);
         if (injectionFlagged) {
           capsuleSupport.push({ incidentId, available: false, reason: "injection-flagged" });
@@ -898,7 +1060,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
                 receiptType: receipt.receiptType,
                 targetLogicalName: receipt.targetLogicalName,
                 summary: derived.summary,
-              })
+              }, { automationStamp })
             : { ok: false, reason: derived.reason ?? "capsule-admission-unavailable" };
           if (admitted?.ok && admitted.capsule) {
             capsules.push(admitted.capsule);
@@ -909,14 +1071,27 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         }
       }
 
-      advanceCursor();
+      // H13-001: Cursor finality must FOLLOW durable admission of all
+      // retry-required work derived from the current observation. The prior
+      // implementation committed the cursor here (before clusters,
+      // contributions, and candidate materialization), so a crash between the
+      // cursor commit and downstream admission silently lost the work: the
+      // cursor had already advanced, so the next scan returned "already
+      // processed" and never re-observed the messages. The cursor is now
+      // committed only after materializeGlobalCandidates succeeds. All
+      // downstream writes are idempotent (deduped by record ID, incident ID,
+      // or binding hash), so a crash before cursor commit converges on the
+      // next scan with no duplicate observations, contributions, or
+      // candidates.
 
       const allObservations = store.readRecords("observation").map((record) => record.payload)
-        .filter((item) => item.projectFingerprint === projectFingerprint && privacy.isObservationEligible?.(item.id) !== false);
+        .filter((item) => item.projectFingerprint === projectFingerprint
+          && item.automationGeneration === automationStamp.generation
+          && privacy.isObservationEligible?.(item.id) !== false);
       const clusters = observation.correlateObservations(allObservations);
       eligibility = observation.evaluateEligibility(clusters, { now: timestamp, ...(options.eligibility ?? {}) });
-      clusters.forEach((cluster) => append("evidence-cluster", cluster, timestamp));
-      eligibility.forEach((item) => append("eligibility-explanation", item, timestamp));
+      clusters.forEach((cluster) => append("evidence-cluster", cluster, timestamp, automationStamp));
+      eligibility.forEach((item) => append("eligibility-explanation", item, timestamp, automationStamp));
       if (options.stopAfter === "correlate") {
         return {
           result: "observed-shadow",
@@ -930,6 +1105,8 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         };
       }
       if (typeof privacy.publishContribution === "function") {
+        options.faultInjection?.("pipeline-boundary-contribution", { sessionIDHash, clusters });
+        assertWorkActive(options.signal);
         const evidenceDomain = schemas.makeEvidenceDomain(options.evidenceDomain
           ?? observation.deriveSourceLineage?.({ remoteUrl: options.remoteUrl, remoteUrls: options.sourceRemoteUrls })
           ?? { lineageStatus: "unknown", sourceLineageHash: null });
@@ -937,7 +1114,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
           for (const item of allObservations.filter((candidate) => cluster.incidentIds.includes(candidate.incidentId))) {
             const signatureHash = signatureForCluster(cluster, item, observation.hashSignature);
             if (!signatureHash || item.injectionFlagged) continue;
-            const support = privacy.getEvidenceCapsuleSupport?.(item.incidentId)
+            const support = privacy.getEvidenceCapsuleSupport?.(item.incidentId, { automationStamp })
               ?? { available: false, reason: "evidence-capsule-unavailable" };
             if (!support.available) continue;
             const published = privacy.publishContribution({
@@ -951,7 +1128,7 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
               occurrenceCount: item.structuredFields.occurrences,
               firstSeenAt: item.createdAt,
               lastSeenAt: item.createdAt,
-            });
+            }, { automationStamp });
             if (!published?.ok && ![
               "sanitized-excerpts-consent-required",
               "cross-repo-consent-required",
@@ -963,304 +1140,46 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
         }
       }
       const globalMaterialization = materializeGlobalCandidates(clusters, options);
+      // H13-001: All retry-required work derived from this observation has
+      // been durably admitted (receipts, observations, capsules, clusters,
+      // eligibility, contributions, global candidates + support sets). The
+      // cursor may now commit safely. A crash after this point leaves the
+      // cursor advanced; the candidate itself is the durable continuation and
+      // will be drained on the next scan's cursor-unchanged pass or an
+      // independent drainEligibleCandidates call.
+      advanceCursor();
+      options.faultInjection?.("pipeline-boundary-cursor-advanced", { sessionIDHash, lastObservedMessageHash });
+      // H7-001: Drain ALL eligible global candidates in a bounded, fair,
+      // budget-aware loop instead of processing only the first one. Each
+      // candidate either completes (recommendation/no-change/failed-closed)
+      // or retains a durable continuation that will be retried on the next
+      // drain pass or restart.
+      if (typeof synthesis.runGlobalSynthesis === "function") {
+        const drainResult = await drainEligibleGlobalCandidates({
+          ctx, options, auditStart, sessionIDHash, mode,
+          observations, capsules, capsuleSupport, eligibility,
+          seededMaterialization: globalMaterialization,
+        });
+        if (drainResult) return drainResult;
+      }
       const globalCandidate = globalMaterialization?.candidates
         ?.filter((candidate) => candidate.state === "eligible")
         .sort((left, right) => left.candidateId.localeCompare(right.candidateId))[0] ?? null;
-      if (globalCandidate && typeof synthesis.runGlobalSynthesis === "function") {
-        const globalResult = await synthesis.runGlobalSynthesis({
-          ctx,
-          candidate: globalCandidate,
-          catalog: globalMaterialization.catalog,
-          inventoryModule: inventory,
-          options: {
-            store,
-            ...(options.synthesis ?? {}),
-            signal: options.signal,
-            reservePassiveProviderCalls: options.reservePassiveProviderCalls,
-            faultInjection: options.faultInjection,
-            suppressors: options.globalSynthesisSuppressors ?? {
-              bootValidated: true,
-              hostSupported: true,
-              circuitBreakerOpen: applier.circuitBreakerOpen?.() === true,
-              processExcluded: false,
-            },
-            getSuppressors: options.getGlobalSynthesisSuppressors,
-          },
-          now,
-        });
-        if (globalResult?.ok && globalResult.recommendation) {
-          return {
-            result: "recommendation-ready",
-            cycleOutcome: "recommendation-created",
-            recommendation: globalResult.recommendation,
-            observations,
-            capsules,
-            capsuleSupport,
-            eligibility,
-            auditEvents: auditSince(store, auditStart),
-            responseText: `Self-evolve created global recommendation ${globalResult.recommendation.recommendationId} for explicit review. No files were applied.`,
-          };
-        }
-        if (globalResult?.ok && globalResult.noChange) {
-          return {
-            result: "no-eligible",
-            cycleOutcome: "valid-no-change",
-            observations,
-            capsules,
-            capsuleSupport,
-            eligibility,
-            auditEvents: auditSince(store, auditStart),
-            responseText: "Self-evolve completed bounded global synthesis without a safe change. No files were applied.",
-          };
-        }
-        return {
-          result: "failed-closed",
-          cycleOutcome: "failed-closed",
-          reason: globalResult?.reason ?? "global-synthesis-failed",
-          observations,
-          capsules,
-          capsuleSupport,
-          eligibility,
-          auditEvents: auditSince(store, auditStart),
-          responseText: `Self-evolve global synthesis failed closed: ${globalResult?.reason ?? "global-synthesis-failed"}. No files were applied.`,
-        };
-      }
-      // v0.3 autonomous targets are global-only. The legacy project-proposal
-      // path below is compatibility-only and never runs for the durable
-      // global-first runtime, which never sets this option.
-      if (!options.legacyProjectProposals) {
-        return {
-          result: "no-eligible",
-          cycleOutcome: observations.length ? "not-eligible" : "no-observations",
-          cycleReason: "insufficient-evidence",
-          observations,
-          capsules,
-          capsuleSupport,
-          eligibility,
-          auditEvents: auditSince(store, auditStart),
-          responseText: globalCandidate
-            ? "Self-evolve found no eligible global recommendation for this evidence. No project proposal was created and no files were applied."
-            : noEligibleText(eligibility),
-        };
-      }
-      const proposedClusterIds = new Set([...latestByLogicalId(store.readRecords("proposal")).values()]
-        .map((record) => record.payload)
-        .filter((proposal) => ["critic-pending", "pending", "approved", "applied"].includes(proposal.state))
-        .map((proposal) => proposal.clusterId));
-      const eligible = clusters.flatMap((cluster) => {
-        const explanation = eligibility.find((item) => item.clusterId === cluster.id);
-        if (!explanation?.eligible || proposedClusterIds.has(cluster.id)) return [];
-        return [{
-          ...cluster,
-          observations: allObservations.filter((item) => cluster.incidentIds.includes(item.incidentId)),
-          eligibility: explanation,
-          injectionFlagged: allObservations.some((item) => cluster.incidentIds.includes(item.incidentId) && item.injectionFlagged),
-        }];
-      });
-      if (!eligible.length) {
-        return {
-          result: "no-eligible",
-          cycleOutcome: observations.length ? "not-eligible" : "no-observations",
-          cycleReason: "insufficient-evidence",
-          observations,
-          capsules,
-          capsuleSupport,
-          eligibility,
-          auditEvents: auditSince(store, auditStart),
-          responseText: noEligibleText(eligibility),
-        };
-      }
-
-      const records = inventoryFor(options);
-      const resolutions = new Map();
-      const deferredClusters = [];
-      for (const cluster of eligible) {
-        const overridden = Boolean(options.targetSkill || options.targetRelativePath);
-        const selection = overridden
-          ? { name: null, via: "test-override" }
-          : typeof cluster.targetLogicalName === "string" && cluster.targetLogicalName
-            ? { name: cluster.targetLogicalName, via: "cluster-target" }
-            : resolveClusterTargetName(cluster);
-        cluster.resolvedTargetLogicalName = selection.name;
-        const resolution = targetFor(records, options, selection.name);
-        if (!resolution.ok) {
-          appendAudit("pipeline-target-resolution-deferred", cluster.id, {
-            reason: resolution.reason,
-            targetLogicalName: selection.name,
-            via: selection.via,
-          });
-          deferredClusters.push({
-            clusterId: cluster.id,
-            reason: resolution.reason,
-            targetLogicalName: selection.name,
-            via: selection.via,
-            ...(resolution.candidateBinding ? {
-              targetKind: resolution.candidateBinding.targetKind,
-              rootId: resolution.candidateBinding.rootId,
-              targetBindingHash: resolution.candidateBinding.bindingHash,
-            } : {}),
-          });
-          continue;
-        }
-        appendDiagnosticAudit("pipeline-target-resolved", cluster.id, {
-          targetLogicalName: selection.name,
-          via: selection.via,
-        });
-        resolutions.set(cluster.id, resolution);
-      }
-      if (resolutions.size === 0) {
-        const reason = deferredClusters[0].reason;
-        return {
-          result: "deferred",
-          cycleOutcome: "deferred",
-          deferred: true,
-          reason,
-          deferredTargets: deferredClusters,
-          observations,
-          capsules,
-          capsuleSupport,
-          eligibility,
-          auditEvents: auditSince(store, auditStart),
-          responseText: `Self-evolve deferred synthesis because the eligible evidence did not resolve one safe skill target: ${reason}. No provider session or proposal was created.`,
-        };
-      }
-      const eligibleResolved = eligible.filter((cluster) => resolutions.has(cluster.id));
-      const captured = new Map();
-      const synthesisCtx = captureSynthesisContent(ctx, captured);
-      let validNoChange = false;
-      let hadSynthesisFailure = false;
-      for (const cluster of eligibleResolved) {
-        assertWorkActive(options.signal);
-        const resolution = resolutions.get(cluster.id);
-        const targetSkill = resolution.target;
-        const targetInventory = resolution.inventory;
-        const finalized = await finalizeSynthesisCandidate({
-          synthesisCtx,
-          cluster,
-          targetSkill,
-          targetInventory,
-          options: { ...options, rootSessionIDHash: lineage.rootLineageHash },
-          timestamp,
-          captured,
-        });
-        if (finalized.status === "no-change") {
-          validNoChange = true;
-          continue;
-        }
-        if (finalized.status !== "accepted") {
-          hadSynthesisFailure = true;
-          continue;
-        }
-        const { proposal, content } = finalized;
-        if (options.signal?.aborted) {
-          return {
-            result: "deferred",
-            cycleOutcome: "deferred",
-            reason: "autonomous-work-cancelled",
-            proposal,
-            observations,
-            capsules,
-            capsuleSupport,
-            eligibility,
-            auditEvents: auditSince(store, auditStart),
-            responseText: `Self-evolve stopped before automatic application of proposal ${proposal.id} because the runtime is shutting down.`,
-          };
-        }
-        // Compatibility-only: no v0.3 runtime resolves an unattended apply mode,
-        // so this legacy branch is unreachable from durable autonomy.
-        if (mode === "yolo") {
-          const applied = await applier.applyProposal({ proposal: { ...proposal, proposedContent: content }, mode, actor: "self-evolve-applier" });
-          const disposition = applied?.disposition
-            ?? (applied?.ok === true ? "applied" : applied?.deferred === true ? "deferred" : "terminal-failure");
-          if (applied?.ok === true && disposition === "applied") {
-            return {
-              result: "applied",
-              cycleOutcome: "applied",
-              proposal,
-              deferredTargets: deferredClusters,
-              observations,
-              capsules,
-              capsuleSupport,
-              eligibility,
-              auditEvents: auditSince(store, auditStart),
-              responseText: `Self-evolve applied proposal ${proposal.id}; appliedHash ${applied.appliedHash}; auditId ${applied.auditId}.`,
-            };
-          }
-          const latest = currentProposal(store, proposal.id) ?? proposal;
-          if (disposition === "deferred" && applied.deferred === true) {
-            return {
-              result: "deferred",
-              cycleOutcome: "deferred",
-              deferred: true,
-              reason: applied.reason ?? "apply-deferred",
-              proposal: latest,
-              deferredTargets: deferredClusters,
-              observations,
-              capsules,
-              capsuleSupport,
-              eligibility,
-              auditEvents: auditSince(store, auditStart),
-              responseText: `Self-evolve deferred automatic application of proposal ${proposal.id}: ${applied.reason ?? "apply-deferred"}.`,
-            };
-          }
-          if (disposition !== "pending-review" || latest.state !== "pending") {
-            const reason = String(applied?.reason ?? "invalid-automatic-apply-outcome").slice(0, 400);
-            const failed = failProposalClosed(latest, reason);
-            return {
-              result: "failed-closed",
-              cycleOutcome: "failed-closed",
-              reason,
-              proposal: failed,
-              deferredTargets: deferredClusters,
-              observations,
-              capsules,
-              capsuleSupport,
-              eligibility,
-              auditEvents: auditSince(store, auditStart),
-              responseText: `Self-evolve automatic application of proposal ${proposal.id} failed closed: ${reason}. No verified skill-file change was accepted.`,
-            };
-          }
-        }
-        return {
-          result: mode === "manual" ? "proposal-pending" : "proposal-ready",
-          cycleOutcome: "recommendation-created",
-          proposal,
-          deferredTargets: deferredClusters,
-          observations,
-          capsules,
-          capsuleSupport,
-          eligibility,
-          auditEvents: auditSince(store, auditStart),
-          responseText: proposalText(proposal, mode),
-        };
-      }
-      if (validNoChange && !hadSynthesisFailure) {
-        return {
-          result: "no-change",
-          cycleOutcome: "valid-no-change",
-          cycleReason: "no-change",
-          deferredTargets: deferredClusters,
-          observations,
-          capsules,
-          capsuleSupport,
-          eligibility,
-          auditEvents: auditSince(store, auditStart),
-          responseText: "Self-evolve analysis completed successfully and found no useful safe change. No files were applied.",
-        };
-      }
       return {
-        result: "failed-closed",
-        cycleOutcome: "failed-closed",
-        deferredTargets: deferredClusters,
+        result: "no-eligible",
+        cycleOutcome: observations.length ? "not-eligible" : "no-observations",
+        cycleReason: "insufficient-evidence",
         observations,
         capsules,
         capsuleSupport,
         eligibility,
         auditEvents: auditSince(store, auditStart),
-        responseText: "Self-evolve evidence was eligible, but synthesis or critic validation failed closed. No files were applied.",
+        responseText: globalCandidate
+          ? "Self-evolve found no eligible global recommendation for this evidence. No project proposal was created and no files were applied."
+          : noEligibleText(eligibility),
       };
     } catch (error) {
-      try { appendAudit("pipeline-failure", observation.hashSessionLineage(sessionID), { reason: String(error?.message ?? error).slice(0, 400), trigger: String(trigger?.reason ?? trigger?.kind ?? trigger ?? "manual") }); } catch {}
+      try { appendAudit("pipeline-failure", observation.hashSessionLineage(sessionID), { reason: String(error?.message ?? error).slice(0, 400), trigger: String(trigger?.reason ?? trigger?.kind ?? trigger ?? "manual") }, { automationStamp }); } catch {}
       return {
         result: "failed-closed",
         cycleOutcome: "failed-closed",
@@ -1317,6 +1236,40 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     };
   }
 
+  // H7-001: Independent candidate drain entry point. This is triggerable
+  // without a new source observation: it reads eligible candidates directly
+  // from the store and drains them in a bounded, fair, budget-aware loop.
+  // A caller (integration, command, or scheduler) invokes this when it wants
+  // to resume pending durable continuations outside the observe-to-notify
+  // flow. Each candidate either completes or retains its durable
+  // continuation for a later pass.
+  async function drainEligibleCandidates({ ctx, projectFingerprint, scopeFingerprint, options = {} }) {
+    const auditStart = store.readRecords("audit-event").length;
+    const sessionIDHash = options.sessionIDHash ?? observation.hashSessionLineage(`drain:${projectFingerprint ?? "global"}`);
+    return (await drainEligibleGlobalCandidates({
+      ctx,
+      options,
+      auditStart,
+      sessionIDHash,
+      mode: options.mode ?? "auto",
+      observations: [],
+      capsules: [],
+      capsuleSupport: [],
+      eligibility: [],
+      seededMaterialization: null,
+    })) ?? {
+      result: "no-eligible",
+      cycleOutcome: "drain-empty",
+      cycleReason: "no-eligible-candidates",
+      observations: [],
+      capsules: [],
+      capsuleSupport: [],
+      eligibility: [],
+      auditEvents: auditSince(store, auditStart),
+      responseText: "Self-evolve found no eligible global candidates to drain. No files were applied.",
+    };
+  }
+
   function close() {
     retryTerminalLeaseCleanups();
     const cleanup = [...pendingSynthesisLeaseCleanups.values()].map(({ attempt, lease }) => {
@@ -1336,5 +1289,5 @@ export function createPipeline({ store, inventory, privacy, synthesis, applier, 
     };
   }
 
-  return Object.freeze({ runEvolutionCycle, runApprovalFlow, runRollbackFlow, runRecoveryOnStartup, recoverContributionTransactions, recoverSynthesisAttempts, readProposalContent, close });
+  return Object.freeze({ runEvolutionCycle, runApprovalFlow, runRollbackFlow, runRecoveryOnStartup, recoverContributionTransactions, recoverSynthesisAttempts, readProposalContent, drainEligibleCandidates, close });
 }

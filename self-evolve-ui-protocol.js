@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { deepFreeze, makeApprovedGlobalRoot } from "./self-evolve-schemas.js";
 
 export const UI_PROJECTION_VERSION = 1;
-export const UI_DASHBOARD_VERSION = 2;
-export const UI_DASHBOARD_VERSIONS = Object.freeze([1, UI_DASHBOARD_VERSION]);
-export const UI_OPERATION_PROTOCOL_VERSION = 1;
+export const UI_DASHBOARD_VERSION = 3;
+export const UI_DASHBOARD_VERSIONS = Object.freeze([1, 2, UI_DASHBOARD_VERSION]);
+export const UI_OPERATION_PROTOCOL_VERSION = 2;
 export const GLOBAL_BRIDGE_SCHEMA_VERSION = 1;
 export const GLOBAL_PROJECTION_VERSION = 1;
 export const GLOBAL_OPERATION_PROTOCOL_VERSION = 1;
@@ -16,7 +16,6 @@ export const GLOBAL_CAPABILITIES = Object.freeze([
   "global-recommendation-detail-v1",
   "global-recommendation-index-v1",
   "global-transaction-v1",
-  "project-analysis-control-v1",
   "project-participation-v1",
 ]);
 const GLOBAL_AUTHORITATIVE_CAPABILITIES = Object.freeze([
@@ -34,6 +33,19 @@ export const GLOBAL_PROTOCOL_COMPATIBILITY = Object.freeze({
   oldTuiNewServer: "limited-old-tui-new-server",
 });
 export const UI_CAPABILITIES = Object.freeze([
+  "automatic-recommendations-control-v1",
+  "legacy-decision-v1",
+  "operation-export-v1",
+  "operation-kill-switch-v1",
+  "operation-purge-all-v1",
+  "operation-purge-scope-v1",
+  "operation-retry-bootstrap-v1",
+  "operation-rollback-v1",
+  "operation-snooze-v1",
+  "projection-index-v1",
+  "projection-review-detail-v1",
+]);
+const LEGACY_UI_CAPABILITIES = Object.freeze([
   "legacy-control-v1",
   "legacy-decision-v1",
   "operation-export-v1",
@@ -47,7 +59,16 @@ export const UI_CAPABILITIES = Object.freeze([
   "projection-index-v1",
   "projection-review-detail-v1",
 ]);
+const ALL_UI_CAPABILITIES = Object.freeze([...new Set([
+  ...UI_CAPABILITIES,
+  ...LEGACY_UI_CAPABILITIES,
+])].sort(compareText));
 export const UI_DASHBOARD_CAPABILITIES = Object.freeze([
+  "decision-feedback-v1",
+  "operation-global-root-policy-v1",
+  "project-participation-v1",
+]);
+const LEGACY_UI_DASHBOARD_CAPABILITIES = Object.freeze([
   "control-repo-mode-v1",
   "decision-feedback-v1",
   "operation-global-root-policy-v1",
@@ -122,9 +143,10 @@ export const UI_ACTIONS = Object.freeze([
   "replace-global-root-policy",
   "retry-bootstrap",
   "rollback-proposal",
+  "set-automatic-recommendations",
   "set-kill-switch",
-  "set-paused",
-  "set-repo-mode",
+  "set-permission",
+  "set-repo-excluded",
   "snooze-proposal",
 ]);
 export const UI_OPERATION_ACTIONS = Object.freeze([
@@ -134,9 +156,10 @@ export const UI_OPERATION_ACTIONS = Object.freeze([
   "replace-global-root-policy",
   "retry-bootstrap",
   "rollback-proposal",
+  "set-automatic-recommendations",
   "set-kill-switch",
-  "set-paused",
-  "set-repo-mode",
+  "set-permission",
+  "set-repo-excluded",
   "snooze-proposal",
 ]);
 export const UI_PROJECTION_INDEX_FIELDS = Object.freeze([
@@ -172,7 +195,7 @@ export const GLOBAL_RECOMMENDATION_DETAIL_FIELDS = Object.freeze([
   "projectionVersion", "stateRootIdentity", "generation", "recommendationId",
   "recommendationVersion", "supportSetHash", "targetBindingHash", "targetHash",
   "proposedContentHash", "priorState", "issuedAt", "expiresAt", "target", "support",
-  "safety", "generality", "rationale", "diff", "evidenceSummary", "availableActions", "detailHash",
+  "safety", "generality", "rationale", "diff", "evidenceSummary", "availableActions", "actionReasons", "detailHash",
 ]);
 export const GLOBAL_ACTION_GRANT_FIELDS = Object.freeze([
   "grantVersion", "capability", "stateRootIdentity", "generation", "indexHash", "detailHash",
@@ -203,7 +226,7 @@ const GLOBAL_PROTOCOL_OFFER_FIELDS = Object.freeze([
   "bridgeSchemaVersions", "projectionVersions", "operationProtocolVersions", "capabilities",
 ]);
 const INDEX_STATUS_FIELDS = Object.freeze([
-  "state", "reason", "storedMode", "effectiveMode", "paused", "killSwitchActive",
+  "state", "reason", "automaticRecommendationsEnabled", "killSwitchActive",
   "repoExcluded", "circuitBreakerOpen",
 ]);
 const BUDGET_FIELDS = Object.freeze([
@@ -240,7 +263,12 @@ const DASHBOARD_LAST_CYCLE_FIELDS = Object.freeze([
   "outcome", "triggerClass", "mode", "observationCount", "eligibilityCount",
   "proposalId", "occurredAt", "reason",
 ]);
+const DASHBOARD_LAST_CYCLE_V3_FIELDS = Object.freeze([
+  "outcome", "triggerClass", "observationCount", "eligibilityCount",
+  "proposalId", "occurredAt", "reason",
+]);
 const DASHBOARD_USAGE_FIELDS = Object.freeze(["passive", "synthesis", "storage"]);
+const DASHBOARD_USAGE_V3_FIELDS = Object.freeze(["provider", "synthesis", "storage"]);
 const DASHBOARD_BUDGET_USAGE_FIELDS = Object.freeze(["used", "limit", "remaining", "resetAt"]);
 const DASHBOARD_STORAGE_USAGE_FIELDS = Object.freeze(["usedBytes", "limitBytes", "remainingBytes"]);
 const DASHBOARD_ROLLOUT_FIELDS = Object.freeze([
@@ -255,8 +283,16 @@ const DASHBOARD_SETTINGS_V2_FIELDS = Object.freeze([
   ...DASHBOARD_SETTINGS_FIELDS, "globalSettingsVersion", "globalRootPolicy",
   "globalRootPolicyConfirmation", "globalRootPolicyAction",
 ]);
+const DASHBOARD_SETTINGS_V3_FIELDS = Object.freeze([
+  "automaticRecommendationsEnabled", "automationGeneration", "killSwitchActive",
+  "repositoryExcluded", "consent", "approvedSkillFolderCount", "collectionSuggestions", "globalSettingsVersion",
+  "globalRootPolicy", "globalRootPolicyConfirmation", "globalRootPolicyAction",
+]);
 const DASHBOARD_CONSENT_FIELDS = Object.freeze([
   "passiveCalls", "durableObservations", "sanitizedExcerpts", "crossRepoAggregation",
+]);
+const DASHBOARD_CONSENT_V3_FIELDS = Object.freeze([
+  "durableObservations", "sanitizedExcerpts", "crossRepoAggregation",
 ]);
 const DASHBOARD_RETENTION_FIELDS = Object.freeze(["observationsDays", "operationalDays"]);
 const DASHBOARD_ACTIVITY_FIELDS = Object.freeze([
@@ -268,8 +304,8 @@ const SNOOZE_PAYLOAD_FIELDS = Object.freeze([
 ]);
 const ROLLBACK_PAYLOAD_FIELDS = Object.freeze(["proposalId", "appliedHash", "decisionVersion"]);
 const SETTINGS_PAYLOAD_FIELDS = Object.freeze(["enabled", "settingsVersion"]);
-const PAUSE_PAYLOAD_FIELDS = Object.freeze(["paused", "settingsVersion"]);
-const PROJECT_MODE_PAYLOAD_FIELDS = Object.freeze(["mode", "settingsVersion"]);
+const PERMISSION_PAYLOAD_FIELDS = Object.freeze(["permission", "enabled", "settingsVersion"]);
+const PROJECT_EXCLUSION_PAYLOAD_FIELDS = Object.freeze(["excluded", "settingsVersion"]);
 const ROOT_POLICY_PAYLOAD_FIELDS = Object.freeze([
   "roots", "creationRootPath", "confirmation", "settingsVersion",
 ]);
@@ -277,13 +313,16 @@ const ROOT_POLICY_ROOT_FIELDS = Object.freeze(["canonicalPath", "canUpdate", "ca
 const PURGE_SCOPE_PAYLOAD_FIELDS = Object.freeze(["scope", "confirmation"]);
 const CONFIRMATION_PAYLOAD_FIELDS = Object.freeze(["confirmation"]);
 const EXPORT_PAYLOAD_FIELDS = Object.freeze(["scope", "confirmation"]);
-// `yolo` is a v0.2 compatibility input only: the v0.3 server never produces it,
-// and the durable domain narrows any legacy value to `auto`.
+// Legacy dashboard versions remain parseable for read-only compatibility only.
 const MODES = Object.freeze(["manual", "auto", "yolo"]);
 const PROPOSAL_STATES = Object.freeze([
   "critic-pending", "pending", "approved", "rejected", "applied", "rolled-back", "superseded", "failed-closed",
 ]);
 export const UI_DASHBOARD_AUTOMATION_STATES = Object.freeze([
+  "terminal", "corrupt", "emergency-stop", "circuit-breaker", "excluded", "off",
+  "setup-required", "running", "backoff", "budget", "quiet-period", "ready",
+]);
+const LEGACY_DASHBOARD_AUTOMATION_STATES = Object.freeze([
   "terminal", "corrupt", "emergency-stop", "circuit-breaker", "paused", "excluded",
   "on-demand", "setup-required", "running", "backoff", "budget", "quiet-period", "ready",
 ]);
@@ -291,21 +330,25 @@ export const UI_DASHBOARD_BLOCKER_DESTINATIONS = deepFreeze({
   "unsupported-host": { dashboard: "settings", section: "settings", anchor: "unsupported-host" },
   "state-root": { dashboard: "settings", section: "settings", anchor: "state-root" },
   "provider": { dashboard: "settings", section: "settings", anchor: "provider" },
-  "first-run": { dashboard: "home", section: "home" },
+  "first-run": { dashboard: "settings", section: "settings", anchor: "automatic-recommendations" },
   "restart-required": { dashboard: "settings", section: "settings", anchor: "restart-required" },
-  "passive-consent": { dashboard: "settings", section: "settings", anchor: "passive-consent" },
+  "automatic-recommendations-off": { dashboard: "settings", section: "settings", anchor: "automatic-recommendations" },
   "observation-consent": { dashboard: "settings", section: "settings", anchor: "observation-consent" },
   "approved-skill-folders": { dashboard: "settings", section: "settings", anchor: "approved-skill-folders" },
-  "yolo-rollout": { dashboard: "settings", section: "settings", anchor: "yolo-rollout" },
   "corrupt-state": { dashboard: "activity-errors", section: "activity", filter: "errors" },
   "emergency-stop": { dashboard: "settings", section: "settings", anchor: "emergency-stop" },
   "circuit-breaker": { dashboard: "activity-errors", section: "activity", filter: "errors" },
-  "paused": { dashboard: "home", section: "home" },
   "repository-excluded": { dashboard: "settings", section: "settings", anchor: "project-scope" },
 });
 export const UI_DASHBOARD_BLOCKER_CODES = Object.freeze(Object.keys(UI_DASHBOARD_BLOCKER_DESTINATIONS));
+const LEGACY_DASHBOARD_BLOCKER_DESTINATIONS = deepFreeze({
+  ...UI_DASHBOARD_BLOCKER_DESTINATIONS,
+  "passive-consent": { dashboard: "settings", section: "settings", anchor: "passive-consent" },
+  "yolo-rollout": { dashboard: "settings", section: "settings", anchor: "yolo-rollout" },
+  paused: { dashboard: "home", section: "home" },
+});
 export const UI_CONTROL_CENTER_SETTINGS_ANCHORS = Object.freeze([
-  "setup", "modes", "privacy", "limits", "maintenance",
+  "setup", "automatic-recommendations", "privacy", "limits", "maintenance",
   ...new Set(Object.values(UI_DASHBOARD_BLOCKER_DESTINATIONS)
     .filter((entry) => entry.section === "settings")
     .map((entry) => entry.anchor)),
@@ -315,7 +358,7 @@ export const UI_DASHBOARD_OUTCOMES = Object.freeze([
   "recommendation-created", "applied", "deferred", "failed-closed", "failed",
   "rolled-back", "recommendation-approved", "recommendation-rejected",
   "recommendation-snoozed", "recommendation-acknowledged", "breaker-open",
-  "breaker-recovered", "paused", "resumed", "emergency-stop-enabled",
+  "breaker-recovered", "automatic-recommendations-on", "automatic-recommendations-off", "emergency-stop-enabled",
   "emergency-stop-disabled", "project-excluded", "project-included",
   "export-completed", "purge-completed", "purge-all-accepted", "bootstrap-completed",
   "recovery-completed",
@@ -327,7 +370,7 @@ export const UI_DASHBOARD_REASON_CODES = Object.freeze([
   "no-change", "critic-rejected", "validation-failed", "apply-deferred",
   "apply-failed", "pipeline-failed", "operation-failed", "three-failures-in-24h",
   "startup-pending", "setup-required", "restart-required", "unsupported-host", "corrupt-state",
-  "emergency-stop", "paused", "repository-excluded", "unknown",
+  "emergency-stop", "automatic-recommendations-off", "repository-excluded", "unknown",
 ]);
 export const UI_ACTION_CAPABILITIES = Object.freeze({
   "acknowledge-audit": "projection-review-detail-v1",
@@ -339,11 +382,21 @@ export const UI_ACTION_CAPABILITIES = Object.freeze({
   "replace-global-root-policy": "operation-global-root-policy-v1",
   "retry-bootstrap": "operation-retry-bootstrap-v1",
   "rollback-proposal": "operation-rollback-v1",
+  "set-automatic-recommendations": "automatic-recommendations-control-v1",
   "set-kill-switch": "operation-kill-switch-v1",
-  "set-paused": "operation-pause-v1",
-  "set-repo-mode": "legacy-control-v1",
+  "set-permission": "automatic-recommendations-control-v1",
+  "set-repo-excluded": "automatic-recommendations-control-v1",
   "snooze-proposal": "operation-snooze-v1",
 });
+const LEGACY_UI_ACTION_CAPABILITIES = Object.freeze({
+  "set-paused": "operation-pause-v1",
+  "set-repo-mode": "legacy-control-v1",
+});
+const ALL_UI_ACTION_CAPABILITIES = Object.freeze({
+  ...UI_ACTION_CAPABILITIES,
+  ...LEGACY_UI_ACTION_CAPABILITIES,
+});
+const ALL_UI_ACTIONS = Object.freeze(Object.keys(ALL_UI_ACTION_CAPABILITIES).sort(compareText));
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u;
 const RECEIPT_TYPES = Object.freeze([
@@ -357,9 +410,10 @@ const HASH_DOMAINS = Object.freeze({
   "projection-index": "self-evolve-ui-projection-index-v1",
   dashboard: "self-evolve-ui-dashboard-v1",
   "dashboard-v2": "self-evolve-ui-dashboard-v2",
+  "dashboard-v3": "self-evolve-ui-dashboard-v3",
   "review-detail": "self-evolve-ui-review-detail-v1",
-  "operation-request": "self-evolve-ui-operation-request-v1",
-  "operation-response": "self-evolve-ui-operation-response-v1",
+  "operation-request": "self-evolve-ui-operation-request-v2",
+  "operation-response": "self-evolve-ui-operation-response-v2",
 });
 const GLOBAL_HASH_DOMAINS = Object.freeze({
   "recommendation-index": ["self-evolve-global-recommendation-index-v1", "indexHash"],
@@ -519,9 +573,11 @@ export function canonicalUiJson(value) {
 }
 
 export function hashUiProtocol(kind, value) {
-  const domain = kind === "dashboard" && value?.dashboardVersion === 2
-    ? HASH_DOMAINS["dashboard-v2"]
-    : HASH_DOMAINS[kind];
+  const domain = kind === "dashboard" && value?.dashboardVersion === 3
+    ? HASH_DOMAINS["dashboard-v3"]
+    : kind === "dashboard" && value?.dashboardVersion === 2
+      ? HASH_DOMAINS["dashboard-v2"]
+      : HASH_DOMAINS[kind];
   if (!domain) fail("unknown-ui-protocol-kind", String(kind));
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("canonical-object");
   const omittedField = kind === "projection-index"
@@ -564,6 +620,7 @@ const GLOBAL_RECOMMENDATION_STATES = Object.freeze([
   "rolled-back", "superseded", "failed-closed",
 ]);
 const GLOBAL_ACTIONS = Object.freeze(["apply", "reject", "undo"]);
+const GLOBAL_ACTION_REASON_FIELDS = GLOBAL_ACTIONS;
 const GLOBAL_ACTION_PRIOR_STATES = Object.freeze({ apply: "pending", reject: "pending", undo: "applied" });
 const GLOBAL_TARGET_KINDS = Object.freeze(["existing-global-skill", "new-global-skill"]);
 const GLOBAL_TARGET_FIELDS = Object.freeze(["kind", "label"]);
@@ -636,6 +693,21 @@ function makeGlobalActions(value, state) {
       : state === "applied" ? new Set(["undo"]) : new Set();
   if (actions.some((action) => !allowed.has(action))) fail("global-action-state-mismatch");
   return actions;
+}
+
+function makeGlobalActionReasons(value, availableActions) {
+  exactKeys(value, GLOBAL_ACTION_REASON_FIELDS, "global-action-reasons");
+  const available = new Set(availableActions);
+  return Object.fromEntries(GLOBAL_ACTIONS.map((action) => {
+    const reason = value[action];
+    if (available.has(action)) {
+      if (reason !== null) fail("global-action-available-with-reason");
+      return [action, null];
+    }
+    const clean = asText(reason, `global-${action}-reason`, 128, { singleLine: true });
+    if (!/^[a-z][a-z0-9-]{0,127}$/u.test(clean)) fail("invalid-global-action-reason");
+    return [action, clean];
+  }));
 }
 
 function makeGlobalIndexEntry(value) {
@@ -791,6 +863,7 @@ export function makeGlobalRecommendationDetail(value, expectedValue) {
   });
   assertOrdered(evidenceSummary, (left, right) => compareText(left.kind, right.kind), "global-evidence-summary");
   if (new Set(evidenceSummary.map((entry) => entry.kind)).size !== evidenceSummary.length) fail("global-evidence-summary-duplicate");
+  const availableActions = makeGlobalActions(value.availableActions, priorState);
   const clean = {
     projectionVersion: GLOBAL_PROJECTION_VERSION,
     stateRootIdentity,
@@ -811,7 +884,8 @@ export function makeGlobalRecommendationDetail(value, expectedValue) {
     rationale: asText(value.rationale, "global-rationale", GLOBAL_PROTOCOL_LIMITS.rationaleBytes),
     diff: makeGlobalDiff(value.diff),
     evidenceSummary,
-    availableActions: makeGlobalActions(value.availableActions, priorState),
+    availableActions,
+    actionReasons: makeGlobalActionReasons(value.actionReasons, availableActions),
     detailHash: asHash(value.detailHash, "global-detail-hash"),
   };
   if (hashGlobalProtocol("recommendation-detail", clean) !== clean.detailHash
@@ -1075,8 +1149,8 @@ export function negotiateGlobalProtocol(serverValue, clientValue) {
 export function makeUiProtocolOffer(value) {
   exactKeys(value, UI_PROTOCOL_OFFER_FIELDS, "ui-protocol-offer");
   const projectionVersions = exactSortedList(value.projectionVersions, "projection-versions", [UI_PROJECTION_VERSION], 4, "unsupported-projection-version");
-  const operationProtocolVersions = exactSortedList(value.operationProtocolVersions, "operation-versions", [UI_OPERATION_PROTOCOL_VERSION], 4, "unsupported-operation-version");
-  const capabilities = exactSortedList(value.capabilities, "capabilities", UI_CAPABILITIES, 32, "unknown-capability");
+  const operationProtocolVersions = exactSortedList(value.operationProtocolVersions, "operation-versions", [1, UI_OPERATION_PROTOCOL_VERSION], 4, "unsupported-operation-version");
+  const capabilities = exactSortedList(value.capabilities, "capabilities", ALL_UI_CAPABILITIES, 32, "unknown-capability");
   return deepFreeze({ projectionVersions, operationProtocolVersions, capabilities });
 }
 
@@ -1127,7 +1201,10 @@ export function negotiateUiProtocol(serverValue, clientValue) {
   if (projectionVersion === null) return legacyNegotiation("projection-version-unavailable");
   const operationProtocolVersion = [...server.operationProtocolVersions].reverse().find((version) => client.operationProtocolVersions.includes(version)) ?? null;
   let capabilities = UI_CAPABILITIES.filter((capability) => server.capabilities.includes(capability) && client.capabilities.includes(capability));
-  if (operationProtocolVersion === null) capabilities = capabilities.filter((capability) => !capability.startsWith("operation-"));
+  if (operationProtocolVersion === null) {
+    capabilities = capabilities.filter((capability) => capability !== "automatic-recommendations-control-v1"
+      && !capability.startsWith("operation-"));
+  }
   return deepFreeze({
     mode: operationProtocolVersion === null ? "read-only" : "native",
     projectionVersion,
@@ -1186,18 +1263,36 @@ function makeProjectionContext(value) {
     stateRootIdentity: asHash(value.stateRootIdentity, "state-root-identity"),
     generation: asHash(value.generation, "generation"),
     now: asTimestamp(value.now, "now"),
-    supportedCapabilities: exactSortedList(value.supportedCapabilities, "capabilities", UI_CAPABILITIES, UI_PROTOCOL_LIMITS.capabilities, "unknown-capability"),
+    supportedCapabilities: exactSortedList(value.supportedCapabilities, "capabilities", ALL_UI_CAPABILITIES, UI_PROTOCOL_LIMITS.capabilities, "unknown-capability"),
   };
 }
 
 function makeStatus(value) {
-  exactKeys(value, INDEX_STATUS_FIELDS, "ui-projection-status");
+  const legacyFields = [
+    "state", "reason", "storedMode", "effectiveMode", "paused", "killSwitchActive",
+    "repoExcluded", "circuitBreakerOpen",
+  ];
+  const legacy = Object.hasOwn(value ?? {}, "storedMode");
+  exactKeys(value, legacy ? legacyFields : INDEX_STATUS_FIELDS, "ui-projection-status");
+  if (legacy) {
+    return {
+      state: asEnum(value.state, ["ready", "setup-required", "startup-pending", "unavailable", "corrupt", "terminal"], "projection-status"),
+      reason: asNullableReason(value.reason),
+      storedMode: asEnum(value.storedMode, MODES, "stored-mode"),
+      effectiveMode: asEnum(value.effectiveMode, MODES, "effective-mode"),
+      paused: asBoolean(value.paused, "paused"),
+      killSwitchActive: asBoolean(value.killSwitchActive, "kill-switch"),
+      repoExcluded: asBoolean(value.repoExcluded, "repo-excluded"),
+      circuitBreakerOpen: asBoolean(value.circuitBreakerOpen, "circuit-breaker"),
+    };
+  }
   return {
     state: asEnum(value.state, ["ready", "setup-required", "startup-pending", "unavailable", "corrupt", "terminal"], "projection-status"),
     reason: asNullableReason(value.reason),
-    storedMode: asEnum(value.storedMode, MODES, "stored-mode"),
-    effectiveMode: asEnum(value.effectiveMode, MODES, "effective-mode"),
-    paused: asBoolean(value.paused, "paused"),
+    automaticRecommendationsEnabled: asBoolean(
+      value.automaticRecommendationsEnabled,
+      "automatic-recommendations-enabled",
+    ),
     killSwitchActive: asBoolean(value.killSwitchActive, "kill-switch"),
     repoExcluded: asBoolean(value.repoExcluded, "repo-excluded"),
     circuitBreakerOpen: asBoolean(value.circuitBreakerOpen, "circuit-breaker"),
@@ -1213,8 +1308,11 @@ function asNullableTimestamp(value, label) {
   return value === null ? null : asTimestamp(value, label);
 }
 
-function makeDashboardReason(value, label = "dashboard-reason") {
-  return value === null ? null : asEnum(value, UI_DASHBOARD_REASON_CODES, label);
+function makeDashboardReason(value, label = "dashboard-reason", dashboardVersion = UI_DASHBOARD_VERSION) {
+  const reasonCodes = dashboardVersion === 3
+    ? UI_DASHBOARD_REASON_CODES
+    : [...UI_DASHBOARD_REASON_CODES, "paused"];
+  return value === null ? null : asEnum(value, reasonCodes, label);
 }
 
 function makeDashboardGlobalRootPolicy(value) {
@@ -1247,6 +1345,24 @@ function makeDashboardGlobalRootPolicy(value) {
   };
 }
 
+function makeDashboardCollectionSuggestions(value) {
+  if (!Array.isArray(value) || value.length > 32) {
+    fail("dashboard-collection-suggestions-out-of-bounds");
+  }
+  const suggestions = value.map((canonicalPath) => makeApprovedGlobalRoot({
+    canonicalPath,
+    canUpdate: true,
+    canCreate: false,
+  }).canonicalPath);
+  if (new Set(suggestions).size !== suggestions.length) fail("dashboard-collection-suggestions-duplicate");
+  for (let index = 1; index < suggestions.length; index += 1) {
+    if (compareText(suggestions[index - 1], suggestions[index]) >= 0) {
+      fail("dashboard-collection-suggestions-not-sorted");
+    }
+  }
+  return suggestions;
+}
+
 function makeDashboardBudgetUsage(value, label) {
   exactKeys(value, DASHBOARD_BUDGET_USAGE_FIELDS, `${label}-usage`);
   const used = asInt(value.used, `${label}-used`, { max: 1_000_000_000 });
@@ -1256,46 +1372,60 @@ function makeDashboardBudgetUsage(value, label) {
   return { used, limit, remaining, resetAt: asNullableTimestamp(value.resetAt, `${label}-reset-at`) };
 }
 
-function makeDashboardUsage(value) {
-  exactKeys(value, DASHBOARD_USAGE_FIELDS, "dashboard-usage");
+function makeDashboardUsage(value, dashboardVersion) {
+  const fields = dashboardVersion === 3 ? DASHBOARD_USAGE_V3_FIELDS : DASHBOARD_USAGE_FIELDS;
+  exactKeys(value, fields, "dashboard-usage");
   exactKeys(value.storage, DASHBOARD_STORAGE_USAGE_FIELDS, "dashboard-storage-usage");
   const usedBytes = asInt(value.storage.usedBytes, "storage-used-bytes");
   const limitBytes = asInt(value.storage.limitBytes, "storage-limit-bytes");
   const remainingBytes = asInt(value.storage.remainingBytes, "storage-remaining-bytes");
   if (remainingBytes !== Math.max(0, limitBytes - usedBytes)) fail("storage-remaining-mismatch");
+  const providerField = dashboardVersion === 3 ? "provider" : "passive";
   return {
-    passive: makeDashboardBudgetUsage(value.passive, "passive"),
+    [providerField]: makeDashboardBudgetUsage(value[providerField], providerField),
     synthesis: makeDashboardBudgetUsage(value.synthesis, "synthesis"),
     storage: { usedBytes, limitBytes, remainingBytes },
   };
 }
 
-function makeDashboardLastCycle(value) {
+function makeDashboardLastCycle(value, dashboardVersion) {
   if (value === null) return null;
-  exactKeys(value, DASHBOARD_LAST_CYCLE_FIELDS, "dashboard-last-cycle");
-  return {
+  exactKeys(
+    value,
+    dashboardVersion === 3 ? DASHBOARD_LAST_CYCLE_V3_FIELDS : DASHBOARD_LAST_CYCLE_FIELDS,
+    "dashboard-last-cycle",
+  );
+  const common = {
     outcome: asEnum(value.outcome, UI_DASHBOARD_OUTCOMES.slice(0, 9), "cycle-outcome"),
     triggerClass: asEnum(value.triggerClass, ["manual", "idle", "recovery", "other"], "cycle-trigger-class"),
-    mode: asEnum(value.mode, MODES, "cycle-mode"),
+  };
+  const tail = {
     observationCount: asInt(value.observationCount, "cycle-observation-count", { max: 1_000_000 }),
     eligibilityCount: asInt(value.eligibilityCount, "cycle-eligibility-count", { max: 1_000_000 }),
     proposalId: value.proposalId === null ? null : asId(value.proposalId, "cycle-proposal-id"),
     occurredAt: asTimestamp(value.occurredAt, "cycle-occurred-at"),
-    reason: makeDashboardReason(value.reason, "cycle-reason"),
+    reason: makeDashboardReason(value.reason, "cycle-reason", dashboardVersion),
   };
+  return dashboardVersion === 3
+    ? { ...common, ...tail }
+    : { ...common, mode: asEnum(value.mode, MODES, "cycle-mode"), ...tail };
 }
 
-function makeDashboardActivity(value) {
+function makeDashboardActivity(value, dashboardVersion) {
   exactKeys(value, DASHBOARD_ACTIVITY_FIELDS, "dashboard-activity-entry");
   return {
     id: asHash(value.id, "activity-id"),
     category: asEnum(value.category, ["cycle", "recommendation", "system", "error"], "activity-category"),
     audience: asEnum(value.audience, ["default", "diagnostic"], "activity-audience"),
-    outcome: asEnum(value.outcome, UI_DASHBOARD_OUTCOMES, "activity-outcome"),
+    outcome: asEnum(
+      value.outcome,
+      dashboardVersion === 3 ? UI_DASHBOARD_OUTCOMES : [...UI_DASHBOARD_OUTCOMES, "paused", "resumed"],
+      "activity-outcome",
+    ),
     summary: asText(value.summary, "activity-summary", UI_PROTOCOL_LIMITS.dashboardSummaryBytes),
     occurredAt: asTimestamp(value.occurredAt, "activity-occurred-at"),
     proposalId: value.proposalId === null ? null : asId(value.proposalId, "activity-proposal-id"),
-    reason: makeDashboardReason(value.reason, "activity-reason"),
+    reason: makeDashboardReason(value.reason, "activity-reason", dashboardVersion),
   };
 }
 
@@ -1332,27 +1462,38 @@ export function makeUiDashboard(value, expectedValue) {
   const generatedAt = asTimestamp(value.generatedAt, "dashboard-generated-at");
   if (generatedAt > expected.now + UI_PROTOCOL_LIMITS.futureSkewMs) fail("future-dashboard");
   if (generatedAt + UI_PROTOCOL_LIMITS.projectionTtlMs <= expected.now) fail("expired-dashboard");
+  const dashboardCapabilities = dashboardVersion === 3
+    ? UI_DASHBOARD_CAPABILITIES
+    : LEGACY_UI_DASHBOARD_CAPABILITIES;
   const capabilities = exactSortedList(
     value.capabilities,
     "dashboard-capabilities",
-    UI_DASHBOARD_CAPABILITIES,
-    UI_DASHBOARD_CAPABILITIES.length,
+    dashboardCapabilities,
+    dashboardCapabilities.length,
     "unknown-dashboard-capability",
   );
   exactKeys(value.automation, DASHBOARD_AUTOMATION_FIELDS, "dashboard-automation");
   const automation = {
-    state: asEnum(value.automation.state, UI_DASHBOARD_AUTOMATION_STATES, "dashboard-automation-state"),
-    reason: makeDashboardReason(value.automation.reason, "dashboard-automation-reason"),
+    state: asEnum(
+      value.automation.state,
+      dashboardVersion === 3 ? UI_DASHBOARD_AUTOMATION_STATES : LEGACY_DASHBOARD_AUTOMATION_STATES,
+      "dashboard-automation-state",
+    ),
+    reason: makeDashboardReason(value.automation.reason, "dashboard-automation-reason", dashboardVersion),
   };
-  if (!Array.isArray(value.blockers) || value.blockers.length > UI_DASHBOARD_BLOCKER_CODES.length) fail("dashboard-blockers-out-of-bounds");
+  const blockerDestinations = dashboardVersion === 3
+    ? UI_DASHBOARD_BLOCKER_DESTINATIONS
+    : LEGACY_DASHBOARD_BLOCKER_DESTINATIONS;
+  const blockerCodes = Object.keys(blockerDestinations);
+  if (!Array.isArray(value.blockers) || value.blockers.length > blockerCodes.length) fail("dashboard-blockers-out-of-bounds");
   const blockers = value.blockers.map((blocker) => {
     exactKeys(blocker, DASHBOARD_BLOCKER_FIELDS, "dashboard-blocker");
     const output = {
-      code: asEnum(blocker.code, UI_DASHBOARD_BLOCKER_CODES, "dashboard-blocker-code"),
+      code: asEnum(blocker.code, blockerCodes, "dashboard-blocker-code"),
       summary: asText(blocker.summary, "dashboard-blocker-summary", UI_PROTOCOL_LIMITS.dashboardSummaryBytes),
       destination: asEnum(blocker.destination, ["home", "recommendations", "activity-errors", "settings"], "dashboard-destination"),
     };
-    if (UI_DASHBOARD_BLOCKER_DESTINATIONS[output.code].dashboard !== output.destination) {
+    if (blockerDestinations[output.code].dashboard !== output.destination) {
       fail("dashboard-blocker-destination-mismatch");
     }
     return output;
@@ -1372,7 +1513,7 @@ export function makeUiDashboard(value, expectedValue) {
       || (!inFlight.active && (inFlight.stage !== null || inFlight.startedAt !== null))) {
     fail("dashboard-in-flight-inconsistent");
   }
-  const lastCycle = makeDashboardLastCycle(value.lastCycle);
+  const lastCycle = makeDashboardLastCycle(value.lastCycle, dashboardVersion);
   const nextEligibleAt = asNullableTimestamp(value.nextEligibleAt, "dashboard-next-eligible-at");
   exactKeys(value.rollout, DASHBOARD_ROLLOUT_FIELDS, "dashboard-rollout");
   const rollout = {
@@ -1388,23 +1529,47 @@ export function makeUiDashboard(value, expectedValue) {
   }
   exactKeys(
     value.settings,
-    dashboardVersion === 1 ? DASHBOARD_SETTINGS_FIELDS : DASHBOARD_SETTINGS_V2_FIELDS,
+    dashboardVersion === 1
+      ? DASHBOARD_SETTINGS_FIELDS
+      : dashboardVersion === 2
+        ? DASHBOARD_SETTINGS_V2_FIELDS
+        : DASHBOARD_SETTINGS_V3_FIELDS,
     "dashboard-settings",
   );
-  exactKeys(value.settings.consent, DASHBOARD_CONSENT_FIELDS, "dashboard-consent");
-  const settings = {
-    globalMode: asEnum(value.settings.globalMode, MODES, "dashboard-global-mode"),
-    repositoryMode: asEnum(value.settings.repositoryMode, ["inherit", ...MODES], "dashboard-repository-mode"),
-    effectiveMode: asEnum(value.settings.effectiveMode, MODES, "dashboard-effective-mode"),
-    paused: asBoolean(value.settings.paused, "dashboard-paused"),
-    killSwitchActive: asBoolean(value.settings.killSwitchActive, "dashboard-kill-switch"),
-    repositoryExcluded: asBoolean(value.settings.repositoryExcluded, "dashboard-repository-excluded"),
-    consent: Object.fromEntries(DASHBOARD_CONSENT_FIELDS.map((field) => [
-      field, asBoolean(value.settings.consent[field], `dashboard-consent-${field}`),
-    ])),
-    approvedSkillFolderCount: asInt(value.settings.approvedSkillFolderCount, "dashboard-approved-skill-folder-count", { max: 1_000_000 }),
-  };
-  if (dashboardVersion === 2) {
+  const consentFields = dashboardVersion === 3 ? DASHBOARD_CONSENT_V3_FIELDS : DASHBOARD_CONSENT_FIELDS;
+  exactKeys(value.settings.consent, consentFields, "dashboard-consent");
+  const settings = dashboardVersion === 3
+    ? {
+        automaticRecommendationsEnabled: asBoolean(
+          value.settings.automaticRecommendationsEnabled,
+          "dashboard-automatic-recommendations-enabled",
+        ),
+        automationGeneration: asInt(
+          value.settings.automationGeneration,
+          "dashboard-automation-generation",
+          { min: 1 },
+        ),
+        killSwitchActive: asBoolean(value.settings.killSwitchActive, "dashboard-kill-switch"),
+        repositoryExcluded: asBoolean(value.settings.repositoryExcluded, "dashboard-repository-excluded"),
+        consent: Object.fromEntries(consentFields.map((field) => [
+          field, asBoolean(value.settings.consent[field], `dashboard-consent-${field}`),
+        ])),
+        approvedSkillFolderCount: asInt(value.settings.approvedSkillFolderCount, "dashboard-approved-skill-folder-count", { max: 1_000_000 }),
+        collectionSuggestions: makeDashboardCollectionSuggestions(value.settings.collectionSuggestions),
+      }
+    : {
+        globalMode: asEnum(value.settings.globalMode, MODES, "dashboard-global-mode"),
+        repositoryMode: asEnum(value.settings.repositoryMode, ["inherit", ...MODES], "dashboard-repository-mode"),
+        effectiveMode: asEnum(value.settings.effectiveMode, MODES, "dashboard-effective-mode"),
+        paused: asBoolean(value.settings.paused, "dashboard-paused"),
+        killSwitchActive: asBoolean(value.settings.killSwitchActive, "dashboard-kill-switch"),
+        repositoryExcluded: asBoolean(value.settings.repositoryExcluded, "dashboard-repository-excluded"),
+        consent: Object.fromEntries(consentFields.map((field) => [
+          field, asBoolean(value.settings.consent[field], `dashboard-consent-${field}`),
+        ])),
+        approvedSkillFolderCount: asInt(value.settings.approvedSkillFolderCount, "dashboard-approved-skill-folder-count", { max: 1_000_000 }),
+      };
+  if (dashboardVersion >= 2) {
     settings.globalSettingsVersion = asHash(value.settings.globalSettingsVersion, "global-settings-version");
     settings.globalRootPolicy = makeDashboardGlobalRootPolicy(value.settings.globalRootPolicy);
     settings.globalRootPolicyConfirmation = asText(
@@ -1425,6 +1590,19 @@ export function makeUiDashboard(value, expectedValue) {
       fail("invalid-global-root-policy-action");
     }
   }
+  if (dashboardVersion === 3) {
+    const permissionsReady = Object.values(settings.consent).every((allowed) => allowed === true);
+    if (settings.automaticRecommendationsEnabled && !permissionsReady) {
+      fail("dashboard-automatic-permissions-inconsistent");
+    }
+    if (settings.automaticRecommendationsEnabled && automation.state === "off") {
+      fail("dashboard-automatic-state-inconsistent");
+    }
+    if (!settings.automaticRecommendationsEnabled
+        && !["terminal", "corrupt", "emergency-stop", "circuit-breaker", "excluded", "off"].includes(automation.state)) {
+      fail("dashboard-automatic-state-inconsistent");
+    }
+  }
   exactKeys(value.retention, DASHBOARD_RETENTION_FIELDS, "dashboard-retention");
   const retention = dashboardVersion === 1
     ? {
@@ -1435,24 +1613,24 @@ export function makeUiDashboard(value, expectedValue) {
         observationsDays: asInt(value.retention.observationsDays, "dashboard-observation-retention", { min: 1, max: 3_650 }),
         operationalDays: asInt(value.retention.operationalDays, "dashboard-operational-retention", { min: 3, max: 10_950 }),
       };
-  if (dashboardVersion === 2 && retention.operationalDays !== retention.observationsDays * 3) {
+  if (dashboardVersion >= 2 && retention.operationalDays !== retention.observationsDays * 3) {
     fail("dashboard-retention-mismatch");
   }
   const supportedControls = exactSortedList(
     value.supportedControls,
     "dashboard-supported-controls",
-    UI_ACTIONS,
-    UI_ACTIONS.length,
+    dashboardVersion === 3 ? UI_ACTIONS : ALL_UI_ACTIONS,
+    dashboardVersion === 3 ? UI_ACTIONS.length : ALL_UI_ACTIONS.length,
     "unknown-dashboard-control",
   );
   for (const action of supportedControls) {
-    const capability = UI_ACTION_CAPABILITIES[action];
-    if (!UI_CAPABILITIES.includes(capability) && !capabilities.includes(capability)) {
+    const capability = ALL_UI_ACTION_CAPABILITIES[action];
+    if (!ALL_UI_CAPABILITIES.includes(capability) && !capabilities.includes(capability)) {
       fail("unsupported-dashboard-control", action);
     }
   }
   if (!Array.isArray(value.activity) || value.activity.length > UI_PROTOCOL_LIMITS.activityEntries) fail("dashboard-activity-out-of-bounds");
-  const activity = value.activity.map(makeDashboardActivity);
+  const activity = value.activity.map((entry) => makeDashboardActivity(entry, dashboardVersion));
   assertOrdered(activity, (left, right) => right.occurredAt - left.occurredAt || compareText(left.id, right.id), "dashboard-activity");
   if (new Set(activity.map((entry) => entry.id)).size !== activity.length) fail("dashboard-activity-duplicate");
   exactKeys(value.overflow, DASHBOARD_OVERFLOW_FIELDS, "dashboard-overflow");
@@ -1470,7 +1648,7 @@ export function makeUiDashboard(value, expectedValue) {
     inFlight,
     lastCycle,
     nextEligibleAt,
-    usage: makeDashboardUsage(value.usage),
+    usage: makeDashboardUsage(value.usage, dashboardVersion),
     rollout,
     settings,
     retention,
@@ -1501,7 +1679,7 @@ function makeOperationEntry(value) {
   exactKeys(value, OPERATION_ENTRY_FIELDS, "ui-operation-entry");
   return {
     requestId: asId(value.requestId, "request-id"),
-    action: asEnum(value.action, UI_ACTIONS, "ui-action"),
+    action: asEnum(value.action, ALL_UI_ACTIONS, "ui-action"),
     status: asEnum(value.status, ["queued", "running", "completed", "failed", "accepted-terminal"], "operation-status"),
     updatedAt: asTimestamp(value.updatedAt, "operation-updated-at"),
     reason: asNullableReason(value.reason),
@@ -1510,9 +1688,13 @@ function makeOperationEntry(value) {
 
 function makeAllowedAction(value, { capabilities, expiresAt, now }) {
   exactKeys(value, ALLOWED_ACTION_FIELDS, "ui-allowed-action");
-  const action = asEnum(value.action, UI_ACTIONS, "ui-action");
-  const capability = asEnum(value.capability, UI_OPERATION_CAPABILITIES, "capability");
-  if (UI_ACTION_CAPABILITIES[action] !== capability) fail("action-capability-mismatch");
+  const action = asEnum(value.action, ALL_UI_ACTIONS, "ui-action");
+  const capability = asEnum(value.capability, [...new Set([
+    ...UI_OPERATION_CAPABILITIES,
+    ...LEGACY_UI_CAPABILITIES,
+    ...LEGACY_UI_DASHBOARD_CAPABILITIES,
+  ])], "capability");
+  if (ALL_UI_ACTION_CAPABILITIES[action] !== capability) fail("action-capability-mismatch");
   if (!capabilities.includes(capability)) fail("unsupported-capability", capability);
   if (action === "acknowledge-audit") {
     if (value.nonce !== null || value.expiresAt !== null) fail("local-action-cannot-have-grant");
@@ -1543,7 +1725,7 @@ export function makeUiProjectionIndex(value, expectedValue) {
   const issuedAt = asTimestamp(value.issuedAt, "projection-issued-at");
   const expiresAt = asTimestamp(value.expiresAt, "projection-expires-at");
   assertProjectionTimes(issuedAt, expiresAt, expected.now);
-  const capabilities = exactSortedList(value.capabilities, "capabilities", UI_CAPABILITIES, UI_PROTOCOL_LIMITS.capabilities, "unknown-capability");
+  const capabilities = exactSortedList(value.capabilities, "capabilities", ALL_UI_CAPABILITIES, UI_PROTOCOL_LIMITS.capabilities, "unknown-capability");
   for (const capability of capabilities) {
     if (!expected.supportedCapabilities.includes(capability)) fail("unsupported-capability", capability);
   }
@@ -1609,7 +1791,7 @@ function makeDetailContext(value) {
     detailRevision: asInt(value.detailRevision, "detail-revision", { max: 1_000_000 }),
     detailHash: asHash(value.detailHash, "detail-hash"),
     now: asTimestamp(value.now, "now"),
-    supportedCapabilities: exactSortedList(value.supportedCapabilities, "capabilities", UI_CAPABILITIES, UI_PROTOCOL_LIMITS.capabilities, "unknown-capability"),
+    supportedCapabilities: exactSortedList(value.supportedCapabilities, "capabilities", ALL_UI_CAPABILITIES, UI_PROTOCOL_LIMITS.capabilities, "unknown-capability"),
   };
 }
 
@@ -1851,17 +2033,29 @@ function makeOperationPayload(action, value, now) {
       settingsVersion: asHash(value.settingsVersion, "settings-version"),
     };
   }
-  if (action === "set-paused") {
-    exactKeys(value, PAUSE_PAYLOAD_FIELDS, "pause-payload");
+  if (action === "set-automatic-recommendations") {
+    exactKeys(value, SETTINGS_PAYLOAD_FIELDS, "automatic-recommendations-payload");
     return {
-      paused: asBoolean(value.paused, "paused"),
+      enabled: asBoolean(value.enabled, "automatic-recommendations-enabled"),
       settingsVersion: asHash(value.settingsVersion, "settings-version"),
     };
   }
-  if (action === "set-repo-mode") {
-    exactKeys(value, PROJECT_MODE_PAYLOAD_FIELDS, "project-mode-payload");
+  if (action === "set-permission") {
+    exactKeys(value, PERMISSION_PAYLOAD_FIELDS, "permission-payload");
     return {
-      mode: asEnum(value.mode, ["inherit", "manual", "auto"], "project-analysis-mode"),
+      permission: asEnum(
+        value.permission,
+        ["durableObservations", "sanitizedExcerpts", "crossRepoAggregation"],
+        "data-permission",
+      ),
+      enabled: asBoolean(value.enabled, "data-permission-enabled"),
+      settingsVersion: asHash(value.settingsVersion, "settings-version"),
+    };
+  }
+  if (action === "set-repo-excluded") {
+    exactKeys(value, PROJECT_EXCLUSION_PAYLOAD_FIELDS, "project-exclusion-payload");
+    return {
+      excluded: asBoolean(value.excluded, "project-excluded"),
       settingsVersion: asHash(value.settingsVersion, "settings-version"),
     };
   }
@@ -1917,7 +2111,7 @@ function makeOperationPayload(action, value, now) {
   if (action === "purge-all") {
     exactKeys(value, CONFIRMATION_PAYLOAD_FIELDS, "purge-all-payload");
     const confirmation = asText(value.confirmation, "purge-all-confirmation", 64, { singleLine: true });
-    if (confirmation !== "PURGE ALL SELF-EVOLVE 0.3.0") fail("invalid-purge-confirmation");
+    if (confirmation !== "PURGE ALL SELF-EVOLVE 0.4.0") fail("invalid-purge-confirmation");
     return { confirmation };
   }
   if (action === "export-data") {

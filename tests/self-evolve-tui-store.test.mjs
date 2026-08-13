@@ -131,7 +131,7 @@ function projection(generation = "a") {
   return Object.freeze({
     mode: "native",
     projectionVersion: 1,
-    operationProtocolVersion: 1,
+    operationProtocolVersion: 2,
     index: Object.freeze({ generation: generation.repeat(64) }),
     details: Object.freeze([]),
     effectiveIndexActions: Object.freeze([]),
@@ -141,6 +141,7 @@ function projection(generation = "a") {
 
 function dashboard(overrides = {}) {
   return {
+    dashboardVersion: 3,
     generatedAt: 1_000,
     automation: { state: "ready", reason: null },
     blockers: [],
@@ -148,7 +149,7 @@ function dashboard(overrides = {}) {
     lastCycle: null,
     nextEligibleAt: null,
     usage: {
-      passive: { used: 1, limit: 3, remaining: 2, resetAt: 2_000 },
+      provider: { used: 1, limit: 3, remaining: 2, resetAt: 2_000 },
       synthesis: { used: 1, limit: 2, remaining: 1, resetAt: 3_000 },
       storage: { usedBytes: 100, limitBytes: 1_000, remainingBytes: 900 },
     },
@@ -160,27 +161,25 @@ function dashboard(overrides = {}) {
       minSuccessRateBasisPoints: 8_000,
     },
     settings: {
-      globalMode: "auto",
-      repositoryMode: "inherit",
-      effectiveMode: "auto",
-      paused: false,
+      automaticRecommendationsEnabled: true,
+      automationGeneration: 1,
       killSwitchActive: false,
       repositoryExcluded: false,
       consent: {
-        passiveCalls: true,
         durableObservations: true,
-        sanitizedExcerpts: false,
-        crossRepoAggregation: false,
+        sanitizedExcerpts: true,
+        crossRepoAggregation: true,
       },
       approvedSkillFolderCount: 1,
+      collectionSuggestions: [],
       globalSettingsVersion: "b".repeat(64),
       globalRootPolicy: null,
       globalRootPolicyConfirmation: "REPLACE GLOBAL ROOT POLICY bbbbbbbbbbbb",
       globalRootPolicyAction: null,
     },
     retention: { observationsDays: 30, operationalDays: 90 },
-    capabilities: ["control-repo-mode-v1", "decision-feedback-v1", "operation-global-root-policy-v1", "project-analysis-control-v1"],
-    supportedControls: ["set-kill-switch", "set-paused", "set-repo-mode"],
+    capabilities: ["decision-feedback-v1", "operation-global-root-policy-v1", "project-participation-v1"],
+    supportedControls: ["set-automatic-recommendations", "set-kill-switch", "set-permission", "set-repo-excluded"],
     activity: [],
     overflow: {
       activity: {
@@ -204,9 +203,18 @@ function modelSnapshot({
   phase = "ready",
   acknowledgedOutcomes = [],
 } = {}) {
+  const projectFingerprint = "a".repeat(64);
+  const stateRootIdentity = "b".repeat(64);
   return {
     phase,
     updatedAt: 1_000,
+    projectFingerprint,
+    stateRootIdentity,
+    tuiHealth: {
+      projectFingerprint,
+      stateRootIdentity,
+      expiresAt: 10_000,
+    },
     pending: [],
     acknowledgedOutcomes,
     dashboard: dashboardValue,
@@ -214,12 +222,14 @@ function modelSnapshot({
     projection: {
       mode: "native",
       projectionVersion: 1,
-      operationProtocolVersion: 1,
-      capabilities: ["legacy-control-v1", "legacy-decision-v1"],
+      operationProtocolVersion: 2,
+      capabilities: [...UI_CAPABILITIES],
       dashboard: dashboardValue,
       dashboardError,
       index: {
-        capabilities: ["legacy-control-v1", "legacy-decision-v1"],
+        projectFingerprint,
+        stateRootIdentity,
+        capabilities: [...UI_CAPABILITIES],
         budgets: {
           passiveCallsPerHour: 3,
           synthesisPerDay: 2,
@@ -231,9 +241,8 @@ function modelSnapshot({
         },
         status: {
           state: "ready",
-          storedMode: "auto",
-          effectiveMode: "auto",
-          paused: false,
+          reason: null,
+          automaticRecommendationsEnabled: true,
           killSwitchActive: false,
           repoExcluded: false,
           circuitBreakerOpen: false,
@@ -276,12 +285,11 @@ test("one operational precedence drives truthful sidebar states and bounded entr
     ["corrupt", modelSnapshot({ status: { state: "corrupt" } }), "activity"],
     ["emergency-stop", modelSnapshot({ dashboard: dashboard({ automation: { state: "emergency-stop", reason: "emergency-stop" } }) }), "settings"],
     ["circuit-breaker", modelSnapshot({ dashboard: dashboard({ automation: { state: "circuit-breaker", reason: "three-failures-in-24h" } }) }), "activity"],
-    ["paused", modelSnapshot({ dashboard: dashboard({ automation: { state: "paused", reason: "paused" } }) }), "home"],
+    ["off", modelSnapshot({ dashboard: dashboard({
+      automation: { state: "off", reason: "automatic-recommendations-off" },
+      settings: { ...dashboard().settings, automaticRecommendationsEnabled: false },
+    }) }), "settings"],
     ["excluded", modelSnapshot({ dashboard: dashboard({ automation: { state: "excluded", reason: "repository-excluded" } }) }), "settings"],
-    ["on-demand", modelSnapshot({ dashboard: dashboard({
-      automation: { state: "on-demand", reason: null },
-      settings: { ...dashboard().settings, globalMode: "manual", effectiveMode: "manual" },
-    }) }), "home"],
     ["setup-required", modelSnapshot({ dashboard: dashboard({
       automation: { state: "setup-required", reason: "setup-required" },
       blockers: [{ code: "provider", summary: "Background analysis has no usable provider.", destination: "settings" }],
@@ -328,7 +336,7 @@ test("one operational precedence drives truthful sidebar states and bounded entr
     assert.equal(sidebar.destination.section, expectedSection);
     assert.equal(
       operational.destination.section,
-      expectedState === "on-demand" ? "settings" : sidebar.destination.section,
+      sidebar.destination.section,
     );
     assert.equal(sidebar.summary, expectedState === "ready" ? "Watching this project" : operational.label);
     assert.doesNotMatch(JSON.stringify(sidebar), /private-proposal-id|[a-f0-9]{64}/u);
@@ -493,11 +501,10 @@ test("project runtime strips inconsistent failed-closed detail grants before any
   store.dispose();
 });
 
-test("setup semantics cover missing auto consent/provider and YOLO rollout without ambiguous readiness", () => {
+test("setup semantics cover missing permissions and provider without ambiguous readiness", () => {
   for (const blocker of [
     { code: "provider", summary: "Background analysis has no usable provider.", destination: "settings" },
     { code: "observation-consent", summary: "Saved structured patterns are not allowed.", destination: "settings" },
-    { code: "yolo-rollout", summary: "Automatic apply rollout evidence is not ready.", destination: "settings" },
   ]) {
     const snapshot = modelSnapshot({ dashboard: dashboard({
       automation: { state: "setup-required", reason: "setup-required" },
@@ -524,16 +531,16 @@ test("sidebar indicator remains visible during startup and old-server fallback i
   assert.match(malformed.detail, /could not be validated/u);
 });
 
-test("manual sidebar entry opens Home while the explicit mode-setting action remains in Settings", () => {
+test("Off sidebar entry opens the binary control in Settings", () => {
   const snapshot = modelSnapshot({ dashboard: dashboard({
-    automation: { state: "on-demand", reason: null },
-    settings: { ...dashboard().settings, globalMode: "manual", effectiveMode: "manual" },
+    automation: { state: "off", reason: "automatic-recommendations-off" },
+    settings: { ...dashboard().settings, automaticRecommendationsEnabled: false },
   }) });
   const operational = deriveOperationalView(snapshot);
   const sidebar = deriveSidebarCard(snapshot);
-  assert.deepEqual(operational.destination, { section: "settings", anchor: "modes" });
-  assert.deepEqual(sidebar.destination, { section: "home" });
-  assert.equal(sidebar.action, "Open Home");
+  assert.deepEqual(operational.destination, { section: "settings", anchor: "automatic-recommendations" });
+  assert.deepEqual(sidebar.destination, operational.destination);
+  assert.equal(sidebar.action, "Open Settings");
 });
 
 test("every published blocker round-trips through one closed exact destination contract", () => {
@@ -552,7 +559,11 @@ test("every published blocker round-trips through one closed exact destination c
     assert.deepEqual(parseControlCenterDestination(params, value), blocker.destination, code);
   }
   const firstRun = UI_DASHBOARD_BLOCKER_DESTINATIONS["first-run"];
-  assert.deepEqual(firstRun, { dashboard: "home", section: "home" });
+  assert.deepEqual(firstRun, {
+    dashboard: "settings",
+    section: "settings",
+    anchor: "automatic-recommendations",
+  });
 });
 
 test("applied attention supports multiple local acknowledgements while Activity history remains", () => {
@@ -619,7 +630,7 @@ test("control center model exposes exactly four sections and remains available w
   const healthy = buildControlCenterModel(modelSnapshot());
   assert.deepEqual(Object.keys(healthy.sections), ["home", "recommendations", "activity", "settings"]);
   assert.equal(healthy.sections.home.operational.state, "ready");
-  assert.equal(healthy.sections.home.mode.effective.label, "Recommend automatically");
+  assert.equal(healthy.sections.settings.automaticRecommendations.enabled, true);
   assert.equal(Object.isFrozen(healthy.sections), true);
 });
 
@@ -632,15 +643,8 @@ test("error and expired snapshots retain bounded stale context but remove every 
   snapshot.stale = true;
   snapshot.error = `expired-projection:${"x".repeat(400)}`;
   snapshot.pending = [{ requestId: "pending-request", kind: "decision", action: "apply-proposal", submittedAt: 800 }];
-  snapshot.controlState = {
-    mode: "auto",
-    effectiveMode: "auto",
-    repoExcluded: false,
-    allowedSkillRoots: ["/stale/approved"],
-    consent: dashboard().settings.consent,
-  };
   snapshot.projection.effectiveIndexActions = [
-    { action: "set-paused" },
+    { action: "set-automatic-recommendations" },
     { action: "set-kill-switch" },
     { action: "export-data" },
   ];
@@ -655,12 +659,10 @@ test("error and expired snapshots retain bounded stale context but remove every 
   assert.equal(model.sections.recommendations.queue.length, 1, "stale recommendation context remains readable");
   assert.deepEqual(model.sections.recommendations.selected.actions, []);
   assert.deepEqual(model.sections.settings.controls, {
-    globalMode: false,
-    repositoryMode: false,
+    automaticRecommendations: false,
     consent: false,
     projectInclusion: false,
     approvedSkillFolders: false,
-    pause: false,
     emergencyStop: false,
   });
   assert.deepEqual(model.sections.settings.maintenance, {
@@ -715,7 +717,7 @@ test("native renderer binds the four-section shell, deep links, granted header c
     'section() === "recommendations"',
     'section() === "activity"',
     'section() === "settings"',
-    "settings().controls.pause",
+    "settings().controls.automaticRecommendations",
     "settings().controls.emergencyStop",
     'flexWrap="wrap"',
     '["all", "All"]',
@@ -726,9 +728,9 @@ test("native renderer binds the four-section shell, deep links, granted header c
     "Open recommendation",
     "Diagnostics",
     "overflowMessage",
-    "Configured analysis",
+    "Automatic recommendations",
     "Approved global skill folders",
-    "Pause, exclusion, and other temporary suppressors do not rewrite configured analysis",
+    "Turning Off does not purge retained data or remove existing recommendations and actions",
     "confirmation() === confirmationKey",
     "automatic-recommendations",
     "Review consent for",
@@ -737,10 +739,10 @@ test("native renderer binds the four-section shell, deep links, granted header c
     "globalRootPolicyConfirmation",
     "replace-global-root-policy",
     "EXPORT SENSITIVE SELF-EVOLVE DATA",
-    "PURGE ALL SELF-EVOLVE 0.3.0",
+    "PURGE ALL SELF-EVOLVE 0.4.0",
     "Actual:",
     "Configured limit:",
-    "set-repo-mode",
+    "set-repo-excluded",
     "isActivationKey",
     "cmd: closeControlCenter",
     "openControlCenter(card.destination)",
@@ -751,9 +753,8 @@ test("native renderer binds the four-section shell, deep links, granted header c
   assert.doesNotMatch(source, />Help<|>Safety<|>Maintenance<\/text>\s*<\/box>\s*<\/Show>/u);
   assert.doesNotMatch(source, /ReviewDialog|REVIEW_DIALOG_ID|api\.ui\.dialog\.replace/u);
   assert.doesNotMatch(source, /api\.ui\.toast|api\.attention\.notify/u);
-  const automaticSetup = source.slice(source.indexOf("const enableAutomaticRecommendations"), source.indexOf("const openConsentDisclosure"));
-  assert.equal(automaticSetup.match(/submitControl\("set-mode", \{ mode: "auto" \}\)/gu)?.length, 1);
-  assert.doesNotMatch(automaticSetup, /set-consent/u);
+  assert.match(source, /submitOperation\("set-automatic-recommendations", \{ enabled:/u);
+  assert.doesNotMatch(source, /submitControl\("set-mode"|set-paused|set-repo-mode/u);
   assert.match(source, /entry\.enabled\s*\?\s*actionButton\([\s\S]*enabled: false[\s\S]*:\s*localActionButton\([\s\S]*Review consent for/u);
 });
 
@@ -773,7 +774,6 @@ test("section models are pure, immutable, human-labeled, and share Home/sidebar 
       lastCycle: {
         outcome: "recommendation-created",
         triggerClass: "idle",
-        mode: "auto",
         observationCount: 3,
         eligibilityCount: 1,
         proposalId,
@@ -804,13 +804,7 @@ test("section models are pure, immutable, human-labeled, and share Home/sidebar 
       ],
     }),
   });
-  snapshot.controlState = {
-    mode: "auto",
-    effectiveMode: "auto",
-    repoExcluded: false,
-    allowedSkillRoots: ["/private/canonical/root"],
-    consent: dashboard().settings.consent,
-  };
+  snapshot.dashboard.settings.collectionSuggestions = ["/private/canonical/root"];
   snapshot.projection.details = [{
     proposalId,
     summary: {
@@ -853,9 +847,8 @@ test("section models are pure, immutable, human-labeled, and share Home/sidebar 
   assert.equal(recommendations.selected.actions[1].feedbackSupported, true);
   assert.equal(activity.activity.length, 1, "diagnostic entries are excluded from All");
   assert.equal(errors.activity.length, 1);
-  assert.equal(settings.mode.effective.label, "Recommend automatically");
-  assert.match(settings.modes.find((mode) => mode.value === "auto").prerequisites, /approved skill folders are not required/u);
-  assert.equal(settings.consent[0].label, "Background AI analysis");
+  assert.equal(settings.automaticRecommendations.enabled, true);
+  assert.equal(settings.consent[0].label, "Saved structured patterns");
   assert.equal(settings.approvedSkillFolderCount, null);
   assert.deepEqual(settings.collectionSuggestions, ["/private/canonical/root"]);
   for (const model of [home, recommendations, activity, errors]) {
@@ -962,7 +955,7 @@ test("Activity filters semantic history, deep-links safely, bounds diagnostics, 
   assert.equal(all.diagnostics.breakerStatus, "Closed");
   assert.equal(all.diagnostics.nextEligibleAt, 2_000);
   assert.deepEqual(all.diagnostics.budgetResetAt, {
-    passive: 2_000,
+    provider: 2_000,
     synthesis: 3_000,
   });
   assert.equal(all.diagnostics.runtime.pluginVersion, "0.2.0");
@@ -981,19 +974,13 @@ test("Activity filters semantic history, deep-links safely, bounds diagnostics, 
   assert.equal(limited.diagnostics.enhancedProjection, "unavailable");
 });
 
-test("Settings explains scope, gates repository mode, validates folder lists, distinguishes limits, and consolidates maintenance", () => {
+test("Settings exposes binary automation, project participation, permissions, limits, and maintenance", () => {
   const value = dashboard({
     dashboardVersion: 2,
     retention: { observationsDays: 10, operationalDays: 30 },
   });
   const snapshot = modelSnapshot({ dashboard: value });
-  snapshot.controlState = {
-    mode: "auto",
-    effectiveMode: "auto",
-    repoExcluded: false,
-    allowedSkillRoots: ["/approved/skills"],
-    consent: value.settings.consent,
-  };
+  snapshot.dashboard.settings.collectionSuggestions = ["/approved/skills"];
   snapshot.inspection = {
     observations: [{}, {}],
     eligibility: [],
@@ -1016,26 +1003,28 @@ test("Settings explains scope, gates repository mode, validates folder lists, di
     { action: "export-data" },
     { action: "purge-scope" },
     { action: "purge-all" },
-    { action: "set-repo-mode" },
+    { action: "set-automatic-recommendations" },
+    { action: "set-permission" },
+    { action: "set-repo-excluded" },
   ];
 
   const settings = buildSettingsModel(snapshot);
-  assert.equal(settings.controls.repositoryMode, true);
-  assert.deepEqual(settings.modes.map((mode) => mode.value), ["manual", "auto"]);
+  assert.equal(settings.controls.automaticRecommendations, true);
+  assert.equal(settings.controls.projectInclusion, true);
+  assert.equal(settings.controls.consent, true);
+  assert.equal(settings.automaticRecommendations.enabled, true);
   assert.equal(settings.approvedSkillFolderRequiresNonEmpty, false);
-  assert.deepEqual(settings.mode.repository, { value: "inherit", label: "Inherit global default" });
   assert.deepEqual(settings.approvedSkillFolders, []);
   assert.deepEqual(settings.collectionSuggestions, ["/approved/skills"]);
   assert.match(settings.approvedSkillFolderWarning, /grant no write authority/u);
   assert.deepEqual(settings.consent.map((entry) => entry.label), [
-    "Background AI analysis",
     "Saved structured patterns",
     "Sanitized evidence excerpts",
     "Cross-project learning (limited)",
   ]);
   assert.equal(settings.consent.find((entry) => entry.key === "crossRepoAggregation").canEnable, false);
-  assert.match(settings.limits.find((limit) => limit.key === "passive").actual, /1 used; 2 remaining/u);
-  assert.match(settings.limits.find((limit) => limit.key === "passive").configured, /3 per rolling hour/u);
+  assert.match(settings.limits.find((limit) => limit.key === "provider").actual, /1 used; 2 remaining/u);
+  assert.match(settings.limits.find((limit) => limit.key === "provider").configured, /3 per rolling hour/u);
   assert.match(settings.limits.find((limit) => limit.key === "retention").actual, /5 retained observations/u);
   assert.equal(
     settings.limits.find((limit) => limit.key === "retention").configured,
@@ -1083,38 +1072,22 @@ test("Settings explains scope, gates repository mode, validates folder lists, di
   assert.deepEqual(exactRoots.collectionSuggestions, []);
   assert.equal(exactRoots.controls.approvedSkillFolders, true);
   const oldTuiPeer = modelSnapshot();
-  oldTuiPeer.dashboard.capabilities = oldTuiPeer.dashboard.capabilities
-    .filter((capability) => capability !== "project-analysis-control-v1");
-  assert.equal(buildSettingsModel(oldTuiPeer).controls.repositoryMode, false,
-    "a peer without the dashboard capability ignores the new server control");
+  oldTuiPeer.projection.operationProtocolVersion = 1;
+  assert.equal(buildSettingsModel(oldTuiPeer).controls.automaticRecommendations, false,
+    "a legacy peer remains read-only");
 
   const blockedSnapshot = modelSnapshot({
     dashboard: dashboard({
       rollout: { ...value.rollout, ready: false, synthesesObserved: 2 },
       settings: {
         ...value.settings,
-        consent: { ...value.settings.consent, passiveCalls: false },
+        consent: { ...value.settings.consent, sanitizedExcerpts: false },
       },
     }),
   });
-  blockedSnapshot.controlState = {
-    ...snapshot.controlState,
-    allowedSkillRoots: [],
-    consent: blockedSnapshot.dashboard.settings.consent,
-  };
   const blocked = buildSettingsModel(blockedSnapshot);
-  assert.deepEqual(blocked.modes.map((mode) => mode.value), ["manual", "auto"]);
-  const yoloStored = modelSnapshot({
-    dashboard: dashboard({
-      settings: { ...value.settings, repositoryMode: "yolo", effectiveMode: "yolo" },
-    }),
-  });
-  yoloStored.controlState = snapshot.controlState;
-  const migrated = buildSettingsModel(yoloStored);
-  assert.deepEqual(migrated.mode.global, { value: "auto", label: "Recommend automatically" });
-  assert.deepEqual(migrated.mode.repository, { value: "auto", label: "Recommend automatically" });
-  assert.deepEqual(migrated.mode.effective, { value: "auto", label: "Recommend automatically" });
-  assert.equal(migrated.approvedSkillFolderRequiresNonEmpty, false);
+  assert.equal(blocked.automaticRecommendations.enabled, true);
+  assert.equal(blocked.consent.find((entry) => entry.key === "sanitizedExcerpts").enabled, false);
 
   assert.deepEqual(validateApprovedSkillFolderInput("/approved/new", ["/approved/skills"]), {
     ok: true,
@@ -1127,53 +1100,50 @@ test("Settings explains scope, gates repository mode, validates folder lists, di
   assert.match(validateApprovedSkillFolderInput("/approved/../escape", []).error, /canonical absolute/u);
 });
 
-test("Home distinguishes valid no-change, still learning, background-off, and no-activity empty states", () => {
-  const make = (lastCycle, settings = dashboard().settings) => buildHomeModel(modelSnapshot({
-    dashboard: dashboard({ lastCycle, settings }),
+test("Home distinguishes valid no-change, still learning, automation Off, and no-activity empty states", () => {
+  const make = (lastCycle, settings = dashboard().settings, automation = { state: "ready", reason: null }) => buildHomeModel(modelSnapshot({
+    dashboard: dashboard({ lastCycle, settings, automation }),
   })).emptyState;
   assert.equal(make({
-    outcome: "valid-no-change", triggerClass: "idle", mode: "auto",
+    outcome: "valid-no-change", triggerClass: "idle",
     observationCount: 1, eligibilityCount: 1, proposalId: null, occurredAt: 900, reason: "no-change",
   }).heading, "No useful change found");
   assert.equal(make({
-    outcome: "not-eligible", triggerClass: "idle", mode: "auto",
+    outcome: "not-eligible", triggerClass: "idle",
     observationCount: 1, eligibilityCount: 0, proposalId: null, occurredAt: 900, reason: "insufficient-evidence",
   }).heading, "Still learning");
   assert.equal(make(null, {
     ...dashboard().settings,
-    consent: { ...dashboard().settings.consent, passiveCalls: false },
-  }).heading, "Background analysis is off");
+    automaticRecommendationsEnabled: false,
+  }, { state: "off", reason: "automatic-recommendations-off" }).heading, "Automatic recommendations are off");
   assert.equal(make(null).heading, "No activity yet");
 });
 
-test("Home exposes fresh-install guidance and labels inactive cross-project learning honestly", () => {
+test("Home exposes Off guidance and labels unavailable cross-project learning honestly", () => {
   const value = dashboard();
   const freshDashboard = dashboard({
-    automation: { state: "on-demand", reason: null },
+    automation: { state: "off", reason: "automatic-recommendations-off" },
     blockers: [{
-      code: "first-run",
-      summary: "Automatic recommendations have not been set up yet.",
-      destination: "home",
+      code: "automatic-recommendations-off",
+      summary: "Automatic recommendations are off.",
+      destination: "settings",
     }],
     settings: {
       ...value.settings,
-      globalMode: "manual",
-      effectiveMode: "manual",
+      automaticRecommendationsEnabled: false,
       consent: {
-        passiveCalls: false,
-        durableObservations: false,
-        sanitizedExcerpts: false,
-        crossRepoAggregation: false,
+        durableObservations: true,
+        sanitizedExcerpts: true,
+        crossRepoAggregation: true,
       },
     },
   });
   const snapshot = modelSnapshot({ dashboard: freshDashboard });
   const home = buildHomeModel(snapshot);
   assert.equal(home.operational.destination.section, "settings");
-  assert.match(home.operational.explanation, /Auto mode.*Background analysis.*Saved observations/u);
+  assert.match(home.operational.explanation, /Existing recommendations remain reviewable/u);
   const settings = buildSettingsModel(snapshot);
-  assert.equal(home.firstRun, true);
-  assert.equal(home.blockers[0].destination.section, "home");
+  assert.equal(home.blockers[0].destination.section, "settings");
   const crossProject = settings.consent.find((entry) => entry.key === "crossRepoAggregation");
   assert.equal(crossProject.label, "Cross-project learning (limited)");
   assert.equal(crossProject.canEnable, false);
@@ -1209,10 +1179,8 @@ test("global Recommendations exposes privacy-safe queue detail, participation, e
   const snapshot = modelSnapshot();
   snapshot.projectFingerprint = projectFingerprint;
   snapshot.stateRootIdentity = "5".repeat(64);
-  snapshot.controlState = {
-    projectFingerprint,
-    stateRootIdentity: snapshot.stateRootIdentity,
-  };
+  snapshot.projection.index.projectFingerprint = projectFingerprint;
+  snapshot.projection.index.stateRootIdentity = snapshot.stateRootIdentity;
   snapshot.tuiHealth = {
     projectFingerprint,
     stateRootIdentity: snapshot.stateRootIdentity,
@@ -1342,9 +1310,9 @@ test("global Recommendations exposes privacy-safe queue detail, participation, e
   const staleActingHealth = structuredClone(snapshot);
   staleActingHealth.tuiHealth.expiresAt = staleActingHealth.updatedAt;
   assert.deepEqual(buildRecommendationsModel(staleActingHealth).selected.actions, []);
-  const missingControl = structuredClone(snapshot);
-  missingControl.controlState = null;
-  assert.deepEqual(buildRecommendationsModel(missingControl).selected.actions, []);
+  const mismatchedProjection = structuredClone(snapshot);
+  mismatchedProjection.projection.index.projectFingerprint = otherProjectFingerprint;
+  assert.deepEqual(buildRecommendationsModel(mismatchedProjection).selected.actions, []);
 
   const applied = structuredClone(snapshot);
   applied.global.pending = [];
@@ -1379,10 +1347,10 @@ test("global Recommendations exposes privacy-safe queue detail, participation, e
   limited.global.projection.grants = [];
   assert.deepEqual(buildRecommendationsModel(limited).selected.actions, []);
   assert.equal(buildSettingsModel(limited).globalProtocol.authoritative, false);
-  assert.equal(buildSettingsModel(limited).controls.repositoryMode, false);
+  assert.equal(buildSettingsModel(limited).controls.automaticRecommendations, false);
 });
 
-test("sidebar project mode model exposes only fresh sibling-control authority", () => {
+test("sidebar binary model exposes only fresh operation authority", () => {
   const snapshot = modelSnapshot();
   snapshot.global = {
     phase: "ready",
@@ -1390,19 +1358,19 @@ test("sidebar project mode model exposes only fresh sibling-control authority", 
     pending: [],
     responses: [],
   };
-  snapshot.projection.effectiveIndexActions = [{ action: "set-repo-mode" }];
+  snapshot.projection.effectiveIndexActions = [{ action: "set-automatic-recommendations" }];
   assert.deepEqual(deriveSidebarModeControl(snapshot), {
-    current: "auto",
+    current: "on",
     pending: false,
     available: true,
     status: "ready",
     options: [
-      { value: "manual", label: "On demand", confirmationRequired: false },
-      { value: "auto", label: "Auto", confirmationRequired: true },
+      { value: "off", label: "Off", confirmationRequired: false },
+      { value: "on", label: "On", confirmationRequired: true },
     ],
   });
   for (const [status, mutate] of [
-    ["pending", (value) => value.pending.push({ action: "set-repo-mode", subject: "repository-mode" })],
+    ["pending", (value) => value.pending.push({ action: "set-automatic-recommendations", subject: "automatic-recommendations" })],
     ["stale", (value) => { value.phase = "error"; }],
     ["limited", (value) => { value.global.phase = "limited"; value.global.projection.mode = "limited"; }],
     ["unsupported", (value) => { value.projection.effectiveIndexActions = []; }],
@@ -1479,7 +1447,7 @@ test("accepted-terminal purge stops every shared state-root runtime and remains 
         return {
           mode: "native",
           projectionVersion: UI_PROJECTION_VERSION,
-          operationProtocolVersion: 1,
+          operationProtocolVersion: 2,
           index: {
             projectFingerprint: context.projectFingerprint,
             stateRootIdentity: context.stateRootIdentity,
@@ -1510,7 +1478,7 @@ test("accepted-terminal purge stops every shared state-root runtime and remains 
   const firstApi = apiFor(root, worktree);
   const first = acquireProjectTuiStore(options(firstApi, scheduler, clientFactory, { now: () => 1_100 }));
   await first.refresh();
-  const request = await first.submitOperation("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" });
+  const request = await first.submitOperation("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.4.0" });
   const terminal = first.getSnapshot();
   assert.equal(terminal.phase, "terminal");
   assert.equal(deriveOperationalView(terminal).state, "terminal");
@@ -1526,8 +1494,8 @@ test("accepted-terminal purge stops every shared state-root runtime and remains 
   firstApi.event.emit("project.updated");
   await first.refresh();
   assert.equal(reads, readsAtAcceptance);
-  await assert.rejects(first.submitControl("set-consent", { key: "passiveCalls", enabled: false }), /restart-required-after-purge-all/u);
-  await assert.rejects(first.submitOperation("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.3.0" }), /restart-required-after-purge-all/u);
+  await assert.rejects(first.submitControl("set-permission", { permission: "durableObservations", enabled: false }), /restart-required-after-purge-all/u);
+  await assert.rejects(first.submitOperation("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.4.0" }), /restart-required-after-purge-all/u);
 
   const watcherCount = scheduler.watchers.length;
   const secondApi = apiFor(root, worktree);
@@ -1591,7 +1559,7 @@ test("project switching preserves one state-root-global queue runtime while repl
     label: "authoritative-global-v1",
     bridgeSchemaVersion: 1,
     projectionVersion: 1,
-    operationProtocolVersion: 1,
+    operationProtocolVersion: 2,
     capabilities: Object.freeze([]),
     reason: null,
     index: Object.freeze({
@@ -1626,11 +1594,10 @@ test("project switching preserves one state-root-global queue runtime while repl
         return Object.freeze({
           ...projection(first ? "a" : "b"),
           dashboard: dashboard({
-            automation: { state: first ? "on-demand" : "ready", reason: null },
+            automation: { state: first ? "excluded" : "ready", reason: first ? "repository-excluded" : null },
             settings: {
               ...dashboard().settings,
-              repositoryMode: first ? "manual" : "auto",
-              effectiveMode: first ? "manual" : "auto",
+              repositoryExcluded: first,
             },
           }),
         });
@@ -1673,7 +1640,7 @@ test("project switching preserves one state-root-global queue runtime while repl
   const first = store.getSnapshot();
   assert.equal(first.global.projection.indexBytes, indexBytes);
   assert.equal(first.participation[recommendationId], true);
-  assert.equal(first.dashboard.settings.effectiveMode, "manual");
+  assert.equal(first.dashboard.settings.repositoryExcluded, true);
   assert.deepEqual(first.global.selectedRecommendationIds, [recommendationId]);
   assert.equal(first.global.pending.length, 1);
 
@@ -1685,7 +1652,7 @@ test("project switching preserves one state-root-global queue runtime while repl
   assert.equal(second.global.projection.indexBytes, indexBytes);
   assert.equal(second.global.projection, first.global.projection);
   assert.equal(second.participation[recommendationId], false);
-  assert.equal(second.dashboard.settings.effectiveMode, "auto");
+  assert.equal(second.dashboard.settings.repositoryExcluded, false);
   assert.deepEqual(second.global.selectedRecommendationIds, [recommendationId]);
   assert.equal(second.global.pending[0].requestId, "global-request");
   assert.equal(globalClients, 1);
@@ -1717,15 +1684,15 @@ test("global Apply submits one fresh acting-project request and keeps its termin
   let complete = false;
   const projectClient = (context) => ({
     async read() {
+      const value = projection();
       return {
-        ...projection(),
+        ...value,
+        index: {
+          ...value.index,
+          projectFingerprint: context.projectFingerprint,
+          stateRootIdentity: context.stateRootIdentity,
+        },
         dashboard: dashboard(),
-      };
-    },
-    async readControlState() {
-      return {
-        projectFingerprint: context.projectFingerprint,
-        stateRootIdentity: context.stateRootIdentity,
       };
     },
     async readTuiHealth() {
@@ -1861,7 +1828,7 @@ test("attachment and project switch expose non-actionable Starting before bounde
   const starting = store.getSnapshot();
   assert.equal(starting.phase, "initializing");
   assert.equal(starting.projection, null);
-  assert.equal(starting.controlState, null);
+  assert.equal("controlState" in starting, false);
   assert.equal(deriveOperationalView(starting).state, "startup");
   assert.notEqual(starting.projectFingerprint, predecessor.projectFingerprint);
 
@@ -2064,7 +2031,7 @@ test("dashboard snapshots and local audit acknowledgements remain immutable and 
     hostVersionSource: "TUI application version",
     pluginVersion: "0.2.0",
     projectionVersion: null,
-    dashboardVersion: null,
+    dashboardVersion: 3,
     projectionMode: "native",
   });
   const firstBinding = { scope: "project", subjectId: "proposal-one", version: "a".repeat(64), auditIds: ["1".repeat(64)] };
@@ -2105,7 +2072,7 @@ test("TUI store sends structured rejection only when the current projection adve
       return {
         mode: "native",
         projectionVersion: 1,
-        operationProtocolVersion: 1,
+        operationProtocolVersion: 2,
         index: {
           generation: "a".repeat(64),
           capabilities: ["legacy-decision-v1"],
@@ -2113,9 +2080,7 @@ test("TUI store sends structured rejection only when the current projection adve
           allowedActions: [],
         },
         dashboard: dashboard({
-          capabilities: feedbackSupported
-            ? ["control-repo-mode-v1", "decision-feedback-v1"]
-            : ["control-repo-mode-v1"],
+          capabilities: feedbackSupported ? ["decision-feedback-v1"] : [],
         }),
         details: [],
         effectiveDetailActions: {
@@ -2164,27 +2129,26 @@ test("TUI store sends structured rejection only when the current projection adve
   store.dispose();
 });
 
-test("TUI store submits project analysis mode only through fresh native operation authority", async (t) => {
+test("TUI store submits Automatic recommendations only through fresh native operation authority", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-repo-mode-root-"));
   const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-repo-mode-project-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
   const scheduler = harness();
-  const controlSubmissions = [];
   const operationSubmissions = [];
   let supported = false;
   const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, (context) => ({
     async read() {
       const grant = {
-        action: "set-repo-mode",
-        capability: "legacy-control-v1",
-        nonce: "project-analysis-operation-nonce",
+        action: "set-automatic-recommendations",
+        capability: "automatic-recommendations-control-v1",
+        nonce: "automatic-recommendations-operation-nonce",
         expiresAt: 10_000,
       };
       return {
         mode: "native",
         projectionVersion: 1,
-        operationProtocolVersion: 1,
+        operationProtocolVersion: 2,
         capabilities: UI_CAPABILITIES,
         index: {
           projectFingerprint: context.projectFingerprint,
@@ -2196,62 +2160,37 @@ test("TUI store submits project analysis mode only through fresh native operatio
           allowedActions: supported ? [grant] : [],
         },
         dashboard: dashboard({
-          capabilities: supported
-            ? ["control-repo-mode-v1", "decision-feedback-v1", "project-analysis-control-v1"]
-            : ["decision-feedback-v1"],
-          supportedControls: supported ? ["set-repo-mode"] : [],
+          supportedControls: supported ? ["set-automatic-recommendations"] : [],
         }),
         details: [],
         effectiveIndexActions: supported ? [grant] : [],
         effectiveDetailActions: {},
       };
     },
-    async readControlState() {
-      return {
-        schemaVersion: SCHEMA_VERSION,
-        projectFingerprint: context.projectFingerprint,
-        actor: "self-evolve-integration",
-        issuedAt: 1_000,
-        expiresAt: 10_000,
-        settingsUpdatedAt: 900,
-        settingsVersion: "b".repeat(64),
-        stateRootIdentity: context.stateRootIdentity,
-        nonce: "repository-mode-control-nonce",
-        mode: "auto",
-        effectiveMode: "auto",
-        allowedSkillRoots: [worktree],
-        consent: {
-          passiveCalls: true,
-          durableObservations: true,
-          sanitizedExcerpts: false,
-          crossRepoAggregation: false,
-        },
-        repoExcluded: false,
-      };
-    },
-    async submitControl(request) { controlSubmissions.push(request); },
     async submitOperation(request) { operationSubmissions.push(request); },
   }), { now: () => 1_100 }));
   await store.refresh();
   await assert.rejects(
-    store.submitControl("set-repo-mode", { mode: "manual" }),
-    /repository-mode-control-not-supported/u,
+    store.submitOperation("set-automatic-recommendations", { enabled: false }),
+    /operation-not-authorized/u,
   );
-  assert.equal(controlSubmissions.length, 0);
+  await assert.rejects(
+    store.submitControl("set-automatic-recommendations", { enabled: false }),
+    /retired-v04-control/u,
+  );
   assert.equal(operationSubmissions.length, 0);
 
   supported = true;
   await store.refresh();
-  const request = await store.submitControl("set-repo-mode", { mode: "manual" });
-  assert.equal(request.action, "set-repo-mode");
-  assert.deepEqual(request.payload, { mode: "manual", settingsVersion: "b".repeat(64) });
+  const request = await store.submitOperation("set-automatic-recommendations", { enabled: false });
+  assert.equal(request.action, "set-automatic-recommendations");
+  assert.deepEqual(request.payload, { enabled: false, settingsVersion: "b".repeat(64) });
   assert.equal(request.generation, "a".repeat(64));
   assert.equal(request.projectionHash, "c".repeat(64));
-  assert.equal(request.capability, "legacy-control-v1");
-  assert.equal(controlSubmissions.length, 0, "legacy control mailbox is never used for project analysis mode");
+  assert.equal(request.capability, "automatic-recommendations-control-v1");
   assert.equal(operationSubmissions.length, 1);
   await assert.rejects(
-    store.submitControl("set-repo-mode", { mode: "auto" }),
+    store.submitOperation("set-automatic-recommendations", { enabled: false }),
     /matching-request-already-pending/u,
   );
   store.dispose();
@@ -2275,7 +2214,7 @@ test("authoritative root-policy submission uses the fresh dashboard grant and se
       return {
         mode: "native",
         projectionVersion: 1,
-        operationProtocolVersion: 1,
+        operationProtocolVersion: 2,
         capabilities: UI_CAPABILITIES,
         index: {
           projectFingerprint: context.projectFingerprint,
@@ -2298,7 +2237,6 @@ test("authoritative root-policy submission uses the fresh dashboard grant and se
       };
     },
     async readInbox() { return []; },
-    async readControlState() { return null; },
     async submitOperation(request) { submissions.push(request); },
     async reconcilePending(entries) { return { pending: entries, responses: [] }; },
   }), { now: () => 1_100 }));
@@ -2329,8 +2267,8 @@ test("downgraded peers never expose raw grants or write mailbox requests", async
     const writes = [];
     const proposalId = `proposal-${mode}`;
     const rawGrant = {
-      action: "set-paused",
-      capability: "operation-pause-v1",
+      action: "set-automatic-recommendations",
+      capability: "automatic-recommendations-control-v1",
       nonce: "raw-index-nonce",
       expiresAt: 10_000,
     };
@@ -2366,39 +2304,18 @@ test("downgraded peers never expose raw grants or write mailbox requests", async
           operationProtocolVersion: negotiatedOperationProtocolVersion,
         };
       },
-      async readControlState() {
-        return {
-          schemaVersion: SCHEMA_VERSION,
-          projectFingerprint: "a".repeat(64),
-          actor: "self-evolve-integration",
-          issuedAt: 1_000,
-          expiresAt: 10_000,
-          settingsUpdatedAt: 900,
-          settingsVersion: "b".repeat(64),
-          stateRootIdentity: "c".repeat(64),
-          nonce: "raw-control-nonce",
-          mode: "auto",
-          effectiveMode: "auto",
-          allowedSkillRoots: [worktree],
-          consent: dashboard().settings.consent,
-          repoExcluded: false,
-        };
-      },
       async readInbox() { return [{ id: proposalId }]; },
       async submitDecision(request) { writes.push(request); },
-      async submitControl(request) { writes.push(request); },
       async submitOperation(request) { writes.push(request); },
     }), { now: () => 1_100 }));
     await store.refresh();
     const snapshot = store.getSnapshot();
     assert.deepEqual(buildRecommendationsModel(snapshot).selected?.actions ?? [], []);
     assert.deepEqual(buildSettingsModel(snapshot).controls, {
-      globalMode: false,
-      repositoryMode: false,
+      automaticRecommendations: false,
       consent: false,
       projectInclusion: false,
       approvedSkillFolders: false,
-      pause: false,
       emergencyStop: false,
     });
     assert.deepEqual(buildSettingsModel(snapshot).maintenance, {
@@ -2408,17 +2325,17 @@ test("downgraded peers never expose raw grants or write mailbox requests", async
       canDeleteAll: false,
     });
     await assert.rejects(store.submitDecision({ proposalId, newState: "rejected" }), /native.*protocol/u);
-    await assert.rejects(store.submitControl("set-mode", { mode: "manual" }), /native.*protocol/u);
-    await assert.rejects(store.submitOperation("set-paused", { paused: true }), /native.*protocol/u);
+    await assert.rejects(store.submitControl("set-mode", { mode: "manual" }), /retired-v04-control/u);
+    await assert.rejects(store.submitOperation("set-automatic-recommendations", { enabled: false }), /native.*protocol/u);
     assert.equal(writes.length, 0);
     if (mode === "read-only") {
       negotiatedMode = "native";
-      negotiatedOperationProtocolVersion = 1;
+      negotiatedOperationProtocolVersion = 2;
       await store.refresh();
-      await assert.rejects(store.submitOperation("set-paused", { paused: true }), /operation-not-authorized/u);
+      await assert.rejects(store.submitOperation("set-automatic-recommendations", { enabled: false }), /operation-not-authorized/u);
       assert.equal(writes.length, 0, "an empty effective list never falls back to the raw index grant");
-      await store.submitControl("set-mode", { mode: "manual" });
-      assert.equal(writes.length, 1, "a matching native peer still submits supported controls");
+      await assert.rejects(store.submitControl("set-mode", { mode: "manual" }), /retired-v04-control/u);
+      assert.equal(writes.length, 0);
     }
     store.dispose();
   }
@@ -2443,7 +2360,7 @@ test("failed refresh strips retained authority and Retry restores only freshly n
     },
     dashboard: dashboard(),
     details: [],
-    effectiveIndexActions: state === "fresh" ? [{ action: "set-kill-switch" }] : [{ action: "set-paused" }],
+    effectiveIndexActions: state === "fresh" ? [{ action: "set-kill-switch" }] : [{ action: "set-automatic-recommendations" }],
     effectiveDetailActions: {
       [proposalId]: state === "fresh" ? [{ action: "reject-proposal" }] : [{ action: "apply-proposal" }],
     },
@@ -2452,24 +2369,6 @@ test("failed refresh strips retained authority and Retry restores only freshly n
     async read() {
       if (state === "expired") throw new Error(`expired-projection:${"private".repeat(80)}`);
       return projectionFor();
-    },
-    async readControlState() {
-      return {
-        schemaVersion: SCHEMA_VERSION,
-        projectFingerprint: "a".repeat(64),
-        actor: "self-evolve-integration",
-        issuedAt: 1_000,
-        expiresAt: 10_000,
-        settingsUpdatedAt: 900,
-        settingsVersion: "b".repeat(64),
-        stateRootIdentity: "c".repeat(64),
-        nonce: "stale-retry-control-nonce",
-        mode: "auto",
-        effectiveMode: "auto",
-        allowedSkillRoots: [worktree],
-        consent: dashboard().settings.consent,
-        repoExcluded: false,
-      };
     },
     async reconcilePending(entries) { return { pending: entries, responses: [] }; },
   }), { now: () => 1_100 }));
@@ -2489,11 +2388,11 @@ test("failed refresh strips retained authority and Retry restores only freshly n
   assert.equal(expired.phase, "error");
   assert.equal(expired.stale, true);
   assert.equal(expired.error.length, 240);
-  assert.equal(expired.controlState, null);
+  assert.equal("controlState" in expired, false);
   assert.deepEqual(expired.projection.effectiveIndexActions, []);
   assert.deepEqual(expired.projection.effectiveDetailActions[proposalId], []);
   assert.equal(expired.pending.length, 1);
-  await assert.rejects(store.submitControl("set-mode", { mode: "manual" }), /native-operation-protocol-unavailable/u);
+  await assert.rejects(store.submitOperation("set-automatic-recommendations", { enabled: false }), /native-operation-protocol-unavailable/u);
 
   state = "fresh";
   await store.refresh();
@@ -2503,14 +2402,14 @@ test("failed refresh strips retained authority and Retry restores only freshly n
   assert.deepEqual(fresh.projection.effectiveIndexActions.map((entry) => entry.action), ["set-kill-switch"]);
   assert.deepEqual(buildRecommendationsModel(fresh).selected.actions, [],
     "a fresh project projection remains read-only while the global protocol is unavailable");
-  assert.equal(buildSettingsModel(fresh).controls.pause, false);
+  assert.equal(buildSettingsModel(fresh).controls.automaticRecommendations, false);
   assert.equal(buildSettingsModel(fresh).controls.emergencyStop, false,
     "a missing global protocol keeps even a fresh project projection read-only");
   store.dispose();
 });
 
-test("authority preflight waits for replacement reads and fails closed before every submit boundary", async (t) => {
-  for (const kind of ["decision", "control", "operation"]) {
+test("authority preflight waits for replacement reads and fails closed before every current submit boundary", async (t) => {
+  for (const kind of ["decision", "operation"]) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), `self-evolve-tui-preflight-${kind}-root-`));
     const worktree = fs.mkdtempSync(path.join(os.tmpdir(), `self-evolve-tui-preflight-${kind}-project-`));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -2521,46 +2420,31 @@ test("authority preflight waits for replacement reads and fails closed before ev
     let reads = 0;
     let resolveReplacement;
     let expireFollowUp = false;
-    const authorized = () => ({
+    const authorized = (context) => ({
       mode: "native",
       projectionVersion: 1,
-      operationProtocolVersion: 1,
+      operationProtocolVersion: 2,
       index: {
+        projectFingerprint: context.projectFingerprint,
+        stateRootIdentity: context.stateRootIdentity,
         generation: "a".repeat(64),
         reviews: [{ proposalId, state: "pending", target: "review/SKILL.md", attention: "normal" }],
         allowedActions: [],
       },
       dashboard: dashboard(),
       details: [],
-      effectiveIndexActions: [{ action: "set-paused" }],
+      effectiveIndexActions: [{ action: "set-automatic-recommendations" }],
       effectiveDetailActions: {
         [proposalId]: [{ action: "reject-proposal" }, { action: "snooze-proposal" }],
       },
     });
-    const controlState = {
-      schemaVersion: SCHEMA_VERSION,
-      projectFingerprint: "a".repeat(64),
-      actor: "self-evolve-integration",
-      issuedAt: 1_000,
-      expiresAt: 10_000,
-      settingsUpdatedAt: 900,
-      settingsVersion: "b".repeat(64),
-      stateRootIdentity: "c".repeat(64),
-      nonce: `preflight-${kind}-nonce`,
-      mode: "auto",
-      effectiveMode: "auto",
-      allowedSkillRoots: [worktree],
-      consent: dashboard().settings.consent,
-      repoExcluded: false,
-    };
-    const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, () => ({
+    const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, (context) => ({
       read() {
         reads += 1;
         if (reads === 2) return new Promise((resolve) => { resolveReplacement = resolve; });
         if (expireFollowUp) throw new Error("expired-projection");
-        return authorized();
+        return authorized(context);
       },
-      async readControlState() { return controlState; },
       async readInbox() {
         return [{
           id: proposalId,
@@ -2570,7 +2454,6 @@ test("authority preflight waits for replacement reads and fails closed before ev
         }];
       },
       async submitDecision(request) { writes.push(request); },
-      async submitControl(request) { writes.push(request); },
       async submitOperation(request) { writes.push(request); },
     }), { now: () => 1_100 }));
     await store.refresh();
@@ -2579,11 +2462,12 @@ test("authority preflight waits for replacement reads and fails closed before ev
     await settle();
     const submission = kind === "decision"
       ? store.submitDecision({ proposalId, newState: "rejected" })
-      : kind === "control"
-        ? store.submitControl("set-mode", { mode: "manual" })
-        : store.submitOperation("snooze-proposal", { snoozedUntil: 5_000 }, { proposalId });
+      : store.submitOperation("snooze-proposal", { snoozedUntil: 5_000 }, { proposalId });
     expireFollowUp = true;
-    resolveReplacement(authorized());
+    resolveReplacement(authorized({
+      projectFingerprint: store.getSnapshot().projectFingerprint,
+      stateRootIdentity: store.getSnapshot().stateRootIdentity,
+    }));
     await replacement;
     await assert.rejects(submission, /native-operation-protocol-unavailable/u, kind);
     assert.equal(reads, 3, `${kind} preflight must await the queued replacement read`);
@@ -2717,10 +2601,10 @@ test("missing responses expire by authoritative class deadline and late response
     expiresAt: 110,
   });
   await store.trackPending({
-    requestId: "control-expiry",
-    kind: "control",
-    action: "set-consent",
-    subject: "consent:passiveCalls",
+    requestId: "permission-expiry",
+    kind: "operation",
+    action: "set-permission",
+    subject: "permission:durableObservations",
     submittedAt: 100,
     expiresAt: 120,
   });
@@ -2736,14 +2620,14 @@ test("missing responses expire by authoritative class deadline and late response
   now = 120;
   publishLateResponses = true;
   await store.refresh();
-  const atControlExpiry = store.getSnapshot();
-  assert.deepEqual(atControlExpiry.pending.map((entry) => entry.requestId), ["operation-expiry"]);
-  assert.deepEqual(atControlExpiry.responses.map((entry) => [entry.requestId, entry.response.status]), [
+  const atPermissionExpiry = store.getSnapshot();
+  assert.deepEqual(atPermissionExpiry.pending.map((entry) => entry.requestId), ["operation-expiry"]);
+  assert.deepEqual(atPermissionExpiry.responses.map((entry) => [entry.requestId, entry.response.status]), [
     ["decision-expiry", "expired"],
-    ["control-expiry", "expired"],
+    ["permission-expiry", "expired"],
   ]);
-  assert.equal(atControlExpiry.responses.every((entry) => entry.response.ok === false), true);
-  assert.equal(atControlExpiry.responses.every((entry) => entry.response.reason === "response-not-received-before-expiry"), true);
+  assert.equal(atPermissionExpiry.responses.every((entry) => entry.response.ok === false), true);
+  assert.equal(atPermissionExpiry.responses.every((entry) => entry.response.reason === "response-not-received-before-expiry"), true);
 
   now = 130;
   await store.refresh();
@@ -2757,7 +2641,7 @@ test("missing responses expire by authoritative class deadline and late response
   store.dispose();
 });
 
-test("real decision, control, and operation submissions track authoritative deadlines and retry with fresh authority", async (t) => {
+test("real decision and operation submissions track authoritative deadlines and retry with fresh authority", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-deadlines-root-"));
   const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-deadlines-project-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -2770,8 +2654,8 @@ test("real decision, control, and operation submissions track authoritative dead
   const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, (context) => {
     const generation = "c".repeat(64);
     const grant = {
-      action: "set-paused",
-      capability: UI_ACTION_CAPABILITIES["set-paused"],
+      action: "set-automatic-recommendations",
+      capability: UI_ACTION_CAPABILITIES["set-automatic-recommendations"],
       nonce: "operation-nonce",
       expiresAt: 31_000,
     };
@@ -2786,9 +2670,7 @@ test("real decision, control, and operation submissions track authoritative dead
       status: {
         state: "ready",
         reason: null,
-        storedMode: "auto",
-        effectiveMode: "auto",
-        paused: false,
+        automaticRecommendationsEnabled: true,
         killSwitchActive: false,
         repoExcluded: false,
         circuitBreakerOpen: false,
@@ -2817,7 +2699,7 @@ test("real decision, control, and operation submissions track authoritative dead
         return {
           mode: "native",
           projectionVersion: UI_PROJECTION_VERSION,
-          operationProtocolVersion: 1,
+          operationProtocolVersion: 2,
           index,
           dashboard: dashboard(),
           details: [],
@@ -2836,26 +2718,7 @@ test("real decision, control, and operation submissions track authoritative dead
           decisionNonce,
         }];
       },
-      async readControlState() {
-        return {
-          schemaVersion: SCHEMA_VERSION,
-          projectFingerprint: context.projectFingerprint,
-          actor: "self-evolve-integration",
-          issuedAt: 900,
-          expiresAt: 6_000,
-          settingsUpdatedAt: 900,
-          settingsVersion: "f".repeat(64),
-          stateRootIdentity: context.stateRootIdentity,
-          nonce: "control-nonce",
-          mode: "auto",
-          effectiveMode: "auto",
-          allowedSkillRoots: [worktree],
-          consent: dashboard().settings.consent,
-          repoExcluded: false,
-        };
-      },
       async submitDecision(request) { submissions.push(request); },
-      async submitControl(request) { submissions.push(request); },
       async submitOperation(request) { submissions.push(request); },
       async reconcilePending(entries) { return { pending: entries, responses: [] }; },
     };
@@ -2863,11 +2726,9 @@ test("real decision, control, and operation submissions track authoritative dead
   await store.refresh();
 
   const firstDecision = await store.submitDecision({ proposalId, newState: "approved" });
-  await store.submitControl("set-consent", { key: "passiveCalls", enabled: true });
-  const operation = await store.submitOperation("set-paused", { paused: true });
+  const operation = await store.submitOperation("set-automatic-recommendations", { enabled: false });
   const pending = new Map(store.getSnapshot().pending.map((entry) => [entry.requestId, entry]));
   assert.equal(pending.get(firstDecision.requestId).expiresAt, 1_000 + BRIDGE_TTL_MS);
-  assert.equal([...pending.values()].find((entry) => entry.kind === "control").expiresAt, 6_000);
   assert.equal(pending.get(operation.requestId).expiresAt, operation.expiresAt);
   assert.equal(operation.expiresAt, 31_000);
 
@@ -2878,7 +2739,7 @@ test("real decision, control, and operation submissions track authoritative dead
   assert.notEqual(retried.requestId, firstDecision.requestId);
   assert.notEqual(retried.nonce, firstDecision.nonce);
   assert.equal(retried.nonce, decisionNonce);
-  assert.equal(submissions.length, 4);
+  assert.equal(submissions.length, 3);
   store.dispose();
 });
 
@@ -2895,18 +2756,18 @@ test("pending tracking rejects overflow instead of forgetting published requests
   for (let index = 0; index < 32; index += 1) {
     await store.trackPending({
       requestId: `capacity-${index}`,
-      kind: "control",
-      action: "set-consent",
-      subject: `consent:${index}`,
+      kind: "operation",
+      action: "set-permission",
+      subject: `permission:${index}`,
       submittedAt: 100,
       expiresAt: 1_000,
     });
   }
   await assert.rejects(store.trackPending({
     requestId: "capacity-overflow",
-    kind: "control",
-    action: "set-consent",
-    subject: "consent:overflow",
+    kind: "operation",
+    action: "set-permission",
+    subject: "permission:overflow",
     submittedAt: 100,
     expiresAt: 1_000,
   }), /pending-request-capacity-exhausted/u);
@@ -2924,36 +2785,32 @@ test("concurrent matching submissions publish only one request", async (t) => {
   const submissions = [];
   const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, (context) => ({
     async read() {
+      const grant = {
+        action: "set-automatic-recommendations",
+        capability: "automatic-recommendations-control-v1",
+        nonce: "concurrent-operation-nonce",
+        expiresAt: 10_000,
+      };
       return {
         ...projection(),
+        index: {
+          ...projection().index,
+          projectFingerprint: context.projectFingerprint,
+          stateRootIdentity: context.stateRootIdentity,
+          projectionHash: "c".repeat(64),
+          capabilities: UI_CAPABILITIES,
+        },
         dashboard: dashboard(),
+        effectiveIndexActions: [grant],
       };
     },
-    async readControlState() {
-      return {
-        schemaVersion: SCHEMA_VERSION,
-        projectFingerprint: context.projectFingerprint,
-        actor: "self-evolve-integration",
-        issuedAt: 1_000,
-        expiresAt: 10_000,
-        settingsUpdatedAt: 900,
-        settingsVersion: "b".repeat(64),
-        stateRootIdentity: context.stateRootIdentity,
-        nonce: "concurrent-control-nonce",
-        mode: "auto",
-        effectiveMode: "auto",
-        allowedSkillRoots: [worktree],
-        consent: dashboard().settings.consent,
-        repoExcluded: false,
-      };
-    },
-    async submitControl(request) { submissions.push(request); },
+    async submitOperation(request) { submissions.push(request); },
     async reconcilePending(entries) { return { pending: entries, responses: [] }; },
   }), { now: () => 1_100 }));
   await store.refresh();
   const results = await Promise.allSettled([
-    store.submitControl("set-mode", { mode: "manual" }),
-    store.submitControl("set-mode", { mode: "manual" }),
+    store.submitOperation("set-automatic-recommendations", { enabled: false }),
+    store.submitOperation("set-automatic-recommendations", { enabled: false }),
   ]);
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
   assert.equal(results.filter((result) => result.status === "rejected"

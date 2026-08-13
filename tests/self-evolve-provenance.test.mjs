@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildTranscript } from "../self-evolve-core.js";
 import { createPipeline } from "../self-evolve-pipeline.js";
 import * as observationModule from "../self-evolve-observation.js";
 import {
@@ -46,27 +45,11 @@ test("recognized control and display envelopes are exclusion-only", () => {
     { role: "user", commandName: "/authorize", parts: [structuredClone(control)] },
   ]), []);
 
-  const transcript = buildTranscript([
-    { id: "control", role: "assistant", parts: [control] },
-    { id: "display", role: "assistant", parts: [display] },
-  ]);
-  assert.equal(transcript.text, "");
-  assert.equal(transcript.messageCount, 0);
 });
 
-test("display parts do not hide surrounding ordinary evidence", () => {
-  const transcript = buildTranscript([{
-    id: "mixed",
-    role: "assistant",
-    parts: [
-      part("render-only control text", automation("display")),
-      { type: "text", text: "ordinary assistant outcome" },
-    ],
-  }]);
-
-  assert.doesNotMatch(transcript.text, /render-only/u);
-  assert.match(transcript.text, /ordinary assistant outcome/u);
-  assert.equal(transcript.messageCount, 1);
+test("display exclusion does not classify surrounding ordinary evidence", () => {
+  assert.equal(partIsExcludedFromEvidence(part("render-only control text", automation("display"))), true);
+  assert.equal(partIsExcludedFromEvidence({ type: "text", text: "ordinary assistant outcome" }), false);
 });
 
 test("malformed and unknown envelopes remain ordinary evidence", () => {
@@ -87,12 +70,6 @@ test("malformed and unknown envelopes remain ordinary evidence", () => {
     assert.equal(isAutomationControlPart(candidate), false, `case ${index}`);
     assert.equal(partIsExcludedFromEvidence(candidate), false, `case ${index}`);
   });
-  const transcript = buildTranscript(cases.map((marker, index) => ({
-    id: `ordinary-${index}`,
-    role: "assistant",
-    parts: [part(`ordinary-${index}`, marker)],
-  })));
-  cases.forEach((_, index) => assert.match(transcript.text, new RegExp(`ordinary-${index}`, "u")));
 });
 
 test("recognition is total for malformed values and serialization failures", () => {
@@ -146,6 +123,10 @@ test("repeated anonymous automation content cannot create receipts while ordinar
 test("pipeline normalization excludes control parts before records and eligibility", async () => {
   const records = [];
   const store = {
+    getAutomationState() {
+      return { ok: true, enabled: true, stamp: { generation: 1, permissionsHash: "f".repeat(64) } };
+    },
+    compareAutomationStamp(stamp) { return stamp?.generation === 1; },
     appendRecord(record) {
       records.push(record);
       return { ok: true, record };
@@ -166,7 +147,7 @@ test("pipeline normalization excludes control parts before records and eligibili
     inventory: {},
     privacy,
     synthesis: {
-      runSynthesis() { throw new Error("control evidence reached synthesis"); },
+      runGlobalSynthesis() { throw new Error("control evidence reached synthesis"); },
     },
     applier: { close() {} },
     commands: {},
@@ -187,7 +168,8 @@ test("pipeline normalization excludes control parts before records and eligibili
     projectFingerprint: FINGERPRINT,
     scopeFingerprint: SCOPE,
     trigger: "test",
-    mode: "manual",
+    mode: "auto",
+    options: { automationStamp: store.getAutomationState().stamp },
   });
 
   assert.equal(result.result, "no-eligible");

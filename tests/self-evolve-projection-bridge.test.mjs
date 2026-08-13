@@ -141,9 +141,7 @@ function bundle(root, {
     status: {
       state: "ready",
       reason: null,
-      storedMode: "auto",
-      effectiveMode: "auto",
-      paused: false,
+      automaticRecommendationsEnabled: true,
       killSwitchActive: false,
       repoExcluded: false,
       circuitBreakerOpen: false,
@@ -168,9 +166,9 @@ function bundle(root, {
     }],
     operations: [],
     allowedActions: includeActions ? [{
-      action: "set-paused",
-      capability: UI_ACTION_CAPABILITIES["set-paused"],
-      nonce: "pause-nonce",
+      action: "set-automatic-recommendations",
+      capability: UI_ACTION_CAPABILITIES["set-automatic-recommendations"],
+      nonce: "automatic-recommendations-nonce",
       expiresAt: issuedAt + 30_000,
     }] : [],
     overflow: {
@@ -194,7 +192,7 @@ function bundle(root, {
     lastCycle: null,
     nextEligibleAt: null,
     usage: {
-      passive: { used: 0, limit: 6, remaining: 6, resetAt: null },
+      provider: { used: 0, limit: 6, remaining: 6, resetAt: null },
       synthesis: { used: 0, limit: 24, remaining: 24, resetAt: null },
       storage: { usedBytes: 0, limitBytes: 8_388_608, remainingBytes: 8_388_608 },
     },
@@ -206,41 +204,59 @@ function bundle(root, {
       minSuccessRateBasisPoints: 8_000,
     },
     settings: {
-      globalMode: "auto",
-      repositoryMode: "inherit",
-      effectiveMode: "auto",
-      paused: false,
+      automaticRecommendationsEnabled: true,
+      automationGeneration: 1,
       killSwitchActive: false,
       repositoryExcluded: false,
       consent: {
-        passiveCalls: true,
         durableObservations: true,
-        sanitizedExcerpts: false,
-        crossRepoAggregation: false,
+        sanitizedExcerpts: true,
+        crossRepoAggregation: true,
       },
       approvedSkillFolderCount: 1,
+      collectionSuggestions: ["/global/skills"],
       globalSettingsVersion: "9".repeat(64),
       globalRootPolicy: null,
       globalRootPolicyConfirmation: "REPLACE GLOBAL ROOT POLICY 999999999999",
       globalRootPolicyAction: null,
     },
     retention: { observationsDays: retentionDays, operationalDays: retentionDays * 3 },
-    supportedControls: ["set-paused"],
+    supportedControls: ["set-automatic-recommendations"],
     activity: [],
     overflow: { activity: overflow(0) },
   };
-  const {
-    globalSettingsVersion: _globalSettingsVersion,
-    globalRootPolicy: _globalRootPolicy,
-    globalRootPolicyConfirmation: _globalRootPolicyConfirmation,
-    globalRootPolicyAction: _globalRootPolicyAction,
-    ...dashboardV1Settings
-  } = dashboardBody.settings;
+  const dashboardV1Settings = {
+    globalMode: "auto",
+    repositoryMode: "inherit",
+    effectiveMode: "auto",
+    paused: false,
+    killSwitchActive: false,
+    repositoryExcluded: false,
+    consent: {
+      passiveCalls: true,
+      durableObservations: true,
+      sanitizedExcerpts: true,
+      crossRepoAggregation: true,
+    },
+    approvedSkillFolderCount: 1,
+  };
   const dashboardV1Body = {
     ...dashboardBody,
     dashboardVersion: 1,
+    capabilities: [
+      "control-repo-mode-v1",
+      "decision-feedback-v1",
+      "operation-global-root-policy-v1",
+      "project-analysis-control-v1",
+    ],
+    usage: {
+      passive: dashboardBody.usage.provider,
+      synthesis: dashboardBody.usage.synthesis,
+      storage: dashboardBody.usage.storage,
+    },
     settings: dashboardV1Settings,
     retention: { observationsDays: retentionDays, operationalDays: 90 },
+    supportedControls: ["set-paused"],
   };
   return {
     index,
@@ -322,7 +338,7 @@ test("publication is atomic, private, negotiated, and preserves the legacy inbox
   assert.equal(native.mode, "native");
   assert.equal(native.index.projectionHash, value.index.projectionHash);
   assert.equal(native.details[0].detailHash, value.details[0].detailHash);
-  assert.deepEqual(native.effectiveIndexActions.map((action) => action.action), ["set-paused"]);
+  assert.deepEqual(native.effectiveIndexActions.map((action) => action.action), ["set-automatic-recommendations"]);
   assert.deepEqual(native.effectiveDetailActions["proposal-1"].map((action) => action.action), ["reject-proposal"]);
 
   const readOnly = readUiProjection(root, PROJECT, {
@@ -376,7 +392,7 @@ test("control-state publication uses Release A wire 0.2.1 and current readers ac
   assert.doesNotMatch(bytes, /0\.2\.2/u);
 });
 
-test("dashboard sidecars publish before the index, prefer v2, and degrade without invalidating core review", (t) => {
+test("dashboard v3 publishes before the index and degrades without invalidating core review", (t) => {
   const root = fixture(t);
   const first = bundle(root, { generation: "7".repeat(64) });
   publishUiProjection(root, first);
@@ -394,9 +410,9 @@ test("dashboard sidecars publish before the index, prefer v2, and degrade withou
 
   publishUiProjection(root, enhanced);
   const dashboardFile = dashboardPath(root, enhanced.index.generation);
-  const dashboardV1File = dashboardPath(root, enhanced.index.generation, 1);
   assert.equal(statMode(dashboardFile), 0o600);
-  assert.equal(statMode(dashboardV1File), 0o600);
+  assert.equal(existsSync(dashboardPath(root, enhanced.index.generation, 1)), false);
+  assert.equal(existsSync(dashboardPath(root, enhanced.index.generation, 2)), false);
   const read = readUiProjection(root, PROJECT, {
     now: NOW,
     clientOffer: clientOffer(),
@@ -416,39 +432,27 @@ test("dashboard sidecars publish before the index, prefer v2, and degrade withou
   assert.equal(dashboardWithReducedCoreOffer.dashboardError, null);
 
   writeFileSync(dashboardFile, "{}\n", { mode: 0o600 });
-  const invalidV2 = readUiProjection(root, PROJECT, {
+  const invalidV3 = readUiProjection(root, PROJECT, {
     now: NOW,
     clientOffer: clientOffer(),
     detailProposalIds: ["proposal-1"],
   });
-  assert.equal(invalidV2.index.projectionHash, enhanced.index.projectionHash);
-  assert.equal(invalidV2.details[0].detailHash, enhanced.details[0].detailHash);
-  assert.equal(invalidV2.dashboard, null);
-  assert.match(invalidV2.dashboardError, /ui-dashboard/u);
-  assert.equal(Buffer.byteLength(invalidV2.dashboardError, "utf8") <= UI_PROTOCOL_LIMITS.reasonBytes, true);
+  assert.equal(invalidV3.index.projectionHash, enhanced.index.projectionHash);
+  assert.equal(invalidV3.details[0].detailHash, enhanced.details[0].detailHash);
+  assert.equal(invalidV3.dashboard, null);
+  assert.match(invalidV3.dashboardError, /ui-dashboard/u);
+  assert.equal(Buffer.byteLength(invalidV3.dashboardError, "utf8") <= UI_PROTOCOL_LIMITS.reasonBytes, true);
 
   unlinkSync(dashboardFile);
-  const fallback = readUiProjection(root, PROJECT, {
+  const withoutDashboard = readUiProjection(root, PROJECT, {
     now: NOW,
     clientOffer: clientOffer(),
   });
-  assert.equal(fallback.dashboard.dashboardVersion, 1);
-  assert.equal(fallback.dashboardError, null);
-
-  writeFileSync(dashboardV1File, "{}\n", { mode: 0o600 });
-  const degraded = readUiProjection(root, PROJECT, {
-    now: NOW,
-    clientOffer: clientOffer(),
-    detailProposalIds: ["proposal-1"],
-  });
-  assert.equal(degraded.index.projectionHash, enhanced.index.projectionHash);
-  assert.equal(degraded.details[0].detailHash, enhanced.details[0].detailHash);
-  assert.equal(degraded.dashboard, null);
-  assert.match(degraded.dashboardError, /ui-dashboard/u);
+  assert.equal(withoutDashboard.dashboard, null);
+  assert.equal(withoutDashboard.dashboardError, null);
   const cleaned = cleanupBridge(root, PROJECT, { now: NOW });
   assert.equal(cleaned.ok, true);
   assert.equal(existsSync(dashboardFile), false);
-  assert.equal(existsSync(dashboardV1File), false);
   assert.equal(existsSync(path.join(projectionRoot(root), "index.json")), true);
 
   const { dashboardHash: _hash, ...wrongBody } = enhanced.dashboard;
@@ -462,27 +466,7 @@ test("dashboard sidecars publish before the index, prefer v2, and degrade withou
   }), /stale-projection/u);
 });
 
-test("dashboard sidecars preserve old-server and old-TUI retention compatibility", (t) => {
-  const oldServerRoot = fixture(t);
-  const oldServerBundle = bundle(oldServerRoot, {
-    generation: "5".repeat(64),
-    includeDashboard: true,
-    retentionDays: 10,
-  });
-  const { dashboardV1: oldDashboard, ...oldServerValues } = oldServerBundle;
-  publishUiProjection(oldServerRoot, { ...oldServerValues, dashboard: oldDashboard });
-
-  const currentReader = readUiProjection(oldServerRoot, PROJECT, {
-    now: NOW,
-    clientOffer: clientOffer(),
-  });
-  assert.equal(currentReader.dashboard.dashboardVersion, 1);
-  assert.deepEqual(currentReader.dashboard.retention, {
-    observationsDays: 10,
-    operationalDays: 90,
-  });
-  assert.equal(currentReader.dashboardError, null);
-
+test("current publication emits only dashboard v3 with exact retention", (t) => {
   const currentServerRoot = fixture(t);
   const currentServerBundle = bundle(currentServerRoot, {
     generation: "6".repeat(64),
@@ -500,22 +484,8 @@ test("dashboard sidecars preserve old-server and old-TUI retention compatibility
     operationalDays: 10_950,
   });
 
-  const v1Value = JSON.parse(readFileSync(
-    dashboardPath(currentServerRoot, current.index.generation, 1),
-    "utf8",
-  ));
-  const oldTuiDashboard = makeUiDashboard(v1Value, {
-    projectFingerprint: PROJECT,
-    stateRootIdentity: stateRootIdentity(currentServerRoot),
-    generation: current.index.generation,
-    indexHash: current.index.projectionHash,
-    now: NOW,
-  });
-  assert.equal(oldTuiDashboard.dashboardVersion, 1);
-  assert.deepEqual(oldTuiDashboard.retention, {
-    observationsDays: 3_650,
-    operationalDays: 90,
-  });
+  assert.equal(existsSync(dashboardPath(currentServerRoot, current.index.generation, 1)), false);
+  assert.equal(existsSync(dashboardPath(currentServerRoot, current.index.generation, 2)), false);
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(
     path.join(projectionRoot(currentServerRoot), "protocol-offer.json"),
     "utf8",
@@ -584,8 +554,8 @@ test("interrupted generation replacement leaves the prior index readable and con
     root,
   ]);
   assert.equal(fsyncedBeforeIndex.some((file) => /\/details\/[a-f0-9]{64}\.json$/u.test(file)), true);
-  assert.equal(fsyncedBeforeIndex.includes(`generations/${second.index.generation}/dashboard-v1.json`), true);
-  assert.equal(fsyncedBeforeIndex.includes(`generations/${second.index.generation}/dashboard-v2.json`), true);
+  assert.equal(fsyncedBeforeIndex.includes(`generations/${second.index.generation}/dashboard-v3.json`), true);
+  assert.equal(fsyncedBeforeIndex.some((file) => /dashboard-v[12]\.json$/u.test(file)), false);
   assert.equal(fsyncedBeforeIndex.at(-1), "protocol-offer.json");
   assert.equal(fsyncedBeforeIndex.includes("index.json"), false);
   assert.equal(durabilityOrder.indexOf(`directory:${root}`) < durabilityOrder.indexOf("file:protocol-offer.json"), true);

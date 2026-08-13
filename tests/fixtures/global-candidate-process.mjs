@@ -1,3 +1,4 @@
+import { writeFileSync } from "node:fs";
 import { openStore } from "../../self-evolve-store.js";
 
 const [root, projectFingerprint, rootPolicySource, targetBindingSource, timestampText, mode = "none"] = process.argv.slice(2);
@@ -19,9 +20,14 @@ const store = openStore(root, {
   }),
 });
 
-const result = store.materializeGlobalCandidates({ targetBindings: [targetBinding], rootPolicy, nowMs });
+const result = store.materializeGlobalCandidates({
+  targetBindings: [targetBinding],
+  rootPolicy,
+  nowMs,
+  automationStamp: store.getAutomationState().stamp,
+});
 store.close();
-process.stdout.write(JSON.stringify({
+writeFileSync(1, JSON.stringify({
   ok: result.ok,
   reason: result.reason ?? null,
   changed: result.changed ?? 0,

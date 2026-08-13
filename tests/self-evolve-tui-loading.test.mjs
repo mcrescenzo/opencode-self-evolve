@@ -93,19 +93,14 @@ test("healthy native startup silently delegates legacy settings to the native si
   assert.equal(harness.layers.length, 0);
 });
 
-test("requested legacy settings surface warns once when a required capability is missing", async () => {
+test("retired legacy settings surface remains inert when a required capability is missing", async () => {
   const harness = tuiHarness({ keymap: false });
   const warnings = await captureWarnings(async () => {
     await SelfEvolveTuiPlugin(harness.api, harness.options);
     await harness.dispose();
   });
 
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /legacy settings command/i);
-  assert.match(warnings[0], /keymap\.registerLayer/u);
-  assert.match(warnings[0], /package root/u);
-  assert.match(warnings[0], /tui\.json/u);
-  assert.ok(warnings[0].length <= 240);
+  assert.deepEqual(warnings, []);
 });
 
 test("legacy-only registration fixture reports the external native-target migration", () => {
@@ -158,7 +153,7 @@ test("package exports and TUI loading docs select the native target and explain 
   assert.match(configuration, /exactly four sections: Home, Recommendations, Activity, and Settings/u);
   assert.match(configuration, /dashboard-v1/u);
   assert.match(configuration, /never a raw-log viewer/u);
-  assert.match(contract, /Release B removes it from\s+normal routing/u);
+  assert.match(contract, /Recommendations is the single normal review path/u);
   assert.match(internals, /self-evolve-tui\.generated\.js[^\n]+public native target/iu);
   assert.match(internals, /renders? exactly Home, Recommendations, Activity, and Settings/u);
   assert.match(releaseB, /automated implementer-authored evidence is\s+not independent human acceptance/iu);

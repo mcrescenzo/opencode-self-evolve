@@ -40,7 +40,7 @@ function hash(value) {
   return createHash("sha256").update(String(value)).digest("hex");
 }
 
-function fixture(t, { mode = "auto" } = {}) {
+function fixture(t, { mode: _retiredMode = "auto" } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-projection-"));
   const skillRoot = path.join(root, "skills");
   const skillPath = path.join(skillRoot, "demo", "SKILL.md");
@@ -48,12 +48,13 @@ function fixture(t, { mode = "auto" } = {}) {
   writeFileSync(skillPath, CURRENT);
   const store = openStore(root, { projectName: "projection", projectFingerprint: PROJECT, now: () => NOW });
   const current = store.getSettings();
-  assert.equal(store.setGlobalSettings(makeGlobalSettings({
+  const legacyMetadata = store.setGlobalSettings(makeGlobalSettings({
     ...current.global,
-    mode,
+    mode: current.global.mode,
     allowedSkillRoots: [skillRoot],
     updatedAt: NOW,
-  })).mode, mode === "yolo" ? "auto" : mode);
+  }));
+  assert.deepEqual(legacyMetadata.allowedSkillRoots, [skillRoot]);
   t.after(() => {
     try { store.close(); } catch {}
     rmSync(root, { recursive: true, force: true });
@@ -176,7 +177,7 @@ function build(f, options = {}) {
   });
 }
 
-test("fresh manual projection guides first-run setup without bundling excerpt consent", (t) => {
+test("fresh projection starts Automatic recommendations On with the required permission bundle", (t) => {
   const root = mkdtempSync(path.join(tmpdir(), "self-evolve-projection-first-run-"));
   const store = openStore(root, {
     projectName: "projection-first-run",
@@ -195,18 +196,14 @@ test("fresh manual projection guides first-run setup without bundling excerpt co
   });
 
   const first = project(store.readProjectionSnapshot());
-  assert.deepEqual(first.dashboard.blockers.map((blocker) => blocker.code), ["first-run"]);
-  assert.equal(first.dashboard.settings.consent.sanitizedExcerpts, false);
-
-  const current = store.getSettings();
-  const changed = store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(changed.ok, true);
-  const afterDecision = project(store.readProjectionSnapshot());
-  assert.equal(afterDecision.dashboard.blockers.some((blocker) => blocker.code === "first-run"), false);
-  assert.equal(current.global.consent.sanitizedExcerpts, false);
+  assert.deepEqual(first.dashboard.blockers, []);
+  assert.equal(first.index.status.automaticRecommendationsEnabled, true);
+  assert.equal(first.dashboard.settings.automaticRecommendationsEnabled, true);
+  assert.deepEqual(first.dashboard.settings.consent, {
+    durableObservations: true,
+    sanitizedExcerpts: true,
+    crossRepoAggregation: true,
+  });
 });
 
 test("dashboard retention derives operational records from the configured store policy", (t) => {
@@ -222,38 +219,21 @@ test("dashboard retention derives operational records from the configured store 
       observationsDays: retentionDays,
       operationalDays,
     });
-    assert.deepEqual(build(f).dashboardV1.retention, {
-      observationsDays: retentionDays,
-      operationalDays: 90,
-    });
   }
 });
 
-test("approved skill folders do not block analysis-only Auto or legacy yolo", (t) => {
-  const f = fixture(t, { mode: "auto" });
+test("creation-policy suggestions do not gate Automatic recommendations", (t) => {
+  const f = fixture(t);
   const current = f.store.getSettings();
-  assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
+  const changed = f.store.setGlobalSettings(makeGlobalSettings({
     ...current.global,
-    mode: "auto",
     allowedSkillRoots: [],
-    consent: {
-      ...current.global.consent,
-      passiveCalls: true,
-      durableObservations: true,
-    },
     updatedAt: NOW + 1,
-  })).mode, "auto");
-  const auto = build(f);
-  assert.equal(auto.dashboard.blockers.some((blocker) => blocker.code === "approved-skill-folders"), false);
-
-  assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
-    ...f.store.getSettings().global,
-    mode: "yolo",
-    updatedAt: NOW + 2,
-  })).mode, "auto", "a stored legacy yolo preference narrows to auto");
-  const yolo = build(f);
-  assert.equal(yolo.dashboard.settings.effectiveMode, "auto");
-  assert.equal(yolo.dashboard.blockers.some((blocker) => blocker.code === "approved-skill-folders"), false);
+  }));
+  assert.deepEqual(changed.allowedSkillRoots, []);
+  const result = build(f);
+  assert.equal(result.dashboard.settings.automaticRecommendationsEnabled, true);
+  assert.equal(result.dashboard.blockers.some((blocker) => blocker.code === "approved-skill-folders"), false);
 });
 
 function treeSnapshot(root) {
@@ -281,16 +261,15 @@ test("pending projections render bounded diff, evidence, eligibility, budgets, a
 
   const result = build(f, { detailProposalIds: [item.id] });
   assert.equal(result.index.status.state, "ready");
-  assert.equal(result.index.status.storedMode, "auto");
-  assert.equal(result.index.status.effectiveMode, "auto");
+  assert.equal(result.index.status.automaticRecommendationsEnabled, true);
   assert.equal(result.dashboard.indexHash, result.index.projectionHash);
   assert.equal(result.dashboard.generation, result.index.generation);
-  assert.equal(result.dashboard.automation.state, "setup-required");
-  assert.equal(result.dashboard.settings.globalMode, "auto");
+  assert.equal(result.dashboard.automation.state, "ready");
+  assert.equal(result.dashboard.settings.automaticRecommendationsEnabled, true);
   assert.equal(result.dashboard.usage.storage.usedBytes > 0, true);
   assert.equal(result.index.capabilities.includes("control-repo-mode-v1"), false);
-  assert.equal(result.dashboard.capabilities.includes("control-repo-mode-v1"), true);
-  assert.equal(result.dashboard.supportedControls.includes("set-repo-mode"), true);
+  assert.equal(result.dashboard.capabilities.includes("control-repo-mode-v1"), false);
+  assert.equal(result.dashboard.supportedControls.includes("set-repo-mode"), false);
   assert.equal(result.index.reviews.length, 1);
   assert.equal(result.details.length, 1);
   assert.equal(result.publicationDetails.length, 1);
@@ -347,34 +326,26 @@ test("critic-pending stays internal until one pending review is published, while
   assert.deepEqual(failed.details[0].allowedActions, []);
 });
 
-test("manual stays advisory while legacy yolo narrows to explicit-review Auto", (t) => {
-  for (const mode of ["manual", "yolo"]) {
-    const f = fixture(t, { mode });
-    const item = proposal(f.skillRoot, { id: `proposal-${mode}` });
-    append(f.store, "proposal", item);
-    seedContent(f.store, item);
-    seedLegacyGrant(f.store, item);
-    const result = build(f, { detailProposalIds: [item.id] });
-    assert.equal(result.details[0].summary.effectiveMode, mode === "yolo" ? "auto" : "manual");
-    assert.deepEqual(
-      result.details[0].allowedActions.map((action) => action.action),
-      mode === "yolo" ? ["apply-proposal", "reject-proposal"] : ["reject-proposal"],
-    );
-  }
+test("existing explicit proposal actions remain available while automation is Off", (t) => {
+  const f = fixture(t);
+  const item = proposal(f.skillRoot, { id: "proposal-off" });
+  append(f.store, "proposal", item);
+  seedContent(f.store, item);
+  seedLegacyGrant(f.store, item);
+  const automation = f.store.getAutomationState();
+  assert.equal(f.store.transitionAutomation({
+    transitionId: "projection-off",
+    expectedGeneration: automation.epoch.generation,
+    action: "set-automatic-recommendations",
+    enabled: false,
+  }).ok, true);
+  const result = build(f, { detailProposalIds: [item.id] });
+  assert.equal(result.dashboard.settings.automaticRecommendationsEnabled, false);
+  assert.deepEqual(result.details[0].allowedActions.map((action) => action.action), ["apply-proposal", "reject-proposal"]);
 });
 
-test("failed-closed review stays critical and actionless while enhanced dashboards are otherwise healthy", (t) => {
-  const f = fixture(t, { mode: "auto" });
-  const current = f.store.getSettings();
-  assert.equal(f.store.setGlobalSettings(makeGlobalSettings({
-    ...current.global,
-    consent: {
-      ...current.global.consent,
-      passiveCalls: true,
-      durableObservations: true,
-    },
-    updatedAt: current.global.updatedAt + 1,
-  })).mode, "auto");
+test("failed-closed review stays critical and actionless while the current dashboard is healthy", (t) => {
+  const f = fixture(t);
   const pending = proposal(f.skillRoot, { id: "failed-healthy-dashboard" });
   append(f.store, "proposal", pending);
   seedContent(f.store, pending);
@@ -384,7 +355,6 @@ test("failed-closed review stays critical and actionless while enhanced dashboar
 
   const result = build(f, { detailProposalIds: [failed.id] });
   assert.equal(result.dashboard.automation.state, "ready");
-  assert.equal(result.dashboardV1.automation.state, "ready");
   assert.deepEqual(result.index.reviews.map((review) => [review.state, review.attention]), [
     ["failed-closed", "critical"],
   ]);
@@ -424,6 +394,9 @@ test("missing content, failed-closed state, target drift, and private material f
   append(f.store, "proposal", drifted);
   seedContent(f.store, drifted, PROPOSED);
   writeFileSync(f.skillPath, `${CURRENT}drift\n`);
+  // Settle the one-time v0.3 metadata mirror before proving that projection
+  // construction itself is read-only.
+  f.store.readProjectionSnapshot();
   const beforeRecords = f.store.readRecords("proposal").map((record) => record.id);
   const beforeTree = treeSnapshot(f.root);
   const result = build(f, { detailProposalIds: [failed.id, drifted.id] });
@@ -463,9 +436,9 @@ test("corrupt, terminal, startup, and unavailable health states are explicit and
   }
 });
 
-test("automatic mode reports when background analysis awaits restart", (t) => {
-  const f = fixture(t, { mode: "auto" });
-  const result = build(f, { health: { passiveEventHookInstalled: false } });
+test("Automatic recommendations reports when the lifecycle hook awaits restart", (t) => {
+  const f = fixture(t);
+  const result = build(f, { health: { lifecycleEventHookInstalled: false } });
   assert.equal(result.index.status.state, "setup-required");
   assert.equal(result.index.status.reason, "restart-required");
   assert.deepEqual(
@@ -478,34 +451,18 @@ test("automatic mode reports when background analysis awaits restart", (t) => {
   );
 });
 
-test("configured Auto remains visible while pause and exclusion are operational states", (t) => {
-  const f = fixture(t, { mode: "auto" });
-  const paused = f.store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    paused: true,
-    updatedAt: global.updatedAt + 1,
-  }));
-  assert.equal(paused.ok, true);
+test("project exclusion is an operational suppressor that does not rewrite preference", (t) => {
+  const f = fixture(t);
+  assert.equal(f.store.setAutomationProjectExcluded(true).ok, true);
   let result = build(f);
-  assert.equal(result.index.status.effectiveMode, "auto");
-  assert.equal(result.dashboard.settings.effectiveMode, "auto");
-  assert.equal(result.dashboard.automation.state, "paused");
-
-  assert.equal(f.store.updateGlobalSettings((global) => makeGlobalSettings({
-    ...global,
-    paused: false,
-    updatedAt: global.updatedAt + 1,
-  })).ok, true);
-  assert.equal(f.store.updateRepoSettings((repo) => ({ ...repo, excluded: true })).ok, true);
-  result = build(f);
-  assert.equal(result.index.status.effectiveMode, "auto");
-  assert.equal(result.dashboard.settings.effectiveMode, "auto");
+  assert.equal(result.index.status.automaticRecommendationsEnabled, true);
+  assert.equal(result.dashboard.settings.automaticRecommendationsEnabled, true);
   assert.equal(result.dashboard.automation.state, "excluded");
 
-  assert.equal(f.store.updateRepoSettings((repo) => ({ ...repo, excluded: false, mode: "yolo" })).ok, true);
+  assert.equal(f.store.setAutomationProjectExcluded(false).ok, true);
   result = build(f);
-  assert.equal(result.index.status.effectiveMode, "auto", "legacy yolo projects display analysis-only Auto");
-  assert.equal(result.dashboard.settings.effectiveMode, "auto");
+  assert.equal(result.index.status.automaticRecommendationsEnabled, true);
+  assert.equal(result.dashboard.automation.state, "ready");
 });
 
 test("operation grants bind the exact project, root, and target-derived generation without circular store hashes", (t) => {
@@ -551,9 +508,9 @@ test("operation grants bind the exact project, root, and target-derived generati
     projectFingerprint: PROJECT,
     stateRootIdentity: ROOT_IDENTITY,
     generation: second.generation,
-    uiAction: "set-paused",
-    capability: "operation-pause-v1",
-    nonce: hash("pause"),
+    uiAction: "set-automatic-recommendations",
+    capability: "automatic-recommendations-control-v1",
+    nonce: hash("automation"),
     expiresAt: NOW + 30_000,
   }, NOW - 2_000));
   append(f.store, "audit-event", audit("decision", null, {
@@ -577,7 +534,7 @@ test("operation grants bind the exact project, root, and target-derived generati
     expiresAt: NOW + 30_000,
   }, NOW - 1_900));
   const third = build(f);
-  assert.deepEqual(third.index.allowedActions.map((action) => action.action), ["set-paused"]);
+  assert.deepEqual(third.index.allowedActions.map((action) => action.action), ["set-automatic-recommendations"]);
   assert.equal(third.dashboard.settings.globalRootPolicyAction.action, "replace-global-root-policy");
 });
 
@@ -621,15 +578,14 @@ test("dashboard activity is allowlisted and usage-only audits do not churn the c
   }), NOW - 60 * 60 * 1000);
   const usageSnapshot = f.store.readProjectionSnapshot();
   assert.equal(usageSnapshot.generation, firstSnapshot.generation);
-  assert.equal(usageSnapshot.usage.passive.used, 2);
-  assert.equal(usageSnapshot.usage.passive.remaining, 4);
-  assert.equal(usageSnapshot.usage.passive.resetAt, NOW);
+  assert.equal(usageSnapshot.usage.provider.used, 2);
+  assert.equal(usageSnapshot.usage.provider.remaining, 4);
+  assert.equal(usageSnapshot.usage.provider.resetAt, NOW);
 
   append(f.store, "audit-event", audit("decision", item.id, {
     action: "cycle-outcome",
     outcome: "valid-no-change",
     triggerClass: "idle",
-    mode: "auto",
     observationCount: 3,
     eligibilityCount: 1,
     occurredAt: NOW - 400,
@@ -640,7 +596,7 @@ test("dashboard activity is allowlisted and usage-only audits do not churn the c
     detail: "secret-value ses_private_session",
   }, NOW - 300));
   const second = build(f);
-  assert.equal(second.dashboard.usage.passive.used, 2);
+  assert.equal(second.dashboard.usage.provider.used, 2);
   assert.notEqual(second.dashboard.dashboardHash, first.dashboard.dashboardHash);
   assert.equal(second.dashboard.lastCycle.outcome, "valid-no-change");
   assert.deepEqual(second.dashboard.activity.map((entry) => entry.outcome), ["valid-no-change"]);
@@ -668,7 +624,6 @@ test("dashboard activity narrates lifecycle, controls, maintenance, recovery, an
       action: "cycle-outcome",
       outcome: "not-eligible",
       triggerClass: "idle",
-      mode: "auto",
       observationCount: 3,
       eligibilityCount: 0,
       occurredAt: NOW - 1_850,
@@ -679,8 +634,8 @@ test("dashboard activity narrates lifecycle, controls, maintenance, recovery, an
       snoozedUntil: NOW + 60_000,
       privatePath: "/never/projected/private/SKILL.md",
     }, NOW - 1_800),
-    audit("mode-change", null, { action: "pause", privateSession: "ses_private" }, NOW - 1_700),
-    audit("mode-change", null, { action: "resume" }, NOW - 1_600),
+    audit("mode-change", null, { action: "automation-control", control: "set-automatic-recommendations", enabled: false, privateSession: "ses_private" }, NOW - 1_700),
+    audit("mode-change", null, { action: "automation-control", control: "set-automatic-recommendations", enabled: true }, NOW - 1_600),
     audit("mode-change", null, { action: "exclude" }, NOW - 1_500),
     audit("mode-change", null, { action: "include" }, NOW - 1_400),
     audit("kill-switch", null, { action: "on" }, NOW - 1_300),
@@ -769,8 +724,8 @@ test("dashboard activity narrates lifecycle, controls, maintenance, recovery, an
     "rolled-back",
     "deferred",
     "failed",
-    "paused",
-    "resumed",
+    "automatic-recommendations-off",
+    "automatic-recommendations-on",
     "project-excluded",
     "project-included",
     "emergency-stop-enabled",

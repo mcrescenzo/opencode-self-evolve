@@ -3,22 +3,18 @@ import path from "node:path";
 import {
   BRIDGE_TTL_MS,
   createGlobalActionRequest,
-  createControlRequest,
   createDecisionRequest,
   createUiOperationRequest,
   pollGlobalActionResponse,
-  pollControlResponse,
   pollDecisionResponse,
   pollUiOperationResponse,
   readBoundedInspection,
-  readControlState,
   readGlobalRecommendationProjection,
   readProjectInbox,
   readProjectParticipationSidecars,
   readTuiHostHealth,
   readUiProjection,
   submitGlobalActionRequest,
-  submitControlRequest,
   submitDecisionRequest,
   submitUiOperationRequest,
 } from "./self-evolve-bridge.js";
@@ -97,8 +93,8 @@ function hasCurrentNativeAuthority(snapshot) {
 
 function hasCurrentActingProjectAuthority(snapshot) {
   return hasCurrentNativeAuthority(snapshot)
-    && snapshot.controlState?.projectFingerprint === snapshot.projectFingerprint
-    && snapshot.controlState?.stateRootIdentity === snapshot.stateRootIdentity
+    && snapshot.projection?.index?.projectFingerprint === snapshot.projectFingerprint
+    && snapshot.projection?.index?.stateRootIdentity === snapshot.stateRootIdentity
     && snapshot.tuiHealth?.projectFingerprint === snapshot.projectFingerprint
     && snapshot.tuiHealth?.stateRootIdentity === snapshot.stateRootIdentity
     && snapshot.tuiHealth.expiresAt > snapshot.updatedAt;
@@ -241,9 +237,7 @@ function defaultClient(context, now) {
           else pending.push(entry);
           continue;
         }
-        const response = entry.kind === "control"
-          ? pollControlResponse(context.stateRoot, context.projectFingerprint, entry.requestId)
-          : pollDecisionResponse(context.stateRoot, context.projectFingerprint, entry.requestId);
+        const response = pollDecisionResponse(context.stateRoot, context.projectFingerprint, entry.requestId);
         if (response) responses.push({ ...entry, response });
         else pending.push(entry);
       }
@@ -251,9 +245,6 @@ function defaultClient(context, now) {
     },
     readInbox() {
       return readProjectInbox(context.stateRoot, context.projectFingerprint, { now: now() });
-    },
-    readControlState() {
-      return readControlState(context.stateRoot, context.projectFingerprint, { now: now() });
     },
     readLatestExport() {
       return readLatestSensitiveExport({
@@ -276,9 +267,6 @@ function defaultClient(context, now) {
     },
     submitDecision(request) {
       return submitDecisionRequest(context.stateRoot, request);
-    },
-    submitControl(request) {
-      return submitControlRequest(context.stateRoot, request);
     },
     submitOperation(request) {
       return submitUiOperationRequest(context.stateRoot, request);
@@ -324,7 +312,7 @@ function cleanPending(value) {
   if (typeof value.requestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(value.requestId)) {
     throw new TypeError("invalid-pending-request-id");
   }
-  if (!["control", "decision", "operation", "global-action"].includes(value.kind)) throw new TypeError("invalid-pending-request-kind");
+  if (!["decision", "operation", "global-action"].includes(value.kind)) throw new TypeError("invalid-pending-request-kind");
   if (typeof value.subject !== "string" || value.subject.length < 1 || value.subject.length > 256) {
     throw new TypeError("invalid-pending-request-subject");
   }
@@ -343,9 +331,8 @@ function cleanPending(value) {
 }
 
 function controlSubject(action, payload = {}) {
-  if (action === "set-consent") return `consent:${String(payload.key ?? "unknown")}`;
-  if (action === "set-mode") return "global-mode";
-  if (action === "set-repo-mode") return "repository-mode";
+  if (action === "set-permission") return `permission:${String(payload.permission ?? "unknown")}`;
+  if (action === "set-automatic-recommendations") return "automatic-recommendations";
   if (action === "set-repo-excluded") return "project-inclusion";
   if (action === "update-allowlist") return "approved-skill-folders";
   return "project";
@@ -353,7 +340,9 @@ function controlSubject(action, payload = {}) {
 
 function operationSubject(action, payload = {}, proposalId) {
   if (proposalId) return proposalId;
-  if (action === "set-repo-mode") return "repository-mode";
+  if (action === "set-automatic-recommendations") return "automatic-recommendations";
+  if (action === "set-permission") return `permission:${String(payload.permission ?? "unknown")}`;
+  if (action === "set-repo-excluded") return "project-inclusion";
   if (["export-data", "purge-scope"].includes(action)) return `scope:${String(payload.scope ?? "project")}`;
   return "project";
 }
@@ -378,10 +367,6 @@ function plural(count, singular, pluralValue = `${singular}s`) {
   return `${count} ${count === 1 ? singular : pluralValue}`;
 }
 
-const MODE_LABELS = Object.freeze({
-  manual: "On demand",
-  auto: "Recommend automatically",
-});
 const ACTIVE_OPERATION_STATES = new Set(["queued", "running", "accepted-terminal"]);
 const REVIEW_ATTENTION_STATES = new Set(["pending", "approved"]);
 const ERROR_OUTCOMES = new Set(["failed", "failed-closed", "breaker-open"]);
@@ -575,12 +560,12 @@ function resultForAutomation(state, snapshot, dashboard, reviews) {
       destination: destination("activity", { filter: "errors" }),
       nextAction: "Review failures, then reset when safe.",
     },
-    paused: {
-      tone: "warning",
-      label: "Self-evolve is paused",
-      explanation: "Existing records remain available while scheduling is paused.",
-      destination: destination("home"),
-      nextAction: "Resume when automatic work should continue.",
+    off: {
+      tone: "neutral",
+      label: "Automatic recommendations are off",
+      explanation: "Existing recommendations remain reviewable, but no new automatic work will start.",
+      destination: destination("settings", { anchor: "automatic-recommendations" }),
+      nextAction: "Turn automatic recommendations on when you want new suggestions.",
     },
     excluded: {
       tone: "warning",
@@ -588,13 +573,6 @@ function resultForAutomation(state, snapshot, dashboard, reviews) {
       explanation: "Global settings remain intact, but this project is excluded.",
       destination: destination("settings", { anchor: "project-scope" }),
       nextAction: "Include this project to allow automatic work.",
-    },
-    "on-demand": {
-      tone: "neutral",
-      label: "Runs on demand",
-      explanation: "Manual mode runs only explicit scans. Auto mode also needs Background analysis and Saved observations consent.",
-      destination: destination("settings", { anchor: "modes" }),
-      nextAction: "Choose Auto and enable both required consents, or run /self-evolve scan on demand.",
     },
     "setup-required": {
       tone: "warning",
@@ -636,7 +614,7 @@ function resultForAutomation(state, snapshot, dashboard, reviews) {
         ? `Automatic work is deferred until ${new Date(dashboard.nextEligibleAt).toISOString()}.`
         : "Automatic work is intentionally deferred.",
       destination: destination("home"),
-      nextAction: "Wait, or use the on-demand path.",
+      nextAction: "Wait for the quiet period to end.",
     },
   };
   const failures = reviews.filter((review) => review.state === "failed-closed");
@@ -710,7 +688,7 @@ function resultForAutomation(state, snapshot, dashboard, reviews) {
     state: "ready",
     tone: "neutral",
     label: "Ready",
-    explanation: "Self-evolve is ready within the displayed mode and safeguards.",
+    explanation: "Automatic recommendations are ready within the displayed safeguards.",
     destination: destination("home"),
     nextAction: "No action required.",
   });
@@ -783,9 +761,8 @@ export function deriveOperationalView(snapshot) {
   let fallbackState = null;
   if (status.killSwitchActive) fallbackState = "emergency-stop";
   else if (status.circuitBreakerOpen) fallbackState = "circuit-breaker";
-  else if (status.paused) fallbackState = "paused";
   else if (status.repoExcluded) fallbackState = "excluded";
-  else if (status.effectiveMode === "manual") fallbackState = "on-demand";
+  else if (status.automaticRecommendationsEnabled === false) fallbackState = "off";
   else if (status.state === "setup-required") fallbackState = "setup-required";
   else if ((index.operations ?? []).some((operation) => ACTIVE_OPERATION_STATES.has(operation.status))
       || (snapshot?.pending?.length ?? 0) > 0) fallbackState = "running";
@@ -826,9 +803,7 @@ function lastChecked(snapshot) {
 
 export function deriveSidebarCard(snapshot) {
   const operational = deriveOperationalView(snapshot);
-  const cardDestination = operational.state === "on-demand"
-    ? destination("home")
-    : operational.destination;
+  const cardDestination = operational.destination;
   const kinds = {
     recommendation: "review",
     applied: "audit",
@@ -891,22 +866,6 @@ export function validateApprovedSkillFolderInput(value, existing = []) {
     error: null,
     warning: "The server will revalidate existence, canonical identity, symlinks, and supported-root policy before saving.",
   });
-}
-
-function modeModel(globalMode, repositoryMode, effectiveMode) {
-  const normalizedGlobal = globalMode === "yolo" ? "auto" : globalMode;
-  const normalizedRepository = repositoryMode === "yolo" ? "auto" : repositoryMode;
-  const normalizedEffective = effectiveMode === "yolo" ? "auto" : effectiveMode;
-  return {
-    global: { value: normalizedGlobal ?? null, label: MODE_LABELS[normalizedGlobal] ?? "Unavailable" },
-    repository: {
-      value: normalizedRepository ?? null,
-      label: normalizedRepository === "inherit"
-        ? "Inherit global default"
-        : MODE_LABELS[normalizedRepository] ?? "Unavailable",
-    },
-    effective: { value: normalizedEffective ?? null, label: MODE_LABELS[normalizedEffective] ?? "Unavailable" },
-  };
 }
 
 function safeActivityRow(entry, reviews) {
@@ -1013,8 +972,8 @@ function emptyHomeState(snapshot, operational, dashboard) {
   if (operational.state === "limited") {
     return { heading: "Limited view", explanation: operational.explanation };
   }
-  if (operational.state === "paused") {
-    return { heading: "Self-evolve is paused", explanation: "Existing records remain available; no automatic cycle will start." };
+  if (operational.state === "off") {
+    return { heading: "Automatic recommendations are off", explanation: "Existing recommendations remain available; no new automatic cycle will start." };
   }
   if (operational.state === "excluded") {
     return { heading: "Disabled for this project", explanation: "Global settings are unchanged; this project is excluded." };
@@ -1024,10 +983,6 @@ function emptyHomeState(snapshot, operational, dashboard) {
   }
   if (dashboard?.lastCycle?.outcome === "not-eligible") {
     return { heading: "Still learning", explanation: "Saved structured patterns are not yet strong or independent enough for a recommendation." };
-  }
-  if (dashboard?.settings?.effectiveMode !== "manual"
-      && dashboard?.settings?.consent?.passiveCalls === false) {
-    return { heading: "Background analysis is off", explanation: "Current consent prevents background AI analysis." };
   }
   if (!dashboard?.activity?.length) {
     return { heading: "No activity yet", explanation: "Self-evolve has not completed a retained cycle for this project." };
@@ -1041,7 +996,6 @@ export function buildHomeModel(snapshot) {
   const operational = deriveOperationalView(snapshot);
   const reviews = reviewsFor(snapshot);
   const settings = dashboard?.settings;
-  const firstRun = dashboard?.blockers?.some((blocker) => blocker.code === "first-run") === true;
   const recentActivity = (dashboard?.activity ?? [])
     .filter((entry) => entry.audience !== "diagnostic")
     .slice(0, 3)
@@ -1049,12 +1003,9 @@ export function buildHomeModel(snapshot) {
   return deepFreeze({
     phase: snapshot?.phase ?? "unavailable",
     operational,
-    mode: modeModel(
-      settings?.globalMode ?? index?.status?.storedMode,
-      settings?.repositoryMode,
-      settings?.effectiveMode ?? index?.status?.effectiveMode,
-    ),
-    firstRun,
+    automaticRecommendationsEnabled: settings?.automaticRecommendationsEnabled
+      ?? index?.status?.automaticRecommendationsEnabled
+      ?? null,
     blockers: (dashboard?.blockers ?? []).map((blocker) => ({
       code: blocker.code,
       summary: blocker.summary,
@@ -1064,7 +1015,6 @@ export function buildHomeModel(snapshot) {
     lastCycle: dashboard?.lastCycle ? {
       outcome: dashboard.lastCycle.outcome,
       triggerClass: dashboard.lastCycle.triggerClass,
-      mode: dashboard.lastCycle.mode,
       observationCount: dashboard.lastCycle.observationCount,
       eligibilityCount: dashboard.lastCycle.eligibilityCount,
       occurredAt: dashboard.lastCycle.occurredAt,
@@ -1085,7 +1035,6 @@ export function buildHomeModel(snapshot) {
       recommendationCount: snapshot.global.projection?.index?.recommendations?.length ?? null,
       stale: snapshot.global.stale === true,
     } : null,
-    manualFallback: "Run /self-evolve scan in the source session. This OpenCode host cannot safely bind a native scan to the selected session.",
   });
 }
 
@@ -1279,7 +1228,6 @@ export function buildRecommendationsModel(snapshot, {
         rationale: detail.summary.rationale,
         state: detail.summary.state,
         target: safeTargetLabel(detail.summary.target.relativePath),
-        effectiveMode: detail.summary.effectiveMode,
         risk: detail.summary.risk,
         criticPassed: detail.summary.criticPassed,
         validDeterministic: detail.summary.validDeterministic,
@@ -1354,6 +1302,7 @@ export function buildActivityModel(snapshot, { filter = "all" } = {}) {
     .map((entry) => safeActivityRow(entry, reviews));
   const activity = [...globalActivityRows(snapshot).filter((entry) => activityFilterMatch(entry, filter)), ...projectActivity]
     .sort((left, right) => right.occurredAt - left.occurredAt);
+  const providerUsage = dashboard?.usage?.provider ?? dashboard?.usage?.passive ?? null;
   return deepFreeze({
     phase: snapshot?.phase ?? "unavailable",
     filter,
@@ -1385,8 +1334,8 @@ export function buildActivityModel(snapshot, { filter = "all" } = {}) {
         : null,
       usage: dashboard?.usage ?? null,
       budgetResetAt: dashboard?.usage ? {
-        passive: dashboard.usage.passive.resetAt,
-        synthesis: dashboard.usage.synthesis.resetAt,
+        provider: providerUsage?.resetAt ?? null,
+        synthesis: dashboard.usage.synthesis?.resetAt ?? null,
       } : null,
       lastError: lastProjectedError ? safeActivityRow(lastProjectedError, reviews) : null,
     },
@@ -1401,17 +1350,16 @@ export function buildActivityModel(snapshot, { filter = "all" } = {}) {
 
 export function buildSettingsModel(snapshot) {
   const dashboard = dashboardFor(snapshot);
-  const control = snapshot?.controlState;
   const index = snapshot?.projection?.index;
   const status = index?.status;
   const settings = dashboard?.settings;
-  const consent = settings?.consent ?? control?.consent ?? null;
+  const consent = settings?.consent ?? null;
   const supportedControls = dashboard?.supportedControls ?? [];
-  const globalRootPolicy = settings?.globalRootPolicy ?? control?.globalRootPolicy ?? null;
+  const globalRootPolicy = settings?.globalRootPolicy ?? null;
   const approvedSkillFolders = globalRootPolicy?.roots?.map((root) => root.canonicalPath) ?? [];
-  const collectionSuggestions = globalRootPolicy ? [] : control?.allowedSkillRoots ?? [];
-  const hasControl = control !== undefined && control !== null;
+  const collectionSuggestions = globalRootPolicy ? [] : settings?.collectionSuggestions ?? [];
   const usage = dashboard?.usage ?? null;
+  const providerUsage = usage?.provider ?? usage?.passive ?? null;
   const budgets = index?.budgets ?? null;
   const inspection = snapshot?.inspection;
   const observationCount = Array.isArray(inspection?.observations)
@@ -1423,68 +1371,34 @@ export function buildSettingsModel(snapshot) {
   const granted = new Set(effectiveActions.map((action) => action.action));
   return deepFreeze({
     phase: snapshot?.phase ?? "unavailable",
-    mode: modeModel(
-      settings?.globalMode ?? control?.mode ?? status?.storedMode,
-      settings?.repositoryMode,
-      settings?.effectiveMode ?? control?.effectiveMode ?? status?.effectiveMode,
-    ),
-    modes: [
-      {
-        value: "manual",
-        label: MODE_LABELS.manual,
-        description: "Runs only from a source-session scan command.",
-        providerUse: "No passive provider calls. An invoked scan may use the configured provider.",
-        savedData: "An invoked scan may save bounded structured observations when separately allowed.",
-        writeAuthority: "Each apply requires an explicit decision.",
-        prerequisites: "No passive setup is required.",
-        available: true,
-        blockers: [],
-      },
-      {
-        value: "auto",
-        label: MODE_LABELS.auto,
-        description: "Analyzes at safe idle points and prepares recommendations.",
-        providerUse: "Background provider calls require Background AI analysis consent.",
-        savedData: "Saved structured patterns remain controlled by their separate consent.",
-        writeAuthority: "Cannot apply without explicit approval.",
-        prerequisites: "Provider, consent, budget, and host gates must pass; approved skill folders are not required to prepare recommendations.",
-        available: true,
-        blockers: [],
-      },
-    ],
+    automaticRecommendations: {
+      enabled: settings?.automaticRecommendationsEnabled
+        ?? status?.automaticRecommendationsEnabled
+        ?? null,
+      generation: settings?.automationGeneration ?? null,
+      description: settings?.automaticRecommendationsEnabled
+        ? "On enables Saved structured patterns, Sanitized evidence excerpts, and Cross-project learning together so Self-evolve can prepare recommendations automatically. Applying or undoing always requires an operator decision."
+        : "Off stops all future automatic analysis. Unfinished work is superseded and is not backfilled after re-enable; existing recommendations and explicit Apply, Reject, and Undo actions remain available; retained data is not purged.",
+    },
     controls: {
-      globalMode: native && hasControl,
-      repositoryMode: native && supportedControls.includes("set-repo-mode")
-        && dashboard?.capabilities?.includes("project-analysis-control-v1") === true
-        && granted.has("set-repo-mode"),
-      consent: native && hasControl,
-      projectInclusion: native && hasControl,
+      automaticRecommendations: native && granted.has("set-automatic-recommendations"),
+      consent: native && granted.has("set-permission"),
+      projectInclusion: native && granted.has("set-repo-excluded"),
       approvedSkillFolders: native
         && dashboard?.capabilities?.includes("operation-global-root-policy-v1") === true
         && granted.has("replace-global-root-policy"),
-      pause: granted.has("set-paused"),
       emergencyStop: granted.has("set-kill-switch"),
     },
-    projectExcluded: settings?.repositoryExcluded ?? control?.repoExcluded ?? status?.repoExcluded ?? null,
-    paused: settings?.paused ?? status?.paused ?? null,
+    projectExcluded: settings?.repositoryExcluded ?? status?.repoExcluded ?? null,
     emergencyStop: settings?.killSwitchActive ?? status?.killSwitchActive ?? null,
     consent: consent ? [
-      {
-        key: "passiveCalls",
-        label: "Background AI analysis",
-        scope: "Global",
-        enabled: consent.passiveCalls,
-        description: "Allows safe-idle hidden provider calls. It does not itself allow saved evidence or writes.",
-        dependency: "Required by both automatic modes.",
-        canEnable: true,
-      },
       {
         key: "durableObservations",
         label: "Saved structured patterns",
         scope: "Global",
         enabled: consent.durableObservations,
         description: "Persists bounded structured patterns across sessions; transcripts are never stored.",
-        dependency: "Required for passive learning and automatic recommendations.",
+        dependency: "Required while automatic recommendations are On.",
         canEnable: true,
       },
       {
@@ -1493,7 +1407,7 @@ export function buildSettingsModel(snapshot) {
         scope: "Global",
         enabled: consent.sanitizedExcerpts,
         description: "Allows bounded redacted evidence text. Redaction reduces exposure but is not a secrecy guarantee.",
-        dependency: "Required before Cross-project learning can be enabled.",
+        dependency: "Required while automatic recommendations are On.",
         canEnable: true,
       },
       {
@@ -1504,9 +1418,8 @@ export function buildSettingsModel(snapshot) {
         scope: "Global",
         enabled: consent.crossRepoAggregation,
         description: "Publishes identity-free bounded support so recurring patterns can qualify across independent projects.",
-        dependency: "Requires Sanitized evidence excerpts and an aligned global participation protocol.",
-        canEnable: consent.sanitizedExcerpts === true
-          && globalProjectionFor(snapshot)?.capabilities?.includes("project-participation-v1") === true,
+        dependency: "Required while automatic recommendations are On; the server still revalidates project participation and global authority.",
+        canEnable: globalProjectionFor(snapshot)?.capabilities?.includes("project-participation-v1") === true,
       },
     ] : [],
     approvedSkillFolderCount: globalRootPolicy?.roots?.length ?? null,
@@ -1536,12 +1449,12 @@ export function buildSettingsModel(snapshot) {
     supportedControls,
     limits: [
       {
-        key: "passive",
-        label: "Background analysis calls",
-        actual: usage ? `${usage.passive.used} used; ${usage.passive.remaining} remaining` : "Actual usage unavailable",
+        key: "provider",
+        label: "Provider calls",
+        actual: providerUsage ? `${providerUsage.used} used; ${providerUsage.remaining} remaining` : "Actual usage unavailable",
         configured: budgets ? `${budgets.passiveCallsPerHour} per rolling hour` : "Configured limit unavailable",
-        resetAt: usage?.passive?.resetAt ?? null,
-        explanation: "Bounds hidden background provider calls; manual scans use their explicit command path.",
+        resetAt: providerUsage?.resetAt ?? null,
+        explanation: "Bounds automatic provider calls.",
       },
       {
         key: "synthesis",
@@ -1589,7 +1502,7 @@ export function buildSettingsModel(snapshot) {
         actual: dashboard?.automation ? `Scheduler is ${dashboard.automation.state.replaceAll("-", " ")}` : "Scheduler status unavailable",
         configured: budgets ? `${budgets.idleDebounceMs} ms quiet period` : "Configured delay unavailable",
         resetAt: null,
-        explanation: "Requires a stable idle window before passive work is eligible.",
+        explanation: "Requires a stable idle window before automatic work is eligible.",
       },
     ],
     rolloutProgress: dashboard?.rollout ? {
@@ -1627,7 +1540,7 @@ export function buildSettingsModel(snapshot) {
       pluginVersion: snapshot?.runtime?.pluginVersion ?? "unknown",
       projectionVersion: snapshot?.runtime?.projectionVersion ?? null,
       dashboardVersion: snapshot?.runtime?.dashboardVersion ?? null,
-      help: "Use Home for current state, Activity for waiting or failures, and /self-evolve scan in the source session for an on-demand analysis.",
+      help: "Use Home for current state, Recommendations for decisions, Activity for waiting or failures, and Settings for automation controls.",
     },
     limited: !dashboard,
     enhancedError: dashboardErrorFor(snapshot) ? "Enhanced settings could not be validated." : null,
@@ -1637,10 +1550,10 @@ export function buildSettingsModel(snapshot) {
 export function deriveSidebarModeControl(snapshot) {
   const settings = buildSettingsModel(snapshot);
   const pending = (snapshot?.pending ?? []).some((entry) =>
-    entry.action === "set-repo-mode" && entry.subject === "repository-mode");
-  const current = settings.mode.effective.value === "auto" ? "auto" : "manual";
+    entry.action === "set-automatic-recommendations" && entry.subject === "automatic-recommendations");
+  const current = settings.automaticRecommendations.enabled === true ? "on" : "off";
   const available = snapshot?.phase === "ready"
-    && settings.controls.repositoryMode
+    && settings.controls.automaticRecommendations
     && settings.globalProtocol?.authoritative !== false
     && !pending;
   return deepFreeze({
@@ -1651,10 +1564,10 @@ export function deriveSidebarModeControl(snapshot) {
       : snapshot?.phase === "initializing" ? "starting"
         : snapshot?.phase === "error" ? "stale"
           : settings.globalProtocol?.authoritative === false ? "limited"
-            : settings.controls.repositoryMode ? "ready" : "unsupported",
+            : settings.controls.automaticRecommendations ? "ready" : "unsupported",
     options: Object.freeze([
-      Object.freeze({ value: "manual", label: "On demand", confirmationRequired: false }),
-      Object.freeze({ value: "auto", label: "Auto", confirmationRequired: true }),
+      Object.freeze({ value: "off", label: "Off", confirmationRequired: false }),
+      Object.freeze({ value: "on", label: "On", confirmationRequired: true }),
     ]),
   });
 }
@@ -1770,7 +1683,6 @@ class ProjectRuntime {
       phase: "initializing",
       projection: null,
       participation: null,
-      controlState: null,
       latestExport: null,
       inspection: null,
       error: null,
@@ -1788,7 +1700,6 @@ class ProjectRuntime {
     phase,
     projection,
     participation = this.snapshot?.participation ?? null,
-    controlState = this.snapshot?.controlState ?? null,
     latestExport = this.snapshot?.latestExport ?? null,
     inspection = this.snapshot?.inspection ?? null,
     tuiHealth = this.snapshot?.tuiHealth ?? null,
@@ -1805,7 +1716,6 @@ class ProjectRuntime {
       participation,
       dashboard: safeProjection?.dashboard ?? null,
       dashboardError: safeProjection?.dashboardError ?? null,
-      controlState,
       latestExport,
       inspection,
       tuiHealth,
@@ -1838,7 +1748,6 @@ class ProjectRuntime {
       phase: "initializing",
       projection: null,
       participation: null,
-      controlState: null,
       latestExport: null,
       inspection: null,
       error: null,
@@ -1909,7 +1818,6 @@ class ProjectRuntime {
       phase: this.snapshot.phase,
       projection: this.snapshot.projection,
       participation: this.snapshot.participation,
-      controlState: this.snapshot.controlState,
       latestExport: this.snapshot.latestExport,
       inspection: this.snapshot.inspection,
       error: this.snapshot.error,
@@ -1929,7 +1837,6 @@ class ProjectRuntime {
       phase: this.snapshot.phase,
       projection: this.snapshot.projection,
       participation: this.snapshot.participation,
-      controlState: this.snapshot.controlState,
       latestExport: this.snapshot.latestExport,
       inspection: this.snapshot.inspection,
       error: this.snapshot.error,
@@ -2006,36 +1913,9 @@ class ProjectRuntime {
     }
   }
 
-  async submitControl(action, payload) {
+  async submitControl() {
     if (this.terminal) throw new Error("restart-required-after-purge-all");
-    if (action === "set-repo-mode") return this.submitOperation(action, payload);
-    await this.requestRefresh("control-preflight");
-    if (!hasCurrentNativeAuthority(this.snapshot)) {
-      throw new Error("native-operation-protocol-unavailable");
-    }
-    const authoritySnapshot = this.snapshot;
-    const subject = controlSubject(action, payload);
-    this.assertNotPending(action, subject);
-    const reservation = this.reservePending(action, subject);
-    try {
-      const controlState = await this.client.readControlState();
-      if (!controlState) throw new Error("control-state-unavailable");
-      this.assertAuthoritySnapshot(authoritySnapshot);
-      const timestamp = this.now();
-      const request = createControlRequest({ controlState, action, payload, timestamp });
-      await this.client.submitControl(request);
-      await this.trackPending({
-        requestId: request.requestId,
-        kind: "control",
-        action,
-        subject,
-        submittedAt: timestamp,
-        expiresAt: Math.min(timestamp + BRIDGE_TTL_MS, controlState.expiresAt),
-      });
-      return request;
-    } finally {
-      this.releasePendingReservation(reservation);
-    }
+    throw new Error("retired-v04-control");
   }
 
   async submitOperation(action, payload = {}, { proposalId } = {}) {
@@ -2047,11 +1927,6 @@ class ProjectRuntime {
     const subject = operationSubject(action, payload, proposalId);
     this.assertNotPending(action, subject);
     if (!projection.index) throw new Error("operation-projection-unavailable");
-    if (action === "set-repo-mode"
-        && (this.snapshot.dashboard?.capabilities?.includes("project-analysis-control-v1") !== true
-          || this.snapshot.dashboard?.supportedControls?.includes("set-repo-mode") !== true)) {
-      throw new Error("repository-mode-control-not-supported");
-    }
     const detail = proposalId
       ? projection.details?.find((item) => item.proposalId === proposalId)
       : null;
@@ -2081,10 +1956,15 @@ class ProjectRuntime {
             appliedHash: detail?.summary?.rollback?.appliedHash,
             decisionVersion: proposal.decisionVersion + 1,
           };
-      } else if (action === "set-kill-switch" || action === "set-paused" || action === "set-repo-mode") {
-        const controlState = await this.client.readControlState();
-        if (!controlState) throw new Error("control-state-unavailable");
-        wirePayload = { ...payload, settingsVersion: controlState.settingsVersion };
+      } else if ([
+        "set-automatic-recommendations",
+        "set-kill-switch",
+        "set-permission",
+        "set-repo-excluded",
+      ].includes(action)) {
+        const settingsVersion = this.snapshot.dashboard?.settings?.globalSettingsVersion;
+        if (!settingsVersion) throw new Error("automation-settings-authority-unavailable");
+        wirePayload = { ...payload, settingsVersion };
       } else if (action === "replace-global-root-policy") {
         const dashboardSettings = this.snapshot.dashboard?.settings;
         if (!dashboardSettings?.globalSettingsVersion || !dashboardSettings.globalRootPolicyConfirmation) {
@@ -2215,13 +2095,11 @@ class ProjectRuntime {
         terminalizeTuiStateRoot(this.context.stateRootIdentity, this, terminalResponses);
         return;
       }
-      const [projection, controlState, latestExport, inspection, participation, tuiHealth] = await Promise.all([
+      const [projection, latestExport, inspection, participation, tuiHealth] = await Promise.all([
         this.boundedServerCall(() => this.client.read({
           detailProposalIds: this.detailProposalIds,
           context: this.context,
         })),
-        typeof this.client.readControlState === "function"
-          ? this.boundedServerCall(() => this.client.readControlState()) : null,
         typeof this.client.readLatestExport === "function"
           ? this.boundedServerCall(() => this.client.readLatestExport()) : null,
         typeof this.client.readInspection === "function"
@@ -2242,7 +2120,6 @@ class ProjectRuntime {
         phase: projection?.mode === "legacy" ? "legacy" : "ready",
         projection,
         participation,
-        controlState,
         latestExport,
         inspection,
         tuiHealth,
@@ -2258,7 +2135,6 @@ class ProjectRuntime {
         phase: "error",
         projection: projectionWithoutAuthority(this.snapshot.projection),
         participation: this.snapshot.participation,
-        controlState: null,
         latestExport: this.snapshot.latestExport,
         inspection: this.snapshot.inspection,
         error: errorReason(error),
@@ -2294,7 +2170,6 @@ class ProjectRuntime {
       phase: "terminal",
       projection: projectionWithoutAuthority(this.snapshot.projection),
       participation: this.snapshot.participation,
-      controlState: null,
       latestExport: this.snapshot.latestExport,
       inspection: this.snapshot.inspection,
       tuiHealth: null,
@@ -2319,7 +2194,6 @@ class ProjectRuntime {
       phase: "disposed",
       projection: this.snapshot.projection,
       participation: this.snapshot.participation,
-      controlState: this.snapshot.controlState,
       latestExport: this.snapshot.latestExport,
       inspection: this.snapshot.inspection,
       error: null,
@@ -2808,7 +2682,6 @@ class StoreOwner {
         projection: null,
         dashboard: null,
         dashboardError: null,
-        controlState: null,
         latestExport: null,
         inspection: null,
         acknowledgedOutcomes: Object.freeze([]),
@@ -2960,6 +2833,94 @@ class StoreOwner {
     this.globalRuntime = null;
     this.context = null;
   }
+}
+
+// Target-exclusive inert recovery store. Constructed when startup trust
+// resolution (state root or project identity) fails so the native sidebar,
+// route, and mode-scoped keymap still register a recovery shell. It holds zero
+// authority: it cannot mint grants, publish envelopes, read private projections,
+// or mutate server state. Its refresh() is the user-initiated Retry: it re-runs
+// the injected resolution once per call and updates the diagnostic snapshot.
+/**
+ * @param {Object} input
+ * @param {string} [input.diagnostic]
+ * @param {() => (Promise<{ ok: boolean, diagnostic?: string }> | { ok: boolean, diagnostic?: string })} [input.retry]
+ * @param {() => number} [input.now]
+ */
+export function createInertRecoveryStore({
+  diagnostic,
+  retry,
+  now = Date.now,
+} = {}) {
+  if (typeof now !== "function") throw new TypeError("inert-store-clock-required");
+  let listeners = new Set();
+  let disposed = false;
+  const buildSnapshot = (message) => deepFreeze({
+    phase: "error",
+    stale: false,
+    inert: true,
+    projection: null,
+    dashboard: null,
+    dashboardError: null,
+    acknowledgedOutcomes: Object.freeze([]),
+    runtime: cleanRuntimeMetadata(undefined),
+    pending: Object.freeze([]),
+    responses: Object.freeze([]),
+    global: null,
+    participation: deepFreeze({}),
+    error: boundedDisplayText(message ?? diagnostic ?? "projection-refresh-failed", 240),
+    updatedAt: Math.trunc(now()),
+  });
+  let snapshot = buildSnapshot(diagnostic);
+  const notify = () => {
+    for (const listener of listeners) {
+      try { listener(snapshot); } catch {}
+    }
+  };
+  return Object.freeze({
+    inert: true,
+    getSnapshot() { return snapshot; },
+    subscribe(listener) {
+      if (typeof listener !== "function") throw new TypeError("tui-store-listener-required");
+      if (disposed) return () => {};
+      listeners.add(listener);
+      try { listener(snapshot); } catch {}
+      return () => listeners.delete(listener);
+    },
+    async refresh() {
+      if (disposed) return snapshot;
+      if (typeof retry !== "function") return snapshot;
+      let result;
+      try {
+        result = await retry();
+      } catch (error) {
+        result = { ok: false, diagnostic: error instanceof Error ? error.message : String(error) };
+      }
+      if (result && result.ok) {
+        snapshot = buildSnapshot("Recovery succeeded. Restart OpenCode to load the full control center.");
+      } else {
+        snapshot = buildSnapshot((result && result.diagnostic) || diagnostic);
+      }
+      notify();
+      return snapshot;
+    },
+    selectDetails() { return Promise.resolve(snapshot); },
+    trackPending() { return Promise.resolve(snapshot); },
+    trackGlobalPending() { return Promise.resolve(snapshot); },
+    submitDecision() { return Promise.reject(new Error("inert-store-no-authority")); },
+    submitRecommendationAction() { return Promise.reject(new Error("inert-store-no-authority")); },
+    submitControl() { return Promise.reject(new Error("inert-store-no-authority")); },
+    submitOperation() { return Promise.reject(new Error("inert-store-no-authority")); },
+    prepareGlobalAction() { return Promise.reject(new Error("inert-store-no-authority")); },
+    acknowledgeOutcome() { return snapshot; },
+    acknowledgeGlobalFailure() { return snapshot; },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      listeners.clear();
+      listeners = new Set();
+    },
+  });
 }
 
 export function acquireProjectTuiStore({
