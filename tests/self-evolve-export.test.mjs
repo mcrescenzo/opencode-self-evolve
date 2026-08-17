@@ -353,3 +353,23 @@ test("sensitive export schema rejects forbidden identity metadata in the global 
   }), { ok: false, reason: "forbidden-global-identity" });
   assert.deepEqual(readdirSync(manager.root), []);
 });
+
+test("BH-6 a lock write that fails mid-acquire never wedges later export jobs", (t) => {
+  const root = fixture(t);
+  let failLockWrite = true;
+  const manager = createSensitiveExportManager({
+    stateRoot: root,
+    projectFingerprint: PROJECT,
+    now: () => 1_000,
+    faultInjection: (point) => {
+      if (point === "export-after-lock-write" && failLockWrite) throw new Error("export-lock-write-interrupted");
+    },
+  });
+
+  assert.throws(() => manager.purge(), /export-lock-write-interrupted/u);
+
+  // The failed acquire must not leave an unreclaimable lock behind: the record it
+  // wrote may be truncated, and an unparseable lock is never removed by cleanup.
+  failLockWrite = false;
+  assert.equal(manager.purge().ok, true, "a later export job must still be able to acquire the lock");
+});

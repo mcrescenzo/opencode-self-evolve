@@ -353,9 +353,17 @@ export const UI_CONTROL_CENTER_SETTINGS_ANCHORS = Object.freeze([
     .filter((entry) => entry.section === "settings")
     .map((entry) => entry.anchor)),
 ]);
-export const UI_DASHBOARD_OUTCOMES = Object.freeze([
+// BH-4: the outcomes an evolution cycle itself can report. This is the exact set
+// runEvolutionCycle emits as `cycleOutcome`; anything outside it is coerced to a
+// failure label, so it must be named explicitly rather than sliced positionally
+// out of UI_DASHBOARD_OUTCOMES.
+export const UI_CYCLE_OUTCOMES = Object.freeze([
   "cursor-unchanged", "no-observations", "not-eligible", "valid-no-change",
   "recommendation-created", "applied", "deferred", "failed-closed", "failed",
+  "automatic-disabled", "automatic-baselined", "observed-shadow", "drain-empty",
+]);
+export const UI_DASHBOARD_OUTCOMES = Object.freeze([
+  ...UI_CYCLE_OUTCOMES,
   "rolled-back", "recommendation-approved", "recommendation-rejected",
   "recommendation-snoozed", "recommendation-acknowledged", "breaker-open",
   "breaker-recovered", "automatic-recommendations-on", "automatic-recommendations-off", "emergency-stop-enabled",
@@ -369,6 +377,7 @@ export const UI_DASHBOARD_REASON_CODES = Object.freeze([
   "synthesis-budget-exhausted", "quiet-period", "backoff", "lease-busy",
   "no-change", "critic-rejected", "validation-failed", "apply-deferred",
   "apply-failed", "pipeline-failed", "operation-failed", "three-failures-in-24h",
+  "future-evidence-only",
   "startup-pending", "setup-required", "restart-required", "unsupported-host", "corrupt-state",
   "emergency-stop", "automatic-recommendations-off", "repository-excluded", "unknown",
 ]);
@@ -1396,7 +1405,7 @@ function makeDashboardLastCycle(value, dashboardVersion) {
     "dashboard-last-cycle",
   );
   const common = {
-    outcome: asEnum(value.outcome, UI_DASHBOARD_OUTCOMES.slice(0, 9), "cycle-outcome"),
+    outcome: asEnum(value.outcome, UI_CYCLE_OUTCOMES, "cycle-outcome"),
     triggerClass: asEnum(value.triggerClass, ["manual", "idle", "recovery", "other"], "cycle-trigger-class"),
   };
   const tail = {

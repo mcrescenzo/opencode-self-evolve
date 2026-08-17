@@ -2910,3 +2910,167 @@ test("detail selection is bounded and stale asynchronous generations cannot upda
   assert.equal(store.getSnapshot(), replacement);
   store.dispose();
 });
+
+test("BH-3 a request submitted while a refresh is in flight survives that refresh", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-store-pending-race-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-project-race-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+
+  let releaseRead;
+  const readGate = new Promise((resolve) => { releaseRead = resolve; });
+  let gateArmed = false;
+  const clientFactory = () => ({
+    async read() {
+      if (gateArmed) await readGate;
+      return projection();
+    },
+    async reconcilePending(pending) {
+      return { pending, responses: [] };
+    },
+  });
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), harness(), clientFactory, {
+    now: () => 1_000,
+  }));
+  t.after(() => store.dispose());
+
+  await store.refresh();
+  assert.equal(store.getSnapshot().phase, "ready");
+
+  // A refresh is in flight and parked inside the server read.
+  gateArmed = true;
+  const refreshing = store.refresh();
+  await settle();
+
+  // The operator submits a request during that window.
+  const tracked = store.trackPending({
+    requestId: "bh3-in-flight-request",
+    kind: "operation",
+    action: "export-data",
+    subject: "project",
+    submittedAt: 1_000,
+    expiresAt: 2_000,
+  });
+
+  releaseRead();
+  await refreshing;
+  await tracked;
+
+  assert.deepEqual(
+    store.getSnapshot().pending.map((entry) => entry.requestId),
+    ["bh3-in-flight-request"],
+    "a request submitted during the refresh window must not be discarded by the snapshot-then-replace",
+  );
+});
+
+test("BH-8 a terminal runtime is evicted from its registry once its last owner detaches", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-terminal-evict-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-terminal-evict-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const scheduler = harness();
+  let accepted = false;
+  const clientFactory = (context) => {
+    const grant = {
+      action: "purge-all",
+      capability: UI_ACTION_CAPABILITIES["purge-all"],
+      nonce: "terminal-evict-nonce",
+      expiresAt: 10_000,
+    };
+    return {
+      async read() {
+        return {
+          mode: "native",
+          projectionVersion: UI_PROJECTION_VERSION,
+          operationProtocolVersion: 2,
+          index: {
+            projectFingerprint: context.projectFingerprint,
+            stateRootIdentity: context.stateRootIdentity,
+            generation: "a".repeat(64),
+            projectionHash: "b".repeat(64),
+            capabilities: UI_CAPABILITIES,
+            allowedActions: [grant],
+          },
+          dashboard: dashboard(),
+          details: [],
+          effectiveIndexActions: [grant],
+          effectiveDetailActions: {},
+        };
+      },
+      async submitOperation() { accepted = true; },
+      async reconcilePending(entries) {
+        if (!accepted) return { pending: entries, responses: [] };
+        return {
+          pending: [],
+          responses: entries.map((entry) => ({
+            ...entry,
+            response: { ok: true, status: "accepted-terminal", processedAt: 1_101, reason: null },
+          })),
+        };
+      },
+    };
+  };
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, clientFactory, { now: () => 1_100 }));
+  await store.refresh();
+  await store.submitOperation("purge-all", { confirmation: "PURGE ALL SELF-EVOLVE 0.4.0" });
+  assert.equal(store.getSnapshot().phase, "terminal");
+  assert.equal(__testTuiStore.projectRegistrySize(), 1);
+
+  store.dispose();
+
+  assert.equal(__testTuiStore.projectRegistrySize(), 0, "a terminal project runtime must not outlive its last owner");
+  assert.equal(__testTuiStore.globalRegistrySize(), 0, "a terminal global runtime must not outlive its last owner");
+});
+
+test("circuit breaker: repeated refresh failures back off polling, gate watcher refreshes, and reset on success", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-breaker-root-"));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-tui-breaker-project-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(worktree, { recursive: true, force: true }));
+  const scheduler = harness();
+  let failing = true;
+  const store = acquireProjectTuiStore(options(apiFor(root, worktree), scheduler, () => ({
+    async read() { return { ...projection(), dashboard: dashboard() }; },
+  }), {
+    globalClientFactory() {
+      return {
+        read() {
+          if (failing) throw new Error("mutation-lock-timeout");
+          return Object.freeze({ mode: "limited" });
+        },
+      };
+    },
+  }));
+  await settle();
+
+  for (let index = 0; index < 4; index += 1) {
+    scheduler.tick();
+    await settle();
+  }
+  const degraded = store.getSnapshot().global;
+  assert.equal(degraded.health.degraded, true);
+  assert.equal(degraded.health.reason, "mutation-lock-timeout");
+  assert.ok(degraded.health.consecutiveFailures >= 3);
+
+  const backedOff = [...scheduler.intervals].filter((timer) => timer.milliseconds > 50);
+  assert.ok(backedOff.length >= 1, "the failing runtime's poll cadence must back off past the base interval");
+
+  const revisionBefore = store.getSnapshot().global.revision;
+  for (const watcher of scheduler.watchers) watcher.callback("change");
+  await settle();
+  assert.equal(
+    store.getSnapshot().global.revision,
+    revisionBefore,
+    "a watcher event must not refresh through an open breaker",
+  );
+
+  failing = false;
+  scheduler.tick();
+  await settle();
+  const healthy = store.getSnapshot().global;
+  assert.equal(healthy.health.degraded, false);
+  assert.equal(healthy.health.consecutiveFailures, 0);
+  const cadences = [...scheduler.intervals].map((timer) => timer.milliseconds);
+  assert.ok(cadences.every((milliseconds) => milliseconds === 50), `all cadences must restore to the base interval, saw ${cadences}`);
+  store.dispose();
+});

@@ -860,3 +860,100 @@ test("H7-001 triggerCandidateDrain without projectFingerprint uses the configure
   assert.equal(work[0].projectFingerprint, PROJECT);
   scheduler.dispose();
 });
+
+test("BH-1 an episode-cursor read failure fails the scheduling pass safely, not as an unhandled rejection", async (t) => {
+  const rejections = [];
+  const onRejection = (reason) => rejections.push(reason);
+  process.on("unhandledRejection", onRejection);
+  t.after(() => process.off("unhandledRejection", onRejection));
+
+  const work = [];
+  const { scheduler, store } = fixture(t, {
+    enqueueWork(item) {
+      work.push(item);
+      return new Promise(() => {});
+    },
+  });
+  const readRecords = store.readRecords.bind(store);
+  store.readRecords = (kind) => {
+    if (kind === "episode-cursor") throw new Error("lock-acquisition-timeout");
+    return readRecords(kind);
+  };
+
+  await scheduler.handleEvent(idle("cursor-read-failure"));
+  await waitFor(() => work.length === 1, "episode admitted despite an episode-cursor read failure");
+
+  await wait(15);
+  assert.deepEqual(rejections, [], "a cursor read failure must not surface as an unhandled rejection");
+  scheduler.dispose();
+});
+
+test("BH-7 episode admission re-reads the durable breaker epoch tripped by a peer process", async (t) => {
+  const work = [];
+  const { scheduler, store } = fixture(t, {
+    enqueueWork(item) {
+      work.push(item);
+      return new Promise(() => {});
+    },
+  });
+
+  // A peer process trips the durable root-global breaker after this scheduler was constructed.
+  store.breakerEpochTripped = () => true;
+
+  await scheduler.handleEvent(idle("peer-tripped-breaker"));
+  await wait(30);
+  assert.equal(work.length, 0, "a durably tripped breaker must suppress admission in this process too");
+
+  // The same fixture admits normally once the durable breaker is closed again.
+  store.breakerEpochTripped = () => false;
+  await scheduler.handleEvent(idle("peer-closed-breaker"));
+  await waitFor(() => work.length === 1, "admission resumes when the durable breaker is closed");
+  scheduler.dispose();
+});
+
+test("BH-7 triggerCandidateDrain re-reads the durable breaker epoch tripped by a peer process", async (t) => {
+  const { scheduler, store } = fixture(t);
+
+  store.breakerEpochTripped = () => true;
+
+  const result = scheduler.triggerCandidateDrain({ projectFingerprint: PROJECT });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "circuit-breaker-open");
+  scheduler.dispose();
+});
+
+test("BH-7 a tripped breaker epoch with no stored breaker record fails closed instead of throwing", (t) => {
+  const { store, clock } = fixture(t);
+  store.breakerEpochTripped = () => true;
+
+  const scheduler = createScheduler({
+    store,
+    privacy: {},
+    budgets: { idleDebounceMs: 5 },
+    now: () => clock.value,
+    enqueueWork: () => new Promise(() => {}),
+  });
+  t.after(() => scheduler.dispose());
+
+  assert.equal(scheduler.getCircuitBreaker().open, true);
+});
+
+test("BH-7 an unreadable breaker record fails closed instead of throwing", (t) => {
+  const { store, clock } = fixture(t);
+  const readRecords = store.readRecords.bind(store);
+  store.readRecords = (kind) => {
+    if (kind === "circuit-breaker") throw new Error("state-file-unsafe");
+    return readRecords(kind);
+  };
+
+  const scheduler = createScheduler({
+    store,
+    privacy: {},
+    budgets: { idleDebounceMs: 5 },
+    now: () => clock.value,
+    enqueueWork: () => new Promise(() => {}),
+  });
+  t.after(() => scheduler.dispose());
+
+  assert.equal(scheduler.getCircuitBreaker().open, true);
+});

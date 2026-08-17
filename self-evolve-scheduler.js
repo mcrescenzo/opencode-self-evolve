@@ -94,9 +94,17 @@ function safeAutomation(store) {
 }
 
 function latestCursor(store, sessionIDHash) {
-  const records = store.readRecords?.("episode-cursor") ?? [];
-  return records.filter((record) => record?.payload?.sessionIDHash === sessionIDHash).at(-1)?.payload
-    ?? makeEpisodeCursor({ sessionIDHash });
+  // BH-1: store reads throw for ordinary reasons (lock-acquisition timeout, a
+  // terminal epoch, an unsafe state file). Fail safe to a fresh cursor like the
+  // other store readers in this module rather than propagating out of the
+  // fire-and-forget reserveEpisode path as an unhandled rejection.
+  try {
+    const records = store.readRecords?.("episode-cursor") ?? [];
+    return records.filter((record) => record?.payload?.sessionIDHash === sessionIDHash).at(-1)?.payload
+      ?? makeEpisodeCursor({ sessionIDHash });
+  } catch {
+    return makeEpisodeCursor({ sessionIDHash });
+  }
 }
 
 function parseClock(value) {
@@ -194,6 +202,18 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     });
   }
 
+  // BH-7: an open breaker is only well-formed with openedAt and reason, so the
+  // fail-closed paths below must build one that actually validates — otherwise
+  // "fail closed" throws out of latestBreaker instead of reporting an open breaker.
+  function openBreaker(reason, tripCount) {
+    return makeCircuitBreaker({
+      open: true,
+      openedAt: now(),
+      reason,
+      tripCount: Number.isSafeInteger(tripCount) && tripCount > 0 ? tripCount : 0,
+    });
+  }
+
   function latestBreaker() {
     try {
       const stored = store.readRecords?.("circuit-breaker").at(-1)?.payload;
@@ -202,13 +222,28 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
       // this process's stale view of the per-trip audit records. A corrupt
       // breaker epoch fails closed (tripped).
       if (store.breakerEpochTripped?.() === true) {
-        return stored?.open === true
-          ? stored
-          : makeCircuitBreaker({ open: true, tripCount: Math.max(0, Number(stored?.tripCount ?? 0)) });
+        return stored?.open === true ? stored : openBreaker("breaker-epoch-tripped", stored?.tripCount);
       }
       return stored ?? makeCircuitBreaker({ open: false, tripCount: 0 });
     } catch {
-      return makeCircuitBreaker({ open: true, tripCount: 0 });
+      return openBreaker("breaker-read-failed");
+    }
+  }
+
+  // BH-7: the process-local `breaker` only moves when THIS process trips or
+  // resets it, so a peer's trip was invisible to this process's admission
+  // boundaries. The durable root-global breaker epoch is the cross-process truth
+  // and must be read fresh at every admission boundary. Open means "locally open
+  // OR durably tripped": a peer trip suppresses admission here immediately, a
+  // peer reset lets it resume, and a local trip stays sticky until this process
+  // resets it. An unreadable epoch fails closed. It deliberately does not write
+  // back to `breaker`, which stays this process's own trip/reset record.
+  function breakerOpenNow() {
+    if (breaker.open) return true;
+    try {
+      return store.breakerEpochTripped?.() === true;
+    } catch {
+      return true;
     }
   }
 
@@ -276,7 +311,20 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     clearTimer(state);
     state.timer = setTimeout(() => {
       state.timer = null;
-      void reserveEpisode(state);
+      // BH-1: this is the only fire-and-forget entry into reserveEpisode. Nothing
+      // downstream catches, and the host registers no unhandledRejection handler,
+      // so any unguarded throw would take the host process down. Fail closed to a
+      // recorded scheduler failure instead.
+      void reserveEpisode(state).catch((error) => {
+        try {
+          audit("scheduler-failure", {
+            sessionIDHash: hashSessionLineage(state.sessionID),
+            reason: String(error?.message ?? error).slice(0, 400),
+          }, now());
+        } catch (auditError) {
+          log({ level: "warn", action: "scheduler-failure-audit", error: String(auditError?.message ?? auditError) });
+        }
+      });
     }, Math.max(0, delay));
     state.timer.unref?.();
   }
@@ -408,7 +456,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     const timestamp = now();
     cleanupStaleSessions(timestamp);
     const automation = safeAutomation(store);
-    if (!automation?.enabled || breaker.open
+    if (!automation?.enabled || breakerOpenNow()
         || automation.global.killSwitchActive || automation.repo.excluded) return;
     const settings = automation;
     cachedMode = "auto";
@@ -725,7 +773,7 @@ export function createScheduler({ store, privacy, budgets = {}, now = () => Date
     if (!automation?.enabled) return { ok: false, reason: "automatic-recommendations-disabled" };
     const settings = automation;
     cachedMode = "auto";
-    if (breaker.open) return { ok: false, reason: "circuit-breaker-open" };
+    if (breakerOpenNow()) return { ok: false, reason: "circuit-breaker-open" };
     const resolvedProject = projectFingerprint ?? settings?.repo?.projectFingerprint;
     if (!resolvedProject) return { ok: false, reason: "project-fingerprint-required" };
     const budget = runBudgetCheck(timestamp, settings);

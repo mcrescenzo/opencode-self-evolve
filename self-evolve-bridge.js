@@ -30,7 +30,7 @@ import {
   makeRepoSettings,
   validateGlobalActionAuthority,
 } from "./self-evolve-schemas.js";
-import { processIsAlive, withStateMutationLock } from "./self-evolve-lock.js";
+import { processIsAlive, sweepMutationLockResidue, withStateMutationLock } from "./self-evolve-lock.js";
 import {
   revalidateStateRootBoundary,
   stateRootIdentity as computeStateRootIdentity,
@@ -2016,11 +2016,52 @@ function globalLimitedResult(negotiation) {
   });
 }
 
+// Torn-read signals: a concurrent projection republish observed mid-read by
+// the lock-free path below. Each is either transient (retry sees a consistent
+// generation) or a genuine corruption that will still throw after the retries.
+const GLOBAL_PROJECTION_READ_ATTEMPTS = 3;
+const GLOBAL_PROJECTION_TORN_READS = new Set([
+  "global-detail-vanished",
+  "global-grant-vanished",
+  "global-detail-unlisted",
+  "global-detail-index-mismatch",
+  "global-grant-detail-unavailable",
+  "global-grant-binding-mismatch",
+  "global-recommendation-index-replaced",
+  "global-projection-generation-unavailable",
+]);
+
+function isTornGlobalProjectionRead(error) {
+  return error?.code === "ENOENT" || GLOBAL_PROJECTION_TORN_READS.has(error?.message);
+}
+
 export function readGlobalRecommendationProjection(stateRoot, options = {}) {
   const now = options.now ?? Date.now();
   const clientOffer = Object.hasOwn(options, "clientOffer") ? options.clientOffer : defaultGlobalProtocolOffer();
   const boundary = stateBoundary(stateRoot);
-  return withStateMutationLock(boundary, () => {
+  // This read is entirely read-only, runs on the 250ms TUI poll path, and used
+  // to serialize on the exclusive cross-process mutation lock — which froze the
+  // TUI for the full lock timeout whenever the lock was contended or wedged
+  // (2026-08-16 incident). It now reads lock-free and optimistically: the index
+  // readback at the end (inode AND bytes unchanged across the whole pass)
+  // proves the projection was not republished mid-read, so a clean pass needs
+  // no lock. A republish observed mid-read surfaces as a torn-read signal and
+  // the whole enumeration restarts, bounded; on exhaustion the last error
+  // propagates and the caller treats it as a transient refresh failure.
+  let lastError = null;
+  for (let attempt = 0; attempt < GLOBAL_PROJECTION_READ_ATTEMPTS; attempt += 1) {
+    try {
+      return readGlobalRecommendationProjectionOnce(boundary, now, clientOffer);
+    } catch (error) {
+      if (!isTornGlobalProjectionRead(error)) throw error;
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+function readGlobalRecommendationProjectionOnce(boundary, now, clientOffer) {
+  {
     const paths = globalBridgePaths(boundary);
     if (!paths) return globalLimitedResult(negotiateGlobalProtocol(null, clientOffer));
     const offerRead = secureProjectionRead(paths, paths.offer, GLOBAL_PROTOCOL_LIMITS.grantBytes, "global-protocol-offer");
@@ -2050,6 +2091,7 @@ export function readGlobalRecommendationProjection(stateRoot, options = {}) {
       const indexed = indexById.get(recommendationId);
       if (!indexed) throw new Error("global-detail-unlisted");
       const read = secureProjectionRead(paths, path.join(generation.details, entry.name), GLOBAL_PROTOCOL_LIMITS.detailBytes, "global-recommendation-detail");
+      if (!read) throw new Error("global-detail-vanished");
       const detail = makeGlobalRecommendationDetail(JSON.parse(read.source), {
         stateRootIdentity: index.stateRootIdentity,
         generation: index.generation,
@@ -2075,6 +2117,7 @@ export function readGlobalRecommendationProjection(stateRoot, options = {}) {
         throw new Error("global-grant-path-rejected");
       }
       const read = secureProjectionRead(paths, path.join(generation.grants, entry.name), GLOBAL_PROTOCOL_LIMITS.grantBytes, "global-action-grant");
+      if (!read) throw new Error("global-grant-vanished");
       const raw = JSON.parse(read.source);
       const detail = detailByHash.get(raw.detailHash);
       if (!detail) throw new Error("global-grant-detail-unavailable");
@@ -2106,7 +2149,7 @@ export function readGlobalRecommendationProjection(stateRoot, options = {}) {
       grants: Object.freeze(freshGrants.sort((left, right) => left.recommendationId.localeCompare(right.recommendationId)
         || left.action.localeCompare(right.action))),
     });
-  });
+  }
 }
 
 export function publishProjectParticipationSidecars(stateRoot, projectFingerprint, sidecars, { now = Date.now() } = {}) {
@@ -3326,6 +3369,8 @@ export function cleanupBridge(stateRoot, projectFingerprint, { now = Date.now(),
       removed += cleanupUiProjectionUnlocked(paths, projectFingerprint, now);
       const globalPaths = globalBridgePaths(paths.boundary);
       if (globalPaths) removed += cleanupGlobalMailboxArtifactsUnlocked(globalPaths, now);
+      const lockResidue = sweepMutationLockResidue(paths.boundary);
+      removed += lockResidue.staleLinks + lockResidue.claims + lockResidue.malformed + lockResidue.temps;
     });
     return { ok: true, removed };
   } finally {

@@ -42,7 +42,7 @@ import {
   UI_ACTION_CAPABILITIES,
   UI_CAPABILITIES,
   UI_DASHBOARD_CAPABILITIES,
-  UI_DASHBOARD_OUTCOMES,
+  UI_CYCLE_OUTCOMES,
   UI_DASHBOARD_REASON_CODES,
   UI_OPERATION_ACTIONS,
   UI_PROTOCOL_LIMITS,
@@ -52,7 +52,7 @@ import { boundedHostCall, cleanupSession, deleteSession, listSessions } from "./
 import { createSensitiveExportManager, readLatestSensitiveExport } from "./self-evolve-export.js";
 
 const RESTART_REMINDER = "OpenCode must be restarted for the new skill content to load in existing sessions; new sessions will pick it up automatically.";
-const CYCLE_OUTCOMES = new Set(UI_DASHBOARD_OUTCOMES.slice(0, 9));
+const CYCLE_OUTCOMES = new Set(UI_CYCLE_OUTCOMES);
 const CYCLE_REASONS = new Set(UI_DASHBOARD_REASON_CODES);
 const DEFAULT_ROLLOUT_GATES = Object.freeze({
   offlineCorpus: false,
@@ -1422,7 +1422,16 @@ export function createIntegration({
         void (async () => {
           try {
             await startWorkDrain();
-            sensitiveExportManager?.purge();
+            // BH-2: purging the sensitive-export subdirectory throws for ordinary
+            // reasons (an export job still in flight, a non-plain-file entry).
+            // Isolate it so it can never skip the scope-wide erasure below, which
+            // is the whole point of the operation. Matches the boot-recovery
+            // duplicate of this sequence.
+            try {
+              sensitiveExportManager?.purge();
+            } catch (exportPurgeError) {
+              lastError = errorReasonCode(exportPurgeError, "sensitive-export-purge-failed");
+            }
             privacy.purgeScope({ scope: "all" });
           } catch (error) {
             lastError = errorReasonCode(error, "unknown-error");

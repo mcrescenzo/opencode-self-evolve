@@ -16,7 +16,22 @@ import {
 } from "./self-evolve-state-root.js";
 import { readTuiHostHealth } from "./self-evolve-bridge.js";
 import { MIGRATION_NOTE } from "./self-evolve-commands.js";
+import { configureMutationLockEvents, sweepMutationLockResidue } from "./self-evolve-lock.js";
 import { errorReasonCode } from "./self-evolve-schemas.js";
+
+// Mutation-lock health must be diagnosable from logs (the 2026-08-16 lock-wedge
+// incident produced zero application-level evidence and needed strace). Events
+// are throttled per type so a degraded lock cannot flood the host log.
+const LOCK_EVENT_LOG_INTERVAL_MS = 5_000;
+const lockEventLastLogged = new Map();
+configureMutationLockEvents((event) => {
+  const type = event?.event ?? "unknown";
+  const now = Date.now();
+  const last = lockEventLastLogged.get(type);
+  if (last !== undefined && now - last < LOCK_EVENT_LOG_INTERVAL_MS) return;
+  lockEventLastLogged.set(type, now);
+  try { console.error(`[self-evolve] mutation-lock ${type} ${JSON.stringify(event)}`); } catch {}
+});
 
 /**
  * @typedef {import("@opencode-ai/plugin").Plugin} OpenCodePlugin
@@ -871,6 +886,10 @@ async function createDurablePipeline(ctx, options, selectedStateRoot, compatibil
   if (typeof options.pipelineFactory === "function") return { integration: await options.pipelineFactory({ ctx, options, identity }), identity };
   const stateRoot = selectedStateRoot ?? await resolveStateRoot(ctx, options);
   if (!stateRoot) return null;
+  // Startup janitor: collect lock residue left by killed processes (.stale.*
+  // hard links, orphaned .stale-recovery claims, .new.* temps, .malformed.*
+  // quarantines) so it can never accumulate across sessions again.
+  try { sweepMutationLockResidue(stateRoot); } catch {}
   const [pipelineModule, inventoryModule, privacyModule, synthesisModule, applierModule, commandsModule, schemasModule, observationModule, schedulerModule, integrationModule] = await Promise.all([
     import("./self-evolve-pipeline.js"),
     import("./self-evolve-inventory.js"),

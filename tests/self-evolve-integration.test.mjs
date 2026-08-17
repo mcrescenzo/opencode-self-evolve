@@ -287,6 +287,7 @@ function harness(t, config = {}) {
       return {
         async runEvolutionCycle(args) {
           calls.cycles.push(args);
+          if (config.cycleResult) return config.cycleResult;
           if (config.deferredCycle) {
             config.deferredCycle.signal = args.options?.signal;
             return config.deferredCycle.promise;
@@ -782,4 +783,86 @@ test("root-policy replacement remains an explicit separately validated operation
     canCreate: root.canCreate,
   })), [{ canonicalPath: approvedRoot, canUpdate: true, canCreate: true }]);
   assert.equal(h.integration.__testBridge.getAutomation().enabled, true);
+});
+
+test("BH-2 a failing sensitive-export purge still runs the scope-wide privacy purge", async (t) => {
+  const purges = [];
+  const h = harness(t, {
+    initialClock: Date.now(),
+    inventory: inventoryModule,
+    privacy: () => ({
+      exportScope: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
+      exportAll: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
+      exportGlobalRecommendations: () => ({ projectFingerprint: FINGERPRINT, records: [] }),
+      purgeScope: (args) => { purges.push(args); return { ok: true, counts: {} }; },
+      scanForForbiddenContent: () => ({ ok: true, issues: [] }),
+    }),
+    integrationOptions: {
+      stateRoot: true,
+      // A sensitive export is already in flight, so the export-artifact purge throws.
+      __testCreateSensitiveExportManager: () => ({
+        run: () => ({ ok: true, path: "/nonexistent/export.tar", bytes: 1 }),
+        purge() { throw new Error("export-job-active"); },
+      }),
+      __testSetTerminalPurgeTimeout: (fn) => { queueMicrotask(fn); return { unref() {} }; },
+      __testTerminalPurgeDelayMs: 0,
+    },
+  });
+
+  // Run an export first so the terminal purge actually has an export manager to purge.
+  let projected = await currentProjection(h);
+  const exportRequest = operationRequest(h, projected, "export-data", {
+    scope: "project",
+    confirmation: "EXPORT SENSITIVE SELF-EVOLVE DATA",
+  }, "bh2-export");
+  assert.equal(submitUiOperationRequest(h.root, exportRequest).ok, true);
+  await h.integration.processMailbox();
+
+  projected = await currentProjection(h);
+  const purgeRequest = operationRequest(h, projected, "purge-all", {
+    confirmation: "PURGE ALL SELF-EVOLVE 0.4.0",
+  }, "bh2-purge-all");
+  assert.equal(submitUiOperationRequest(h.root, purgeRequest).ok, true);
+  await h.integration.processMailbox();
+  await h.integration.shutdown();
+
+  assert.deepEqual(
+    purges,
+    [{ scope: "all" }],
+    "the scope-wide privacy purge must still run when the sensitive-export purge throws",
+  );
+});
+
+test("BH-4 a normal automatic-disabled cycle is audited as itself, not as a failure", async (t) => {
+  const h = harness(t, {
+    cycleResult: { result: "automatic-disabled", cycleOutcome: "automatic-disabled", cycleReason: "automatic-recommendations-off" },
+  });
+  await h.integration.boot({ processMailbox: false, recoverHostSessions: false });
+  await h.integration.handleEvent({
+    type: "session.idle",
+    properties: { sessionID: "bh4-automatic-disabled", projectFingerprint: FINGERPRINT },
+  });
+
+  const outcome = h.store.readRecords("audit-event")
+    .map((record) => record.payload.details)
+    .findLast((details) => details?.action === "cycle-outcome");
+  assert.equal(outcome.outcome, "automatic-disabled");
+  assert.equal(outcome.reason, "automatic-recommendations-off");
+});
+
+test("BH-4 a normal automatic-baselined cycle keeps its own outcome and reason", async (t) => {
+  const h = harness(t, {
+    cycleResult: { result: "automatic-baselined", cycleOutcome: "automatic-baselined", cycleReason: "future-evidence-only" },
+  });
+  await h.integration.boot({ processMailbox: false, recoverHostSessions: false });
+  await h.integration.handleEvent({
+    type: "session.idle",
+    properties: { sessionID: "bh4-automatic-baselined", projectFingerprint: FINGERPRINT },
+  });
+
+  const outcome = h.store.readRecords("audit-event")
+    .map((record) => record.payload.details)
+    .findLast((details) => details?.action === "cycle-outcome");
+  assert.equal(outcome.outcome, "automatic-baselined");
+  assert.equal(outcome.reason, "future-evidence-only");
 });

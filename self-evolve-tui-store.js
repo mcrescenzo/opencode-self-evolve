@@ -38,6 +38,12 @@ import {
 } from "./self-evolve-ui-protocol.js";
 
 const DEFAULT_POLL_MS = 250;
+// Circuit breaker for the refresh loop: after this many consecutive refresh
+// failures the poll cadence backs off exponentially (capped) instead of
+// retrying a failing server call at full rate forever, and the snapshot
+// carries a degraded-health record for the UI. One success restores cadence.
+const BREAKER_OPEN_THRESHOLD = 3;
+const BREAKER_MAX_INTERVAL_MS = 30_000;
 const MIN_POLL_MS = 25;
 const MAX_POLL_MS = 5_000;
 const DEFAULT_SERVER_RESPONSE_MS = 5_000;
@@ -305,6 +311,19 @@ function cleanDetailIds(value) {
     throw new TypeError("resident-details-out-of-bounds");
   }
   return Object.freeze([...ids].sort());
+}
+
+// BH-3: a refresh pass snapshots the pending map, then awaits the server. Any
+// request submitted during that window lands in the live map, so committing the
+// snapshot wholesale would silently discard it and its outcome would never
+// surface. Reconcile only the requests this pass took responsibility for and
+// keep everything that arrived meanwhile.
+function mergePending(live, reconciled, reconciling) {
+  const merged = new Map(reconciled.map((entry) => [entry.requestId, entry]));
+  for (const [requestId, entry] of live) {
+    if (!reconciling.has(requestId)) merged.set(requestId, entry);
+  }
+  return merged;
 }
 
 function cleanPending(value) {
@@ -1634,6 +1653,7 @@ export function buildControlCenterModel(snapshot, options = {}) {
       diagnostic: boundedDisplayText(snapshot?.error ?? "projection-refresh-failed", 240),
       canRetry: true,
     } : null,
+    health: degradedHealthView(snapshot),
     operational: deriveOperationalView(snapshot),
     sections: {
       home: buildHomeModel(snapshot),
@@ -1645,6 +1665,20 @@ export function buildControlCenterModel(snapshot, options = {}) {
       settings: buildSettingsModel(snapshot),
     },
   });
+}
+
+// Degraded-health banner input: the worse of the project and global runtimes'
+// circuit-breaker states, or null when neither breaker is open.
+function degradedHealthView(snapshot) {
+  const candidates = [snapshot?.health, snapshot?.global?.health].filter((health) => health?.degraded);
+  if (!candidates.length) return null;
+  const worst = candidates.sort((left, right) => (right.consecutiveFailures ?? 0) - (left.consecutiveFailures ?? 0))[0];
+  return {
+    degraded: true,
+    reason: boundedDisplayText(worst.reason ?? "refresh-degraded", 240),
+    consecutiveFailures: worst.consecutiveFailures ?? 0,
+    nextRetryAt: worst.nextRetryAt ?? null,
+  };
 }
 
 class ProjectRuntime {
@@ -1679,6 +1713,9 @@ class ProjectRuntime {
     this.watcher = null;
     this.watcherError = null;
     this.readCount = 0;
+    this.consecutiveFailures = 0;
+    this.lastFailureReason = null;
+    this.breakerNextRetryAt = 0;
     this.snapshot = this.makeSnapshot({
       phase: "initializing",
       projection: null,
@@ -1730,6 +1767,12 @@ class ProjectRuntime {
       responses: this.responses,
       watcher: this.watcher ? "active" : "polling",
       watcherError: this.watcherError,
+      health: {
+        degraded: this.consecutiveFailures >= BREAKER_OPEN_THRESHOLD,
+        reason: this.lastFailureReason,
+        consecutiveFailures: this.consecutiveFailures,
+        nextRetryAt: this.breakerNextRetryAt || null,
+      },
       revision: this.readCount,
       updatedAt: this.now(),
       error,
@@ -1757,7 +1800,12 @@ class ProjectRuntime {
 
   detach(owner) {
     this.owners.delete(owner);
-    if (this.owners.size === 0 && !this.terminal) this.dispose();
+    // BH-8: a terminal runtime stays live for the owners still showing its
+    // terminal snapshot, but once the last one detaches nothing can observe it
+    // again and it must leave the registry. Terminality for later owners comes
+    // from terminalStateRoots, not from this entry, so a fresh runtime for the
+    // same state root still terminalizes itself on construction.
+    if (this.owners.size === 0) this.dispose();
   }
 
   notify() {
@@ -1770,6 +1818,9 @@ class ProjectRuntime {
       const watcher = this.watch(this.context.watchPath, { persistent: false }, (eventType) => {
         if (this.disposed) return;
         if (eventType === "rename") this.closeWatcher("watched-directory-replaced");
+        // An open breaker also gates watcher-driven refreshes: an fs event storm
+        // must not bypass the backed-off cadence and re-enter a failing refresh.
+        if (this.breakerOpen()) return;
         this.requestRefresh(`watch:${eventType ?? "change"}`);
       });
       this.watcher = watcher;
@@ -1777,6 +1828,7 @@ class ProjectRuntime {
       watcher?.on?.("error", (error) => {
         if (this.disposed || watcher !== this.watcher) return;
         this.closeWatcher(errorReason(error));
+        if (this.breakerOpen()) return;
         this.requestRefresh("watch:error");
       });
     } catch (error) {
@@ -1798,6 +1850,35 @@ class ProjectRuntime {
     if (this.disposed) return;
     this.armWatcher();
     this.requestRefresh("poll");
+  }
+
+  breakerOpen() {
+    return this.consecutiveFailures >= BREAKER_OPEN_THRESHOLD;
+  }
+
+  rearmPollTimer(intervalMs) {
+    if (this.disposed || this.terminal || !this.pollTimer) return;
+    this.clearInterval(this.pollTimer);
+    this.pollTimer = this.setInterval(() => this.poll(), intervalMs);
+    this.pollTimer?.unref?.();
+  }
+
+  noteRefreshFailure() {
+    this.consecutiveFailures += 1;
+    if (!this.breakerOpen()) return;
+    const step = this.consecutiveFailures - BREAKER_OPEN_THRESHOLD;
+    const backoff = Math.min(this.pollMs * 2 ** (step + 1), BREAKER_MAX_INTERVAL_MS);
+    const interval = Math.round(backoff * (1 + Math.random() * 0.25));
+    this.breakerNextRetryAt = this.now() + interval;
+    this.rearmPollTimer(interval);
+  }
+
+  noteRefreshSuccess() {
+    if (this.consecutiveFailures === 0) return;
+    this.consecutiveFailures = 0;
+    this.lastFailureReason = null;
+    this.breakerNextRetryAt = 0;
+    this.rearmPollTimer(this.pollMs);
   }
 
   selectDetails(ids) {
@@ -2036,6 +2117,12 @@ class ProjectRuntime {
     for (const waiter of settled) waiter.resolve(this.snapshot);
   }
 
+  // CAUTION: this bound is inert for a synchronous `operation`. The timeout is
+  // scheduled on the same event loop the operation runs on, so a client that
+  // blocks synchronously (every default client method is sync) can never be
+  // interrupted by it — the microtask drains before the timers phase. It only
+  // protects against genuinely asynchronous clients that stall. Do not rely on
+  // serverResponseMs to bound a synchronous call; keep sync client work short.
   async boundedServerCall(operation) {
     let timer;
     try {
@@ -2057,6 +2144,7 @@ class ProjectRuntime {
     this.refreshInFlight = true;
     const lease = this.epoch;
     let pending = [...this.pending.values()];
+    const reconciling = new Set(this.pending.keys());
     let responses = [];
     try {
       if (pending.length) {
@@ -2113,9 +2201,10 @@ class ProjectRuntime {
       this.acknowledgedOutcomes = Object.freeze(
         this.acknowledgements?.read?.(this.context.projectFingerprint) ?? [],
       );
-      this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
+      this.pending = mergePending(this.pending, pending, reconciling);
       this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
       this.readCount += 1;
+      this.noteRefreshSuccess();
       this.snapshot = this.makeSnapshot({
         phase: projection?.mode === "legacy" ? "legacy" : "ready",
         projection,
@@ -2128,9 +2217,11 @@ class ProjectRuntime {
       this.notify();
     } catch (error) {
       if (this.disposed || lease !== this.epoch) return;
-      this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
+      this.pending = mergePending(this.pending, pending, reconciling);
       this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
       this.readCount += 1;
+      this.lastFailureReason = errorReason(error);
+      this.noteRefreshFailure();
       this.snapshot = this.makeSnapshot({
         phase: "error",
         projection: projectionWithoutAuthority(this.snapshot.projection),
@@ -2229,6 +2320,9 @@ class GlobalRuntime {
     this.watcher = null;
     this.watcherError = null;
     this.readCount = 0;
+    this.consecutiveFailures = 0;
+    this.lastFailureReason = null;
+    this.breakerNextRetryAt = 0;
     this.snapshot = this.makeSnapshot({ phase: "initializing", projection: null, error: null });
     this.pollTimer = null;
     if (terminalStateRoots.has(context.stateRootIdentity)) this.terminalize();
@@ -2250,6 +2344,12 @@ class GlobalRuntime {
       responses: this.responses,
       watcher: this.watcher ? "active" : "polling",
       watcherError: this.watcherError,
+      health: {
+        degraded: this.consecutiveFailures >= BREAKER_OPEN_THRESHOLD,
+        reason: this.lastFailureReason,
+        consecutiveFailures: this.consecutiveFailures,
+        nextRetryAt: this.breakerNextRetryAt || null,
+      },
       revision: this.readCount,
       updatedAt: this.now(),
       error,
@@ -2266,7 +2366,12 @@ class GlobalRuntime {
 
   detach(owner) {
     this.owners.delete(owner);
-    if (this.owners.size === 0 && !this.terminal) this.dispose();
+    // BH-8: a terminal runtime stays live for the owners still showing its
+    // terminal snapshot, but once the last one detaches nothing can observe it
+    // again and it must leave the registry. Terminality for later owners comes
+    // from terminalStateRoots, not from this entry, so a fresh runtime for the
+    // same state root still terminalizes itself on construction.
+    if (this.owners.size === 0) this.dispose();
   }
 
   notify() {
@@ -2279,6 +2384,9 @@ class GlobalRuntime {
       const watcher = this.watch(this.context.globalWatchPath, { persistent: false }, (eventType) => {
         if (this.disposed) return;
         if (eventType === "rename") this.closeWatcher("watched-global-directory-replaced");
+        // An open breaker also gates watcher-driven refreshes: an fs event storm
+        // must not bypass the backed-off cadence and re-enter a failing refresh.
+        if (this.breakerOpen()) return;
         this.requestRefresh(`global-watch:${eventType ?? "change"}`);
       });
       this.watcher = watcher;
@@ -2286,6 +2394,7 @@ class GlobalRuntime {
       watcher?.on?.("error", (error) => {
         if (this.disposed || watcher !== this.watcher) return;
         this.closeWatcher(errorReason(error));
+        if (this.breakerOpen()) return;
         this.requestRefresh("global-watch:error");
       });
     } catch (error) {
@@ -2305,6 +2414,35 @@ class GlobalRuntime {
     if (this.disposed || this.terminal) return;
     this.armWatcher();
     this.requestRefresh("global-poll");
+  }
+
+  breakerOpen() {
+    return this.consecutiveFailures >= BREAKER_OPEN_THRESHOLD;
+  }
+
+  rearmPollTimer(intervalMs) {
+    if (this.disposed || this.terminal || !this.pollTimer) return;
+    this.clearInterval(this.pollTimer);
+    this.pollTimer = this.setInterval(() => this.poll(), intervalMs);
+    this.pollTimer?.unref?.();
+  }
+
+  noteRefreshFailure() {
+    this.consecutiveFailures += 1;
+    if (!this.breakerOpen()) return;
+    const step = this.consecutiveFailures - BREAKER_OPEN_THRESHOLD;
+    const backoff = Math.min(this.pollMs * 2 ** (step + 1), BREAKER_MAX_INTERVAL_MS);
+    const interval = Math.round(backoff * (1 + Math.random() * 0.25));
+    this.breakerNextRetryAt = this.now() + interval;
+    this.rearmPollTimer(interval);
+  }
+
+  noteRefreshSuccess() {
+    if (this.consecutiveFailures === 0) return;
+    this.consecutiveFailures = 0;
+    this.lastFailureReason = null;
+    this.breakerNextRetryAt = 0;
+    this.rearmPollTimer(this.pollMs);
   }
 
   selectDetails(ids) {
@@ -2416,6 +2554,12 @@ class GlobalRuntime {
     for (const waiter of settled) waiter.resolve(this.snapshot);
   }
 
+  // CAUTION: this bound is inert for a synchronous `operation`. The timeout is
+  // scheduled on the same event loop the operation runs on, so a client that
+  // blocks synchronously (every default client method is sync) can never be
+  // interrupted by it — the microtask drains before the timers phase. It only
+  // protects against genuinely asynchronous clients that stall. Do not rely on
+  // serverResponseMs to bound a synchronous call; keep sync client work short.
   async boundedServerCall(operation) {
     let timer;
     try {
@@ -2437,6 +2581,7 @@ class GlobalRuntime {
     this.refreshInFlight = true;
     const lease = this.epoch;
     let pending = [...this.pending.values()];
+    const reconciling = new Set(this.pending.keys());
     let responses = [];
     try {
       if (pending.length) {
@@ -2464,9 +2609,10 @@ class GlobalRuntime {
         context: this.context,
       }));
       if (this.disposed || lease !== this.epoch) return;
-      this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
+      this.pending = mergePending(this.pending, pending, reconciling);
       this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
       this.readCount += 1;
+      this.noteRefreshSuccess();
       this.snapshot = this.makeSnapshot({
         phase: projection?.mode === "native" ? "ready" : "limited",
         projection,
@@ -2475,9 +2621,11 @@ class GlobalRuntime {
       this.notify();
     } catch (error) {
       if (this.disposed || lease !== this.epoch) return;
-      this.pending = new Map(pending.map((entry) => [entry.requestId, entry]));
+      this.pending = mergePending(this.pending, pending, reconciling);
       this.responses = deepFreeze([...this.responses, ...responses].slice(-MAX_COMPLETED_RESPONSES));
       this.readCount += 1;
+      this.lastFailureReason = errorReason(error);
+      this.noteRefreshFailure();
       this.snapshot = this.makeSnapshot({
         phase: "error",
         projection: globalProjectionWithoutAuthority(this.snapshot.projection),

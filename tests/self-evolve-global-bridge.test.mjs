@@ -1983,3 +1983,31 @@ test("a dead global projection lease owner never blocks a later publication", as
     [recovered.generation],
   );
 });
+
+test("global projection read is lock-free and torn reads surface as typed signals", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "self-evolve-global-lockfree-read-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = openStore(root, { projectFingerprint: PROJECT, now: () => NOW });
+  t.after(() => store.close());
+  const { projection } = projectionFixture(store.rootIdentity);
+  publishGlobalRecommendationProjection(root, projection, { store, expectedGeneration: null, now: NOW });
+
+  // A live foreign process holds the exclusive mutation lock: the read path
+  // must not serialize on it. Pre-fix, this froze the caller for the full lock
+  // timeout on every 250ms TUI poll tick (the 2026-08-16 incident).
+  const lockPath = path.join(root, ".self-evolve-mutation.lock");
+  fs.writeFileSync(lockPath, `${JSON.stringify({ pid: process.pid, nonce: "foreign-live-lock", acquiredAt: Date.now() })}\n`);
+  try {
+    const started = Date.now();
+    const read = readGlobalRecommendationProjection(root, { now: NOW });
+    assert.equal(read.index.indexHash, projection.index.indexHash);
+    assert.ok(Date.now() - started < 1_000, "the read must not wait on the mutation lock");
+  } finally {
+    fs.rmSync(lockPath, { force: true });
+  }
+
+  // A generation directory swept mid-read (concurrent republish) classifies as
+  // a torn read: bounded retries, then the typed signal — never a TypeError.
+  fs.rmSync(path.join(root, "self-evolve", "bridge", "global", "generations", projection.index.generation), { recursive: true });
+  assert.throws(() => readGlobalRecommendationProjection(root, { now: NOW }), /global-projection-generation-unavailable/u);
+});

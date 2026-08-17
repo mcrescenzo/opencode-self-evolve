@@ -1049,6 +1049,16 @@ function ControlCenter(props: {
         width="100%"
         onMouseScroll={() => cancelDestinationFocus()}
       >
+        <Show when={model().health}>
+          {(health) => (
+            <box border borderColor={props.api.theme.current.warning} paddingLeft={1} paddingRight={1} flexDirection="column">
+              <text><b>Refresh degraded</b>: polling backed off</text>
+              <text fg={props.api.theme.current.textMuted} wrapMode="word">
+                {health().consecutiveFailures} consecutive refresh failures ({health().reason}). Data may be stale until a refresh succeeds.
+              </text>
+            </box>
+          )}
+        </Show>
         <Show when={model().recovery}>
           {(recovery) => (
             <box border borderColor={props.api.theme.current.error} paddingLeft={1} paddingRight={1} flexDirection="column" gap={1}>

@@ -235,23 +235,43 @@ export function createSensitiveExportManager({
     if (active) throw new Error("export-job-active");
     cleanup(timestamp);
     let descriptor;
+    let created = false;
     const nonce = randomBytes(16).toString("hex");
     try {
       descriptor = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NOFOLLOW, FILE_MODE);
-      const source = `${JSON.stringify({
+      created = true;
+      const source = Buffer.from(`${JSON.stringify({
         pid: process.pid,
         issuedAt: timestamp,
         expiresAt: timestamp + ttlMs,
         nonce,
-      })}\n`;
-      writeSync(descriptor, source);
+      })}\n`, "utf8");
+      // BH-6: writeSync may write fewer bytes than supplied — it does not loop the
+      // way writeFileSync does. A short write leaves an unparseable lock record,
+      // and the size readback below is what proves the whole record landed.
+      let written = 0;
+      while (written < source.length) {
+        const chunk = writeSync(descriptor, source, written, source.length - written);
+        if (!(chunk > 0)) throw new Error("export-lock-rejected");
+        written += chunk;
+      }
+      faultInjection?.("export-after-lock-write", { lockPath });
       fsyncSync(descriptor);
       const stat = fstatSync(descriptor);
-      if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== FILE_MODE) throw new Error("export-lock-rejected");
+      if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== FILE_MODE || stat.size !== source.length) {
+        throw new Error("export-lock-rejected");
+      }
       active = true;
       activeNonce = nonce;
     } catch (error) {
       if (error?.code === "EEXIST") throw new Error("export-job-active");
+      // BH-6: this lock was created by this call and never became active. Leaving
+      // it behind wedges every later job: a partial record is unparseable, and
+      // both removeOwnedLock and cleanup ignore a lock they cannot parse, so
+      // nothing would ever reclaim it.
+      if (created) {
+        try { unlinkSync(lockPath); } catch { /* nothing further to reclaim */ }
+      }
       throw error;
     } finally {
       if (descriptor !== undefined) closeSync(descriptor);

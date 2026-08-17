@@ -1109,35 +1109,26 @@ function ControlCenter(props) {
     _$setProp(_el$30, "onMouseScroll", () => cancelDestinationFocus());
     _$insert(_el$30, _$createComponent(Show, {
       get when() {
-        return model().recovery;
+        return model().health;
       },
-      children: (recovery) => (() => {
-        var _el$181 = _$createElement("box"), _el$182 = _$createElement("text"), _el$183 = _$createElement("b"), _el$184 = _$createElement("text"), _el$185 = _$createTextNode(`Latest refresh failed: `), _el$186 = _$createElement("text");
+      children: (health) => (() => {
+        var _el$181 = _$createElement("box"), _el$182 = _$createElement("text"), _el$183 = _$createElement("b"), _el$185 = _$createTextNode(`: polling backed off`), _el$186 = _$createElement("text"), _el$187 = _$createTextNode(` consecutive refresh failures (`), _el$188 = _$createTextNode(`). Data may be stale until a refresh succeeds.`);
         _$insertNode(_el$181, _el$182);
-        _$insertNode(_el$181, _el$184);
         _$insertNode(_el$181, _el$186);
         _$setProp(_el$181, "border", true);
         _$setProp(_el$181, "paddingLeft", 1);
         _$setProp(_el$181, "paddingRight", 1);
         _$setProp(_el$181, "flexDirection", "column");
-        _$setProp(_el$181, "gap", 1);
         _$insertNode(_el$182, _el$183);
-        _$insert(_el$183, () => recovery().stale ? "Read-only stale snapshot" : "Projection unavailable");
-        _$insertNode(_el$184, _el$185);
-        _$setProp(_el$184, "wrapMode", "word");
-        _$insert(_el$184, () => recovery().diagnostic, null);
-        _$insertNode(_el$186, _$createTextNode(`Decision, control, and operation actions are unavailable until a fresh projection is negotiated.`));
+        _$insertNode(_el$182, _el$185);
+        _$insertNode(_el$183, _$createTextNode(`Refresh degraded`));
+        _$insertNode(_el$186, _el$187);
+        _$insertNode(_el$186, _el$188);
         _$setProp(_el$186, "wrapMode", "word");
-        _$insert(_el$181, _$createComponent(Show, {
-          get when() {
-            return recovery().canRetry;
-          },
-          get children() {
-            return localActionButton("Retry", () => void retryProjection());
-          }
-        }), null);
+        _$insert(_el$186, () => health().consecutiveFailures, _el$187);
+        _$insert(_el$186, () => health().reason, _el$188);
         _$effect((_p$) => {
-          var _v$52 = props.api.theme.current.error, _v$53 = props.api.theme.current.textMuted;
+          var _v$52 = props.api.theme.current.warning, _v$53 = props.api.theme.current.textMuted;
           _v$52 !== _p$.e && (_p$.e = _$setProp(_el$181, "borderColor", _v$52, _p$.e));
           _v$53 !== _p$.t && (_p$.t = _$setProp(_el$186, "fg", _v$53, _p$.t));
           return _p$;
@@ -1146,6 +1137,47 @@ function ControlCenter(props) {
           t: undefined
         });
         return _el$181;
+      })()
+    }), null);
+    _$insert(_el$30, _$createComponent(Show, {
+      get when() {
+        return model().recovery;
+      },
+      children: (recovery) => (() => {
+        var _el$189 = _$createElement("box"), _el$190 = _$createElement("text"), _el$191 = _$createElement("b"), _el$192 = _$createElement("text"), _el$193 = _$createTextNode(`Latest refresh failed: `), _el$194 = _$createElement("text");
+        _$insertNode(_el$189, _el$190);
+        _$insertNode(_el$189, _el$192);
+        _$insertNode(_el$189, _el$194);
+        _$setProp(_el$189, "border", true);
+        _$setProp(_el$189, "paddingLeft", 1);
+        _$setProp(_el$189, "paddingRight", 1);
+        _$setProp(_el$189, "flexDirection", "column");
+        _$setProp(_el$189, "gap", 1);
+        _$insertNode(_el$190, _el$191);
+        _$insert(_el$191, () => recovery().stale ? "Read-only stale snapshot" : "Projection unavailable");
+        _$insertNode(_el$192, _el$193);
+        _$setProp(_el$192, "wrapMode", "word");
+        _$insert(_el$192, () => recovery().diagnostic, null);
+        _$insertNode(_el$194, _$createTextNode(`Decision, control, and operation actions are unavailable until a fresh projection is negotiated.`));
+        _$setProp(_el$194, "wrapMode", "word");
+        _$insert(_el$189, _$createComponent(Show, {
+          get when() {
+            return recovery().canRetry;
+          },
+          get children() {
+            return localActionButton("Retry", () => void retryProjection());
+          }
+        }), null);
+        _$effect((_p$) => {
+          var _v$54 = props.api.theme.current.error, _v$55 = props.api.theme.current.textMuted;
+          _v$54 !== _p$.e && (_p$.e = _$setProp(_el$189, "borderColor", _v$54, _p$.e));
+          _v$55 !== _p$.t && (_p$.t = _$setProp(_el$194, "fg", _v$55, _p$.t));
+          return _p$;
+        }, {
+          e: undefined,
+          t: undefined
+        });
+        return _el$189;
       })()
     }), null);
     _$insert(_el$30, _$createComponent(Show, {
@@ -1189,46 +1221,46 @@ function ControlCenter(props) {
             return home().globalReadiness;
           },
           children: (globalReadiness) => (() => {
-            var _el$188 = _$createElement("box"), _el$189 = _$createElement("text"), _el$190 = _$createElement("b"), _el$192 = _$createTextNode(`: `), _el$193 = _$createElement("text"), _el$194 = _$createTextNode(`Protocol: `);
-            _$insertNode(_el$188, _el$189);
-            _$insertNode(_el$188, _el$193);
-            _$setProp(_el$188, "border", true);
-            _$setProp(_el$188, "paddingLeft", 1);
-            _$setProp(_el$188, "paddingRight", 1);
-            _$setProp(_el$188, "flexDirection", "column");
-            _$insertNode(_el$189, _el$190);
-            _$insertNode(_el$189, _el$192);
-            _$insertNode(_el$190, _$createTextNode(`Global recommendations`));
-            _$insert(_el$189, () => globalReadiness().state === "ready" ? "Ready" : "Limited / read-only", null);
-            _$insertNode(_el$193, _el$194);
-            _$setProp(_el$193, "wrapMode", "word");
-            _$insert(_el$193, () => globalReadiness().label, null);
-            _$insert(_el$188, _$createComponent(Show, {
+            var _el$196 = _$createElement("box"), _el$197 = _$createElement("text"), _el$198 = _$createElement("b"), _el$200 = _$createTextNode(`: `), _el$201 = _$createElement("text"), _el$202 = _$createTextNode(`Protocol: `);
+            _$insertNode(_el$196, _el$197);
+            _$insertNode(_el$196, _el$201);
+            _$setProp(_el$196, "border", true);
+            _$setProp(_el$196, "paddingLeft", 1);
+            _$setProp(_el$196, "paddingRight", 1);
+            _$setProp(_el$196, "flexDirection", "column");
+            _$insertNode(_el$197, _el$198);
+            _$insertNode(_el$197, _el$200);
+            _$insertNode(_el$198, _$createTextNode(`Global recommendations`));
+            _$insert(_el$197, () => globalReadiness().state === "ready" ? "Ready" : "Limited / read-only", null);
+            _$insertNode(_el$201, _el$202);
+            _$setProp(_el$201, "wrapMode", "word");
+            _$insert(_el$201, () => globalReadiness().label, null);
+            _$insert(_el$196, _$createComponent(Show, {
               get when() {
                 return globalReadiness().recommendationCount !== null;
               },
               get children() {
-                var _el$195 = _$createElement("text"), _el$196 = _$createTextNode(` global recommendation`);
-                _$insertNode(_el$195, _el$196);
-                _$insert(_el$195, () => globalReadiness().recommendationCount, _el$196);
-                _$insert(_el$195, () => globalReadiness().recommendationCount === 1 ? "" : "s", null);
-                return _el$195;
+                var _el$203 = _$createElement("text"), _el$204 = _$createTextNode(` global recommendation`);
+                _$insertNode(_el$203, _el$204);
+                _$insert(_el$203, () => globalReadiness().recommendationCount, _el$204);
+                _$insert(_el$203, () => globalReadiness().recommendationCount === 1 ? "" : "s", null);
+                return _el$203;
               }
             }), null);
-            _$insert(_el$188, _$createComponent(Show, {
+            _$insert(_el$196, _$createComponent(Show, {
               get when() {
                 return globalReadiness().reason;
               },
               get children() {
-                var _el$197 = _$createElement("text");
-                _$setProp(_el$197, "wrapMode", "word");
-                _$insert(_el$197, () => globalReadiness().reason);
-                _$effect((_$p) => _$setProp(_el$197, "fg", props.api.theme.current.textMuted, _$p));
-                return _el$197;
+                var _el$205 = _$createElement("text");
+                _$setProp(_el$205, "wrapMode", "word");
+                _$insert(_el$205, () => globalReadiness().reason);
+                _$effect((_$p) => _$setProp(_el$205, "fg", props.api.theme.current.textMuted, _$p));
+                return _el$205;
               }
             }), null);
-            _$effect((_$p) => _$setProp(_el$188, "borderColor", globalReadiness().state === "ready" ? props.api.theme.current.borderSubtle : props.api.theme.current.warning, _$p));
-            return _el$188;
+            _$effect((_$p) => _$setProp(_el$196, "borderColor", globalReadiness().state === "ready" ? props.api.theme.current.borderSubtle : props.api.theme.current.warning, _$p));
+            return _el$196;
           })()
         }), null);
         _$insert(_el$31, _$createComponent(Show, {
@@ -1242,31 +1274,31 @@ function ControlCenter(props) {
             _$insertNode(_el$48, _el$49);
             _$insertNode(_el$49, _$createTextNode(`Setup`));
             _$insert(_el$47, () => reactiveChild(() => home().blockers.map((blocker) => (() => {
-              var _el$198 = _$createElement("box"), _el$199 = _$createElement("text"), _el$200 = _$createTextNode(` \xB7 Open `);
-              _$insertNode(_el$198, _el$199);
-              _$setProp(_el$198, "focusable", true);
-              _$setProp(_el$198, "border", true);
-              _$setProp(_el$198, "paddingLeft", 1);
-              _$setProp(_el$198, "paddingRight", 1);
-              _$setProp(_el$198, "on:focused", () => setFocusedControl(`blocker:${blocker.code}`));
-              _$setProp(_el$198, "on:blurred", () => setFocusedControl((current) => current === `blocker:${blocker.code}` ? null : current));
-              _$setProp(_el$198, "onMouseUp", () => navigate(blocker.destination));
-              _$setProp(_el$198, "onKeyDown", (event) => {
+              var _el$206 = _$createElement("box"), _el$207 = _$createElement("text"), _el$208 = _$createTextNode(` \xB7 Open `);
+              _$insertNode(_el$206, _el$207);
+              _$setProp(_el$206, "focusable", true);
+              _$setProp(_el$206, "border", true);
+              _$setProp(_el$206, "paddingLeft", 1);
+              _$setProp(_el$206, "paddingRight", 1);
+              _$setProp(_el$206, "on:focused", () => setFocusedControl(`blocker:${blocker.code}`));
+              _$setProp(_el$206, "on:blurred", () => setFocusedControl((current) => current === `blocker:${blocker.code}` ? null : current));
+              _$setProp(_el$206, "onMouseUp", () => navigate(blocker.destination));
+              _$setProp(_el$206, "onKeyDown", (event) => {
                 if (!isActivationKey(event))
                   return;
                 event.preventDefault();
                 navigate(blocker.destination);
               });
-              _$insertNode(_el$199, _el$200);
-              _$setProp(_el$199, "wrapMode", "word");
-              _$insert(_el$199, () => focusMark(`blocker:${blocker.code}`), _el$200);
-              _$insert(_el$199, () => blocker.summary, _el$200);
-              _$insert(_el$199, (() => {
+              _$insertNode(_el$207, _el$208);
+              _$setProp(_el$207, "wrapMode", "word");
+              _$insert(_el$207, () => focusMark(`blocker:${blocker.code}`), _el$208);
+              _$insert(_el$207, () => blocker.summary, _el$208);
+              _$insert(_el$207, (() => {
                 var _c$7 = _$memo(() => blocker.destination.section === "activity");
                 return () => _c$7() ? "Activity errors" : blocker.destination.section.charAt(0).toUpperCase() + blocker.destination.section.slice(1);
               })(), null);
-              _$effect((_$p) => _$setProp(_el$198, "borderColor", props.api.theme.current.warning, _$p));
-              return _el$198;
+              _$effect((_$p) => _$setProp(_el$206, "borderColor", props.api.theme.current.warning, _$p));
+              return _el$206;
             })())), null);
             return _el$47;
           }
@@ -1276,20 +1308,20 @@ function ControlCenter(props) {
             return home().lastCycle;
           },
           children: (lastCycle) => (() => {
-            var _el$201 = _$createElement("box"), _el$202 = _$createElement("text"), _el$203 = _$createElement("b"), _el$205 = _$createElement("text"), _el$206 = _$createTextNode(` \xB7 `), _el$207 = _$createTextNode(` observations \xB7 `), _el$208 = _$createTextNode(` eligible`);
-            _$insertNode(_el$201, _el$202);
-            _$insertNode(_el$201, _el$205);
-            _$setProp(_el$201, "flexDirection", "column");
-            _$insertNode(_el$202, _el$203);
-            _$insertNode(_el$203, _$createTextNode(`Last cycle`));
-            _$insertNode(_el$205, _el$206);
-            _$insertNode(_el$205, _el$207);
-            _$insertNode(_el$205, _el$208);
-            _$setProp(_el$205, "wrapMode", "word");
-            _$insert(_el$205, () => lastCycle().outcome.replaceAll("-", " "), _el$206);
-            _$insert(_el$205, () => lastCycle().observationCount, _el$207);
-            _$insert(_el$205, () => lastCycle().eligibilityCount, _el$208);
-            return _el$201;
+            var _el$209 = _$createElement("box"), _el$210 = _$createElement("text"), _el$211 = _$createElement("b"), _el$213 = _$createElement("text"), _el$214 = _$createTextNode(` \xB7 `), _el$215 = _$createTextNode(` observations \xB7 `), _el$216 = _$createTextNode(` eligible`);
+            _$insertNode(_el$209, _el$210);
+            _$insertNode(_el$209, _el$213);
+            _$setProp(_el$209, "flexDirection", "column");
+            _$insertNode(_el$210, _el$211);
+            _$insertNode(_el$211, _$createTextNode(`Last cycle`));
+            _$insertNode(_el$213, _el$214);
+            _$insertNode(_el$213, _el$215);
+            _$insertNode(_el$213, _el$216);
+            _$setProp(_el$213, "wrapMode", "word");
+            _$insert(_el$213, () => lastCycle().outcome.replaceAll("-", " "), _el$214);
+            _$insert(_el$213, () => lastCycle().observationCount, _el$215);
+            _$insert(_el$213, () => lastCycle().eligibilityCount, _el$216);
+            return _el$209;
           })()
         }), null);
         _$insert(_el$31, _$createComponent(Show, {
@@ -1297,36 +1329,36 @@ function ControlCenter(props) {
             return home().attention;
           },
           children: (attention) => (() => {
-            var _el$209 = _$createElement("box"), _el$210 = _$createElement("text"), _el$211 = _$createTextNode(` `), _el$212 = _$createTextNode(` needs attention`);
-            _$insertNode(_el$209, _el$210);
-            _$setProp(_el$209, "focusable", true);
-            _$setProp(_el$209, "border", true);
-            _$setProp(_el$209, "paddingLeft", 1);
-            _$setProp(_el$209, "paddingRight", 1);
-            _$setProp(_el$209, "on:focused", () => setFocusedControl("home:attention"));
-            _$setProp(_el$209, "on:blurred", () => setFocusedControl((current) => current === "home:attention" ? null : current));
-            _$setProp(_el$209, "onMouseUp", () => navigate(attention().destination));
-            _$setProp(_el$209, "onKeyDown", (event) => {
+            var _el$217 = _$createElement("box"), _el$218 = _$createElement("text"), _el$219 = _$createTextNode(` `), _el$220 = _$createTextNode(` needs attention`);
+            _$insertNode(_el$217, _el$218);
+            _$setProp(_el$217, "focusable", true);
+            _$setProp(_el$217, "border", true);
+            _$setProp(_el$217, "paddingLeft", 1);
+            _$setProp(_el$217, "paddingRight", 1);
+            _$setProp(_el$217, "on:focused", () => setFocusedControl("home:attention"));
+            _$setProp(_el$217, "on:blurred", () => setFocusedControl((current) => current === "home:attention" ? null : current));
+            _$setProp(_el$217, "onMouseUp", () => navigate(attention().destination));
+            _$setProp(_el$217, "onKeyDown", (event) => {
               if (!isActivationKey(event))
                 return;
               event.preventDefault();
               navigate(attention().destination);
             });
-            _$insertNode(_el$210, _el$211);
-            _$insertNode(_el$210, _el$212);
-            _$insert(_el$210, () => focusMark("home:attention"), _el$211);
-            _$insert(_el$210, () => attention().count, _el$211);
-            _$insert(_el$210, () => attention().kind === "applied" ? "applied change" : "recommendation", _el$212);
+            _$insertNode(_el$218, _el$219);
+            _$insertNode(_el$218, _el$220);
+            _$insert(_el$218, () => focusMark("home:attention"), _el$219);
+            _$insert(_el$218, () => attention().count, _el$219);
+            _$insert(_el$218, () => attention().kind === "applied" ? "applied change" : "recommendation", _el$220);
             _$effect((_p$) => {
-              var _v$54 = focusId("home:attention"), _v$55 = props.api.theme.current.warning;
-              _v$54 !== _p$.e && (_p$.e = _$setProp(_el$209, "id", _v$54, _p$.e));
-              _v$55 !== _p$.t && (_p$.t = _$setProp(_el$209, "borderColor", _v$55, _p$.t));
+              var _v$56 = focusId("home:attention"), _v$57 = props.api.theme.current.warning;
+              _v$56 !== _p$.e && (_p$.e = _$setProp(_el$217, "id", _v$56, _p$.e));
+              _v$57 !== _p$.t && (_p$.t = _$setProp(_el$217, "borderColor", _v$57, _p$.t));
               return _p$;
             }, {
               e: undefined,
               t: undefined
             });
-            return _el$209;
+            return _el$217;
           })()
         }), null);
         _$insert(_el$31, _$createComponent(Show, {
@@ -1334,40 +1366,40 @@ function ControlCenter(props) {
             return home().usage;
           },
           children: (usage) => (() => {
-            var _el$213 = _$createElement("box"), _el$214 = _$createElement("text"), _el$215 = _$createElement("b"), _el$217 = _$createElement("text"), _el$218 = _$createTextNode(`Provider calls: `), _el$219 = _$createTextNode(` / `), _el$220 = _$createElement("text"), _el$221 = _$createTextNode(`Provider calls reset: `), _el$222 = _$createElement("text"), _el$223 = _$createTextNode(`Recommendation synthesis: `), _el$224 = _$createTextNode(` / `), _el$225 = _$createElement("text"), _el$226 = _$createTextNode(`Recommendation synthesis resets: `), _el$227 = _$createElement("text"), _el$228 = _$createTextNode(`Storage: `), _el$229 = _$createTextNode(` / `), _el$230 = _$createTextNode(` bytes`);
-            _$insertNode(_el$213, _el$214);
-            _$insertNode(_el$213, _el$217);
-            _$insertNode(_el$213, _el$220);
-            _$insertNode(_el$213, _el$222);
-            _$insertNode(_el$213, _el$225);
-            _$insertNode(_el$213, _el$227);
-            _$setProp(_el$213, "flexDirection", "column");
-            _$insertNode(_el$214, _el$215);
-            _$insertNode(_el$215, _$createTextNode(`Actual usage`));
-            _$insertNode(_el$217, _el$218);
-            _$insertNode(_el$217, _el$219);
-            _$insert(_el$217, () => usage().provider.used, _el$219);
-            _$insert(_el$217, () => usage().provider.limit, null);
-            _$insertNode(_el$220, _el$221);
-            _$insert(_el$220, (() => {
+            var _el$221 = _$createElement("box"), _el$222 = _$createElement("text"), _el$223 = _$createElement("b"), _el$225 = _$createElement("text"), _el$226 = _$createTextNode(`Provider calls: `), _el$227 = _$createTextNode(` / `), _el$228 = _$createElement("text"), _el$229 = _$createTextNode(`Provider calls reset: `), _el$230 = _$createElement("text"), _el$231 = _$createTextNode(`Recommendation synthesis: `), _el$232 = _$createTextNode(` / `), _el$233 = _$createElement("text"), _el$234 = _$createTextNode(`Recommendation synthesis resets: `), _el$235 = _$createElement("text"), _el$236 = _$createTextNode(`Storage: `), _el$237 = _$createTextNode(` / `), _el$238 = _$createTextNode(` bytes`);
+            _$insertNode(_el$221, _el$222);
+            _$insertNode(_el$221, _el$225);
+            _$insertNode(_el$221, _el$228);
+            _$insertNode(_el$221, _el$230);
+            _$insertNode(_el$221, _el$233);
+            _$insertNode(_el$221, _el$235);
+            _$setProp(_el$221, "flexDirection", "column");
+            _$insertNode(_el$222, _el$223);
+            _$insertNode(_el$223, _$createTextNode(`Actual usage`));
+            _$insertNode(_el$225, _el$226);
+            _$insertNode(_el$225, _el$227);
+            _$insert(_el$225, () => usage().provider.used, _el$227);
+            _$insert(_el$225, () => usage().provider.limit, null);
+            _$insertNode(_el$228, _el$229);
+            _$insert(_el$228, (() => {
               var _c$8 = _$memo(() => !!usage().provider.resetAt);
               return () => _c$8() ? new Date(usage().provider.resetAt).toISOString() : "Unavailable";
             })(), null);
-            _$insertNode(_el$222, _el$223);
-            _$insertNode(_el$222, _el$224);
-            _$insert(_el$222, () => usage().synthesis.used, _el$224);
-            _$insert(_el$222, () => usage().synthesis.limit, null);
-            _$insertNode(_el$225, _el$226);
-            _$insert(_el$225, (() => {
+            _$insertNode(_el$230, _el$231);
+            _$insertNode(_el$230, _el$232);
+            _$insert(_el$230, () => usage().synthesis.used, _el$232);
+            _$insert(_el$230, () => usage().synthesis.limit, null);
+            _$insertNode(_el$233, _el$234);
+            _$insert(_el$233, (() => {
               var _c$9 = _$memo(() => !!usage().synthesis.resetAt);
               return () => _c$9() ? new Date(usage().synthesis.resetAt).toISOString() : "Unavailable";
             })(), null);
-            _$insertNode(_el$227, _el$228);
-            _$insertNode(_el$227, _el$229);
-            _$insertNode(_el$227, _el$230);
-            _$insert(_el$227, () => usage().storage.usedBytes, _el$229);
-            _$insert(_el$227, () => usage().storage.limitBytes, _el$230);
-            return _el$213;
+            _$insertNode(_el$235, _el$236);
+            _$insertNode(_el$235, _el$237);
+            _$insertNode(_el$235, _el$238);
+            _$insert(_el$235, () => usage().storage.usedBytes, _el$237);
+            _$insert(_el$235, () => usage().storage.limitBytes, _el$238);
+            return _el$221;
           })()
         }), null);
         _$insert(_el$31, _$createComponent(Show, {
@@ -1381,13 +1413,13 @@ function ControlCenter(props) {
             _$insertNode(_el$52, _el$53);
             _$insertNode(_el$53, _$createTextNode(`Recent activity`));
             _$insert(_el$51, () => reactiveChild(() => home().recentActivity.map((entry) => (() => {
-              var _el$231 = _$createElement("text"), _el$232 = _$createTextNode(`[`), _el$233 = _$createTextNode(`] `);
-              _$insertNode(_el$231, _el$232);
-              _$insertNode(_el$231, _el$233);
-              _$setProp(_el$231, "wrapMode", "word");
-              _$insert(_el$231, () => entry.marker, _el$233);
-              _$insert(_el$231, () => entry.summary, null);
-              return _el$231;
+              var _el$239 = _$createElement("text"), _el$240 = _$createTextNode(`[`), _el$241 = _$createTextNode(`] `);
+              _$insertNode(_el$239, _el$240);
+              _$insertNode(_el$239, _el$241);
+              _$setProp(_el$239, "wrapMode", "word");
+              _$insert(_el$239, () => entry.marker, _el$241);
+              _$insert(_el$239, () => entry.summary, null);
+              return _el$239;
             })())), null);
             return _el$51;
           }
@@ -1397,15 +1429,15 @@ function ControlCenter(props) {
             return home().emptyState;
           },
           children: (emptyState) => (() => {
-            var _el$234 = _$createElement("box"), _el$235 = _$createElement("text"), _el$236 = _$createElement("b"), _el$237 = _$createElement("text");
-            _$insertNode(_el$234, _el$235);
-            _$insertNode(_el$234, _el$237);
-            _$setProp(_el$234, "flexDirection", "column");
-            _$insertNode(_el$235, _el$236);
-            _$insert(_el$236, () => emptyState().heading);
-            _$setProp(_el$237, "wrapMode", "word");
-            _$insert(_el$237, () => emptyState().explanation);
-            return _el$234;
+            var _el$242 = _$createElement("box"), _el$243 = _$createElement("text"), _el$244 = _$createElement("b"), _el$245 = _$createElement("text");
+            _$insertNode(_el$242, _el$243);
+            _$insertNode(_el$242, _el$245);
+            _$setProp(_el$242, "flexDirection", "column");
+            _$insertNode(_el$243, _el$244);
+            _$insert(_el$244, () => emptyState().heading);
+            _$setProp(_el$245, "wrapMode", "word");
+            _$insert(_el$245, () => emptyState().explanation);
+            return _el$242;
           })()
         }), null);
         _$effect((_p$) => {
@@ -1462,15 +1494,15 @@ function ControlCenter(props) {
         _$setProp(_el$62, "gap", 1);
         _$setProp(_el$62, "flexWrap", "wrap");
         _$insert(_el$62, () => [["needs-review", "Needs review"], ["applied", "Applied"], ["dismissed", "Dismissed"], ["all", "All"]].map(([value, label]) => (() => {
-          var _el$238 = _$createElement("box"), _el$239 = _$createElement("text");
-          _$insertNode(_el$238, _el$239);
-          _$setProp(_el$238, "focusable", true);
-          _$setProp(_el$238, "border", true);
-          _$setProp(_el$238, "paddingLeft", 1);
-          _$setProp(_el$238, "paddingRight", 1);
-          _$setProp(_el$238, "on:focused", () => setFocusedControl(`recommendation-filter:${value}`));
-          _$setProp(_el$238, "on:blurred", () => setFocusedControl((current) => current === `recommendation-filter:${value}` ? null : current));
-          _$setProp(_el$238, "onMouseUp", () => {
+          var _el$246 = _$createElement("box"), _el$247 = _$createElement("text");
+          _$insertNode(_el$246, _el$247);
+          _$setProp(_el$246, "focusable", true);
+          _$setProp(_el$246, "border", true);
+          _$setProp(_el$246, "paddingLeft", 1);
+          _$setProp(_el$246, "paddingRight", 1);
+          _$setProp(_el$246, "on:focused", () => setFocusedControl(`recommendation-filter:${value}`));
+          _$setProp(_el$246, "on:blurred", () => setFocusedControl((current) => current === `recommendation-filter:${value}` ? null : current));
+          _$setProp(_el$246, "onMouseUp", () => {
             setRecommendationFilter(value);
             const first = buildControlCenterModel(props.snapshot(), {
               recommendationFilter: value
@@ -1478,7 +1510,7 @@ function ControlCenter(props) {
             if (first)
               selectRecommendation(first.sourceIndex);
           });
-          _$setProp(_el$238, "onKeyDown", (event) => {
+          _$setProp(_el$246, "onKeyDown", (event) => {
             if (!isActivationKey(event))
               return;
             event.preventDefault();
@@ -1489,18 +1521,18 @@ function ControlCenter(props) {
             if (first)
               selectRecommendation(first.sourceIndex);
           });
-          _$insert(_el$239, () => focusMark(`recommendation-filter:${value}`), null);
-          _$insert(_el$239, label, null);
+          _$insert(_el$247, () => focusMark(`recommendation-filter:${value}`), null);
+          _$insert(_el$247, label, null);
           _$effect((_p$) => {
-            var _v$56 = focusId(`recommendation-filter:${value}`), _v$57 = recommendationFilter() === value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle;
-            _v$56 !== _p$.e && (_p$.e = _$setProp(_el$238, "id", _v$56, _p$.e));
-            _v$57 !== _p$.t && (_p$.t = _$setProp(_el$238, "borderColor", _v$57, _p$.t));
+            var _v$58 = focusId(`recommendation-filter:${value}`), _v$59 = recommendationFilter() === value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle;
+            _v$58 !== _p$.e && (_p$.e = _$setProp(_el$246, "id", _v$58, _p$.e));
+            _v$59 !== _p$.t && (_p$.t = _$setProp(_el$246, "borderColor", _v$59, _p$.t));
             return _p$;
           }, {
             e: undefined,
             t: undefined
           });
-          return _el$238;
+          return _el$246;
         })()));
         _$insert(_el$55, _$createComponent(Show, {
           get when() {
@@ -1513,26 +1545,26 @@ function ControlCenter(props) {
           }
         }), null);
         _$insert(_el$55, () => reactiveChild(() => recommendations().queue.map((item, index) => (() => {
-          var _el$240 = _$createElement("box"), _el$241 = _$createElement("text"), _el$242 = _$createTextNode(` \xB7 `), _el$243 = _$createTextNode(` \xB7 `), _el$244 = _$createElement("text"), _el$245 = _$createElement("text"), _el$246 = _$createTextNode(`Risk: `), _el$247 = _$createTextNode(` \xB7 Evidence: `);
-          _$insertNode(_el$240, _el$241);
-          _$insertNode(_el$240, _el$244);
-          _$insertNode(_el$240, _el$245);
-          _$use((value) => recommendationNodes.set(item.sourceIndex, value), _el$240);
-          _$setProp(_el$240, "focusable", true);
-          _$setProp(_el$240, "border", true);
-          _$setProp(_el$240, "paddingLeft", 1);
-          _$setProp(_el$240, "paddingRight", 1);
-          _$setProp(_el$240, "flexDirection", "column");
-          _$setProp(_el$240, "on:focused", () => {
+          var _el$248 = _$createElement("box"), _el$249 = _$createElement("text"), _el$250 = _$createTextNode(` \xB7 `), _el$251 = _$createTextNode(` \xB7 `), _el$252 = _$createElement("text"), _el$253 = _$createElement("text"), _el$254 = _$createTextNode(`Risk: `), _el$255 = _$createTextNode(` \xB7 Evidence: `);
+          _$insertNode(_el$248, _el$249);
+          _$insertNode(_el$248, _el$252);
+          _$insertNode(_el$248, _el$253);
+          _$use((value) => recommendationNodes.set(item.sourceIndex, value), _el$248);
+          _$setProp(_el$248, "focusable", true);
+          _$setProp(_el$248, "border", true);
+          _$setProp(_el$248, "paddingLeft", 1);
+          _$setProp(_el$248, "paddingRight", 1);
+          _$setProp(_el$248, "flexDirection", "column");
+          _$setProp(_el$248, "on:focused", () => {
             setFocusedControl(`recommendation-row:${item.sourceIndex}`);
             selectRecommendation(item.sourceIndex);
           });
-          _$setProp(_el$240, "on:blurred", () => setFocusedControl((current) => current === `recommendation-row:${item.sourceIndex}` ? null : current));
-          _$setProp(_el$240, "onMouseUp", () => {
+          _$setProp(_el$248, "on:blurred", () => setFocusedControl((current) => current === `recommendation-row:${item.sourceIndex}` ? null : current));
+          _$setProp(_el$248, "onMouseUp", () => {
             selectRecommendation(item.sourceIndex);
             recommendationNodes.get(item.sourceIndex)?.focus();
           });
-          _$setProp(_el$240, "onKeyDown", (event) => {
+          _$setProp(_el$248, "onKeyDown", (event) => {
             if (isActivationKey(event)) {
               event.preventDefault();
               selectRecommendation(item.sourceIndex);
@@ -1544,29 +1576,29 @@ function ControlCenter(props) {
               moveRecommendation(1);
             }
           });
-          _$insertNode(_el$241, _el$242);
-          _$insertNode(_el$241, _el$243);
-          _$setProp(_el$241, "wrapMode", "word");
-          _$insert(_el$241, () => focusMark(`recommendation-row:${item.sourceIndex}`), _el$242);
-          _$insert(_el$241, (() => {
+          _$insertNode(_el$249, _el$250);
+          _$insertNode(_el$249, _el$251);
+          _$setProp(_el$249, "wrapMode", "word");
+          _$insert(_el$249, () => focusMark(`recommendation-row:${item.sourceIndex}`), _el$250);
+          _$insert(_el$249, (() => {
             var _c$0 = _$memo(() => item.attention === "critical");
             return () => _c$0() ? "[Urgent] " : item.attention === "warning" ? "[Attention] " : "";
-          })(), _el$242);
-          _$insert(_el$241, () => item.target, _el$242);
-          _$insert(_el$241, () => item.state.replaceAll("-", " "), _el$243);
-          _$insert(_el$241, () => relativeTime(item.updatedAt), null);
-          _$setProp(_el$244, "wrapMode", "word");
-          _$insert(_el$244, () => item.rationale);
-          _$insertNode(_el$245, _el$246);
-          _$insertNode(_el$245, _el$247);
-          _$insert(_el$245, () => item.risk ?? "Loading", _el$247);
-          _$insert(_el$245, () => item.evidenceCount ?? "Loading", null);
+          })(), _el$250);
+          _$insert(_el$249, () => item.target, _el$250);
+          _$insert(_el$249, () => item.state.replaceAll("-", " "), _el$251);
+          _$insert(_el$249, () => relativeTime(item.updatedAt), null);
+          _$setProp(_el$252, "wrapMode", "word");
+          _$insert(_el$252, () => item.rationale);
+          _$insertNode(_el$253, _el$254);
+          _$insertNode(_el$253, _el$255);
+          _$insert(_el$253, () => item.risk ?? "Loading", _el$255);
+          _$insert(_el$253, () => item.evidenceCount ?? "Loading", null);
           _$effect((_p$) => {
-            var _v$58 = focusId(`recommendation-row:${item.sourceIndex}`), _v$59 = recommendations().selectedIndex === index ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle, _v$60 = props.api.theme.current.textMuted, _v$61 = props.api.theme.current.textMuted;
-            _v$58 !== _p$.e && (_p$.e = _$setProp(_el$240, "id", _v$58, _p$.e));
-            _v$59 !== _p$.t && (_p$.t = _$setProp(_el$240, "borderColor", _v$59, _p$.t));
-            _v$60 !== _p$.a && (_p$.a = _$setProp(_el$244, "fg", _v$60, _p$.a));
-            _v$61 !== _p$.o && (_p$.o = _$setProp(_el$245, "fg", _v$61, _p$.o));
+            var _v$60 = focusId(`recommendation-row:${item.sourceIndex}`), _v$61 = recommendations().selectedIndex === index ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle, _v$62 = props.api.theme.current.textMuted, _v$63 = props.api.theme.current.textMuted;
+            _v$60 !== _p$.e && (_p$.e = _$setProp(_el$248, "id", _v$60, _p$.e));
+            _v$61 !== _p$.t && (_p$.t = _$setProp(_el$248, "borderColor", _v$61, _p$.t));
+            _v$62 !== _p$.a && (_p$.a = _$setProp(_el$252, "fg", _v$62, _p$.a));
+            _v$63 !== _p$.o && (_p$.o = _$setProp(_el$253, "fg", _v$63, _p$.o));
             return _p$;
           }, {
             e: undefined,
@@ -1574,355 +1606,355 @@ function ControlCenter(props) {
             a: undefined,
             o: undefined
           });
-          return _el$240;
+          return _el$248;
         })())), null);
         _$insert(_el$55, _$createComponent(Show, {
           get when() {
             return recommendations().selected;
           },
           children: (selected) => (() => {
-            var _el$248 = _$createElement("box"), _el$249 = _$createElement("text"), _el$250 = _$createElement("b"), _el$258 = _$createElement("box"), _el$259 = _$createElement("box"), _el$260 = _$createElement("text"), _el$261 = _$createTextNode(`Open in Activity`);
-            _$insertNode(_el$248, _el$249);
-            _$insertNode(_el$248, _el$258);
-            _$setProp(_el$248, "border", true);
-            _$setProp(_el$248, "paddingLeft", 1);
-            _$setProp(_el$248, "paddingRight", 1);
-            _$setProp(_el$248, "flexDirection", "column");
-            _$setProp(_el$248, "gap", 1);
-            _$insertNode(_el$249, _el$250);
-            _$insert(_el$250, () => selected().target);
-            _$insert(_el$248, _$createComponent(Show, {
+            var _el$256 = _$createElement("box"), _el$257 = _$createElement("text"), _el$258 = _$createElement("b"), _el$266 = _$createElement("box"), _el$267 = _$createElement("box"), _el$268 = _$createElement("text"), _el$269 = _$createTextNode(`Open in Activity`);
+            _$insertNode(_el$256, _el$257);
+            _$insertNode(_el$256, _el$266);
+            _$setProp(_el$256, "border", true);
+            _$setProp(_el$256, "paddingLeft", 1);
+            _$setProp(_el$256, "paddingRight", 1);
+            _$setProp(_el$256, "flexDirection", "column");
+            _$setProp(_el$256, "gap", 1);
+            _$insertNode(_el$257, _el$258);
+            _$insert(_el$258, () => selected().target);
+            _$insert(_el$256, _$createComponent(Show, {
               get when() {
                 return selected().loading;
               },
               get children() {
-                var _el$251 = _$createElement("text");
-                _$insertNode(_el$251, _$createTextNode(`Loading authoritative recommendation detail\u2026`));
-                return _el$251;
+                var _el$259 = _$createElement("text");
+                _$insertNode(_el$259, _$createTextNode(`Loading authoritative recommendation detail\u2026`));
+                return _el$259;
               }
-            }), _el$258);
-            _$insert(_el$248, _$createComponent(Show, {
+            }), _el$266);
+            _$insert(_el$256, _$createComponent(Show, {
               get when() {
                 return selected().summary;
               },
               children: (summary) => [(() => {
-                var _el$264 = _$createElement("box"), _el$265 = _$createElement("text"), _el$266 = _$createElement("b"), _el$268 = _$createElement("text");
-                _$insertNode(_el$264, _el$265);
-                _$insertNode(_el$264, _el$268);
-                _$setProp(_el$264, "flexDirection", "column");
-                _$insertNode(_el$265, _el$266);
-                _$insertNode(_el$266, _$createTextNode(`Why this was suggested`));
-                _$setProp(_el$268, "wrapMode", "word");
-                _$insert(_el$268, () => summary().rationale);
-                _$insert(_el$264, _$createComponent(Show, {
+                var _el$272 = _$createElement("box"), _el$273 = _$createElement("text"), _el$274 = _$createElement("b"), _el$276 = _$createElement("text");
+                _$insertNode(_el$272, _el$273);
+                _$insertNode(_el$272, _el$276);
+                _$setProp(_el$272, "flexDirection", "column");
+                _$insertNode(_el$273, _el$274);
+                _$insertNode(_el$274, _$createTextNode(`Why this was suggested`));
+                _$setProp(_el$276, "wrapMode", "word");
+                _$insert(_el$276, () => summary().rationale);
+                _$insert(_el$272, _$createComponent(Show, {
                   get when() {
                     return summary().support;
                   },
                   children: (support) => [(() => {
-                    var _el$319 = _$createElement("text"), _el$320 = _$createTextNode(`Target: `), _el$321 = _$createTextNode(` \xB7 `);
-                    _$insertNode(_el$319, _el$320);
-                    _$insertNode(_el$319, _el$321);
-                    _$setProp(_el$319, "wrapMode", "word");
-                    _$insert(_el$319, () => summary().targetKind === "new-global-skill" ? "New global skill" : "Existing global skill", _el$321);
-                    _$insert(_el$319, () => summary().target, null);
-                    return _el$319;
+                    var _el$327 = _$createElement("text"), _el$328 = _$createTextNode(`Target: `), _el$329 = _$createTextNode(` \xB7 `);
+                    _$insertNode(_el$327, _el$328);
+                    _$insertNode(_el$327, _el$329);
+                    _$setProp(_el$327, "wrapMode", "word");
+                    _$insert(_el$327, () => summary().targetKind === "new-global-skill" ? "New global skill" : "Existing global skill", _el$329);
+                    _$insert(_el$327, () => summary().target, null);
+                    return _el$327;
                   })(), (() => {
-                    var _el$322 = _$createElement("text"), _el$323 = _$createTextNode(`Support: `), _el$324 = _$createTextNode(` \xB7 `), _el$325 = _$createTextNode(` independent domains \xB7 `), _el$326 = _$createTextNode(` incidents \xB7 `), _el$327 = _$createTextNode(` occurrences`);
-                    _$insertNode(_el$322, _el$323);
-                    _$insertNode(_el$322, _el$324);
-                    _$insertNode(_el$322, _el$325);
-                    _$insertNode(_el$322, _el$326);
-                    _$insertNode(_el$322, _el$327);
-                    _$setProp(_el$322, "wrapMode", "word");
-                    _$insert(_el$322, () => support().tier.replaceAll("-", " "), _el$324);
-                    _$insert(_el$322, () => support().independentDomainCount, _el$325);
-                    _$insert(_el$322, () => support().independentIncidentCount, _el$326);
-                    _$insert(_el$322, () => support().occurrenceCount, _el$327);
-                    return _el$322;
+                    var _el$330 = _$createElement("text"), _el$331 = _$createTextNode(`Support: `), _el$332 = _$createTextNode(` \xB7 `), _el$333 = _$createTextNode(` independent domains \xB7 `), _el$334 = _$createTextNode(` incidents \xB7 `), _el$335 = _$createTextNode(` occurrences`);
+                    _$insertNode(_el$330, _el$331);
+                    _$insertNode(_el$330, _el$332);
+                    _$insertNode(_el$330, _el$333);
+                    _$insertNode(_el$330, _el$334);
+                    _$insertNode(_el$330, _el$335);
+                    _$setProp(_el$330, "wrapMode", "word");
+                    _$insert(_el$330, () => support().tier.replaceAll("-", " "), _el$332);
+                    _$insert(_el$330, () => support().independentDomainCount, _el$333);
+                    _$insert(_el$330, () => support().independentIncidentCount, _el$334);
+                    _$insert(_el$330, () => support().occurrenceCount, _el$335);
+                    return _el$330;
                   })(), (() => {
-                    var _el$328 = _$createElement("text"), _el$329 = _$createTextNode(`Observed: `), _el$330 = _$createTextNode(` through `);
-                    _$insertNode(_el$328, _el$329);
-                    _$insertNode(_el$328, _el$330);
-                    _$setProp(_el$328, "wrapMode", "word");
-                    _$insert(_el$328, () => support().firstSeenDay, _el$330);
-                    _$insert(_el$328, () => support().lastSeenDay, null);
-                    return _el$328;
+                    var _el$336 = _$createElement("text"), _el$337 = _$createTextNode(`Observed: `), _el$338 = _$createTextNode(` through `);
+                    _$insertNode(_el$336, _el$337);
+                    _$insertNode(_el$336, _el$338);
+                    _$setProp(_el$336, "wrapMode", "word");
+                    _$insert(_el$336, () => support().firstSeenDay, _el$338);
+                    _$insert(_el$336, () => support().lastSeenDay, null);
+                    return _el$336;
                   })(), (() => {
-                    var _el$331 = _$createElement("text"), _el$332 = _$createTextNode(`Current project contributed: `);
-                    _$insertNode(_el$331, _el$332);
-                    _$setProp(_el$331, "wrapMode", "word");
-                    _$insert(_el$331, (() => {
+                    var _el$339 = _$createElement("text"), _el$340 = _$createTextNode(`Current project contributed: `);
+                    _$insertNode(_el$339, _el$340);
+                    _$setProp(_el$339, "wrapMode", "word");
+                    _$insert(_el$339, (() => {
                       var _c$10 = _$memo(() => summary().currentProjectContributed === null);
                       return () => _c$10() ? "Unavailable" : summary().currentProjectContributed ? "Yes" : "No";
                     })(), null);
-                    return _el$331;
+                    return _el$339;
                   })()]
                 }), null);
-                return _el$264;
+                return _el$272;
               })(), (() => {
-                var _el$269 = _$createElement("box"), _el$270 = _$createElement("text"), _el$271 = _$createElement("b");
-                _$insertNode(_el$269, _el$270);
-                _$setProp(_el$269, "flexDirection", "column");
-                _$insertNode(_el$270, _el$271);
-                _$insertNode(_el$271, _$createTextNode(`Proposed change`));
-                _$insert(_el$269, () => reactiveChild(() => selected().diff?.lines.map((line) => (() => {
-                  var _el$333 = _$createElement("text");
-                  _$setProp(_el$333, "wrapMode", "word");
-                  _$insert(_el$333, line);
-                  return _el$333;
+                var _el$277 = _$createElement("box"), _el$278 = _$createElement("text"), _el$279 = _$createElement("b");
+                _$insertNode(_el$277, _el$278);
+                _$setProp(_el$277, "flexDirection", "column");
+                _$insertNode(_el$278, _el$279);
+                _$insertNode(_el$279, _$createTextNode(`Proposed change`));
+                _$insert(_el$277, () => reactiveChild(() => selected().diff?.lines.map((line) => (() => {
+                  var _el$341 = _$createElement("text");
+                  _$setProp(_el$341, "wrapMode", "word");
+                  _$insert(_el$341, line);
+                  return _el$341;
                 })()) ?? []), null);
-                _$insert(_el$269, _$createComponent(Show, {
+                _$insert(_el$277, _$createComponent(Show, {
                   get when() {
                     return selected().diff?.overflow?.truncated;
                   },
                   get children() {
-                    var _el$273 = _$createElement("text");
-                    _$insertNode(_el$273, _$createTextNode(`The proposed change was truncated by the bounded projection.`));
-                    _$effect((_$p) => _$setProp(_el$273, "fg", props.api.theme.current.warning, _$p));
-                    return _el$273;
+                    var _el$281 = _$createElement("text");
+                    _$insertNode(_el$281, _$createTextNode(`The proposed change was truncated by the bounded projection.`));
+                    _$effect((_$p) => _$setProp(_el$281, "fg", props.api.theme.current.warning, _$p));
+                    return _el$281;
                   }
                 }), null);
-                return _el$269;
+                return _el$277;
               })(), (() => {
-                var _el$275 = _$createElement("box"), _el$276 = _$createElement("text"), _el$277 = _$createElement("b");
-                _$insertNode(_el$275, _el$276);
-                _$setProp(_el$275, "flexDirection", "column");
-                _$insertNode(_el$276, _el$277);
-                _$insertNode(_el$277, _$createTextNode(`Evidence`));
-                _$insert(_el$275, () => reactiveChild(() => selected().evidence.map((entry) => (() => {
-                  var _el$334 = _$createElement("text"), _el$335 = _$createTextNode(`: `);
-                  _$insertNode(_el$334, _el$335);
-                  _$setProp(_el$334, "wrapMode", "word");
-                  _$insert(_el$334, () => entry.kind, _el$335);
-                  _$insert(_el$334, () => entry.summary, null);
-                  _$insert(_el$334, () => entry.redacted ? " [redacted]" : "", null);
-                  return _el$334;
+                var _el$283 = _$createElement("box"), _el$284 = _$createElement("text"), _el$285 = _$createElement("b");
+                _$insertNode(_el$283, _el$284);
+                _$setProp(_el$283, "flexDirection", "column");
+                _$insertNode(_el$284, _el$285);
+                _$insertNode(_el$285, _$createTextNode(`Evidence`));
+                _$insert(_el$283, () => reactiveChild(() => selected().evidence.map((entry) => (() => {
+                  var _el$342 = _$createElement("text"), _el$343 = _$createTextNode(`: `);
+                  _$insertNode(_el$342, _el$343);
+                  _$setProp(_el$342, "wrapMode", "word");
+                  _$insert(_el$342, () => entry.kind, _el$343);
+                  _$insert(_el$342, () => entry.summary, null);
+                  _$insert(_el$342, () => entry.redacted ? " [redacted]" : "", null);
+                  return _el$342;
                 })())), null);
-                _$insert(_el$275, _$createComponent(Show, {
+                _$insert(_el$283, _$createComponent(Show, {
                   get when() {
                     return !selected().evidence.length;
                   },
                   get children() {
-                    var _el$279 = _$createElement("text");
-                    _$insertNode(_el$279, _$createTextNode(`No bounded evidence detail is loaded.`));
-                    return _el$279;
+                    var _el$287 = _$createElement("text");
+                    _$insertNode(_el$287, _$createTextNode(`No bounded evidence detail is loaded.`));
+                    return _el$287;
                   }
                 }), null);
-                return _el$275;
+                return _el$283;
               })(), (() => {
-                var _el$281 = _$createElement("box"), _el$282 = _$createElement("text"), _el$283 = _$createElement("b"), _el$285 = _$createElement("text"), _el$286 = _$createTextNode(`Critic: `), _el$290 = _$createElement("text"), _el$291 = _$createTextNode(`Deterministic checks: `);
-                _$insertNode(_el$281, _el$282);
-                _$insertNode(_el$281, _el$285);
-                _$insertNode(_el$281, _el$290);
-                _$setProp(_el$281, "flexDirection", "column");
-                _$insertNode(_el$282, _el$283);
-                _$insertNode(_el$283, _$createTextNode(`Safety checks`));
-                _$insertNode(_el$285, _el$286);
-                _$insert(_el$285, () => summary().criticPassed ? "Passed" : "Not passed", null);
-                _$insert(_el$281, _$createComponent(Show, {
+                var _el$289 = _$createElement("box"), _el$290 = _$createElement("text"), _el$291 = _$createElement("b"), _el$293 = _$createElement("text"), _el$294 = _$createTextNode(`Critic: `), _el$298 = _$createElement("text"), _el$299 = _$createTextNode(`Deterministic checks: `);
+                _$insertNode(_el$289, _el$290);
+                _$insertNode(_el$289, _el$293);
+                _$insertNode(_el$289, _el$298);
+                _$setProp(_el$289, "flexDirection", "column");
+                _$insertNode(_el$290, _el$291);
+                _$insertNode(_el$291, _$createTextNode(`Safety checks`));
+                _$insertNode(_el$293, _el$294);
+                _$insert(_el$293, () => summary().criticPassed ? "Passed" : "Not passed", null);
+                _$insert(_el$289, _$createComponent(Show, {
                   get when() {
                     return summary().criticScoreBasisPoints !== undefined;
                   },
                   get children() {
-                    var _el$287 = _$createElement("text"), _el$288 = _$createTextNode(`Critic score: `), _el$289 = _$createTextNode(`%`);
-                    _$insertNode(_el$287, _el$288);
-                    _$insertNode(_el$287, _el$289);
-                    _$insert(_el$287, () => (summary().criticScoreBasisPoints / 100).toFixed(2), _el$289);
-                    return _el$287;
+                    var _el$295 = _$createElement("text"), _el$296 = _$createTextNode(`Critic score: `), _el$297 = _$createTextNode(`%`);
+                    _$insertNode(_el$295, _el$296);
+                    _$insertNode(_el$295, _el$297);
+                    _$insert(_el$295, () => (summary().criticScoreBasisPoints / 100).toFixed(2), _el$297);
+                    return _el$295;
                   }
-                }), _el$290);
-                _$insertNode(_el$290, _el$291);
-                _$insert(_el$290, () => summary().validDeterministic ? "Passed" : "Not passed", null);
-                _$insert(_el$281, _$createComponent(Show, {
+                }), _el$298);
+                _$insertNode(_el$298, _el$299);
+                _$insert(_el$298, () => summary().validDeterministic ? "Passed" : "Not passed", null);
+                _$insert(_el$289, _$createComponent(Show, {
                   get when() {
                     return summary().injectionFlagged !== undefined;
                   },
                   get children() {
-                    var _el$292 = _$createElement("text"), _el$293 = _$createTextNode(`Injection scan: `);
-                    _$insertNode(_el$292, _el$293);
-                    _$insert(_el$292, () => summary().injectionFlagged ? "Flagged" : "Clear", null);
-                    return _el$292;
+                    var _el$300 = _$createElement("text"), _el$301 = _$createTextNode(`Injection scan: `);
+                    _$insertNode(_el$300, _el$301);
+                    _$insert(_el$300, () => summary().injectionFlagged ? "Flagged" : "Clear", null);
+                    return _el$300;
                   }
                 }), null);
-                _$insert(_el$281, _$createComponent(Show, {
+                _$insert(_el$289, _$createComponent(Show, {
                   get when() {
                     return summary().eligibility;
                   },
                   children: (eligibility) => reactiveChild(() => eligibility().checks.map((check) => (() => {
-                    var _el$336 = _$createElement("text"), _el$337 = _$createTextNode(`[`), _el$338 = _$createTextNode(`] `), _el$339 = _$createTextNode(`: `), _el$340 = _$createTextNode(` / `);
-                    _$insertNode(_el$336, _el$337);
-                    _$insertNode(_el$336, _el$338);
-                    _$insertNode(_el$336, _el$339);
-                    _$insertNode(_el$336, _el$340);
-                    _$setProp(_el$336, "wrapMode", "word");
-                    _$insert(_el$336, () => check.met ? "Passed" : "Blocked", _el$338);
-                    _$insert(_el$336, () => check.name, _el$339);
-                    _$insert(_el$336, () => check.actual, _el$340);
-                    _$insert(_el$336, () => check.required, null);
-                    return _el$336;
+                    var _el$344 = _$createElement("text"), _el$345 = _$createTextNode(`[`), _el$346 = _$createTextNode(`] `), _el$347 = _$createTextNode(`: `), _el$348 = _$createTextNode(` / `);
+                    _$insertNode(_el$344, _el$345);
+                    _$insertNode(_el$344, _el$346);
+                    _$insertNode(_el$344, _el$347);
+                    _$insertNode(_el$344, _el$348);
+                    _$setProp(_el$344, "wrapMode", "word");
+                    _$insert(_el$344, () => check.met ? "Passed" : "Blocked", _el$346);
+                    _$insert(_el$344, () => check.name, _el$347);
+                    _$insert(_el$344, () => check.actual, _el$348);
+                    _$insert(_el$344, () => check.required, null);
+                    return _el$344;
                   })()))
                 }), null);
-                return _el$281;
+                return _el$289;
               })(), (() => {
-                var _el$294 = _$createElement("box"), _el$295 = _$createElement("text"), _el$296 = _$createElement("b"), _el$298 = _$createElement("text"), _el$299 = _$createTextNode(`: `);
-                _$insertNode(_el$294, _el$295);
-                _$insertNode(_el$294, _el$298);
-                _$setProp(_el$294, "flexDirection", "column");
-                _$insertNode(_el$295, _el$296);
-                _$insertNode(_el$296, _$createTextNode(`Generality`));
-                _$insertNode(_el$298, _el$299);
-                _$setProp(_el$298, "wrapMode", "word");
-                _$insert(_el$298, () => summary().generality.status, _el$299);
-                _$insert(_el$298, () => summary().generality.explanation, null);
-                return _el$294;
+                var _el$302 = _$createElement("box"), _el$303 = _$createElement("text"), _el$304 = _$createElement("b"), _el$306 = _$createElement("text"), _el$307 = _$createTextNode(`: `);
+                _$insertNode(_el$302, _el$303);
+                _$insertNode(_el$302, _el$306);
+                _$setProp(_el$302, "flexDirection", "column");
+                _$insertNode(_el$303, _el$304);
+                _$insertNode(_el$304, _$createTextNode(`Generality`));
+                _$insertNode(_el$306, _el$307);
+                _$setProp(_el$306, "wrapMode", "word");
+                _$insert(_el$306, () => summary().generality.status, _el$307);
+                _$insert(_el$306, () => summary().generality.explanation, null);
+                return _el$302;
               })(), (() => {
-                var _el$300 = _$createElement("box"), _el$301 = _$createElement("text"), _el$302 = _$createElement("b");
-                _$insertNode(_el$300, _el$301);
-                _$setProp(_el$300, "flexDirection", "column");
-                _$insertNode(_el$301, _el$302);
-                _$insertNode(_el$302, _$createTextNode(`Token impact`));
-                _$insert(_el$300, _$createComponent(Show, {
+                var _el$308 = _$createElement("box"), _el$309 = _$createElement("text"), _el$310 = _$createElement("b");
+                _$insertNode(_el$308, _el$309);
+                _$setProp(_el$308, "flexDirection", "column");
+                _$insertNode(_el$309, _el$310);
+                _$insertNode(_el$310, _$createTextNode(`Token impact`));
+                _$insert(_el$308, _$createComponent(Show, {
                   get when() {
                     return summary().tokenImpact.available;
                   },
                   get fallback() {
                     return (() => {
-                      var _el$341 = _$createElement("text"), _el$342 = _$createTextNode(`Unavailable: `);
-                      _$insertNode(_el$341, _el$342);
-                      _$setProp(_el$341, "wrapMode", "word");
-                      _$insert(_el$341, () => summary().tokenImpact.explanation, null);
-                      return _el$341;
+                      var _el$349 = _$createElement("text"), _el$350 = _$createTextNode(`Unavailable: `);
+                      _$insertNode(_el$349, _el$350);
+                      _$setProp(_el$349, "wrapMode", "word");
+                      _$insert(_el$349, () => summary().tokenImpact.explanation, null);
+                      return _el$349;
                     })();
                   },
                   get children() {
-                    var _el$304 = _$createElement("text"), _el$305 = _$createTextNode(` estimated / `), _el$306 = _$createTextNode(` budgeted tokens`);
-                    _$insertNode(_el$304, _el$305);
-                    _$insertNode(_el$304, _el$306);
-                    _$insert(_el$304, () => summary().tokenImpact.estimatedTokens, _el$305);
-                    _$insert(_el$304, () => summary().tokenImpact.budgetTokens, _el$306);
-                    return _el$304;
+                    var _el$312 = _$createElement("text"), _el$313 = _$createTextNode(` estimated / `), _el$314 = _$createTextNode(` budgeted tokens`);
+                    _$insertNode(_el$312, _el$313);
+                    _$insertNode(_el$312, _el$314);
+                    _$insert(_el$312, () => summary().tokenImpact.estimatedTokens, _el$313);
+                    _$insert(_el$312, () => summary().tokenImpact.budgetTokens, _el$314);
+                    return _el$312;
                   }
                 }), null);
-                return _el$300;
+                return _el$308;
               })(), (() => {
-                var _el$307 = _$createElement("box"), _el$308 = _$createElement("text"), _el$309 = _$createElement("b"), _el$311 = _$createElement("text");
-                _$insertNode(_el$307, _el$308);
-                _$insertNode(_el$307, _el$311);
-                _$setProp(_el$307, "flexDirection", "column");
-                _$insertNode(_el$308, _el$309);
-                _$insertNode(_el$309, _$createTextNode(`Rollback`));
-                _$insert(_el$311, (() => {
+                var _el$315 = _$createElement("box"), _el$316 = _$createElement("text"), _el$317 = _$createElement("b"), _el$319 = _$createElement("text");
+                _$insertNode(_el$315, _el$316);
+                _$insertNode(_el$315, _el$319);
+                _$setProp(_el$315, "flexDirection", "column");
+                _$insertNode(_el$316, _el$317);
+                _$insertNode(_el$317, _$createTextNode(`Rollback`));
+                _$insert(_el$319, (() => {
                   var _c$1 = _$memo(() => !!summary().rollback.eligible);
                   return () => _c$1() ? "Undo is currently eligible." : `Unavailable: ${summary().rollback.reason ?? "not offered"}`;
                 })());
-                return _el$307;
+                return _el$315;
               })(), (() => {
-                var _el$312 = _$createElement("box"), _el$313 = _$createElement("text"), _el$314 = _$createTextNode(`Technical details `);
-                _$insertNode(_el$312, _el$313);
-                _$setProp(_el$312, "focusable", true);
-                _$setProp(_el$312, "border", true);
-                _$setProp(_el$312, "paddingLeft", 1);
-                _$setProp(_el$312, "paddingRight", 1);
-                _$setProp(_el$312, "on:focused", () => setFocusedControl("recommendation:technical"));
-                _$setProp(_el$312, "on:blurred", () => setFocusedControl((current) => current === "recommendation:technical" ? null : current));
-                _$setProp(_el$312, "onMouseUp", () => setTechnicalExpanded((value) => !value));
-                _$setProp(_el$312, "onKeyDown", (event) => {
+                var _el$320 = _$createElement("box"), _el$321 = _$createElement("text"), _el$322 = _$createTextNode(`Technical details `);
+                _$insertNode(_el$320, _el$321);
+                _$setProp(_el$320, "focusable", true);
+                _$setProp(_el$320, "border", true);
+                _$setProp(_el$320, "paddingLeft", 1);
+                _$setProp(_el$320, "paddingRight", 1);
+                _$setProp(_el$320, "on:focused", () => setFocusedControl("recommendation:technical"));
+                _$setProp(_el$320, "on:blurred", () => setFocusedControl((current) => current === "recommendation:technical" ? null : current));
+                _$setProp(_el$320, "onMouseUp", () => setTechnicalExpanded((value) => !value));
+                _$setProp(_el$320, "onKeyDown", (event) => {
                   if (!isActivationKey(event))
                     return;
                   event.preventDefault();
                   setTechnicalExpanded((value) => !value);
                 });
-                _$insertNode(_el$313, _el$314);
-                _$insert(_el$313, () => focusMark("recommendation:technical"), _el$314);
-                _$insert(_el$313, () => technicalExpanded() ? "\u25B2" : "\u25BC", null);
-                _$effect((_$p) => _$setProp(_el$312, "borderColor", technicalExpanded() ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle, _$p));
-                return _el$312;
+                _$insertNode(_el$321, _el$322);
+                _$insert(_el$321, () => focusMark("recommendation:technical"), _el$322);
+                _$insert(_el$321, () => technicalExpanded() ? "\u25B2" : "\u25BC", null);
+                _$effect((_$p) => _$setProp(_el$320, "borderColor", technicalExpanded() ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle, _$p));
+                return _el$320;
               })(), _$createComponent(Show, {
                 get when() {
                   return technicalExpanded();
                 },
                 get children() {
                   return [(() => {
-                    var _el$315 = _$createElement("text"), _el$316 = _$createTextNode(`State: `);
-                    _$insertNode(_el$315, _el$316);
-                    _$insert(_el$315, () => summary().state, null);
-                    return _el$315;
+                    var _el$323 = _$createElement("text"), _el$324 = _$createTextNode(`State: `);
+                    _$insertNode(_el$323, _el$324);
+                    _$insert(_el$323, () => summary().state, null);
+                    return _el$323;
                   })(), _$createComponent(Show, {
                     get when() {
                       return summary().operation;
                     },
                     get children() {
-                      var _el$317 = _$createElement("text"), _el$318 = _$createTextNode(`Operation: `);
-                      _$insertNode(_el$317, _el$318);
-                      _$insert(_el$317, () => summary().operation.status, null);
-                      return _el$317;
+                      var _el$325 = _$createElement("text"), _el$326 = _$createTextNode(`Operation: `);
+                      _$insertNode(_el$325, _el$326);
+                      _$insert(_el$325, () => summary().operation.status, null);
+                      return _el$325;
                     }
                   }), _$memo(() => reactiveChild(() => selected().audit.map((entry) => (() => {
-                    var _el$343 = _$createElement("text"), _el$344 = _$createTextNode(`: `);
-                    _$insertNode(_el$343, _el$344);
-                    _$setProp(_el$343, "wrapMode", "word");
-                    _$insert(_el$343, () => entry.kind, _el$344);
-                    _$insert(_el$343, () => entry.summary, null);
-                    return _el$343;
+                    var _el$351 = _$createElement("text"), _el$352 = _$createTextNode(`: `);
+                    _$insertNode(_el$351, _el$352);
+                    _$setProp(_el$351, "wrapMode", "word");
+                    _$insert(_el$351, () => entry.kind, _el$352);
+                    _$insert(_el$351, () => entry.summary, null);
+                    return _el$351;
                   })())))];
                 }
               })]
-            }), _el$258);
-            _$insert(_el$248, _$createComponent(Show, {
+            }), _el$266);
+            _$insert(_el$256, _$createComponent(Show, {
               get when() {
                 return selected().actions.some((action) => ["reject-proposal", "reject"].includes(action.action) && action.feedbackSupported);
               },
               get children() {
-                var _el$253 = _$createElement("box"), _el$254 = _$createElement("text"), _el$256 = _$createElement("box");
-                _$insertNode(_el$253, _el$254);
-                _$insertNode(_el$253, _el$256);
-                _$setProp(_el$253, "flexDirection", "column");
-                _$insertNode(_el$254, _$createTextNode(`Optional rejection feedback (audit-only)`));
-                _$setProp(_el$256, "flexDirection", "row");
-                _$setProp(_el$256, "gap", 1);
-                _$setProp(_el$256, "flexWrap", "wrap");
-                _$insert(_el$256, () => reactiveChild(() => recommendations().rejectionFeedbackOptions.map((option) => (() => {
-                  var _el$345 = _$createElement("box"), _el$346 = _$createElement("text");
-                  _$insertNode(_el$345, _el$346);
-                  _$setProp(_el$345, "focusable", true);
-                  _$setProp(_el$345, "border", true);
-                  _$setProp(_el$345, "paddingLeft", 1);
-                  _$setProp(_el$345, "paddingRight", 1);
-                  _$setProp(_el$345, "on:focused", () => setFocusedControl(`rejection:${option.value}`));
-                  _$setProp(_el$345, "on:blurred", () => setFocusedControl((current) => current === `rejection:${option.value}` ? null : current));
-                  _$setProp(_el$345, "onMouseUp", () => setRejectionReason(rejectionReason() === option.value ? null : option.value));
-                  _$setProp(_el$345, "onKeyDown", (event) => {
+                var _el$261 = _$createElement("box"), _el$262 = _$createElement("text"), _el$264 = _$createElement("box");
+                _$insertNode(_el$261, _el$262);
+                _$insertNode(_el$261, _el$264);
+                _$setProp(_el$261, "flexDirection", "column");
+                _$insertNode(_el$262, _$createTextNode(`Optional rejection feedback (audit-only)`));
+                _$setProp(_el$264, "flexDirection", "row");
+                _$setProp(_el$264, "gap", 1);
+                _$setProp(_el$264, "flexWrap", "wrap");
+                _$insert(_el$264, () => reactiveChild(() => recommendations().rejectionFeedbackOptions.map((option) => (() => {
+                  var _el$353 = _$createElement("box"), _el$354 = _$createElement("text");
+                  _$insertNode(_el$353, _el$354);
+                  _$setProp(_el$353, "focusable", true);
+                  _$setProp(_el$353, "border", true);
+                  _$setProp(_el$353, "paddingLeft", 1);
+                  _$setProp(_el$353, "paddingRight", 1);
+                  _$setProp(_el$353, "on:focused", () => setFocusedControl(`rejection:${option.value}`));
+                  _$setProp(_el$353, "on:blurred", () => setFocusedControl((current) => current === `rejection:${option.value}` ? null : current));
+                  _$setProp(_el$353, "onMouseUp", () => setRejectionReason(rejectionReason() === option.value ? null : option.value));
+                  _$setProp(_el$353, "onKeyDown", (event) => {
                     if (!isActivationKey(event))
                       return;
                     event.preventDefault();
                     setRejectionReason(rejectionReason() === option.value ? null : option.value);
                   });
-                  _$insert(_el$346, () => focusMark(`rejection:${option.value}`), null);
-                  _$insert(_el$346, () => option.label, null);
-                  _$effect((_$p) => _$setProp(_el$345, "borderColor", rejectionReason() === option.value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle, _$p));
-                  return _el$345;
+                  _$insert(_el$354, () => focusMark(`rejection:${option.value}`), null);
+                  _$insert(_el$354, () => option.label, null);
+                  _$effect((_$p) => _$setProp(_el$353, "borderColor", rejectionReason() === option.value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle, _$p));
+                  return _el$353;
                 })())));
-                _$insert(_el$253, _$createComponent(Show, {
+                _$insert(_el$261, _$createComponent(Show, {
                   get when() {
                     return rejectionReason() === "other";
                   },
                   get children() {
-                    var _el$257 = _$createElement("input");
-                    _$setProp(_el$257, "placeholder", "Optional bounded reason (512 characters)");
-                    _$setProp(_el$257, "onInput", (value) => setRejectionText(value.slice(0, 512)));
-                    _$effect((_$p) => _$setProp(_el$257, "value", rejectionText(), _$p));
-                    return _el$257;
+                    var _el$265 = _$createElement("input");
+                    _$setProp(_el$265, "placeholder", "Optional bounded reason (512 characters)");
+                    _$setProp(_el$265, "onInput", (value) => setRejectionText(value.slice(0, 512)));
+                    _$effect((_$p) => _$setProp(_el$265, "value", rejectionText(), _$p));
+                    return _el$265;
                   }
                 }), null);
-                _$effect((_$p) => _$setProp(_el$254, "fg", props.api.theme.current.textMuted, _$p));
-                return _el$253;
+                _$effect((_$p) => _$setProp(_el$262, "fg", props.api.theme.current.textMuted, _$p));
+                return _el$261;
               }
-            }), _el$258);
-            _$insertNode(_el$258, _el$259);
-            _$setProp(_el$258, "flexDirection", "row");
-            _$setProp(_el$258, "gap", 1);
-            _$setProp(_el$258, "flexWrap", "wrap");
-            _$insert(_el$258, () => reactiveChild(() => selected().actions.flatMap((action) => {
+            }), _el$266);
+            _$insertNode(_el$266, _el$267);
+            _$setProp(_el$266, "flexDirection", "row");
+            _$setProp(_el$266, "gap", 1);
+            _$setProp(_el$266, "flexWrap", "wrap");
+            _$insert(_el$266, () => reactiveChild(() => selected().actions.flatMap((action) => {
               const choices = action.action === "snooze-proposal" ? [{
                 label: "Snooze 1 hour",
                 delay: 3600000
@@ -1939,80 +1971,80 @@ function ControlCenter(props) {
               return choices.map((choice) => {
                 const key = `${action.action}:${choice.delay ?? ""}`;
                 return (() => {
-                  var _el$347 = _$createElement("box"), _el$348 = _$createElement("text");
-                  _$insertNode(_el$347, _el$348);
-                  _$setProp(_el$347, "border", true);
-                  _$setProp(_el$347, "paddingLeft", 1);
-                  _$setProp(_el$347, "paddingRight", 1);
-                  _$setProp(_el$347, "on:focused", () => setFocusedControl(`recommendation-action:${key}`));
-                  _$setProp(_el$347, "on:blurred", () => setFocusedControl((current) => current === `recommendation-action:${key}` ? null : current));
-                  _$setProp(_el$347, "onMouseUp", () => {
+                  var _el$355 = _$createElement("box"), _el$356 = _$createElement("text");
+                  _$insertNode(_el$355, _el$356);
+                  _$setProp(_el$355, "border", true);
+                  _$setProp(_el$355, "paddingLeft", 1);
+                  _$setProp(_el$355, "paddingRight", 1);
+                  _$setProp(_el$355, "on:focused", () => setFocusedControl(`recommendation-action:${key}`));
+                  _$setProp(_el$355, "on:blurred", () => setFocusedControl((current) => current === `recommendation-action:${key}` ? null : current));
+                  _$setProp(_el$355, "onMouseUp", () => {
                     if (!action.pending)
                       activateRecommendation(action.action, choice.delay);
                   });
-                  _$setProp(_el$347, "onKeyDown", (event) => {
+                  _$setProp(_el$355, "onKeyDown", (event) => {
                     if (!isActivationKey(event) || action.pending)
                       return;
                     event.preventDefault();
                     activateRecommendation(action.action, choice.delay);
                   });
-                  _$insert(_el$348, () => focusMark(`recommendation-action:${key}`), null);
-                  _$insert(_el$348, (() => {
+                  _$insert(_el$356, () => focusMark(`recommendation-action:${key}`), null);
+                  _$insert(_el$356, (() => {
                     var _c$11 = _$memo(() => !!action.pending);
                     return () => _c$11() ? `${choice.label} \xB7 Pending` : _$memo(() => confirmation() === key)() ? `Confirm ${choice.label}` : choice.label;
                   })(), null);
                   _$effect((_p$) => {
-                    var _v$64 = !action.pending, _v$65 = confirmation() === key ? props.api.theme.current.warning : props.api.theme.current.borderSubtle, _v$66 = action.pending ? props.api.theme.current.textMuted : props.api.theme.current.text;
-                    _v$64 !== _p$.e && (_p$.e = _$setProp(_el$347, "focusable", _v$64, _p$.e));
-                    _v$65 !== _p$.t && (_p$.t = _$setProp(_el$347, "borderColor", _v$65, _p$.t));
-                    _v$66 !== _p$.a && (_p$.a = _$setProp(_el$348, "fg", _v$66, _p$.a));
+                    var _v$66 = !action.pending, _v$67 = confirmation() === key ? props.api.theme.current.warning : props.api.theme.current.borderSubtle, _v$68 = action.pending ? props.api.theme.current.textMuted : props.api.theme.current.text;
+                    _v$66 !== _p$.e && (_p$.e = _$setProp(_el$355, "focusable", _v$66, _p$.e));
+                    _v$67 !== _p$.t && (_p$.t = _$setProp(_el$355, "borderColor", _v$67, _p$.t));
+                    _v$68 !== _p$.a && (_p$.a = _$setProp(_el$356, "fg", _v$68, _p$.a));
                     return _p$;
                   }, {
                     e: undefined,
                     t: undefined,
                     a: undefined
                   });
-                  return _el$347;
+                  return _el$355;
                 })();
               });
-            })), _el$259);
-            _$insertNode(_el$259, _el$260);
-            _$setProp(_el$259, "focusable", true);
-            _$setProp(_el$259, "border", true);
-            _$setProp(_el$259, "paddingLeft", 1);
-            _$setProp(_el$259, "paddingRight", 1);
-            _$setProp(_el$259, "on:focused", () => setFocusedControl("recommendation:open-activity"));
-            _$setProp(_el$259, "on:blurred", () => setFocusedControl((current) => current === "recommendation:open-activity" ? null : current));
-            _$setProp(_el$259, "onMouseUp", () => void activateRecommendation("open-activity"));
-            _$setProp(_el$259, "onKeyDown", (event) => {
+            })), _el$267);
+            _$insertNode(_el$267, _el$268);
+            _$setProp(_el$267, "focusable", true);
+            _$setProp(_el$267, "border", true);
+            _$setProp(_el$267, "paddingLeft", 1);
+            _$setProp(_el$267, "paddingRight", 1);
+            _$setProp(_el$267, "on:focused", () => setFocusedControl("recommendation:open-activity"));
+            _$setProp(_el$267, "on:blurred", () => setFocusedControl((current) => current === "recommendation:open-activity" ? null : current));
+            _$setProp(_el$267, "onMouseUp", () => void activateRecommendation("open-activity"));
+            _$setProp(_el$267, "onKeyDown", (event) => {
               if (!isActivationKey(event))
                 return;
               event.preventDefault();
               activateRecommendation("open-activity");
             });
-            _$insertNode(_el$260, _el$261);
-            _$insert(_el$260, () => focusMark("recommendation:open-activity"), _el$261);
-            _$insert(_el$248, _$createComponent(Show, {
+            _$insertNode(_el$268, _el$269);
+            _$insert(_el$268, () => focusMark("recommendation:open-activity"), _el$269);
+            _$insert(_el$256, _$createComponent(Show, {
               get when() {
                 return pendingRecommendation();
               },
               get children() {
-                var _el$262 = _$createElement("text");
-                _$insertNode(_el$262, _$createTextNode(`Request pending server validation\u2026`));
-                _$effect((_$p) => _$setProp(_el$262, "fg", props.api.theme.current.info, _$p));
-                return _el$262;
+                var _el$270 = _$createElement("text");
+                _$insertNode(_el$270, _$createTextNode(`Request pending server validation\u2026`));
+                _$effect((_$p) => _$setProp(_el$270, "fg", props.api.theme.current.info, _$p));
+                return _el$270;
               }
             }), null);
             _$effect((_p$) => {
-              var _v$62 = props.api.theme.current.borderActive, _v$63 = props.api.theme.current.borderSubtle;
-              _v$62 !== _p$.e && (_p$.e = _$setProp(_el$248, "borderColor", _v$62, _p$.e));
-              _v$63 !== _p$.t && (_p$.t = _$setProp(_el$259, "borderColor", _v$63, _p$.t));
+              var _v$64 = props.api.theme.current.borderActive, _v$65 = props.api.theme.current.borderSubtle;
+              _v$64 !== _p$.e && (_p$.e = _$setProp(_el$256, "borderColor", _v$64, _p$.e));
+              _v$65 !== _p$.t && (_p$.t = _$setProp(_el$267, "borderColor", _v$65, _p$.t));
               return _p$;
             }, {
               e: undefined,
               t: undefined
             });
-            return _el$248;
+            return _el$256;
           })()
         }), null);
         return _el$55;
@@ -2035,20 +2067,20 @@ function ControlCenter(props) {
         _$setProp(_el$68, "gap", 1);
         _$setProp(_el$68, "flexWrap", "wrap");
         _$insert(_el$68, () => [["all", "All"], ["recommendations", "Recommendations"], ["system", "System"], ["errors", "Errors"]].map(([value, label]) => (() => {
-          var _el$349 = _$createElement("box"), _el$350 = _$createElement("text");
-          _$insertNode(_el$349, _el$350);
-          _$setProp(_el$349, "focusable", true);
-          _$setProp(_el$349, "border", true);
-          _$setProp(_el$349, "paddingLeft", 1);
-          _$setProp(_el$349, "paddingRight", 1);
-          _$setProp(_el$349, "on:focused", () => setFocusedControl(`activity-filter:${value}`));
-          _$setProp(_el$349, "on:blurred", () => setFocusedControl((current) => current === `activity-filter:${value}` ? null : current));
-          _$setProp(_el$349, "onMouseUp", () => {
+          var _el$357 = _$createElement("box"), _el$358 = _$createElement("text");
+          _$insertNode(_el$357, _el$358);
+          _$setProp(_el$357, "focusable", true);
+          _$setProp(_el$357, "border", true);
+          _$setProp(_el$357, "paddingLeft", 1);
+          _$setProp(_el$357, "paddingRight", 1);
+          _$setProp(_el$357, "on:focused", () => setFocusedControl(`activity-filter:${value}`));
+          _$setProp(_el$357, "on:blurred", () => setFocusedControl((current) => current === `activity-filter:${value}` ? null : current));
+          _$setProp(_el$357, "onMouseUp", () => {
             setActivityFilter(value);
             setActivityExpanded(null);
             setActivityIndex(0);
           });
-          _$setProp(_el$349, "onKeyDown", (event) => {
+          _$setProp(_el$357, "onKeyDown", (event) => {
             if (!isActivationKey(event))
               return;
             event.preventDefault();
@@ -2056,18 +2088,18 @@ function ControlCenter(props) {
             setActivityExpanded(null);
             setActivityIndex(0);
           });
-          _$insert(_el$350, () => focusMark(`activity-filter:${value}`), null);
-          _$insert(_el$350, label, null);
+          _$insert(_el$358, () => focusMark(`activity-filter:${value}`), null);
+          _$insert(_el$358, label, null);
           _$effect((_p$) => {
-            var _v$67 = focusId(`activity-filter:${value}`), _v$68 = activityFilter() === value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle;
-            _v$67 !== _p$.e && (_p$.e = _$setProp(_el$349, "id", _v$67, _p$.e));
-            _v$68 !== _p$.t && (_p$.t = _$setProp(_el$349, "borderColor", _v$68, _p$.t));
+            var _v$69 = focusId(`activity-filter:${value}`), _v$70 = activityFilter() === value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle;
+            _v$69 !== _p$.e && (_p$.e = _$setProp(_el$357, "id", _v$69, _p$.e));
+            _v$70 !== _p$.t && (_p$.t = _$setProp(_el$357, "borderColor", _v$70, _p$.t));
             return _p$;
           }, {
             e: undefined,
             t: undefined
           });
-          return _el$349;
+          return _el$357;
         })()));
         _$insert(_el$64, _$createComponent(Show, {
           get when() {
@@ -2081,25 +2113,25 @@ function ControlCenter(props) {
           }
         }), _el$71);
         _$insert(_el$64, () => reactiveChild(() => activity().activity.map((entry, index) => (() => {
-          var _el$351 = _$createElement("box"), _el$352 = _$createElement("text"), _el$353 = _$createTextNode(`[`), _el$354 = _$createTextNode(`] [`), _el$355 = _$createTextNode(`] `), _el$356 = _$createTextNode(` \xB7 `);
-          _$insertNode(_el$351, _el$352);
-          _$use((value) => activityNodes.set(index, value), _el$351);
-          _$setProp(_el$351, "focusable", true);
-          _$setProp(_el$351, "border", true);
-          _$setProp(_el$351, "paddingLeft", 1);
-          _$setProp(_el$351, "paddingRight", 1);
-          _$setProp(_el$351, "flexDirection", "column");
-          _$setProp(_el$351, "on:focused", () => {
+          var _el$359 = _$createElement("box"), _el$360 = _$createElement("text"), _el$361 = _$createTextNode(`[`), _el$362 = _$createTextNode(`] [`), _el$363 = _$createTextNode(`] `), _el$364 = _$createTextNode(` \xB7 `);
+          _$insertNode(_el$359, _el$360);
+          _$use((value) => activityNodes.set(index, value), _el$359);
+          _$setProp(_el$359, "focusable", true);
+          _$setProp(_el$359, "border", true);
+          _$setProp(_el$359, "paddingLeft", 1);
+          _$setProp(_el$359, "paddingRight", 1);
+          _$setProp(_el$359, "flexDirection", "column");
+          _$setProp(_el$359, "on:focused", () => {
             setFocusedControl(`activity-row:${index}`);
             setActivityIndex(index);
           });
-          _$setProp(_el$351, "on:blurred", () => setFocusedControl((current) => current === `activity-row:${index}` ? null : current));
-          _$setProp(_el$351, "onMouseUp", () => {
+          _$setProp(_el$359, "on:blurred", () => setFocusedControl((current) => current === `activity-row:${index}` ? null : current));
+          _$setProp(_el$359, "onMouseUp", () => {
             setActivityIndex(index);
             activityNodes.get(index)?.focus();
             setActivityExpanded(activityExpanded() === index ? null : index);
           });
-          _$setProp(_el$351, "onKeyDown", (event) => {
+          _$setProp(_el$359, "onKeyDown", (event) => {
             if (isActivationKey(event)) {
               event.preventDefault();
               setActivityExpanded(activityExpanded() === index ? null : index);
@@ -2114,55 +2146,55 @@ function ControlCenter(props) {
               moveActivity(1);
             }
           });
-          _$insertNode(_el$352, _el$353);
-          _$insertNode(_el$352, _el$354);
-          _$insertNode(_el$352, _el$355);
-          _$insertNode(_el$352, _el$356);
-          _$setProp(_el$352, "wrapMode", "word");
-          _$insert(_el$352, () => focusMark(`activity-row:${index}`), _el$353);
-          _$insert(_el$352, () => entry.marker, _el$354);
-          _$insert(_el$352, () => entry.scope, _el$355);
-          _$insert(_el$352, () => entry.summary, _el$356);
-          _$insert(_el$352, () => relativeTime(entry.occurredAt), null);
-          _$insert(_el$351, _$createComponent(Show, {
+          _$insertNode(_el$360, _el$361);
+          _$insertNode(_el$360, _el$362);
+          _$insertNode(_el$360, _el$363);
+          _$insertNode(_el$360, _el$364);
+          _$setProp(_el$360, "wrapMode", "word");
+          _$insert(_el$360, () => focusMark(`activity-row:${index}`), _el$361);
+          _$insert(_el$360, () => entry.marker, _el$362);
+          _$insert(_el$360, () => entry.scope, _el$363);
+          _$insert(_el$360, () => entry.summary, _el$364);
+          _$insert(_el$360, () => relativeTime(entry.occurredAt), null);
+          _$insert(_el$359, _$createComponent(Show, {
             get when() {
               return entry.target;
             },
             get children() {
-              var _el$357 = _$createElement("text"), _el$358 = _$createTextNode(`Skill: `);
-              _$insertNode(_el$357, _el$358);
-              _$insert(_el$357, () => entry.target, null);
-              _$effect((_$p) => _$setProp(_el$357, "fg", props.api.theme.current.textMuted, _$p));
-              return _el$357;
+              var _el$365 = _$createElement("text"), _el$366 = _$createTextNode(`Skill: `);
+              _$insertNode(_el$365, _el$366);
+              _$insert(_el$365, () => entry.target, null);
+              _$effect((_$p) => _$setProp(_el$365, "fg", props.api.theme.current.textMuted, _$p));
+              return _el$365;
             }
           }), null);
-          _$insert(_el$351, _$createComponent(Show, {
+          _$insert(_el$359, _$createComponent(Show, {
             get when() {
               return activityExpanded() === index;
             },
             get children() {
               return [(() => {
-                var _el$359 = _$createElement("text"), _el$360 = _$createTextNode(`Category: `);
-                _$insertNode(_el$359, _el$360);
-                _$insert(_el$359, () => entry.technical.category, null);
-                _$effect((_$p) => _$setProp(_el$359, "fg", props.api.theme.current.textMuted, _$p));
-                return _el$359;
+                var _el$367 = _$createElement("text"), _el$368 = _$createTextNode(`Category: `);
+                _$insertNode(_el$367, _el$368);
+                _$insert(_el$367, () => entry.technical.category, null);
+                _$effect((_$p) => _$setProp(_el$367, "fg", props.api.theme.current.textMuted, _$p));
+                return _el$367;
               })(), (() => {
-                var _el$361 = _$createElement("text"), _el$362 = _$createTextNode(`Outcome: `);
-                _$insertNode(_el$361, _el$362);
-                _$insert(_el$361, () => entry.technical.outcome.replaceAll("-", " "), null);
-                _$effect((_$p) => _$setProp(_el$361, "fg", props.api.theme.current.textMuted, _$p));
-                return _el$361;
+                var _el$369 = _$createElement("text"), _el$370 = _$createTextNode(`Outcome: `);
+                _$insertNode(_el$369, _el$370);
+                _$insert(_el$369, () => entry.technical.outcome.replaceAll("-", " "), null);
+                _$effect((_$p) => _$setProp(_el$369, "fg", props.api.theme.current.textMuted, _$p));
+                return _el$369;
               })(), _$createComponent(Show, {
                 get when() {
                   return entry.technical.reason;
                 },
                 children: (reason) => (() => {
-                  var _el$366 = _$createElement("text"), _el$367 = _$createTextNode(`Reason: `);
-                  _$insertNode(_el$366, _el$367);
-                  _$insert(_el$366, () => reason().replaceAll("-", " "), null);
-                  _$effect((_$p) => _$setProp(_el$366, "fg", props.api.theme.current.textMuted, _$p));
-                  return _el$366;
+                  var _el$374 = _$createElement("text"), _el$375 = _$createTextNode(`Reason: `);
+                  _$insertNode(_el$374, _el$375);
+                  _$insert(_el$374, () => reason().replaceAll("-", " "), null);
+                  _$effect((_$p) => _$setProp(_el$374, "fg", props.api.theme.current.textMuted, _$p));
+                  return _el$374;
                 })()
               }), _$createComponent(Show, {
                 get when() {
@@ -2174,39 +2206,39 @@ function ControlCenter(props) {
                   return entry.destination?.section === "recommendations";
                 },
                 get children() {
-                  var _el$363 = _$createElement("box"), _el$364 = _$createElement("text"), _el$365 = _$createTextNode(`Open recommendation`);
-                  _$insertNode(_el$363, _el$364);
-                  _$setProp(_el$363, "focusable", true);
-                  _$setProp(_el$363, "border", true);
-                  _$setProp(_el$363, "paddingLeft", 1);
-                  _$setProp(_el$363, "paddingRight", 1);
-                  _$setProp(_el$363, "on:focused", () => setFocusedControl(`activity-open:${index}`));
-                  _$setProp(_el$363, "on:blurred", () => setFocusedControl((current) => current === `activity-open:${index}` ? null : current));
-                  _$setProp(_el$363, "onMouseUp", () => openActivityDestination(entry));
-                  _$setProp(_el$363, "onKeyDown", (event) => {
+                  var _el$371 = _$createElement("box"), _el$372 = _$createElement("text"), _el$373 = _$createTextNode(`Open recommendation`);
+                  _$insertNode(_el$371, _el$372);
+                  _$setProp(_el$371, "focusable", true);
+                  _$setProp(_el$371, "border", true);
+                  _$setProp(_el$371, "paddingLeft", 1);
+                  _$setProp(_el$371, "paddingRight", 1);
+                  _$setProp(_el$371, "on:focused", () => setFocusedControl(`activity-open:${index}`));
+                  _$setProp(_el$371, "on:blurred", () => setFocusedControl((current) => current === `activity-open:${index}` ? null : current));
+                  _$setProp(_el$371, "onMouseUp", () => openActivityDestination(entry));
+                  _$setProp(_el$371, "onKeyDown", (event) => {
                     if (!isActivationKey(event))
                       return;
                     event.preventDefault();
                     openActivityDestination(entry);
                   });
-                  _$insertNode(_el$364, _el$365);
-                  _$insert(_el$364, () => focusMark(`activity-open:${index}`), _el$365);
-                  _$effect((_$p) => _$setProp(_el$363, "borderColor", props.api.theme.current.borderSubtle, _$p));
-                  return _el$363;
+                  _$insertNode(_el$372, _el$373);
+                  _$insert(_el$372, () => focusMark(`activity-open:${index}`), _el$373);
+                  _$effect((_$p) => _$setProp(_el$371, "borderColor", props.api.theme.current.borderSubtle, _$p));
+                  return _el$371;
                 }
               })];
             }
           }), null);
           _$effect((_p$) => {
-            var _v$69 = focusId(`activity-row:${index}`), _v$70 = activityExpanded() === index ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle;
-            _v$69 !== _p$.e && (_p$.e = _$setProp(_el$351, "id", _v$69, _p$.e));
-            _v$70 !== _p$.t && (_p$.t = _$setProp(_el$351, "borderColor", _v$70, _p$.t));
+            var _v$71 = focusId(`activity-row:${index}`), _v$72 = activityExpanded() === index ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle;
+            _v$71 !== _p$.e && (_p$.e = _$setProp(_el$359, "id", _v$71, _p$.e));
+            _v$72 !== _p$.t && (_p$.t = _$setProp(_el$359, "borderColor", _v$72, _p$.t));
             return _p$;
           }, {
             e: undefined,
             t: undefined
           });
-          return _el$351;
+          return _el$359;
         })())), _el$71);
         _$insert(_el$64, _$createComponent(Show, {
           get when() {
@@ -2298,11 +2330,11 @@ function ControlCenter(props) {
                 return activity().diagnostics.automation;
               },
               children: (automation) => (() => {
-                var _el$368 = _$createElement("text"), _el$369 = _$createTextNode(`Scheduler: `);
-                _$insertNode(_el$368, _el$369);
-                _$setProp(_el$368, "wrapMode", "word");
-                _$insert(_el$368, () => automation().state.replaceAll("-", " "), null);
-                return _el$368;
+                var _el$376 = _$createElement("text"), _el$377 = _$createTextNode(`Scheduler: `);
+                _$insertNode(_el$376, _el$377);
+                _$setProp(_el$376, "wrapMode", "word");
+                _$insert(_el$376, () => automation().state.replaceAll("-", " "), null);
+                return _el$376;
               })()
             }), null);
             _$insert(_el$74, _$createComponent(Show, {
@@ -2310,11 +2342,11 @@ function ControlCenter(props) {
                 return activity().diagnostics.backoffUntil;
               },
               children: (backoffUntil) => (() => {
-                var _el$370 = _$createElement("text"), _el$371 = _$createTextNode(`Backoff ends: `);
-                _$insertNode(_el$370, _el$371);
-                _$setProp(_el$370, "wrapMode", "word");
-                _$insert(_el$370, () => new Date(backoffUntil()).toISOString(), null);
-                return _el$370;
+                var _el$378 = _$createElement("text"), _el$379 = _$createTextNode(`Backoff ends: `);
+                _$insertNode(_el$378, _el$379);
+                _$setProp(_el$378, "wrapMode", "word");
+                _$insert(_el$378, () => new Date(backoffUntil()).toISOString(), null);
+                return _el$378;
               })()
             }), null);
             _$insert(_el$74, _$createComponent(Show, {
@@ -2322,11 +2354,11 @@ function ControlCenter(props) {
                 return activity().diagnostics.nextEligibleAt;
               },
               children: (nextEligibleAt) => (() => {
-                var _el$372 = _$createElement("text"), _el$373 = _$createTextNode(`Next eligible: `);
-                _$insertNode(_el$372, _el$373);
-                _$setProp(_el$372, "wrapMode", "word");
-                _$insert(_el$372, () => new Date(nextEligibleAt()).toISOString(), null);
-                return _el$372;
+                var _el$380 = _$createElement("text"), _el$381 = _$createTextNode(`Next eligible: `);
+                _$insertNode(_el$380, _el$381);
+                _$setProp(_el$380, "wrapMode", "word");
+                _$insert(_el$380, () => new Date(nextEligibleAt()).toISOString(), null);
+                return _el$380;
               })()
             }), null);
             _$insert(_el$74, _$createComponent(Show, {
@@ -2334,46 +2366,46 @@ function ControlCenter(props) {
                 return activity().diagnostics.usage;
               },
               children: (usage) => [(() => {
-                var _el$374 = _$createElement("text"), _el$375 = _$createTextNode(`Provider calls used/remaining: `), _el$376 = _$createTextNode(` / `);
-                _$insertNode(_el$374, _el$375);
-                _$insertNode(_el$374, _el$376);
-                _$setProp(_el$374, "wrapMode", "word");
-                _$insert(_el$374, () => usage().provider.used, _el$376);
-                _$insert(_el$374, () => usage().provider.remaining, null);
-                return _el$374;
+                var _el$382 = _$createElement("text"), _el$383 = _$createTextNode(`Provider calls used/remaining: `), _el$384 = _$createTextNode(` / `);
+                _$insertNode(_el$382, _el$383);
+                _$insertNode(_el$382, _el$384);
+                _$setProp(_el$382, "wrapMode", "word");
+                _$insert(_el$382, () => usage().provider.used, _el$384);
+                _$insert(_el$382, () => usage().provider.remaining, null);
+                return _el$382;
               })(), (() => {
-                var _el$377 = _$createElement("text"), _el$378 = _$createTextNode(`Recommendation synthesis used/remaining: `), _el$379 = _$createTextNode(` / `);
-                _$insertNode(_el$377, _el$378);
-                _$insertNode(_el$377, _el$379);
-                _$setProp(_el$377, "wrapMode", "word");
-                _$insert(_el$377, () => usage().synthesis.used, _el$379);
-                _$insert(_el$377, () => usage().synthesis.remaining, null);
-                return _el$377;
+                var _el$385 = _$createElement("text"), _el$386 = _$createTextNode(`Recommendation synthesis used/remaining: `), _el$387 = _$createTextNode(` / `);
+                _$insertNode(_el$385, _el$386);
+                _$insertNode(_el$385, _el$387);
+                _$setProp(_el$385, "wrapMode", "word");
+                _$insert(_el$385, () => usage().synthesis.used, _el$387);
+                _$insert(_el$385, () => usage().synthesis.remaining, null);
+                return _el$385;
               })(), (() => {
-                var _el$380 = _$createElement("text"), _el$381 = _$createTextNode(`Storage used/quota: `), _el$382 = _$createTextNode(` / `), _el$383 = _$createTextNode(` bytes`);
-                _$insertNode(_el$380, _el$381);
-                _$insertNode(_el$380, _el$382);
-                _$insertNode(_el$380, _el$383);
-                _$setProp(_el$380, "wrapMode", "word");
-                _$insert(_el$380, () => usage().storage.usedBytes, _el$382);
-                _$insert(_el$380, () => usage().storage.limitBytes, _el$383);
-                return _el$380;
+                var _el$388 = _$createElement("text"), _el$389 = _$createTextNode(`Storage used/quota: `), _el$390 = _$createTextNode(` / `), _el$391 = _$createTextNode(` bytes`);
+                _$insertNode(_el$388, _el$389);
+                _$insertNode(_el$388, _el$390);
+                _$insertNode(_el$388, _el$391);
+                _$setProp(_el$388, "wrapMode", "word");
+                _$insert(_el$388, () => usage().storage.usedBytes, _el$390);
+                _$insert(_el$388, () => usage().storage.limitBytes, _el$391);
+                return _el$388;
               })(), _$createComponent(Show, {
                 get when() {
                   return activity().diagnostics.budgetResetAt;
                 },
                 children: (budgetResetAt) => [(() => {
-                  var _el$384 = _$createElement("text"), _el$385 = _$createTextNode(`Provider calls reset: `);
-                  _$insertNode(_el$384, _el$385);
-                  _$setProp(_el$384, "wrapMode", "word");
-                  _$insert(_el$384, () => new Date(budgetResetAt().provider).toISOString(), null);
-                  return _el$384;
+                  var _el$392 = _$createElement("text"), _el$393 = _$createTextNode(`Provider calls reset: `);
+                  _$insertNode(_el$392, _el$393);
+                  _$setProp(_el$392, "wrapMode", "word");
+                  _$insert(_el$392, () => new Date(budgetResetAt().provider).toISOString(), null);
+                  return _el$392;
                 })(), (() => {
-                  var _el$386 = _$createElement("text"), _el$387 = _$createTextNode(`Recommendation synthesis resets: `);
-                  _$insertNode(_el$386, _el$387);
-                  _$setProp(_el$386, "wrapMode", "word");
-                  _$insert(_el$386, () => new Date(budgetResetAt().synthesis).toISOString(), null);
-                  return _el$386;
+                  var _el$394 = _$createElement("text"), _el$395 = _$createTextNode(`Recommendation synthesis resets: `);
+                  _$insertNode(_el$394, _el$395);
+                  _$setProp(_el$394, "wrapMode", "word");
+                  _$insert(_el$394, () => new Date(budgetResetAt().synthesis).toISOString(), null);
+                  return _el$394;
                 })()]
               })]
             }), null);
@@ -2382,11 +2414,11 @@ function ControlCenter(props) {
                 return activity().diagnostics.lastError;
               },
               children: (lastError) => (() => {
-                var _el$388 = _$createElement("text"), _el$389 = _$createTextNode(`Last bounded error: `);
-                _$insertNode(_el$388, _el$389);
-                _$setProp(_el$388, "wrapMode", "word");
-                _$insert(_el$388, () => lastError().summary, null);
-                return _el$388;
+                var _el$396 = _$createElement("text"), _el$397 = _$createTextNode(`Last bounded error: `);
+                _$insertNode(_el$396, _el$397);
+                _$setProp(_el$396, "wrapMode", "word");
+                _$insert(_el$396, () => lastError().summary, null);
+                return _el$396;
               })()
             }), null);
             return _el$74;
@@ -2436,31 +2468,31 @@ function ControlCenter(props) {
             return settingsAnchor();
           },
           children: (anchor) => (() => {
-            var _el$390 = _$createElement("box"), _el$391 = _$createElement("text"), _el$392 = _$createTextNode(`Opened at `), _el$393 = _$createTextNode(` settings.`);
-            _$insertNode(_el$390, _el$391);
-            _$setProp(_el$390, "focusable", true);
-            _$setProp(_el$390, "border", true);
-            _$setProp(_el$390, "paddingLeft", 1);
-            _$setProp(_el$390, "paddingRight", 1);
-            _$setProp(_el$390, "on:focused", () => setFocusedControl(`anchor:${anchor()}`));
-            _$setProp(_el$390, "on:blurred", () => setFocusedControl((current) => current === `anchor:${anchor()}` ? null : current));
-            _$insertNode(_el$391, _el$392);
-            _$insertNode(_el$391, _el$393);
-            _$setProp(_el$391, "wrapMode", "word");
-            _$insert(_el$391, () => focusMark(`anchor:${anchor()}`), _el$392);
-            _$insert(_el$391, () => anchor().replaceAll("-", " "), _el$393);
+            var _el$398 = _$createElement("box"), _el$399 = _$createElement("text"), _el$400 = _$createTextNode(`Opened at `), _el$401 = _$createTextNode(` settings.`);
+            _$insertNode(_el$398, _el$399);
+            _$setProp(_el$398, "focusable", true);
+            _$setProp(_el$398, "border", true);
+            _$setProp(_el$398, "paddingLeft", 1);
+            _$setProp(_el$398, "paddingRight", 1);
+            _$setProp(_el$398, "on:focused", () => setFocusedControl(`anchor:${anchor()}`));
+            _$setProp(_el$398, "on:blurred", () => setFocusedControl((current) => current === `anchor:${anchor()}` ? null : current));
+            _$insertNode(_el$399, _el$400);
+            _$insertNode(_el$399, _el$401);
+            _$setProp(_el$399, "wrapMode", "word");
+            _$insert(_el$399, () => focusMark(`anchor:${anchor()}`), _el$400);
+            _$insert(_el$399, () => anchor().replaceAll("-", " "), _el$401);
             _$effect((_p$) => {
-              var _v$71 = focusId(`anchor:${anchor()}`), _v$72 = focusedControl() === `anchor:${anchor()}` ? props.api.theme.current.borderActive : props.api.theme.current.info, _v$73 = props.api.theme.current.info;
-              _v$71 !== _p$.e && (_p$.e = _$setProp(_el$390, "id", _v$71, _p$.e));
-              _v$72 !== _p$.t && (_p$.t = _$setProp(_el$390, "borderColor", _v$72, _p$.t));
-              _v$73 !== _p$.a && (_p$.a = _$setProp(_el$391, "fg", _v$73, _p$.a));
+              var _v$73 = focusId(`anchor:${anchor()}`), _v$74 = focusedControl() === `anchor:${anchor()}` ? props.api.theme.current.borderActive : props.api.theme.current.info, _v$75 = props.api.theme.current.info;
+              _v$73 !== _p$.e && (_p$.e = _$setProp(_el$398, "id", _v$73, _p$.e));
+              _v$74 !== _p$.t && (_p$.t = _$setProp(_el$398, "borderColor", _v$74, _p$.t));
+              _v$75 !== _p$.a && (_p$.a = _$setProp(_el$399, "fg", _v$75, _p$.a));
               return _p$;
             }, {
               e: undefined,
               t: undefined,
               a: undefined
             });
-            return _el$390;
+            return _el$398;
           })()
         }), _el$106);
         _$insert(_el$99, _$createComponent(Show, {
@@ -2492,14 +2524,14 @@ function ControlCenter(props) {
             return settings().globalProtocol;
           },
           children: (globalProtocol) => (() => {
-            var _el$394 = _$createElement("text"), _el$395 = _$createTextNode(`Global protocol: `), _el$396 = _$createTextNode(` \xB7 `);
-            _$insertNode(_el$394, _el$395);
-            _$insertNode(_el$394, _el$396);
-            _$setProp(_el$394, "wrapMode", "word");
-            _$insert(_el$394, () => globalProtocol().label, _el$396);
-            _$insert(_el$394, () => globalProtocol().authoritative ? "authoritative" : "limited / read-only", null);
-            _$effect((_$p) => _$setProp(_el$394, "fg", globalProtocol().authoritative ? props.api.theme.current.textMuted : props.api.theme.current.warning, _$p));
-            return _el$394;
+            var _el$402 = _$createElement("text"), _el$403 = _$createTextNode(`Global protocol: `), _el$404 = _$createTextNode(` \xB7 `);
+            _$insertNode(_el$402, _el$403);
+            _$insertNode(_el$402, _el$404);
+            _$setProp(_el$402, "wrapMode", "word");
+            _$insert(_el$402, () => globalProtocol().label, _el$404);
+            _$insert(_el$402, () => globalProtocol().authoritative ? "authoritative" : "limited / read-only", null);
+            _$effect((_$p) => _$setProp(_el$402, "fg", globalProtocol().authoritative ? props.api.theme.current.textMuted : props.api.theme.current.warning, _$p));
+            return _el$402;
           })()
         }), _el$106);
         _$insertNode(_el$106, _el$107);
@@ -2560,25 +2592,25 @@ function ControlCenter(props) {
           }
         }), null);
         _$insert(_el$99, () => reactiveChild(() => settings().consent.map((entry) => (() => {
-          var _el$397 = _$createElement("box"), _el$398 = _$createElement("text"), _el$399 = _$createElement("b"), _el$400 = _$createTextNode(`: `), _el$401 = _$createTextNode(` \xB7 `), _el$402 = _$createElement("text"), _el$403 = _$createElement("text");
-          _$insertNode(_el$397, _el$398);
-          _$insertNode(_el$397, _el$402);
-          _$insertNode(_el$397, _el$403);
-          _$setProp(_el$397, "border", true);
-          _$setProp(_el$397, "paddingLeft", 1);
-          _$setProp(_el$397, "paddingRight", 1);
-          _$setProp(_el$397, "flexDirection", "column");
-          _$insertNode(_el$398, _el$399);
-          _$insertNode(_el$398, _el$400);
-          _$insertNode(_el$398, _el$401);
-          _$insert(_el$399, () => entry.label);
-          _$insert(_el$398, () => entry.enabled ? "Allowed" : "Not allowed", _el$401);
-          _$insert(_el$398, () => entry.scope, null);
-          _$setProp(_el$402, "wrapMode", "word");
-          _$insert(_el$402, () => entry.description);
-          _$setProp(_el$403, "wrapMode", "word");
-          _$insert(_el$403, () => entry.dependency);
-          _$insert(_el$397, _$createComponent(Show, {
+          var _el$405 = _$createElement("box"), _el$406 = _$createElement("text"), _el$407 = _$createElement("b"), _el$408 = _$createTextNode(`: `), _el$409 = _$createTextNode(` \xB7 `), _el$410 = _$createElement("text"), _el$411 = _$createElement("text");
+          _$insertNode(_el$405, _el$406);
+          _$insertNode(_el$405, _el$410);
+          _$insertNode(_el$405, _el$411);
+          _$setProp(_el$405, "border", true);
+          _$setProp(_el$405, "paddingLeft", 1);
+          _$setProp(_el$405, "paddingRight", 1);
+          _$setProp(_el$405, "flexDirection", "column");
+          _$insertNode(_el$406, _el$407);
+          _$insertNode(_el$406, _el$408);
+          _$insertNode(_el$406, _el$409);
+          _$insert(_el$407, () => entry.label);
+          _$insert(_el$406, () => entry.enabled ? "Allowed" : "Not allowed", _el$409);
+          _$insert(_el$406, () => entry.scope, null);
+          _$setProp(_el$410, "wrapMode", "word");
+          _$insert(_el$410, () => entry.description);
+          _$setProp(_el$411, "wrapMode", "word");
+          _$insert(_el$411, () => entry.dependency);
+          _$insert(_el$405, _$createComponent(Show, {
             get when() {
               return _$memo(() => !!settings().controls.consent)() && (entry.enabled || entry.canEnable);
             },
@@ -2592,29 +2624,29 @@ function ControlCenter(props) {
               }) : localActionButton(`Review consent for ${entry.label}`, () => openConsentDisclosure(entry.key), false, undefined, undefined, `consent:${entry.key}`);
             }
           }), null);
-          _$insert(_el$397, () => consentDisclosure(entry.key), null);
-          _$insert(_el$397, _$createComponent(Show, {
+          _$insert(_el$405, () => consentDisclosure(entry.key), null);
+          _$insert(_el$405, _$createComponent(Show, {
             get when() {
               return _$memo(() => !!!entry.enabled)() && !entry.canEnable;
             },
             get children() {
-              var _el$404 = _$createElement("text");
-              _$insertNode(_el$404, _$createTextNode(`Resolve the dependency above before enabling this setting.`));
-              _$setProp(_el$404, "wrapMode", "word");
-              _$effect((_$p) => _$setProp(_el$404, "fg", props.api.theme.current.warning, _$p));
-              return _el$404;
+              var _el$412 = _$createElement("text");
+              _$insertNode(_el$412, _$createTextNode(`Resolve the dependency above before enabling this setting.`));
+              _$setProp(_el$412, "wrapMode", "word");
+              _$effect((_$p) => _$setProp(_el$412, "fg", props.api.theme.current.warning, _$p));
+              return _el$412;
             }
           }), null);
           _$effect((_p$) => {
-            var _v$74 = props.api.theme.current.borderSubtle, _v$75 = props.api.theme.current.textMuted;
-            _v$74 !== _p$.e && (_p$.e = _$setProp(_el$397, "borderColor", _v$74, _p$.e));
-            _v$75 !== _p$.t && (_p$.t = _$setProp(_el$403, "fg", _v$75, _p$.t));
+            var _v$76 = props.api.theme.current.borderSubtle, _v$77 = props.api.theme.current.textMuted;
+            _v$76 !== _p$.e && (_p$.e = _$setProp(_el$405, "borderColor", _v$76, _p$.e));
+            _v$77 !== _p$.t && (_p$.t = _$setProp(_el$411, "fg", _v$77, _p$.t));
             return _p$;
           }, {
             e: undefined,
             t: undefined
           });
-          return _el$397;
+          return _el$405;
         })())), _el$127);
         _$insertNode(_el$127, _el$128);
         _$insertNode(_el$127, _el$129);
@@ -2637,40 +2669,40 @@ function ControlCenter(props) {
           }
         }), _el$145);
         _$insert(_el$99, () => reactiveChild(() => settings().globalRoots.map((root, index) => (() => {
-          var _el$406 = _$createElement("box"), _el$407 = _$createElement("text"), _el$408 = _$createElement("text"), _el$409 = _$createTextNode(` \xB7 `);
-          _$insertNode(_el$406, _el$407);
-          _$insertNode(_el$406, _el$408);
-          _$setProp(_el$406, "border", true);
-          _$setProp(_el$406, "paddingLeft", 1);
-          _$setProp(_el$406, "paddingRight", 1);
-          _$setProp(_el$406, "flexDirection", "column");
-          _$setProp(_el$407, "wrapMode", "word");
-          _$insert(_el$407, () => root.canonicalPath);
-          _$insertNode(_el$408, _el$409);
-          _$setProp(_el$408, "wrapMode", "word");
-          _$insert(_el$408, () => root.canUpdate ? "Update" : "No update", _el$409);
-          _$insert(_el$408, () => root.canCreate ? "Create" : "No create", null);
-          _$insert(_el$408, () => root.primaryCreationRoot ? " \xB7 Primary creation root" : "", null);
-          _$insert(_el$406, _$createComponent(Show, {
+          var _el$414 = _$createElement("box"), _el$415 = _$createElement("text"), _el$416 = _$createElement("text"), _el$417 = _$createTextNode(` \xB7 `);
+          _$insertNode(_el$414, _el$415);
+          _$insertNode(_el$414, _el$416);
+          _$setProp(_el$414, "border", true);
+          _$setProp(_el$414, "paddingLeft", 1);
+          _$setProp(_el$414, "paddingRight", 1);
+          _$setProp(_el$414, "flexDirection", "column");
+          _$setProp(_el$415, "wrapMode", "word");
+          _$insert(_el$415, () => root.canonicalPath);
+          _$insertNode(_el$416, _el$417);
+          _$setProp(_el$416, "wrapMode", "word");
+          _$insert(_el$416, () => root.canUpdate ? "Update" : "No update", _el$417);
+          _$insert(_el$416, () => root.canCreate ? "Create" : "No create", null);
+          _$insert(_el$416, () => root.primaryCreationRoot ? " \xB7 Primary creation root" : "", null);
+          _$insert(_el$414, _$createComponent(Show, {
             get when() {
               return settings().controls.approvedSkillFolders;
             },
             get children() {
-              var _el$410 = _$createElement("box");
-              _$setProp(_el$410, "flexDirection", "row");
-              _$setProp(_el$410, "flexWrap", "wrap");
-              _$setProp(_el$410, "gap", 1);
-              _$insert(_el$410, () => localActionButton(`Edit ${root.canonicalPath}`, () => stageFolderList(settings().globalRoots), false, undefined, undefined, `edit-root:${index}`), null);
-              _$insert(_el$410, () => localActionButton(`Remove ${root.canonicalPath}`, () => stageFolderList(settings().globalRoots.filter((_, currentIndex) => currentIndex !== index)), true, undefined, undefined, `remove-root:${index}`), null);
-              return _el$410;
+              var _el$418 = _$createElement("box");
+              _$setProp(_el$418, "flexDirection", "row");
+              _$setProp(_el$418, "flexWrap", "wrap");
+              _$setProp(_el$418, "gap", 1);
+              _$insert(_el$418, () => localActionButton(`Edit ${root.canonicalPath}`, () => stageFolderList(settings().globalRoots), false, undefined, undefined, `edit-root:${index}`), null);
+              _$insert(_el$418, () => localActionButton(`Remove ${root.canonicalPath}`, () => stageFolderList(settings().globalRoots.filter((_, currentIndex) => currentIndex !== index)), true, undefined, undefined, `remove-root:${index}`), null);
+              return _el$418;
             }
           }), null);
           _$effect((_p$) => {
-            var _v$76 = focusId(`root-row:${index}`), _v$77 = props.api.theme.current.borderSubtle, _v$78 = focusId(`root-capabilities:${index}`), _v$79 = props.api.theme.current.textMuted;
-            _v$76 !== _p$.e && (_p$.e = _$setProp(_el$406, "id", _v$76, _p$.e));
-            _v$77 !== _p$.t && (_p$.t = _$setProp(_el$406, "borderColor", _v$77, _p$.t));
-            _v$78 !== _p$.a && (_p$.a = _$setProp(_el$408, "id", _v$78, _p$.a));
-            _v$79 !== _p$.o && (_p$.o = _$setProp(_el$408, "fg", _v$79, _p$.o));
+            var _v$78 = focusId(`root-row:${index}`), _v$79 = props.api.theme.current.borderSubtle, _v$80 = focusId(`root-capabilities:${index}`), _v$81 = props.api.theme.current.textMuted;
+            _v$78 !== _p$.e && (_p$.e = _$setProp(_el$414, "id", _v$78, _p$.e));
+            _v$79 !== _p$.t && (_p$.t = _$setProp(_el$414, "borderColor", _v$79, _p$.t));
+            _v$80 !== _p$.a && (_p$.a = _$setProp(_el$416, "id", _v$80, _p$.a));
+            _v$81 !== _p$.o && (_p$.o = _$setProp(_el$416, "fg", _v$81, _p$.o));
             return _p$;
           }, {
             e: undefined,
@@ -2678,7 +2710,7 @@ function ControlCenter(props) {
             a: undefined,
             o: undefined
           });
-          return _el$406;
+          return _el$414;
         })())), _el$145);
         _$insert(_el$99, _$createComponent(Show, {
           get when() {
@@ -2691,10 +2723,10 @@ function ControlCenter(props) {
             _$insertNode(_el$137, _el$138);
             _$insertNode(_el$138, _$createTextNode(`Legacy collection suggestions (no authority)`));
             _$insert(_el$136, () => reactiveChild(() => settings().collectionSuggestions.map((folder) => (() => {
-              var _el$411 = _$createElement("text");
-              _$setProp(_el$411, "wrapMode", "word");
-              _$insert(_el$411, folder);
-              return _el$411;
+              var _el$419 = _$createElement("text");
+              _$setProp(_el$419, "wrapMode", "word");
+              _$insert(_el$419, folder);
+              return _el$419;
             })())), null);
             return _el$136;
           }
@@ -2744,40 +2776,40 @@ function ControlCenter(props) {
             return folderDraft();
           },
           children: (draft) => (() => {
-            var _el$412 = _$createElement("box"), _el$413 = _$createElement("text"), _el$414 = _$createElement("b"), _el$416 = _$createElement("text"), _el$417 = _$createTextNode(`Type exactly: `), _el$418 = _$createElement("input"), _el$419 = _$createElement("box");
-            _$insertNode(_el$412, _el$413);
-            _$insertNode(_el$412, _el$416);
-            _$insertNode(_el$412, _el$418);
-            _$insertNode(_el$412, _el$419);
-            _$setProp(_el$412, "border", true);
-            _$setProp(_el$412, "paddingLeft", 1);
-            _$setProp(_el$412, "paddingRight", 1);
-            _$setProp(_el$412, "flexDirection", "column");
-            _$insertNode(_el$413, _el$414);
-            _$insertNode(_el$414, _$createTextNode(`Complete authoritative replacement`));
-            _$insert(_el$412, () => reactiveChild(() => draft().map((root, index) => (() => {
-              var _el$420 = _$createElement("box"), _el$421 = _$createElement("text"), _el$422 = _$createElement("box");
-              _$insertNode(_el$420, _el$421);
-              _$insertNode(_el$420, _el$422);
-              _$setProp(_el$420, "border", true);
-              _$setProp(_el$420, "paddingLeft", 1);
-              _$setProp(_el$420, "paddingRight", 1);
-              _$setProp(_el$420, "flexDirection", "column");
-              _$setProp(_el$421, "wrapMode", "word");
-              _$insert(_el$421, () => root.canonicalPath);
-              _$setProp(_el$422, "flexDirection", "row");
-              _$setProp(_el$422, "flexWrap", "wrap");
-              _$setProp(_el$422, "gap", 1);
-              _$insert(_el$422, () => localActionButton(root.canUpdate ? "Update allowed" : "Allow updates", () => updateFolderDraft(index, {
+            var _el$420 = _$createElement("box"), _el$421 = _$createElement("text"), _el$422 = _$createElement("b"), _el$424 = _$createElement("text"), _el$425 = _$createTextNode(`Type exactly: `), _el$426 = _$createElement("input"), _el$427 = _$createElement("box");
+            _$insertNode(_el$420, _el$421);
+            _$insertNode(_el$420, _el$424);
+            _$insertNode(_el$420, _el$426);
+            _$insertNode(_el$420, _el$427);
+            _$setProp(_el$420, "border", true);
+            _$setProp(_el$420, "paddingLeft", 1);
+            _$setProp(_el$420, "paddingRight", 1);
+            _$setProp(_el$420, "flexDirection", "column");
+            _$insertNode(_el$421, _el$422);
+            _$insertNode(_el$422, _$createTextNode(`Complete authoritative replacement`));
+            _$insert(_el$420, () => reactiveChild(() => draft().map((root, index) => (() => {
+              var _el$428 = _$createElement("box"), _el$429 = _$createElement("text"), _el$430 = _$createElement("box");
+              _$insertNode(_el$428, _el$429);
+              _$insertNode(_el$428, _el$430);
+              _$setProp(_el$428, "border", true);
+              _$setProp(_el$428, "paddingLeft", 1);
+              _$setProp(_el$428, "paddingRight", 1);
+              _$setProp(_el$428, "flexDirection", "column");
+              _$setProp(_el$429, "wrapMode", "word");
+              _$insert(_el$429, () => root.canonicalPath);
+              _$setProp(_el$430, "flexDirection", "row");
+              _$setProp(_el$430, "flexWrap", "wrap");
+              _$setProp(_el$430, "gap", 1);
+              _$insert(_el$430, () => localActionButton(root.canUpdate ? "Update allowed" : "Allow updates", () => updateFolderDraft(index, {
                 canUpdate: !root.canUpdate
               }), false, undefined, undefined, `draft-update:${index}`), null);
-              _$insert(_el$422, () => localActionButton(root.canCreate ? "Create allowed" : "Allow creation", () => updateFolderDraft(index, {
+              _$insert(_el$430, () => localActionButton(root.canCreate ? "Create allowed" : "Allow creation", () => updateFolderDraft(index, {
                 canCreate: !root.canCreate,
                 ...!root.canCreate ? {} : {
                   primaryCreationRoot: false
                 }
               }), false, undefined, undefined, `draft-create:${index}`), null);
-              _$insert(_el$422, () => localActionButton(root.primaryCreationRoot ? "Primary creation root" : "Make primary creation root", () => {
+              _$insert(_el$430, () => localActionButton(root.primaryCreationRoot ? "Primary creation root" : "Make primary creation root", () => {
                 setFolderDraft((current) => current?.map((entry, currentIndex) => ({
                   ...entry,
                   primaryCreationRoot: currentIndex === index,
@@ -2786,31 +2818,31 @@ function ControlCenter(props) {
                 setFolderConfirmation("");
                 setFolderError(null);
               }, root.primaryCreationRoot, undefined, undefined, `draft-primary:${index}`), null);
-              _$insert(_el$422, () => localActionButton("Remove row", () => stageFolderList(draft().filter((_, currentIndex) => currentIndex !== index)), true, undefined, undefined, `draft-remove:${index}`), null);
-              _$effect((_$p) => _$setProp(_el$420, "borderColor", props.api.theme.current.borderSubtle, _$p));
-              return _el$420;
-            })())), _el$416);
-            _$insertNode(_el$416, _el$417);
-            _$setProp(_el$416, "wrapMode", "word");
-            _$insert(_el$416, () => settings().globalRootPolicyConfirmation ?? "Fresh server confirmation unavailable", null);
-            _$setProp(_el$418, "onInput", (value) => setFolderConfirmation(value.slice(0, 64)));
-            _$setProp(_el$419, "flexDirection", "row");
-            _$setProp(_el$419, "flexWrap", "wrap");
-            _$setProp(_el$419, "gap", 1);
-            _$insert(_el$419, () => localActionButton("Replace authoritative roots", () => void submitFolderList(), true, undefined, {
+              _$insert(_el$430, () => localActionButton("Remove row", () => stageFolderList(draft().filter((_, currentIndex) => currentIndex !== index)), true, undefined, undefined, `draft-remove:${index}`), null);
+              _$effect((_$p) => _$setProp(_el$428, "borderColor", props.api.theme.current.borderSubtle, _$p));
+              return _el$428;
+            })())), _el$424);
+            _$insertNode(_el$424, _el$425);
+            _$setProp(_el$424, "wrapMode", "word");
+            _$insert(_el$424, () => settings().globalRootPolicyConfirmation ?? "Fresh server confirmation unavailable", null);
+            _$setProp(_el$426, "onInput", (value) => setFolderConfirmation(value.slice(0, 64)));
+            _$setProp(_el$427, "flexDirection", "row");
+            _$setProp(_el$427, "flexWrap", "wrap");
+            _$setProp(_el$427, "gap", 1);
+            _$insert(_el$427, () => localActionButton("Replace authoritative roots", () => void submitFolderList(), true, undefined, {
               action: "replace-global-root-policy",
               subject: "project"
             }), null);
-            _$insert(_el$419, () => localActionButton("Cancel", () => {
+            _$insert(_el$427, () => localActionButton("Cancel", () => {
               setFolderDraft(null);
               setFolderConfirmation("");
             }, false, undefined, undefined, "cancel-folder-update"), null);
             _$effect((_p$) => {
-              var _v$80 = props.api.theme.current.warning, _v$81 = focusId("root-policy-confirmation"), _v$82 = folderConfirmation(), _v$83 = settings().globalRootPolicyConfirmation ?? "Fresh server confirmation unavailable";
-              _v$80 !== _p$.e && (_p$.e = _$setProp(_el$412, "borderColor", _v$80, _p$.e));
-              _v$81 !== _p$.t && (_p$.t = _$setProp(_el$418, "id", _v$81, _p$.t));
-              _v$82 !== _p$.a && (_p$.a = _$setProp(_el$418, "value", _v$82, _p$.a));
-              _v$83 !== _p$.o && (_p$.o = _$setProp(_el$418, "placeholder", _v$83, _p$.o));
+              var _v$82 = props.api.theme.current.warning, _v$83 = focusId("root-policy-confirmation"), _v$84 = folderConfirmation(), _v$85 = settings().globalRootPolicyConfirmation ?? "Fresh server confirmation unavailable";
+              _v$82 !== _p$.e && (_p$.e = _$setProp(_el$420, "borderColor", _v$82, _p$.e));
+              _v$83 !== _p$.t && (_p$.t = _$setProp(_el$426, "id", _v$83, _p$.t));
+              _v$84 !== _p$.a && (_p$.a = _$setProp(_el$426, "value", _v$84, _p$.a));
+              _v$85 !== _p$.o && (_p$.o = _$setProp(_el$426, "placeholder", _v$85, _p$.o));
               return _p$;
             }, {
               e: undefined,
@@ -2818,7 +2850,7 @@ function ControlCenter(props) {
               a: undefined,
               o: undefined
             });
-            return _el$412;
+            return _el$420;
           })()
         }), _el$145);
         _$insertNode(_el$145, _el$146);
@@ -2826,73 +2858,73 @@ function ControlCenter(props) {
         _$insertNode(_el$148, _$createTextNode(`These values are read-only here. Change configured numeric limits through startup configuration.`));
         _$setProp(_el$148, "wrapMode", "word");
         _$insert(_el$99, () => reactiveChild(() => settings().limits.map((limit) => (() => {
-          var _el$423 = _$createElement("box"), _el$424 = _$createElement("text"), _el$425 = _$createElement("b"), _el$426 = _$createElement("text"), _el$427 = _$createTextNode(`Actual: `), _el$428 = _$createElement("text"), _el$429 = _$createTextNode(`Configured limit: `), _el$430 = _$createElement("text");
-          _$insertNode(_el$423, _el$424);
-          _$insertNode(_el$423, _el$426);
-          _$insertNode(_el$423, _el$428);
-          _$insertNode(_el$423, _el$430);
-          _$setProp(_el$423, "border", true);
-          _$setProp(_el$423, "paddingLeft", 1);
-          _$setProp(_el$423, "paddingRight", 1);
-          _$setProp(_el$423, "flexDirection", "column");
-          _$insertNode(_el$424, _el$425);
-          _$insert(_el$425, () => limit.label);
-          _$insertNode(_el$426, _el$427);
-          _$setProp(_el$426, "wrapMode", "word");
-          _$insert(_el$426, () => limit.actual, null);
-          _$insertNode(_el$428, _el$429);
-          _$setProp(_el$428, "wrapMode", "word");
-          _$insert(_el$428, () => limit.configured, null);
-          _$insert(_el$423, _$createComponent(Show, {
+          var _el$431 = _$createElement("box"), _el$432 = _$createElement("text"), _el$433 = _$createElement("b"), _el$434 = _$createElement("text"), _el$435 = _$createTextNode(`Actual: `), _el$436 = _$createElement("text"), _el$437 = _$createTextNode(`Configured limit: `), _el$438 = _$createElement("text");
+          _$insertNode(_el$431, _el$432);
+          _$insertNode(_el$431, _el$434);
+          _$insertNode(_el$431, _el$436);
+          _$insertNode(_el$431, _el$438);
+          _$setProp(_el$431, "border", true);
+          _$setProp(_el$431, "paddingLeft", 1);
+          _$setProp(_el$431, "paddingRight", 1);
+          _$setProp(_el$431, "flexDirection", "column");
+          _$insertNode(_el$432, _el$433);
+          _$insert(_el$433, () => limit.label);
+          _$insertNode(_el$434, _el$435);
+          _$setProp(_el$434, "wrapMode", "word");
+          _$insert(_el$434, () => limit.actual, null);
+          _$insertNode(_el$436, _el$437);
+          _$setProp(_el$436, "wrapMode", "word");
+          _$insert(_el$436, () => limit.configured, null);
+          _$insert(_el$431, _$createComponent(Show, {
             get when() {
               return limit.resetAt;
             },
             children: (resetAt) => (() => {
-              var _el$431 = _$createElement("text"), _el$432 = _$createTextNode(`Resets: `);
-              _$insertNode(_el$431, _el$432);
-              _$setProp(_el$431, "wrapMode", "word");
-              _$insert(_el$431, () => new Date(resetAt()).toISOString(), null);
-              return _el$431;
+              var _el$439 = _$createElement("text"), _el$440 = _$createTextNode(`Resets: `);
+              _$insertNode(_el$439, _el$440);
+              _$setProp(_el$439, "wrapMode", "word");
+              _$insert(_el$439, () => new Date(resetAt()).toISOString(), null);
+              return _el$439;
             })()
-          }), _el$430);
-          _$setProp(_el$430, "wrapMode", "word");
-          _$insert(_el$430, () => limit.explanation);
+          }), _el$438);
+          _$setProp(_el$438, "wrapMode", "word");
+          _$insert(_el$438, () => limit.explanation);
           _$effect((_p$) => {
-            var _v$84 = props.api.theme.current.borderSubtle, _v$85 = props.api.theme.current.textMuted;
-            _v$84 !== _p$.e && (_p$.e = _$setProp(_el$423, "borderColor", _v$84, _p$.e));
-            _v$85 !== _p$.t && (_p$.t = _$setProp(_el$430, "fg", _v$85, _p$.t));
+            var _v$86 = props.api.theme.current.borderSubtle, _v$87 = props.api.theme.current.textMuted;
+            _v$86 !== _p$.e && (_p$.e = _$setProp(_el$431, "borderColor", _v$86, _p$.e));
+            _v$87 !== _p$.t && (_p$.t = _$setProp(_el$438, "fg", _v$87, _p$.t));
             return _p$;
           }, {
             e: undefined,
             t: undefined
           });
-          return _el$423;
+          return _el$431;
         })())), _el$150);
         _$insert(_el$99, _$createComponent(Show, {
           get when() {
             return settings().rolloutProgress;
           },
           children: (rolloutProgress) => (() => {
-            var _el$433 = _$createElement("box"), _el$434 = _$createElement("text"), _el$435 = _$createElement("b"), _el$437 = _$createTextNode(`: `), _el$438 = _$createElement("text"), _el$439 = _$createTextNode(`Actual: `), _el$440 = _$createElement("text"), _el$441 = _$createTextNode(`Configured requirement: `);
-            _$insertNode(_el$433, _el$434);
-            _$insertNode(_el$433, _el$438);
-            _$insertNode(_el$433, _el$440);
-            _$setProp(_el$433, "border", true);
-            _$setProp(_el$433, "paddingLeft", 1);
-            _$setProp(_el$433, "paddingRight", 1);
-            _$setProp(_el$433, "flexDirection", "column");
-            _$insertNode(_el$434, _el$435);
-            _$insertNode(_el$434, _el$437);
-            _$insertNode(_el$435, _$createTextNode(`Compatibility rollout diagnostics (no authority)`));
-            _$insert(_el$434, () => rolloutProgress().ready ? "Threshold met" : "Threshold not met", null);
-            _$insertNode(_el$438, _el$439);
-            _$setProp(_el$438, "wrapMode", "word");
-            _$insert(_el$438, () => rolloutProgress().actual, null);
-            _$insertNode(_el$440, _el$441);
-            _$setProp(_el$440, "wrapMode", "word");
-            _$insert(_el$440, () => rolloutProgress().configured, null);
-            _$effect((_$p) => _$setProp(_el$433, "borderColor", props.api.theme.current.borderSubtle, _$p));
-            return _el$433;
+            var _el$441 = _$createElement("box"), _el$442 = _$createElement("text"), _el$443 = _$createElement("b"), _el$445 = _$createTextNode(`: `), _el$446 = _$createElement("text"), _el$447 = _$createTextNode(`Actual: `), _el$448 = _$createElement("text"), _el$449 = _$createTextNode(`Configured requirement: `);
+            _$insertNode(_el$441, _el$442);
+            _$insertNode(_el$441, _el$446);
+            _$insertNode(_el$441, _el$448);
+            _$setProp(_el$441, "border", true);
+            _$setProp(_el$441, "paddingLeft", 1);
+            _$setProp(_el$441, "paddingRight", 1);
+            _$setProp(_el$441, "flexDirection", "column");
+            _$insertNode(_el$442, _el$443);
+            _$insertNode(_el$442, _el$445);
+            _$insertNode(_el$443, _$createTextNode(`Compatibility rollout diagnostics (no authority)`));
+            _$insert(_el$442, () => rolloutProgress().ready ? "Threshold met" : "Threshold not met", null);
+            _$insertNode(_el$446, _el$447);
+            _$setProp(_el$446, "wrapMode", "word");
+            _$insert(_el$446, () => rolloutProgress().actual, null);
+            _$insertNode(_el$448, _el$449);
+            _$setProp(_el$448, "wrapMode", "word");
+            _$insert(_el$448, () => rolloutProgress().configured, null);
+            _$effect((_$p) => _$setProp(_el$441, "borderColor", props.api.theme.current.borderSubtle, _$p));
+            return _el$441;
           })()
         }), _el$150);
         _$insertNode(_el$150, _el$151);
@@ -2903,20 +2935,20 @@ function ControlCenter(props) {
         _$setProp(_el$155, "flexWrap", "wrap");
         _$setProp(_el$155, "gap", 1);
         _$insert(_el$155, () => reactiveChild(() => settings().maintenance.scopes.map((scope) => (() => {
-          var _el$442 = _$createElement("box"), _el$443 = _$createElement("text");
-          _$insertNode(_el$442, _el$443);
-          _$setProp(_el$442, "focusable", true);
-          _$setProp(_el$442, "border", true);
-          _$setProp(_el$442, "paddingLeft", 1);
-          _$setProp(_el$442, "paddingRight", 1);
-          _$setProp(_el$442, "on:focused", () => setFocusedControl(`maintenance-scope:${scope.value}`));
-          _$setProp(_el$442, "on:blurred", () => setFocusedControl((current) => current === `maintenance-scope:${scope.value}` ? null : current));
-          _$setProp(_el$442, "onMouseUp", () => {
+          var _el$450 = _$createElement("box"), _el$451 = _$createElement("text");
+          _$insertNode(_el$450, _el$451);
+          _$setProp(_el$450, "focusable", true);
+          _$setProp(_el$450, "border", true);
+          _$setProp(_el$450, "paddingLeft", 1);
+          _$setProp(_el$450, "paddingRight", 1);
+          _$setProp(_el$450, "on:focused", () => setFocusedControl(`maintenance-scope:${scope.value}`));
+          _$setProp(_el$450, "on:blurred", () => setFocusedControl((current) => current === `maintenance-scope:${scope.value}` ? null : current));
+          _$setProp(_el$450, "onMouseUp", () => {
             setMaintenanceScope(scope.value);
             setMaintenanceIntent(null);
             setMaintenanceConfirmation("");
           });
-          _$setProp(_el$442, "onKeyDown", (event) => {
+          _$setProp(_el$450, "onKeyDown", (event) => {
             if (!isActivationKey(event))
               return;
             event.preventDefault();
@@ -2924,10 +2956,10 @@ function ControlCenter(props) {
             setMaintenanceIntent(null);
             setMaintenanceConfirmation("");
           });
-          _$insert(_el$443, () => focusMark(`maintenance-scope:${scope.value}`), null);
-          _$insert(_el$443, () => scope.label, null);
-          _$effect((_$p) => _$setProp(_el$442, "borderColor", maintenanceScope() === scope.value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle, _$p));
-          return _el$442;
+          _$insert(_el$451, () => focusMark(`maintenance-scope:${scope.value}`), null);
+          _$insert(_el$451, () => scope.label, null);
+          _$effect((_$p) => _$setProp(_el$450, "borderColor", maintenanceScope() === scope.value ? props.api.theme.current.borderActive : props.api.theme.current.borderSubtle, _$p));
+          return _el$450;
         })())));
         _$setProp(_el$156, "wrapMode", "word");
         _$insert(_el$156, () => settings().maintenance.scopes.find((scope) => scope.value === maintenanceScope())?.explanation);
@@ -3008,37 +3040,37 @@ function ControlCenter(props) {
             return settings().latestExport;
           },
           children: (latestExport) => (() => {
-            var _el$444 = _$createElement("box"), _el$445 = _$createElement("text"), _el$446 = _$createElement("b"), _el$448 = _$createElement("text"), _el$449 = _$createTextNode(`Scope: `), _el$450 = _$createElement("text"), _el$451 = _$createTextNode(`Private path: `), _el$452 = _$createElement("text"), _el$453 = _$createTextNode(`Size: `), _el$454 = _$createTextNode(` bytes`), _el$455 = _$createElement("text"), _el$456 = _$createTextNode(`SHA-256: `), _el$457 = _$createElement("text"), _el$458 = _$createTextNode(`Expires: `);
-            _$insertNode(_el$444, _el$445);
-            _$insertNode(_el$444, _el$448);
-            _$insertNode(_el$444, _el$450);
-            _$insertNode(_el$444, _el$452);
-            _$insertNode(_el$444, _el$455);
-            _$insertNode(_el$444, _el$457);
-            _$setProp(_el$444, "border", true);
-            _$setProp(_el$444, "paddingLeft", 1);
-            _$setProp(_el$444, "paddingRight", 1);
-            _$setProp(_el$444, "flexDirection", "column");
-            _$insertNode(_el$445, _el$446);
-            _$insertNode(_el$446, _$createTextNode(`Latest private export`));
-            _$insertNode(_el$448, _el$449);
-            _$setProp(_el$448, "wrapMode", "word");
-            _$insert(_el$448, () => latestExport().scope, null);
-            _$insertNode(_el$450, _el$451);
-            _$setProp(_el$450, "wrapMode", "word");
-            _$insert(_el$450, () => latestExport().path, null);
+            var _el$452 = _$createElement("box"), _el$453 = _$createElement("text"), _el$454 = _$createElement("b"), _el$456 = _$createElement("text"), _el$457 = _$createTextNode(`Scope: `), _el$458 = _$createElement("text"), _el$459 = _$createTextNode(`Private path: `), _el$460 = _$createElement("text"), _el$461 = _$createTextNode(`Size: `), _el$462 = _$createTextNode(` bytes`), _el$463 = _$createElement("text"), _el$464 = _$createTextNode(`SHA-256: `), _el$465 = _$createElement("text"), _el$466 = _$createTextNode(`Expires: `);
             _$insertNode(_el$452, _el$453);
-            _$insertNode(_el$452, _el$454);
-            _$setProp(_el$452, "wrapMode", "word");
-            _$insert(_el$452, () => latestExport().bytes, _el$454);
-            _$insertNode(_el$455, _el$456);
-            _$setProp(_el$455, "wrapMode", "word");
-            _$insert(_el$455, () => latestExport().sha256, null);
-            _$insertNode(_el$457, _el$458);
-            _$setProp(_el$457, "wrapMode", "word");
-            _$insert(_el$457, () => new Date(latestExport().expiresAt).toISOString(), null);
-            _$effect((_$p) => _$setProp(_el$444, "borderColor", props.api.theme.current.warning, _$p));
-            return _el$444;
+            _$insertNode(_el$452, _el$456);
+            _$insertNode(_el$452, _el$458);
+            _$insertNode(_el$452, _el$460);
+            _$insertNode(_el$452, _el$463);
+            _$insertNode(_el$452, _el$465);
+            _$setProp(_el$452, "border", true);
+            _$setProp(_el$452, "paddingLeft", 1);
+            _$setProp(_el$452, "paddingRight", 1);
+            _$setProp(_el$452, "flexDirection", "column");
+            _$insertNode(_el$453, _el$454);
+            _$insertNode(_el$454, _$createTextNode(`Latest private export`));
+            _$insertNode(_el$456, _el$457);
+            _$setProp(_el$456, "wrapMode", "word");
+            _$insert(_el$456, () => latestExport().scope, null);
+            _$insertNode(_el$458, _el$459);
+            _$setProp(_el$458, "wrapMode", "word");
+            _$insert(_el$458, () => latestExport().path, null);
+            _$insertNode(_el$460, _el$461);
+            _$insertNode(_el$460, _el$462);
+            _$setProp(_el$460, "wrapMode", "word");
+            _$insert(_el$460, () => latestExport().bytes, _el$462);
+            _$insertNode(_el$463, _el$464);
+            _$setProp(_el$463, "wrapMode", "word");
+            _$insert(_el$463, () => latestExport().sha256, null);
+            _$insertNode(_el$465, _el$466);
+            _$setProp(_el$465, "wrapMode", "word");
+            _$insert(_el$465, () => new Date(latestExport().expiresAt).toISOString(), null);
+            _$effect((_$p) => _$setProp(_el$452, "borderColor", props.api.theme.current.warning, _$p));
+            return _el$452;
           })()
         }), _el$164);
         _$insertNode(_el$164, _el$165);
@@ -3110,47 +3142,47 @@ function ControlCenter(props) {
           },
           get children() {
             return [_$memo(() => reactiveChild(() => props.snapshot().responses.map((completedResponse, index) => (() => {
-              var _el$459 = _$createElement("box"), _el$460 = _$createElement("text");
-              _$insertNode(_el$459, _el$460);
-              _$setProp(_el$459, "focusable", true);
-              _$setProp(_el$459, "on:focused", () => setFocusedControl(`outcome:${index}`));
-              _$setProp(_el$459, "on:blurred", () => setFocusedControl((current) => current === `outcome:${index}` ? null : current));
-              _$setProp(_el$460, "wrapMode", "word");
-              _$insert(_el$460, () => focusMark(`outcome:${index}`), null);
-              _$insert(_el$460, () => requestResponseMessage(completedResponse), null);
+              var _el$467 = _$createElement("box"), _el$468 = _$createElement("text");
+              _$insertNode(_el$467, _el$468);
+              _$setProp(_el$467, "focusable", true);
+              _$setProp(_el$467, "on:focused", () => setFocusedControl(`outcome:${index}`));
+              _$setProp(_el$467, "on:blurred", () => setFocusedControl((current) => current === `outcome:${index}` ? null : current));
+              _$setProp(_el$468, "wrapMode", "word");
+              _$insert(_el$468, () => focusMark(`outcome:${index}`), null);
+              _$insert(_el$468, () => requestResponseMessage(completedResponse), null);
               _$effect((_p$) => {
-                var _v$86 = focusId(`outcome:${index}`), _v$87 = completedResponse.response?.ok === false ? props.api.theme.current.error : props.api.theme.current.info;
-                _v$86 !== _p$.e && (_p$.e = _$setProp(_el$459, "id", _v$86, _p$.e));
-                _v$87 !== _p$.t && (_p$.t = _$setProp(_el$460, "fg", _v$87, _p$.t));
+                var _v$88 = focusId(`outcome:${index}`), _v$89 = completedResponse.response?.ok === false ? props.api.theme.current.error : props.api.theme.current.info;
+                _v$88 !== _p$.e && (_p$.e = _$setProp(_el$467, "id", _v$88, _p$.e));
+                _v$89 !== _p$.t && (_p$.t = _$setProp(_el$468, "fg", _v$89, _p$.t));
                 return _p$;
               }, {
                 e: undefined,
                 t: undefined
               });
-              return _el$459;
+              return _el$467;
             })()))), _$createComponent(Show, {
               get when() {
                 return feedback();
               },
               children: (message) => (() => {
-                var _el$461 = _$createElement("box"), _el$462 = _$createElement("text");
-                _$insertNode(_el$461, _el$462);
-                _$setProp(_el$461, "focusable", true);
-                _$setProp(_el$461, "on:focused", () => setFocusedControl("outcome-feedback"));
-                _$setProp(_el$461, "on:blurred", () => setFocusedControl((current) => current === "outcome-feedback" ? null : current));
-                _$setProp(_el$462, "wrapMode", "word");
-                _$insert(_el$462, () => focusMark("outcome-feedback"), null);
-                _$insert(_el$462, message, null);
+                var _el$469 = _$createElement("box"), _el$470 = _$createElement("text");
+                _$insertNode(_el$469, _el$470);
+                _$setProp(_el$469, "focusable", true);
+                _$setProp(_el$469, "on:focused", () => setFocusedControl("outcome-feedback"));
+                _$setProp(_el$469, "on:blurred", () => setFocusedControl((current) => current === "outcome-feedback" ? null : current));
+                _$setProp(_el$470, "wrapMode", "word");
+                _$insert(_el$470, () => focusMark("outcome-feedback"), null);
+                _$insert(_el$470, message, null);
                 _$effect((_p$) => {
-                  var _v$88 = focusId("outcome-feedback"), _v$89 = props.api.theme.current.info;
-                  _v$88 !== _p$.e && (_p$.e = _$setProp(_el$461, "id", _v$88, _p$.e));
-                  _v$89 !== _p$.t && (_p$.t = _$setProp(_el$462, "fg", _v$89, _p$.t));
+                  var _v$90 = focusId("outcome-feedback"), _v$91 = props.api.theme.current.info;
+                  _v$90 !== _p$.e && (_p$.e = _$setProp(_el$469, "id", _v$90, _p$.e));
+                  _v$91 !== _p$.t && (_p$.t = _$setProp(_el$470, "fg", _v$91, _p$.t));
                   return _p$;
                 }, {
                   e: undefined,
                   t: undefined
                 });
-                return _el$461;
+                return _el$469;
               })()
             })];
           }
@@ -3357,11 +3389,11 @@ var tui = async (api, options, meta) => {
     slots: {
       sidebar_content() {
         return (() => {
-          var _el$463 = _$createElement("box");
-          _$setProp(_el$463, "flexDirection", "column");
-          _$setProp(_el$463, "width", "100%");
-          _$setProp(_el$463, "gap", 1);
-          _$insert(_el$463, _$createComponent(SidebarCard, {
+          var _el$471 = _$createElement("box");
+          _$setProp(_el$471, "flexDirection", "column");
+          _$setProp(_el$471, "width", "100%");
+          _$setProp(_el$471, "gap", 1);
+          _$insert(_el$471, _$createComponent(SidebarCard, {
             api,
             card: () => deriveSidebarCard(snapshot()),
             open: () => {
@@ -3369,12 +3401,12 @@ var tui = async (api, options, meta) => {
               openControlCenter(card.destination);
             }
           }), null);
-          _$insert(_el$463, _$createComponent(SidebarModeControl, {
+          _$insert(_el$471, _$createComponent(SidebarModeControl, {
             api,
             store,
             snapshot
           }), null);
-          return _el$463;
+          return _el$471;
         })();
       }
     }
